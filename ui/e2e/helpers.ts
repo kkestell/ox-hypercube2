@@ -137,13 +137,15 @@ export function workspaceGroup(cwd: string) {
 
 /** The session list's entry for the session in `cwd`. */
 export function sessionEntry(cwd: string) {
-  return $(`//li[@class="session"][button[@class="select"][@title="${cwd}"]]`);
+  return $(`//li[@class="sidebar-row session"][button[@class="select"][@title="${cwd}"]]`);
 }
 
 /** The session list's entry for the one session in a worktree. */
 export function worktreeEntry() {
   const worktrees = join(process.env.OX_E2E_DIR!, "worktrees/");
-  return $(`//li[@class="session"][button[@class="select"][starts-with(@title, "${worktrees}")]]`);
+  return $(
+    `//li[@class="sidebar-row session"][button[@class="select"][starts-with(@title, "${worktrees}")]]`,
+  );
 }
 
 /** Opens the New Task menu of the workspace in `cwd`. */

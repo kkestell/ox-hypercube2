@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use ox_protocol::{
@@ -13,6 +14,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 use crate::daemon::{ClientGuard, Daemon};
+use crate::directories::{self, Changes};
 use crate::session::Session;
 
 /// Messages queued for a client before its subscriptions wait for it to
@@ -37,8 +39,8 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
     let (read, write) = stream.into_split();
     let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
     let mut writer = Task(tokio::spawn(write_loop(write, outgoing_rx)));
-    // Event subscriptions and watches, by the id of the request that started
-    // each.
+    // Event subscriptions, watches, and directory watches, by the id of the
+    // request that started each.
     let mut subscriptions: HashMap<u64, Task> = HashMap::new();
     let mut lines = BufReader::new(read).lines();
     let mut greeted = false;
@@ -119,6 +121,22 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     break;
                 }
                 let task = tokio::spawn(watch(daemon.clone(), id, outgoing.clone()));
+                subscriptions.insert(id, Task(task));
+                continue;
+            }
+            Method::DirectoryWatch { path } if !path.is_absolute() => Err(ErrorBody {
+                code: code::INVALID_REQUEST,
+                message: format!("{} is not an absolute path", path.display()),
+            }),
+            Method::DirectoryWatch { path } => {
+                let ack = ServerMessage::Result {
+                    id,
+                    result: Value::Null,
+                };
+                if outgoing.send(ack).await.is_err() {
+                    break;
+                }
+                let task = tokio::spawn(directory(daemon.clone(), path, id, outgoing.clone()));
                 subscriptions.insert(id, Task(task));
                 continue;
             }
@@ -226,6 +244,70 @@ async fn watch(daemon: Arc<Daemon>, subscription: u64, outgoing: mpsc::Sender<Se
         if changed.changed().await.is_err() {
             return;
         }
+    }
+}
+
+/// Sends directory watch `subscription` the entries of the directory at
+/// `path`, then the entries each time they differ from the last ones sent.
+///
+/// The stream watches the directory once it can be read, and otherwise its
+/// nearest existing ancestor-or-self, moving the watch each time that
+/// changes. The watch is registered before the directory is read, so a change
+/// during the read wakes the stream again.
+async fn directory(
+    daemon: Arc<Daemon>,
+    path: PathBuf,
+    subscription: u64,
+    outgoing: mpsc::Sender<ServerMessage>,
+) {
+    let watch = || {
+        let directories = daemon.directories().clone();
+        let path = path.clone();
+        async move {
+            tokio::task::spawn_blocking(move || directories.watch(&path))
+                .await
+                .expect("watching does not panic")
+        }
+    };
+    let read = || {
+        let path = path.clone();
+        async move {
+            tokio::task::spawn_blocking(move || directories::read(&path))
+                .await
+                .expect("reading does not panic")
+        }
+    };
+    let mut changes: Changes = watch().await;
+    let mut sent = None;
+    loop {
+        changes.mark_seen();
+        let entries = if changes.is_target() {
+            read().await
+        } else {
+            None
+        };
+        if entries.is_none() {
+            // The directory is missing, or has gone since the watch started.
+            // Watching where it now resolves replaces the watch only when
+            // that moved, so a change already signalled is not lost.
+            let next = watch().await;
+            if next.path() != changes.path() {
+                changes = next;
+                continue;
+            }
+        }
+        let entries = entries.unwrap_or_default();
+        if sent.as_ref() != Some(&entries) {
+            let message = ServerMessage::Directory {
+                subscription,
+                entries: entries.clone(),
+            };
+            if outgoing.send(message).await.is_err() {
+                return;
+            }
+            sent = Some(entries);
+        }
+        changes.changed().await;
     }
 }
 

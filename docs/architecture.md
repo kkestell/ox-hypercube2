@@ -69,6 +69,16 @@ a worktree's unsaved work, says which branch `oxd` kept, and counts a session
 that is already gone as deleted. The app's dialogs are in-window `<dialog>`
 elements; errors show in a native message box.
 
+The right sidebar shows a file tree of the viewed session's `cwd`, rendered
+only while the sidebar is shown. Each open folder watches its directory with
+`directory.watch`, so only open folders are read, and collapsing a folder ends
+the watches below it. The tree sorts folders first, then names in natural
+order, as VS Code's explorer does. Each session's open folders, as paths
+relative to the root, and its scroll position are kept in the webview's
+`localStorage` under `fileTree:<session id>`, and the tree restores them when
+it is shown again, after a switch or a restart. The app removes a session's
+saved tree once a listing no longer has the session.
+
 **oxctl.** A command-line client of `oxd` that speaks the same protocol as
 the app. `oxctl new --worktree` starts a session in a new worktree on its own
 branch, `--branch` in one on an existing branch, and `--new-branch` in one on
@@ -121,6 +131,17 @@ sequence per session. Cancelling the turn cancels open permission requests;
 an elicitation stays open until a client answers it or the agent withdraws it
 with `$/cancel_request`. When the agent exits or the session is parked or
 closed, every open request ends cancelled.
+
+**Directory watches.** `directory.watch` streams the entries of a directory
+at an absolute path: at once, then each time they change. Entries are sorted
+by name and leave out `.git`, `.hg`, `.svn`, `.jj`, `CVS`, `.DS_Store`,
+`Thumbs.db`, and names that are not UTF-8; a symlink has its target's kind.
+`oxd` holds one `notify` watcher (FSEvents on macOS) and watches each
+directory non-recursively, once however many streams want it, until its last
+stream ends. A directory that does not exist or cannot be read lists no
+entries. Its stream watches the nearest existing ancestor and moves the watch
+each time that changes, so a worktree that is still being added, or a folder
+that is deleted and comes back, is listed once it can be read.
 
 **Workspaces and saved sessions.** A workspace is a directory the user
 added. A session belongs to a workspace by ID and runs in the workspace's

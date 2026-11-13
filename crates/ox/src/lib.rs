@@ -1,14 +1,14 @@
 mod conversation;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, Error, SessionInfo, WorkspaceInfo, code,
-    content, default_socket_path,
+    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, SessionInfo, WorkspaceInfo,
+    code, content, default_socket_path,
 };
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
@@ -33,6 +33,8 @@ struct App {
     client: tokio::sync::Mutex<Option<Arc<Client>>>,
     watch: Mutex<Option<Task>>,
     view: Mutex<Option<Task>>,
+    /// The directory watches, by the ID of the channel each sends on.
+    directories: Mutex<HashMap<u32, Task>>,
 }
 
 impl App {
@@ -73,12 +75,14 @@ enum Agent {
     Claude,
 }
 
-// `watch` and `view_session` are synchronous, so they run on the
-// main thread in the order the webview calls them, and the last call's task
-// is the one that stays.
+// `watch`, `view_session`, `watch_directory`, and `unwatch_directory` are
+// synchronous, so they run on the main thread in the order the webview calls
+// them, and the last call's task is the one that stays.
 
 /// Sends the workspaces and sessions lists on `channel` each time either
-/// changes, replacing the previous watch.
+/// changes, replacing the previous watch. A new watch means the webview
+/// reloaded or reconnected, and in both it watches its directories again once
+/// the watch connects, so this ends every directory watch.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
@@ -113,6 +117,7 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
         }
     });
     *app.watch.lock().unwrap() = Some(Task(task));
+    app.directories.lock().unwrap().clear();
 }
 
 /// Sends a session's conversation on `channel` from its first event,
@@ -152,6 +157,49 @@ fn view_session(
         }))
     });
     *app.view.lock().unwrap() = task;
+}
+
+/// Sends the entries of the directory at `path` on `channel` each time they
+/// change, until `unwatch_directory` ends it. The watch ends when the
+/// connection drops, and a watch that cannot connect sends nothing; the
+/// webview watches again once the workspace watch reconnects.
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri passes managed state to commands as `State` by value"
+)]
+fn watch_directory(
+    handle: AppHandle,
+    app: State<'_, App>,
+    path: PathBuf,
+    channel: Channel<Vec<DirEntry>>,
+) {
+    let id = channel.id();
+    let task = tauri::async_runtime::spawn(async move {
+        let app = handle.state::<App>();
+        let Ok(client) = app.client().await else {
+            return;
+        };
+        let Ok(mut watch) = client.watch_directory(&path).await else {
+            return;
+        };
+        while let Ok(entries) = watch.next().await {
+            if channel.send(entries).is_err() {
+                return;
+            }
+        }
+    });
+    app.directories.lock().unwrap().insert(id, Task(task));
+}
+
+/// Ends the directory watch that sends on the channel `channel_id`.
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri passes managed state to commands as `State` by value"
+)]
+fn unwatch_directory(app: State<'_, App>, channel_id: u32) {
+    app.directories.lock().unwrap().remove(&channel_id);
 }
 
 #[tauri::command]
@@ -425,6 +473,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             watch,
             view_session,
+            watch_directory,
+            unwatch_directory,
             add_workspace,
             remove_workspace,
             workspace_branches,

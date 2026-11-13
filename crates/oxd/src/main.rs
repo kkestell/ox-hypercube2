@@ -11,6 +11,7 @@
 mod branches;
 mod conn;
 mod daemon;
+mod directories;
 mod session;
 mod state;
 mod store;
@@ -29,6 +30,7 @@ use tokio::net::UnixListener;
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::daemon::Daemon;
+use crate::directories::Directories;
 use crate::store::Store;
 
 const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(5);
@@ -132,7 +134,9 @@ async fn run(args: Args) -> io::Result<()> {
     // Worktrees sit beside the socket too. Git runs them from the
     // repository, so the path is absolute.
     let worktrees = std::path::absolute(args.socket.with_file_name("worktrees"))?;
-    let daemon = Daemon::new(store, worktrees, args.park_after)
+    let directories = Directories::new()
+        .map_err(|error| io::Error::other(format!("starting the file watcher: {error}")))?;
+    let daemon = Daemon::new(store, worktrees, args.park_after, directories)
         .map_err(|error| io::Error::other(format!("reading {}: {error}", database.display())))?;
     let daemon = Arc::new(daemon);
 

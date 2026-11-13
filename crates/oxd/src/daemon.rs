@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::branches;
+use crate::directories::Directories;
 use crate::session::Session;
 use crate::state::Change;
 use crate::store::{SavedSession, SavedWorkspace, SavedWorktree, Store};
@@ -45,6 +46,8 @@ pub struct Daemon {
     /// The sessions that never started and have a worktree to remove, each
     /// with its lifecycle guard, until `clean_up` takes them.
     unstarted: Mutex<Vec<(Arc<Session>, OwnedMutexGuard<()>)>>,
+    /// The directories that directory watches follow.
+    directories: Arc<Directories>,
 }
 
 /// Counts one connected client for as long as it lives.
@@ -60,7 +63,8 @@ impl Daemon {
     /// A daemon with the workspaces and sessions `store` holds, which adds
     /// sessions' worktrees in `worktrees_dir`, and parks the agent of a session
     /// that has been idle, with no background work, and unviewed for
-    /// `park_after`. Each saved session is
+    /// `park_after`, and whose directory watches follow `directories`. Each
+    /// saved session is
     /// `exited`, with no agent, until it loads. A saved session that never
     /// started has nothing to load. One without a worktree is deleted; one
     /// with a worktree waits, `exited`, for `clean_up`.
@@ -68,6 +72,7 @@ impl Daemon {
         store: Store,
         worktrees_dir: PathBuf,
         park_after: Duration,
+        directories: Arc<Directories>,
     ) -> rusqlite::Result<Self> {
         let store = Arc::new(store);
         let changed = watch::Sender::new(());
@@ -101,6 +106,7 @@ impl Daemon {
             changed,
             fetches: Arc::default(),
             unstarted: Mutex::new(unstarted),
+            directories,
         })
     }
 
@@ -188,6 +194,10 @@ impl Daemon {
     /// A receiver that sees a change each time the lists may have changed.
     pub fn changed(&self) -> watch::Receiver<()> {
         self.changed.subscribe()
+    }
+
+    pub fn directories(&self) -> &Arc<Directories> {
+        &self.directories
     }
 
     pub fn session(&self, id: &str) -> Result<Arc<Session>, ErrorBody> {
@@ -304,6 +314,7 @@ impl Daemon {
             Method::Hello { .. }
             | Method::SessionSubscribe { .. }
             | Method::Watch
+            | Method::DirectoryWatch { .. }
             | Method::Unsubscribe { .. } => Err(ErrorBody {
                 code: code::INVALID_REQUEST,
                 message: "unexpected method".into(),

@@ -30,10 +30,13 @@ interface Drag {
 
 export function Workbench({
   left,
+  right,
   actions,
   children,
 }: {
   left: ReactNode;
+  /** The right sidebar's content, rendered only while the sidebar shows. */
+  right?: ReactNode;
   /** Controls for the content, at the start of its header. */
   actions?: ReactNode;
   children: ReactNode;
@@ -44,7 +47,7 @@ export function Workbench({
   const [visible, setVisible] = useState<Record<Panel, boolean>>({
     left: true,
     bottom: false,
-    right: false,
+    right: true,
   });
   const [sizes, setSizes] = useState<Record<Panel, number>>(minSizes);
 
@@ -150,7 +153,9 @@ export function Workbench({
         <section className="panel bottom" hidden={!visible.bottom} />
       </div>
       {sash("right")}
-      <aside className="panel right" hidden={!visible.right} />
+      <aside className="panel right" hidden={!visible.right}>
+        {visible.right && right}
+      </aside>
     </div>
   );
 }

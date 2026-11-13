@@ -94,6 +94,12 @@ export interface SessionInfo {
   archived: boolean;
 }
 
+/** An entry of a directory, as a directory watch lists it. */
+export interface DirEntry {
+  name: string;
+  kind: "file" | "directory";
+}
+
 export interface PermissionOption {
   optionId: string;
   name: string;

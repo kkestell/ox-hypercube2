@@ -14,8 +14,9 @@ use ox_protocol::schema::{
     TextContent, TextResourceContents,
 };
 use ox_protocol::{
-    Checkout, Client, ConfigValue, End, Error, Event, EventKind, Listing, PROTOCOL_VERSION,
-    SessionInfo, SessionState, Subscription, Watch, WorkspaceInfo, code,
+    Checkout, Client, ConfigValue, DirEntry, DirectoryWatch, End, EntryKind, Error, Event,
+    EventKind, Listing, PROTOCOL_VERSION, SessionInfo, SessionState, Subscription, Watch,
+    WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -2476,4 +2477,88 @@ async fn a_daemon_whose_sessions_are_parked_exits() {
     drop(client);
     assert!(daemon.wait_for_exit().await.success());
     assert!(!daemon.socket.exists());
+}
+
+/// Waits for a directory watch to list exactly `expected`, as name and kind
+/// pairs.
+async fn entries_until(watch: &mut DirectoryWatch, expected: &[(&str, EntryKind)]) {
+    let expected: Vec<DirEntry> = expected
+        .iter()
+        .map(|&(name, kind)| DirEntry {
+            name: name.into(),
+            kind,
+        })
+        .collect();
+    loop {
+        let entries = timeout(TIMEOUT, watch.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {expected:?}"))
+            .expect("the directory watch ended");
+        if entries == expected {
+            return;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_watch_follows_changes() {
+    let daemon = Daemon::start(1000).await;
+    let client = daemon.client().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("a.txt"), "a").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::create_dir(root.join(".git")).unwrap();
+    std::fs::write(root.join(".DS_Store"), "").unwrap();
+    let mut watch = client.watch_directory(root).await.unwrap();
+    let first = timeout(TIMEOUT, watch.next()).await.unwrap().unwrap();
+    assert_eq!(
+        first,
+        [
+            DirEntry {
+                name: "a.txt".into(),
+                kind: EntryKind::File,
+            },
+            DirEntry {
+                name: "sub".into(),
+                kind: EntryKind::Directory,
+            },
+        ]
+    );
+
+    std::fs::write(root.join("b.txt"), "b").unwrap();
+    let file = EntryKind::File;
+    let directory = EntryKind::Directory;
+    entries_until(
+        &mut watch,
+        &[("a.txt", file), ("b.txt", file), ("sub", directory)],
+    )
+    .await;
+    std::fs::rename(root.join("a.txt"), root.join("c.txt")).unwrap();
+    entries_until(
+        &mut watch,
+        &[("b.txt", file), ("c.txt", file), ("sub", directory)],
+    )
+    .await;
+    std::fs::remove_dir(root.join("sub")).unwrap();
+    entries_until(&mut watch, &[("b.txt", file), ("c.txt", file)]).await;
+}
+
+/// A directory watch on a path that does not exist yet, such as the worktree
+/// of a session that is starting, lists the directory once it is created.
+#[tokio::test(flavor = "multi_thread")]
+async fn directory_watch_lists_a_directory_once_it_exists() {
+    let daemon = Daemon::start(1000).await;
+    let client = daemon.client().await;
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let path = parent.join("worktree");
+    let mut watch = client.watch_directory(&path).await.unwrap();
+    let first = timeout(TIMEOUT, watch.next()).await.unwrap().unwrap();
+    assert_eq!(first, []);
+
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("a.txt"), "a").unwrap();
+    entries_until(&mut watch, &[("a.txt", EntryKind::File)]).await;
 }

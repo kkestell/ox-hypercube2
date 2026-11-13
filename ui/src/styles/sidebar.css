@@ -1,0 +1,78 @@
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.sidebar-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--spacing) var(--sidebar-padding) var(--sidebar-padding);
+}
+
+/* The sidebar's actions share a column with its rows' actions. */
+.sidebar-header {
+  padding-inline: calc(var(--sidebar-padding) + var(--row-action-inset));
+}
+
+.sidebar-body ul {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sidebar-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: var(--sidebar-row-height);
+  border-radius: var(--radius-md);
+}
+
+.sidebar-row:hover {
+  background: var(--hover);
+}
+
+.sidebar-row:has(.select[aria-current="true"]) {
+  background: var(--selected);
+}
+
+.sidebar-row .select {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
+  min-width: 0;
+  height: 100%;
+  padding: 0 var(--sidebar-row-padding);
+  border: none;
+  border-radius: inherit;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  text-align: left;
+}
+
+.sidebar-row .title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A tree row indents by its depth. */
+.tree-row .select {
+  padding-inline-start: calc(var(--sidebar-row-padding) + var(--depth) * var(--tree-indent));
+}
+
+/* A file row leaves the chevron's place empty. */
+.tree-spacer {
+  flex: none;
+  width: var(--icon-size);
+}

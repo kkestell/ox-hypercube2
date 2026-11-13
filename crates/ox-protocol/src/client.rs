@@ -19,8 +19,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigValue, Deleted, ErrorBody, Event, EventKind, HelloResult, Listing,
-    Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo, WorkspaceInfo,
+    Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, HelloResult,
+    Listing, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo, WorkspaceInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -111,11 +111,13 @@ struct Routes {
     streams: HashMap<u64, Route>,
 }
 
-/// A stream's messages: a subscription's events, or a watch's listings.
+/// A stream's messages: a subscription's events, a watch's listings, or a
+/// directory watch's entries.
 #[derive(Debug)]
 enum Route {
     Events(mpsc::UnboundedSender<Event>),
     Listings(mpsc::UnboundedSender<Listing>),
+    Entries(mpsc::UnboundedSender<Vec<DirEntry>>),
 }
 
 impl Routes {
@@ -226,6 +228,22 @@ impl Watch {
     /// [`End::Disconnected`].
     pub async fn next(&mut self) -> Result<Listing, End> {
         self.listings.recv().await.ok_or(End::Disconnected)
+    }
+}
+
+/// A directory's entries, each time they change. Dropping it unsubscribes.
+#[derive(Debug)]
+pub struct DirectoryWatch {
+    entries: mpsc::UnboundedReceiver<Vec<DirEntry>>,
+    _unsubscribe: Unsubscribe,
+}
+
+impl DirectoryWatch {
+    /// The next entries, which differ from the ones before them. The first
+    /// are the entries when the watch started. A directory watch ends only
+    /// with [`End::Disconnected`].
+    pub async fn next(&mut self) -> Result<Vec<DirEntry>, End> {
+        self.entries.recv().await.ok_or(End::Disconnected)
     }
 }
 
@@ -413,6 +431,25 @@ impl Client {
             _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Listings(sender)),
         };
         self.send::<Value>(id, Method::Watch).await?;
+        Ok(watch)
+    }
+
+    /// Watches the entries of the directory at `path`, which must be
+    /// absolute.
+    pub async fn watch_directory(&self, path: &Path) -> Result<DirectoryWatch, Error> {
+        let id = self.connection.next_id();
+        let (sender, entries) = mpsc::unbounded_channel();
+        let watch = DirectoryWatch {
+            entries,
+            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Entries(sender)),
+        };
+        self.send::<Value>(
+            id,
+            Method::DirectoryWatch {
+                path: path.to_owned(),
+            },
+        )
+        .await?;
         Ok(watch)
     }
 
@@ -605,6 +642,14 @@ async fn read_loop(read: OwnedReadHalf, connection: Arc<Connection>) {
                     });
                 }
             }
+            ServerMessage::Directory {
+                subscription,
+                entries,
+            } => {
+                if let Some(Route::Entries(sender)) = routes.streams.get(&subscription) {
+                    let _ = sender.send(entries);
+                }
+            }
         }
     }
     connection.routes.lock().unwrap().close();
@@ -767,6 +812,25 @@ mod tests {
         let (client, mut daemon) = connect().await;
         let (watch, request) = tokio::join!(client.watch(), daemon.answer(Value::Null));
         assert!(matches!(request.method, Method::Watch));
+        drop(watch.unwrap());
+        let unsubscribe = daemon.answer(Value::Null).await;
+        assert!(matches!(
+            unsubscribe.method,
+            Method::Unsubscribe { subscription } if subscription == request.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_directory_watch_unsubscribes() {
+        let (client, mut daemon) = connect().await;
+        let (watch, request) = tokio::join!(
+            client.watch_directory(Path::new("/work")),
+            daemon.answer(Value::Null)
+        );
+        assert!(matches!(
+            request.method,
+            Method::DirectoryWatch { ref path } if path == Path::new("/work")
+        ));
         drop(watch.unwrap());
         let unsubscribe = daemon.answer(Value::Null).await;
         assert!(matches!(

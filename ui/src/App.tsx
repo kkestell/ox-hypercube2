@@ -3,6 +3,8 @@ import { Workbench } from "./components/Workbench";
 import { Composer } from "./features/composer/Composer";
 import { Conversation } from "./features/conversation/Conversation";
 import { useConversation } from "./features/conversation/useConversation";
+import { FileTree } from "./features/files/FileTree";
+import { forgetDeletedTrees } from "./features/files/treeState";
 import { localMerge } from "./features/sessions/localMerge";
 import { MergeButton } from "./features/sessions/MergeButton";
 import { SessionList } from "./features/sessions/SessionList";
@@ -18,6 +20,11 @@ export function App() {
     if (viewed === null) sessionStorage.removeItem("viewed");
     else sessionStorage.setItem("viewed", viewed);
   }, [viewed]);
+  // Each listing names every session, so a saved tree of any other session
+  // belongs to one that was deleted.
+  useEffect(() => {
+    if (connection > 0) forgetDeletedTrees(sessions);
+  }, [sessions, connection]);
   const session = sessions.find((session) => session.id === viewed);
   const merge = session && localMerge(session);
   const actions = useSessionActions();
@@ -38,6 +45,16 @@ export function App() {
             onSelect={setViewed}
             actions={actions}
           />
+        }
+        right={
+          session && (
+            <FileTree
+              key={session.id}
+              sessionId={session.id}
+              root={session.cwd}
+              connection={connection}
+            />
+          )
         }
         actions={
           session &&

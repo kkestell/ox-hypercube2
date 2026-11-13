@@ -21,7 +21,7 @@ function exists(path: string) {
 
 /** The entry of the workspace's one session. */
 function entry(cwd: string) {
-  return workspaceGroup(cwd).$('./ul/li[@class="session"]');
+  return workspaceGroup(cwd).$('./ul/li[@class="sidebar-row session"]');
 }
 
 /** The Archived group's toggle in the workspace in `cwd`. */

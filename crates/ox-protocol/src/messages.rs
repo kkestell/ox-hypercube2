@@ -109,8 +109,19 @@ pub enum Method {
         #[serde(default)]
         after_seq: u64,
     },
-    /// Ends the subscription or watch that request `subscription` started. Messages the daemon was sending it may arrive after the
-    /// answer.
+    /// Starts a directory watch: after the answer, the daemon sends the
+    /// entries of the directory at `path` at once and again each time they
+    /// differ from the last it sent. `path` must be absolute. Entries are
+    /// sorted by name, and leave out version-control folders, OS clutter
+    /// files, and names that are not UTF-8. A symlink has its target's kind;
+    /// a broken one is a file. A directory that does not exist or cannot be
+    /// read lists no entries, and the watch lists it once it can be read.
+    /// The request's `id` names the watch in every listing.
+    #[serde(rename = "directory.watch")]
+    DirectoryWatch { path: PathBuf },
+    /// Ends the subscription, watch, or directory watch that request
+    /// `subscription` started. Messages the daemon was sending it may arrive
+    /// after the answer.
     #[serde(rename = "unsubscribe")]
     Unsubscribe { subscription: u64 },
     #[serde(rename = "permission.respond")]
@@ -514,9 +525,23 @@ pub mod code {
     pub const GIT: i32 = 8;
 }
 
+/// An entry of a directory a directory watch lists.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: EntryKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryKind {
+    File,
+    Directory,
+}
+
 /// A daemon message: a response to request `id`, or an event or listing
-/// delivered to the subscription or watch that request `subscription`
-/// started.
+/// delivered to the subscription, watch, or directory watch that request
+/// `subscription` started.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ServerMessage {
@@ -536,6 +561,10 @@ pub enum ServerMessage {
         subscription: u64,
         workspaces: Vec<WorkspaceInfo>,
         sessions: Vec<SessionInfo>,
+    },
+    Directory {
+        subscription: u64,
+        entries: Vec<DirEntry>,
     },
 }
 
@@ -580,6 +609,17 @@ mod tests {
         assert_eq!(value, json!({"id": 9, "method": "watch"}));
         let request: Request = serde_json::from_value(value).unwrap();
         assert!(matches!(request.method, Method::Watch));
+
+        let request: Request = serde_json::from_value(json!({
+            "id": 12,
+            "method": "directory.watch",
+            "params": {"path": "/work/src"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.method,
+            Method::DirectoryWatch { ref path } if path == std::path::Path::new("/work/src")
+        ));
 
         let request: Request = serde_json::from_value(json!({
             "id": 10,
@@ -1013,6 +1053,19 @@ mod tests {
                 subscription: 4,
                 workspaces: Vec::new(),
                 sessions: Vec::new(),
+            },
+            ServerMessage::Directory {
+                subscription: 6,
+                entries: vec![
+                    DirEntry {
+                        name: "a.txt".into(),
+                        kind: EntryKind::File,
+                    },
+                    DirEntry {
+                        name: "src".into(),
+                        kind: EntryKind::Directory,
+                    },
+                ],
             },
         ];
         for message in messages.into_iter().chain(elicitation_events()) {

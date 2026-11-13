@@ -11,6 +11,7 @@ import {
   Plus,
 } from "lucide-react";
 import { type MouseEvent, useState } from "react";
+import { Sidebar } from "../../components/Sidebar";
 import type {
   Branches,
   Checkout,
@@ -134,7 +135,7 @@ export function SessionList({
     return (
       <li
         key={session.id}
-        className="session"
+        className="sidebar-row session"
         onContextMenu={(event) =>
           contextMenu(event, [
             {
@@ -195,8 +196,8 @@ export function SessionList({
   };
 
   return (
-    <div className="sidebar">
-      <header className="pane-header sidebar-header">
+    <Sidebar
+      actions={
         <button
           type="button"
           className="icon-button"
@@ -206,111 +207,110 @@ export function SessionList({
         >
           <FolderPlus />
         </button>
-      </header>
-      <div className="session-list">
-        {workspaces.map((workspace) => {
-          const workspaceSessions = sessions.filter(
-            (session) => session.workspace_id === workspace.id,
-          );
-          const active = workspaceSessions.filter((session) => !session.archived);
-          const archived = workspaceSessions.filter((session) => session.archived);
-          const archiveOpen = openArchives.has(workspace.id);
-          return (
-            <section
-              key={workspace.id}
-              className="workspace"
-              aria-labelledby={`workspace-${workspace.id}`}
-            >
-              <div className="workspace-header">
-                <h2
-                  id={`workspace-${workspace.id}`}
-                  title={workspace.path}
-                  onContextMenu={(event) =>
-                    contextMenu(event, [
-                      {
-                        text: "Remove Workspace",
-                        enabled: workspaceSessions.length === 0,
-                        action: () => removeWorkspace(workspace.id),
-                      },
-                    ])
-                  }
+      }
+    >
+      {workspaces.map((workspace) => {
+        const workspaceSessions = sessions.filter(
+          (session) => session.workspace_id === workspace.id,
+        );
+        const active = workspaceSessions.filter((session) => !session.archived);
+        const archived = workspaceSessions.filter((session) => session.archived);
+        const archiveOpen = openArchives.has(workspace.id);
+        return (
+          <section
+            key={workspace.id}
+            className="workspace"
+            aria-labelledby={`workspace-${workspace.id}`}
+          >
+            <div className="workspace-header">
+              <h2
+                id={`workspace-${workspace.id}`}
+                title={workspace.path}
+                onContextMenu={(event) =>
+                  contextMenu(event, [
+                    {
+                      text: "Remove Workspace",
+                      enabled: workspaceSessions.length === 0,
+                      action: () => removeWorkspace(workspace.id),
+                    },
+                  ])
+                }
+              >
+                {directoryName(workspace.path)}
+              </h2>
+              <button
+                type="button"
+                className="icon-button"
+                title="New Task"
+                aria-label="New Task"
+                popoverTarget={`new-session-${workspace.id}`}
+                style={{ anchorName: `--new-session-${workspace.id}` }}
+              >
+                <Plus />
+              </button>
+              <div
+                id={`new-session-${workspace.id}`}
+                className="menu new-session-menu"
+                role="menu"
+                popover="auto"
+                style={{ positionAnchor: `--new-session-${workspace.id}` }}
+              >
+                <select
+                  aria-label="Agent"
+                  title="Agent"
+                  value={agent}
+                  onChange={(event) => setAgent(event.target.value)}
                 >
-                  {directoryName(workspace.path)}
-                </h2>
-                <button
-                  type="button"
-                  className="icon-button"
-                  title="New Task"
-                  aria-label="New Task"
-                  popoverTarget={`new-session-${workspace.id}`}
-                  style={{ anchorName: `--new-session-${workspace.id}` }}
-                >
-                  <Plus />
-                </button>
-                <div
-                  id={`new-session-${workspace.id}`}
-                  className="menu new-session-menu"
-                  role="menu"
-                  popover="auto"
-                  style={{ positionAnchor: `--new-session-${workspace.id}` }}
-                >
-                  <select
-                    aria-label="Agent"
-                    title="Agent"
-                    value={agent}
-                    onChange={(event) => setAgent(event.target.value)}
-                  >
-                    {agents.map((choice) => (
-                      <option key={choice.id} value={choice.id}>
-                        {choice.name}
-                      </option>
-                    ))}
-                  </select>
-                  {workspace.git_working_tree && (
-                    <button
-                      type="button"
-                      role="menuitem"
-                      popoverTarget={`new-session-${workspace.id}`}
-                      popoverTargetAction="hide"
-                      onClick={() => newTask(workspace, agent)}
-                    >
-                      New Task
-                    </button>
-                  )}
+                  {agents.map((choice) => (
+                    <option key={choice.id} value={choice.id}>
+                      {choice.name}
+                    </option>
+                  ))}
+                </select>
+                {workspace.git_working_tree && (
                   <button
                     type="button"
                     role="menuitem"
                     popoverTarget={`new-session-${workspace.id}`}
                     popoverTargetAction="hide"
-                    onClick={() => newSession(workspace.id, agent, { type: "workspace" })}
+                    onClick={() => newTask(workspace, agent)}
                   >
-                    Session in Checkout
+                    New Task
                   </button>
-                </div>
-              </div>
-              <ul className="sessions">
-                {active.map(sessionRow)}
-                {archived.length > 0 && (
-                  <li className="session archived-toggle">
-                    <button
-                      type="button"
-                      className="select"
-                      aria-expanded={archiveOpen}
-                      onClick={() => toggleArchive(workspace.id)}
-                    >
-                      <span className="status">
-                        {archiveOpen ? <ChevronDown /> : <ChevronRight />}
-                      </span>
-                      <span className="title">Archived ({archived.length})</span>
-                    </button>
-                  </li>
                 )}
-                {archiveOpen && archived.map(sessionRow)}
-              </ul>
-            </section>
-          );
-        })}
-      </div>
-    </div>
+                <button
+                  type="button"
+                  role="menuitem"
+                  popoverTarget={`new-session-${workspace.id}`}
+                  popoverTargetAction="hide"
+                  onClick={() => newSession(workspace.id, agent, { type: "workspace" })}
+                >
+                  Session in Checkout
+                </button>
+              </div>
+            </div>
+            <ul>
+              {active.map(sessionRow)}
+              {archived.length > 0 && (
+                <li className="sidebar-row archived-toggle">
+                  <button
+                    type="button"
+                    className="select"
+                    aria-expanded={archiveOpen}
+                    onClick={() => toggleArchive(workspace.id)}
+                  >
+                    <span className="status">
+                      {archiveOpen ? <ChevronDown /> : <ChevronRight />}
+                    </span>
+                    <span className="title">Archived ({archived.length})</span>
+                  </button>
+                </li>
+              )}
+              {archiveOpen && archived.map(sessionRow)}
+            </ul>
+          </section>
+        );
+      })}
+    </Sidebar>
   );
 }
