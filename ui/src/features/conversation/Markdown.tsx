@@ -2,7 +2,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import type { ComponentProps } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { showError } from "./showError";
+import { showError } from "../../lib/showError";
 
 /** Transcript prose, rendered from the complete text accumulated so far. */
 export function Markdown({ text }: { text: string }) {

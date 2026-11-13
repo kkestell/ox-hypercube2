@@ -11,9 +11,15 @@ import {
   Plus,
 } from "lucide-react";
 import { type MouseEvent, useState } from "react";
+import type {
+  Branches,
+  Checkout,
+  SessionInfo,
+  SessionState,
+  WorkspaceInfo,
+} from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 import { branchStatus, localMerge } from "./localMerge";
-import type { Branches, Checkout, SessionInfo, SessionState, WorkspaceInfo } from "./protocol";
-import { showError } from "./showError";
 import type { SessionActions } from "./useSessionActions";
 
 type Agent = { id: string; name: string };

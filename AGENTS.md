@@ -47,7 +47,7 @@
     conversation on `session/resume` with `replayFrom: {"type": "start"}`.
   - The bridge advertises the `image` prompt capability and sends images to
     Claude.
-- The UI is idiomatic React (`ui/src/*.tsx`) with icons from `lucide-react`.
+- The UI is idiomatic React (`ui/src/`) with icons from `lucide-react`.
   The user designs the app's look: UI changes add only the CSS a layout needs
   to work, such as a scrolling region or `white-space: pre-wrap`, and styling
   only where the user asks for it or where it makes an element match its peers.
@@ -120,7 +120,7 @@ After changing the behaviour of `crates/ox` or of the UI's TypeScript, also
 run `make e2e` and report its result. It builds the app with its embedded
 WebDriver server and drives it through the tests in `ui/e2e`, against sessions
 of `oxd-fake-agent` that the tests start with `oxctl`. A change to
-`ui/src/styles.css` alone takes `make check-ui`.
+`ui/src/styles/` alone takes `make check-ui`.
 
 After changing `oxd`, `ox-protocol`, `oxctl`, `claude-code-acp`, or
 `scripts/smoke-acp.py`, also run this and report its result:

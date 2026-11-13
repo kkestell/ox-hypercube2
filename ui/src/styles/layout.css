@@ -1,0 +1,121 @@
+.workbench {
+  display: flex;
+  height: 100%;
+}
+
+.center {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.content {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--surface);
+}
+
+/* The bar along the top of a pane; panes side by side share its centre line. */
+.pane-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: flex-end;
+  height: calc(var(--spacing) * 7);
+  padding: calc(var(--spacing) * 2);
+}
+
+.content-header {
+  gap: calc(var(--spacing) * 2);
+  border-bottom: var(--border-width) solid var(--border);
+}
+
+.content-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.toggles {
+  display: flex;
+  align-items: center;
+}
+
+.toggles .icon-button[aria-pressed="false"] {
+  color: var(--muted-foreground);
+}
+
+/* A text button in a pane header, as tall as the header's icon buttons. */
+.pane-header .text-button {
+  box-sizing: border-box;
+  height: var(--pane-header-button-height);
+}
+
+/* Workbench panels */
+
+.panel {
+  flex: none;
+  overflow: hidden;
+}
+
+.panel.left {
+  width: var(--left-size);
+  background: var(--sidebar);
+}
+
+.panel.right {
+  width: var(--right-size);
+  background: var(--sidebar);
+}
+
+.panel.bottom {
+  height: var(--bottom-size);
+  background: var(--surface);
+}
+
+.sash {
+  position: relative;
+  flex: none;
+  background: var(--border);
+  touch-action: none;
+}
+
+.sash::after {
+  content: "";
+  position: absolute;
+  z-index: 1;
+}
+
+.sash.vertical {
+  width: var(--border-width);
+  cursor: col-resize;
+}
+
+.sash.vertical::after {
+  inset: 0 calc(var(--spacing) * -0.5);
+}
+
+.sash.horizontal {
+  height: var(--border-width);
+  cursor: row-resize;
+}
+
+.sash.horizontal::after {
+  inset: calc(var(--spacing) * -0.5) 0;
+}
+
+body.resizing {
+  user-select: none;
+}
+
+body.resizing.vertical {
+  cursor: col-resize;
+}
+
+body.resizing.horizontal {
+  cursor: row-resize;
+}

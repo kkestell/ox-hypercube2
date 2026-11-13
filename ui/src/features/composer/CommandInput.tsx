@@ -1,5 +1,5 @@
 import { useId, useLayoutEffect, useRef, useState } from "react";
-import type { Command } from "./protocol";
+import type { Command } from "../../lib/protocol";
 
 /** The message editor and completion for the agent's leading slash command. */
 export function CommandInput({

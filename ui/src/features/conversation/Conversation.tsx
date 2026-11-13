@@ -1,8 +1,8 @@
 import { Check, X } from "lucide-react";
 import { useLayoutEffect, useRef } from "react";
-import { CodeSpans } from "./CodeSpans";
+import { CodeSpans } from "../../components/CodeSpans";
+import type { Item, ToolCallStatus } from "../../lib/protocol";
 import { Markdown } from "./Markdown";
-import type { Item, ToolCallStatus } from "./protocol";
 
 export function Conversation({ sessionId, items }: { sessionId: string; items: Item[] }) {
   const element = useRef<HTMLDivElement>(null);

@@ -1,7 +1,7 @@
 import { Check, ChevronDown, Search } from "lucide-react";
 import { type CSSProperties, useEffect, useRef, useState } from "react";
+import type { ConfigOption, SelectOption } from "../../lib/protocol";
 import { ClaudeLogo } from "./ClaudeLogo";
-import type { ConfigOption, SelectOption } from "./protocol";
 
 export type SelectConfig = Extract<ConfigOption, { type: "select" }>;
 

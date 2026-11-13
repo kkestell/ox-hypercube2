@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useState } from "react";
-import type { EnumOption, Field, Item } from "./protocol";
-import { showError } from "./showError";
+import type { EnumOption, Field, Item } from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 
 /** What a field holds while the form is open: text for text and number
  * inputs, a value for a choice, values for a multiple choice. */

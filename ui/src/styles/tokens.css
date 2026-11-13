@@ -1,0 +1,106 @@
+:root {
+  color-scheme: light dark;
+
+  /* Colour */
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --success: oklch(0.627 0.194 149.214);
+  --warning: oklch(0.666 0.179 58.318);
+  --border: oklch(0.922 0 0);
+  --sidebar: oklch(0.985 0 0);
+  --text: oklch(0.371 0 0);
+  --shadow-color: oklch(0 0 0 / 10%);
+  --claude: oklch(0.672 0.131 38.756);
+  --hover: var(--accent);
+  --selected: var(--muted);
+  --surface: color-mix(in oklab, var(--background), var(--card));
+  --disabled-opacity: 0.5;
+  --dimmed-opacity: 0.6;
+  --busy-dot-opacity: 0.4;
+
+  /* Spacing: every padding, margin, gap, and size is a multiple of this. */
+  --spacing: 0.25rem;
+
+  /* Type */
+  --font-sans: system-ui, sans-serif;
+  --font-mono: ui-monospace, monospace;
+  --text-xs: 0.75rem;
+  --text-sm: 0.875rem;
+  --leading: 1.5;
+
+  /* Motion */
+  --transition-duration: 150ms;
+  --busy-dot-duration: 1s;
+
+  /* Shape */
+  --border-width: 1px;
+  --radius: 0.625rem;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 6px);
+  --radius-full: 50%;
+  --shadow-sm:
+    0 var(--border-width) calc(var(--border-width) * 3) 0 var(--shadow-color),
+    0 var(--border-width) calc(var(--border-width) * 2) calc(var(--border-width) * -1)
+    var(--shadow-color);
+  --shadow-md:
+    0 var(--spacing) calc(var(--spacing) * 1.5) calc(var(--border-width) * -1) var(--shadow-color),
+    0 calc(var(--spacing) * 0.5) var(--spacing) calc(var(--spacing) * -0.5) var(--shadow-color);
+
+  /* Components */
+  --icon-size: calc(var(--spacing) * 4);
+  --status-dot-size: calc(var(--spacing) * 2);
+  --icon-button-size: calc(var(--spacing) * 6);
+  --pane-header-button-height: var(--icon-button-size);
+  --sidebar-padding: calc(var(--spacing) * 2);
+  --sidebar-row-height: calc(var(--spacing) * 8);
+  --sidebar-row-padding: calc(var(--spacing) * 2);
+  --row-action-inset: var(--spacing);
+  --workspace-header-height: calc(var(--spacing) * 7);
+  --menu-min-width: calc(var(--spacing) * 32);
+  --menu-list-max-height: 40vh;
+  --menu-item-padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 2);
+  --model-menu-width: calc(var(--spacing) * 80);
+  --dialog-width: calc(var(--spacing) * 96);
+  --slider-track-height: calc(var(--spacing) * 1.5);
+  --slider-thumb-size: calc(var(--spacing) * 4);
+  --slider-tick-height: calc(var(--spacing) * 1.5);
+  --composer-margin: calc(var(--spacing) * 4);
+  --composer-padding: calc(var(--spacing) * 3);
+  --composer-max-lines: 8;
+  --request-panel-max-height: 50vh;
+  --choice-gap: calc(var(--spacing) * 2);
+  --prompt-max-width: 75%;
+  --tool-call-gap: calc(var(--spacing) * 2);
+  /* The transcript's text lines up with the composer's text. */
+  --conversation-inset: calc(
+    var(--composer-margin) +
+    var(--border-width) +
+    var(--composer-padding)
+  );
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --success: oklch(0.723 0.219 149.579);
+    --warning: oklch(0.769 0.188 70.08);
+    --border: oklch(1 0 0 / 10%);
+    --sidebar: oklch(0.205 0 0);
+    --text: oklch(0.87 0 0);
+    --hover: color-mix(in oklab, var(--accent) 50%, transparent);
+  }
+}

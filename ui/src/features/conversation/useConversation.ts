@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { useEffect, useReducer } from "react";
-import type { Item } from "./protocol";
+import type { Item } from "../../lib/protocol";
 
 // The viewed session's items by key, in the order their keys first appeared.
 interface State {

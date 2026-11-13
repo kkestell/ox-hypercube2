@@ -1,7 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import type { SessionInfo, WatchMessage, WorkspaceInfo } from "./protocol";
+import type { SessionInfo, WatchMessage, WorkspaceInfo } from "../../lib/protocol";
 
 /**
  * The daemon's workspaces and sessions, from a watch that restarts,

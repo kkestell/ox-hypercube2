@@ -1,14 +1,14 @@
 import { useEffect, useState } from "react";
-import { Composer } from "./Composer";
-import { Conversation } from "./Conversation";
-import { localMerge } from "./localMerge";
-import { MergeButton } from "./MergeButton";
-import type { Item } from "./protocol";
-import { SessionList } from "./SessionList";
-import { useConversation } from "./useConversation";
-import { useSessionActions } from "./useSessionActions";
-import { useWorkspaces } from "./useWorkspaces";
-import { Workbench } from "./Workbench";
+import { Workbench } from "./components/Workbench";
+import { Composer } from "./features/composer/Composer";
+import { Conversation } from "./features/conversation/Conversation";
+import { useConversation } from "./features/conversation/useConversation";
+import { localMerge } from "./features/sessions/localMerge";
+import { MergeButton } from "./features/sessions/MergeButton";
+import { SessionList } from "./features/sessions/SessionList";
+import { useSessionActions } from "./features/sessions/useSessionActions";
+import { useWorkspaces } from "./features/sessions/useWorkspaces";
+import type { Item } from "./lib/protocol";
 
 export function App() {
   const { workspaces, sessions, connection } = useWorkspaces();

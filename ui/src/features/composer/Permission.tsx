@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
-import { CodeSpans } from "./CodeSpans";
-import type { Item } from "./protocol";
-import { showError } from "./showError";
+import { CodeSpans } from "../../components/CodeSpans";
+import type { Item } from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 
 /** A permission request awaiting its answer, with the options the agent offers. */
 export function Permission({

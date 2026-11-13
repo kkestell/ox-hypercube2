@@ -1,0 +1,244 @@
+.icon-button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-button-size);
+  height: var(--icon-button-size);
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--foreground);
+}
+
+.icon-button:hover:enabled {
+  background: var(--hover);
+}
+
+.icon-button svg,
+.status svg {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+.icon-button:disabled {
+  opacity: var(--disabled-opacity);
+}
+
+/* A button labelled with text, such as a request's action or a dialog's
+   action. */
+/* A text button and a text field share one box. */
+.text-button,
+.text-field {
+  height: calc(var(--spacing) * 8);
+  padding: 0 calc(var(--spacing) * 3);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--background);
+  color: var(--foreground);
+  font: inherit;
+  box-shadow: var(--shadow-sm);
+}
+
+.text-button:hover:enabled {
+  background: var(--accent);
+}
+
+.text-button:disabled,
+.text-field:disabled {
+  opacity: var(--disabled-opacity);
+}
+
+/* A checkbox or radio and its label, with any description under the
+   label. */
+.choice {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  column-gap: var(--choice-gap);
+}
+
+.choice input {
+  margin: 0;
+}
+
+.choice .description {
+  grid-column: 2;
+}
+
+/* A surface that floats over the app: a popover menu or a dialog. */
+.menu,
+.dialog {
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--card);
+  box-shadow: var(--shadow-md);
+  font-size: var(--text-sm);
+  color: var(--foreground);
+}
+
+/* A popover menu, placed beside the top of the button that opens it. */
+.menu {
+  inset: auto;
+  top: anchor(top);
+  left: anchor(right);
+  min-width: var(--menu-min-width);
+  margin: 0 0 0 var(--spacing);
+  padding: var(--spacing);
+}
+
+.menu:popover-open {
+  display: flex;
+  flex-direction: column;
+}
+
+.menu button {
+  padding: var(--menu-item-padding);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  text-align: left;
+}
+
+.menu button:hover,
+.menu button:focus-visible,
+.menu button.active {
+  background: var(--accent);
+}
+
+/* A menu's select, above its items. */
+.menu select {
+  font: inherit;
+  color: inherit;
+}
+
+.menu-list {
+  display: flex;
+  flex-direction: column;
+  max-height: var(--menu-list-max-height);
+  overflow: auto;
+}
+
+.model-menu .search,
+.menu-list [role="option"] {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+}
+
+.menu-item-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* Dialogs */
+
+/* A dialog is as tall as its content, centred in the window. */
+.dialog {
+  inset-block: 50% auto;
+  translate: 0 -50%;
+  height: auto;
+  width: var(--dialog-width);
+  padding: calc(var(--spacing) * 4);
+}
+
+.dialog::backdrop {
+  background: var(--shadow-color);
+}
+
+.dialog[open] {
+  display: grid;
+  gap: calc(var(--spacing) * 3);
+}
+
+.dialog h2,
+.dialog .message {
+  margin: 0;
+}
+
+.dialog h2 {
+  font-size: inherit;
+}
+
+.dialog .message {
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+}
+
+.dialog .actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: calc(var(--spacing) * 2);
+}
+
+/* A state shown in an icon-sized box: a dot, or an icon. */
+.status {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-size);
+  height: var(--icon-size);
+  color: var(--muted-foreground);
+}
+
+.status:empty::before {
+  content: "";
+  box-sizing: border-box;
+  width: var(--status-dot-size);
+  height: var(--status-dot-size);
+  border: var(--border-width) solid currentColor;
+  border-radius: var(--radius-full);
+  background: currentColor;
+}
+
+.status.running {
+  color: var(--success);
+  animation: breathe var(--busy-dot-duration) ease-in-out infinite alternate;
+}
+
+.status.awaiting_permission,
+.status.awaiting_input,
+.status.attention {
+  color: var(--warning);
+}
+
+.status.failed {
+  color: var(--destructive);
+}
+
+.status.exited::before {
+  background: transparent;
+}
+
+@keyframes breathe {
+  to {
+    opacity: var(--busy-dot-opacity);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status.running {
+    animation: none;
+  }
+}
+
+.prompt .attachment,
+.tool-call .label,
+.session-closed,
+.request-panel legend,
+.choice .description,
+.menu-detail {
+  font-size: var(--text-xs);
+  color: var(--muted-foreground);
+}
+
+.tool-call .title code,
+.request-panel .title code {
+  color: var(--muted-foreground);
+}

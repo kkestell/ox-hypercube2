@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
-import { Dialog } from "./Dialog";
-import type { Archival, Deletion } from "./protocol";
-import { showError } from "./showError";
+import { Dialog } from "../../components/Dialog";
+import type { Archival, Deletion } from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 
 /**
  * Deleting, archiving and unarchiving sessions, with the dialogs that ask

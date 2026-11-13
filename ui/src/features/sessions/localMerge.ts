@@ -1,7 +1,7 @@
 // The wording of a local merge session's git status, shared by its row and
 // its Merge button.
 
-import type { Comparison, SessionInfo } from "./protocol";
+import type { Comparison, SessionInfo } from "../../lib/protocol";
 
 function commits(count: number) {
   return count === 1 ? "1 commit" : `${count} commits`;

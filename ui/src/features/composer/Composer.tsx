@@ -2,12 +2,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { useState } from "react";
+import type { ConfigOption, Item, SelectOption, SessionInfo } from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
 import { Elicitation } from "./Elicitation";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { Permission } from "./Permission";
-import type { ConfigOption, Item, SelectOption, SessionInfo } from "./protocol";
-import { showError } from "./showError";
 
 export function Composer({
   session,

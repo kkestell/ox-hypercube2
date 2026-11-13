@@ -1,9 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useState } from "react";
-import { Dialog } from "./Dialog";
+import { Dialog } from "../../components/Dialog";
+import type { Comparison, SessionInfo } from "../../lib/protocol";
+import { showError } from "../../lib/showError";
 import { mergeBlocker } from "./localMerge";
-import type { Comparison, SessionInfo } from "./protocol";
-import { showError } from "./showError";
 
 /**
  * Merge into `compare`: fast-forwards the ref's branch to the session's
