@@ -203,9 +203,12 @@ describe("A session", () => {
     await expect(composer()).toBeDisabled();
   });
 
-  it("is removed from the list when deleted", async () => {
-    await expect(sessionEntry(cwd)).toBeExisting();
+  it("hides the transcript when deleted during a turn", async () => {
+    await send("say 1 0\nwait");
+    await expect(agentText()[0]).toHaveText("chunk-1");
+    await expect(sessionEntry(cwd).$('[aria-label="Running"]')).toBeDisplayed();
     await deleteSessions(cwd);
     await expect(sessionEntry(cwd)).not.toBeExisting();
+    await expect($(".conversation")).not.toBeExisting();
   });
 });

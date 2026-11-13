@@ -21,7 +21,7 @@ export function App() {
   const session = sessions.find((session) => session.id === viewed);
   const merge = session && localMerge(session);
   const actions = useSessionActions();
-  const items = useConversation(viewed, connection);
+  const items = useConversation(session?.id ?? null, connection);
   const request = items.find(
     (item): item is Extract<Item, { type: "permission" | "elicitation" }> =>
       (item.type === "permission" || item.type === "elicitation") && !item.answered,
@@ -52,8 +52,12 @@ export function App() {
           )
         }
       >
-        <Conversation sessionId={viewed} items={items} />
-        {session && <Composer key={session.id} session={session} request={request} />}
+        {session && (
+          <>
+            <Conversation sessionId={session.id} items={items} />
+            <Composer key={session.id} session={session} request={request} />
+          </>
+        )}
       </Workbench>
       {actions.dialogs}
     </>

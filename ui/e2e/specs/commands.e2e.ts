@@ -96,6 +96,8 @@ describe("Slash command completion", () => {
     await expect(firstOption().$(".menu-item-text > span:first-child")).toHaveText("/echo");
     await expect(firstOption().$(".menu-item-text > .menu-detail")).toHaveText("Changed");
     await browser.refresh();
+    // The old editor still holds `/` while the webview reloads.
+    await expect(composer()).toHaveValue("");
     await composer().setValue("/");
     await expect(options()).toBeElementsArrayOfSize(1);
     await expect(firstOption().$(".menu-item-text > span:first-child")).toHaveText("/echo");

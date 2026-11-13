@@ -4,7 +4,7 @@ import { CodeSpans } from "./CodeSpans";
 import { Markdown } from "./Markdown";
 import type { Item, ToolCallStatus } from "./protocol";
 
-export function Conversation({ sessionId, items }: { sessionId: string | null; items: Item[] }) {
+export function Conversation({ sessionId, items }: { sessionId: string; items: Item[] }) {
   const element = useRef<HTMLDivElement>(null);
   // Whether the view follows the end of the conversation as it grows.
   const following = useRef(true);
@@ -29,7 +29,9 @@ export function Conversation({ sessionId, items }: { sessionId: string | null; i
         following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 1;
       }}
     >
-      {sessionId && items.map((item) => <ItemView key={item.key} item={item} />)}
+      {items.map((item) => (
+        <ItemView key={item.key} item={item} />
+      ))}
     </div>
   );
 }
