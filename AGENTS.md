@@ -1,5 +1,22 @@
 # Agent instructions
 
+## Project scope
+
+- Ox is a hobby project with one user, Kyle. The desktop app is his normal
+  interface. Agents use `oxctl` to test the daemon and handle occasional tasks
+  on his behalf. Custom daemon sockets, including `--socket` and `OX_SOCKET`,
+  are development and test tools. A CLI option alone does not establish a
+  user workflow or a compatibility promise.
+- Prioritize failures Kyle can encounter in the desktop and in the workflows
+  he asks agents to run. Rank findings by likelihood in those workflows and
+  the cost of failure. Protect work and preserve required guarantees with
+  the simplest mechanism that covers the demonstrated problem.
+- Defer unusual inputs, unlikely combinations of failures, and recovery
+  machinery until there is evidence of a practical need. A short, local
+  TODO may record a credible concern and the condition that would make it
+  worth revisiting. Match tests to the consequence and the supported workflow.
+  One focused regression is usually enough.
+
 ## Writing code
 
 - Wait on events. A process announces readiness, state changes publish to a
@@ -9,15 +26,14 @@
   - `oxd` prints `ready` once it listens; `connect_or_start` reads that line.
   - Idle exit watches a `watch::Sender<()>` signalled whenever clients,
     sessions, or a session's state change, then starts its idle timer.
-- Production code serves production. Tests drive the same interfaces users
-  do; flags, environment variables, methods, and modes exist because a user
-  of the program needs them. Test fixtures live with the tests.
+- Tests drive the same application paths the desktop uses. Development
+  controls such as socket selection support isolated runs. Put test fixtures
+  with the tests and reuse existing operations when exercising behavior.
   - A session stuck in startup is deleted with `session.delete`, the method a
     UI uses, rather than through a test-only timeout flag.
   - Tests build text prompts with a helper in the test file; `Client` has
     one `prompt` method.
-- The project has no external users. Change an interface by updating every
-  caller; there is no old form to preserve.
+- Change an interface by updating every caller in the repository.
 - Versions stay at 1 until the project is in production. The client–daemon
   `hello` handshake checks the protocol version, but no change bumps it, and
   there are no backwards-compatibility paths.
@@ -77,16 +93,17 @@
 
 ## Testing
 
-- Each fix has a test that fails without it. Check by undoing the fix and
-  running the test.
+- For a meaningful behavior fix, use an existing test or add a focused
+  regression that fails without the fix. Check that it exercises the actual
+  failure. Use direct inspection for documentation and simple cleanup.
   - Making the stderr reader wait for end of file makes
     `failed_exit_reports_claude_stderr` time out.
   - Making idle ignore sessions makes `lifetime` fail.
 - A test that waits for something confirms it happened: that the process
   started before checking it stopped, that the event arrived before checking
   the state it sets.
-  - `close_while_starting` waits for the agent to open its FIFO before
-    closing the session, then waits for the FIFO to reach end of file.
+  - `delete_while_starting` waits for the agent to open its FIFO before
+    deleting the session, then waits for the FIFO to reach end of file.
   - `cancellation_stops_a_pending_permission` waits for the prompt's
     `cancelled` response, which follows Claude withdrawing the request,
     before it answers the withdrawn request.
