@@ -16,6 +16,9 @@
   --text: oklch(0.371 0 0);
   --shadow-color: oklch(0 0 0 / 10%);
   --claude: oklch(0.672 0.131 38.756);
+  --pi-red: #f09082;
+  --pi-blue: #4d9abf;
+  --pi-yellow: #f1be58;
   --hover: var(--accent);
   --selected: var(--muted);
   --surface: color-mix(in oklab, var(--background), var(--card));
@@ -73,7 +76,7 @@
   --menu-padding: calc(var(--spacing) * 2);
   --menu-list-max-height: 40vh;
   --menu-item-padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 3);
-  --model-menu-width: calc(var(--spacing) * 60);
+  --model-menu-width: calc(var(--spacing) * 72);
   --dialog-width: calc(var(--spacing) * 96);
   --slider-track-height: calc(var(--spacing) * 1.5);
   --slider-thumb-size: calc(var(--spacing) * 4);

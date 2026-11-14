@@ -1,7 +1,6 @@
 import { ChevronDown, Search } from "lucide-react";
 import { type CSSProperties, type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { ConfigOption, SelectOption } from "../../lib/protocol";
-import { ClaudeLogo } from "./ClaudeLogo";
 
 export type SelectConfig = Extract<ConfigOption, { type: "select" }>;
 
@@ -67,7 +66,6 @@ export function ModelPicker({
         popoverTarget="model-menu"
         style={{ anchorName: "--model-picker" }}
       >
-        <ClaudeLogo />
         <span>{current?.name ?? selectedModel}</span>
         {levels[level] && <span className="effort-name">{levels[level].name}</span>}
         <ChevronDown />
@@ -140,8 +138,7 @@ export function ModelPicker({
               onFocus={() => setActive(index)}
               onClick={() => choose(choice)}
             >
-              <ClaudeLogo />
-              {choice.name}
+              <span title={choice.name}>{choice.name}</span>
             </button>
           ))}
         </div>

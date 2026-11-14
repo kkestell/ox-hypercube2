@@ -82,6 +82,7 @@ export type Archival = { type: "archived" } | { type: "unsaved_work"; message: s
 
 export interface SessionInfo {
   id: string;
+  command: string[];
   workspace_id: string;
   cwd: string;
   state: SessionState;

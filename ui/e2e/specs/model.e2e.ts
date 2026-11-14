@@ -1,5 +1,10 @@
+import { execFile } from "node:child_process";
+import { mkdtemp, realpath, symlink } from "node:fs/promises";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import {
   agentText,
+  binary,
   composer,
   deleteSessions,
   openSession,
@@ -8,6 +13,17 @@ import {
   slide,
   startSession,
 } from "../helpers.ts";
+
+/** Runs the scripted agent under a real bridge's name to exercise harness identity. */
+async function startHarnessSession(bridge: string): Promise<string> {
+  const cwd = await realpath(await mkdtemp(join(process.env.OX_E2E_DIR!, "harness-")));
+  const command = join(cwd, bridge);
+  await symlink(binary("oxd-fake-agent"), command);
+  const run = promisify(execFile);
+  const { stdout } = await run(binary("oxctl"), ["workspace", "add", cwd]);
+  await run(binary("oxctl"), ["new", "--workspace", stdout.trim(), "--", command]);
+  return cwd;
+}
 
 const picker = () => $("button.model-picker");
 const menu = () => $("#model-menu");
@@ -26,10 +42,31 @@ describe("The model picker", () => {
 
   it("shows the session's model and effort", async () => {
     await expect(picker()).toHaveText("SmartMedium");
-    const paperclip = $('.composer button[aria-label="Attach Files"] svg');
-    expect(await picker().$(".claude-logo").getLocation("x")).toBe(
-      await paperclip.getLocation("x"),
-    );
+    await expect($(".composer .harness-logo")).not.toBeExisting();
+  });
+
+  it("shows the harness beside the selected model and leaves model options icon-free", async () => {
+    for (const [bridge, label] of [
+      ["claude-code-acp", "Claude Code"],
+      ["pi-acp", "Pi"],
+    ] as const) {
+      await openSession(await startHarnessSession(bridge));
+      const logo = $(`.composer .harness-logo[aria-label="${label}"]`);
+      await expect(logo).toBeDisplayed();
+      await expect(picker()).toHaveText("SmartMedium");
+      const paperclip = $('.composer button[aria-label="Attach Files"] svg');
+      expect(await logo.getLocation("x")).toBe(await paperclip.getLocation("x"));
+      expect(await logo.getSize()).toEqual(await paperclip.getSize());
+      await picker().click();
+      await expect(menu()).toBeDisplayed();
+      await expect(menu().$$("[role='option'] svg")).toBeElementsArrayOfSize(0);
+      await menu().$("button=Fast").click();
+      await expect(picker()).toHaveText("FastMedium");
+      await expect(logo).toBeDisplayed();
+      await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, `${bridge}-model-menu.png`));
+    }
+    await openSession(cwd);
+    await expect($(".composer .harness-logo")).not.toBeExisting();
   });
 
   it("reserves the settings row before the agent reports its configuration", async () => {

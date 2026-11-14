@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { memo } from "react";
+import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import type { ConfigOption, Item, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -147,7 +148,12 @@ export const Composer = memo(function Composer({
         </div>
       </div>
       <div className="settings">
-        {model && <ModelPicker model={model} effort={effort} onChange={setOption} />}
+        {model && (
+          <div className="model-setting">
+            <HarnessLogo command={session.command} />
+            <ModelPicker model={model} effort={effort} onChange={setOption} />
+          </div>
+        )}
         {others.map((option) => (
           <ConfigPicker
             key={option.configId}

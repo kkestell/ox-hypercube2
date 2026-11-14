@@ -17,9 +17,18 @@
 }
 
 .icon-button svg,
-.status svg {
+.status svg,
+.harness-logo {
   width: var(--icon-size);
   height: var(--icon-size);
+}
+
+.harness-logo {
+  flex: none;
+}
+
+.claude-logo {
+  color: var(--claude);
 }
 
 .icon-button:disabled {

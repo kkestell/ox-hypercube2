@@ -13,8 +13,11 @@
   height: var(--icon-size);
 }
 
-.claude-logo {
-  color: var(--claude);
+.model-menu [role="option"] > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* A slider whose stops are named below it. Its fill and each stop sit at
@@ -197,6 +200,12 @@
   height: var(--select-picker-height);
   font: inherit;
   color: inherit;
+}
+
+.composer .model-setting {
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
 }
 
 .model-picker .effort-name {
