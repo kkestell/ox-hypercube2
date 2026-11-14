@@ -41,5 +41,5 @@ messages, and a message's streamed text chunks arrive joined.
 
 The stress spec, `ui/e2e/specs/stress.e2e.ts`, holds the app to time budgets
 with hundreds of sessions and a transcript of thousands of long Markdown
-replies. [Testing](dev/testing.md#ox-tests-and-fixtures) describes how it
+replies. [Testing](testing.md#ox-tests-and-fixtures) describes how it
 measures.

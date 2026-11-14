@@ -22,8 +22,6 @@
   --disabled-opacity: 0.5;
   --dimmed-opacity: 0.6;
   --busy-dot-opacity: 0.4;
-  --scrollbar-thumb: color-mix(in oklab, var(--foreground) 20%, transparent);
-  --scrollbar-thumb-hover: color-mix(in oklab, var(--foreground) 40%, transparent);
 
   /* Spacing: every padding, margin, gap, and size is a multiple of this. */
   --spacing: 0.25rem;
@@ -88,8 +86,6 @@
   --prompt-max-width: 75%;
   --tool-call-gap: calc(var(--spacing) * 2);
   --tool-argument-gap: var(--spacing);
-  --scrollbar-size: calc(var(--spacing) * 2.5);
-  --scrollbar-inset: calc(var(--spacing) * 0.5);
   /* The transcript's text lines up with the composer's text. */
   --conversation-inset: calc(
     var(--composer-margin) +

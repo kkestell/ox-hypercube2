@@ -84,7 +84,7 @@ they need; the daemon shares one non-recursive watch per directory across
 consumers and releases it when the last consumer stops watching. The file tree
 subscribes only for open folders.
 
-[Performance](../performance.md) describes how changes flow through the
+[Performance](performance.md) describes how changes flow through the
 daemon, desktop core, and UI without reprocessing unrelated state.
 
 ## Persistence and recovery

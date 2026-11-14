@@ -90,7 +90,7 @@ in [Code style](code-style.md#implementation) applies to tests too.
   everyday use. It measures inside the webview and waits on the daemon through
   `oxctl`, because finding thousands of elements through the driver occupies
   the webview's main thread. A change whose work grows with the session list
-  or the transcript fails it. [Performance](../performance.md) describes the
+  or the transcript fails it. [Performance](performance.md) describes the
   design it checks.
 - Isolate a failure with the smallest relevant test before rerunning a broad
   suite. Distinguish fixture and driver failures from product failures; fix
