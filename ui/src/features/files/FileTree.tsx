@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, FileIcon } from "lucide-react";
+import { FileIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
 import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Sidebar } from "../../components/Sidebar";
 import type { DirEntry } from "../../lib/protocol";
@@ -125,7 +125,6 @@ function Folder({
         <li key={entry.name}>
           <div className="sidebar-row tree-row" style={style}>
             <div className="select">
-              <span className="tree-spacer" />
               <span className="status">
                 <FileIcon />
               </span>
@@ -146,7 +145,7 @@ function Folder({
             aria-expanded={expanded}
             onClick={() => toggle(childRelative)}
           >
-            <span className="status">{expanded ? <ChevronDown /> : <ChevronRight />}</span>
+            <span className="status">{expanded ? <FolderOpenIcon /> : <FolderIcon />}</span>
             <span className="title">{entry.name}</span>
           </button>
         </div>

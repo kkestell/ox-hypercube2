@@ -1,16 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
 import { open } from "@tauri-apps/plugin-dialog";
-import {
-  Archive,
-  ArchiveRestore,
-  ChevronDown,
-  ChevronRight,
-  FolderPlus,
-  GitBranch,
-  Plus,
-} from "lucide-react";
+import { ChevronDown, ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
 import { type MouseEvent, useState } from "react";
+import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
 import type {
   Branches,
@@ -139,6 +132,12 @@ export function SessionList({
         onContextMenu={(event) =>
           contextMenu(event, [
             {
+              text: session.archived ? "Unarchive Session" : "Archive Session",
+              enabled: !busy.has(session.id),
+              action: () =>
+                session.archived ? unarchiveSession(session.id) : archiveSession(session.id, false),
+            },
+            {
               text: "Delete Session",
               enabled: !busy.has(session.id),
               action: () => deleteSession(session.id, false),
@@ -166,31 +165,6 @@ export function SessionList({
             </span>
           )}
         </button>
-        <div className="row-actions">
-          {session.archived ? (
-            <button
-              type="button"
-              className="icon-button"
-              title="Unarchive Session"
-              aria-label="Unarchive Session"
-              disabled={busy.has(session.id)}
-              onClick={() => unarchiveSession(session.id)}
-            >
-              <ArchiveRestore />
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="icon-button"
-              title="Archive Session"
-              aria-label="Archive Session"
-              disabled={busy.has(session.id)}
-              onClick={() => archiveSession(session.id, false)}
-            >
-              <Archive />
-            </button>
-          )}
-        </div>
       </li>
     );
   };
@@ -255,18 +229,14 @@ export function SessionList({
                 popover="auto"
                 style={{ positionAnchor: `--new-session-${workspace.id}` }}
               >
-                <select
-                  aria-label="Agent"
-                  title="Agent"
-                  value={agent}
-                  onChange={(event) => setAgent(event.target.value)}
-                >
-                  {agents.map((choice) => (
-                    <option key={choice.id} value={choice.id}>
-                      {choice.name}
-                    </option>
-                  ))}
-                </select>
+                <div className="menu-field">
+                  <SelectPicker
+                    label="Harness"
+                    value={agent}
+                    options={agents.map(({ id, name }) => ({ value: id, name }))}
+                    onChange={setAgent}
+                  />
+                </div>
                 {workspace.git_working_tree && (
                   <button
                     type="button"

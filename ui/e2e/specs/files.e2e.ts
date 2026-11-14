@@ -14,11 +14,15 @@ describe("The file tree", () => {
     const cwd = await startSession();
     await writeFile(join(cwd, "a.txt"), "a\n");
     await mkdir(join(cwd, "sub"));
+    await mkdir(join(cwd, "sub", "nested"));
     await writeFile(join(cwd, "sub", "inner.txt"), "inner\n");
     const other = await startSession();
     await openSession(cwd);
     await expect(treeRow("sub")).toBeDisplayed();
     await expect(treeRow("a.txt")).toBeDisplayed();
+    await expect(treeRow("sub").$("svg.lucide-folder")).toBeDisplayed();
+    const rootIconX = await treeRow("sub").$("svg").getLocation("x");
+    expect(await treeRow("a.txt").$("svg").getLocation("x")).toBe(rootIconX);
 
     await writeFile(join(cwd, "b.txt"), "b\n");
     await expect(treeRow("b.txt")).toBeDisplayed();
@@ -27,6 +31,11 @@ describe("The file tree", () => {
     await sub.click();
     await expect(sub).toHaveAttribute("aria-expanded", "true");
     await expect(treeRow("inner.txt")).toBeDisplayed();
+    await expect(sub.$("svg.lucide-folder-open")).toBeDisplayed();
+    await expect(treeRow("nested")).toBeDisplayed();
+    const childIconX = await treeRow("nested").$("svg").getLocation("x");
+    expect(await treeRow("inner.txt").$("svg").getLocation("x")).toBe(childIconX);
+    expect(childIconX).toBeGreaterThan(rootIconX);
 
     await openSession(other);
     await expect(treeRow("sub")).not.toBeExisting();

@@ -1,12 +1,12 @@
-import { Check, ChevronDown, Search } from "lucide-react";
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { ChevronDown, Search } from "lucide-react";
+import { type CSSProperties, type KeyboardEvent, useEffect, useRef, useState } from "react";
 import type { ConfigOption, SelectOption } from "../../lib/protocol";
 import { ClaudeLogo } from "./ClaudeLogo";
 
 export type SelectConfig = Extract<ConfigOption, { type: "select" }>;
 
 /** A select option's choices, with its groups flattened. */
-export function choices(option: SelectConfig): SelectOption[] {
+function choices(option: SelectConfig): SelectOption[] {
   return option.options.flatMap((entry) => ("group" in entry ? entry.options : [entry]));
 }
 
@@ -27,16 +27,19 @@ export function ModelPicker({
   onChange: (option: SelectConfig, value: string) => Promise<boolean>;
 }) {
   const search = useRef<HTMLInputElement>(null);
+  const list = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
   const [pendingEffort, setPendingEffort] = useState<string | null>(null);
   // biome-ignore lint/correctness/useExhaustiveDependencies: a new current level ends the pending one
   useEffect(() => setPendingEffort(null), [effort?.currentValue]);
 
-  const models = choices(model).filter((choice) =>
-    choice.name.toLowerCase().includes(query.trim().toLowerCase()),
+  const allModels = choices(model);
+  const searchable = allModels.length >= 6;
+  const models = allModels.filter(
+    (choice) => !searchable || choice.name.toLowerCase().includes(query.trim().toLowerCase()),
   );
-  const current = choices(model).find((choice) => choice.value === model.currentValue);
+  const current = allModels.find((choice) => choice.value === model.currentValue);
   const levels = effort ? choices(effort) : [];
   const level = levels.findIndex(
     (choice) => choice.value === (pendingEffort ?? effort?.currentValue),
@@ -44,6 +47,19 @@ export function ModelPicker({
 
   const choose = (choice: SelectOption) => {
     if (choice.value !== model.currentValue) onChange(model, choice.value);
+  };
+
+  const navigate = (event: KeyboardEvent<HTMLElement>) => {
+    let next = active;
+    if (event.key === "ArrowDown") next = Math.min(active + 1, models.length - 1);
+    else if (event.key === "ArrowUp") next = Math.max(active - 1, 0);
+    else if (!searchable && event.key === "Home") next = 0;
+    else if (!searchable && event.key === "End") next = models.length - 1;
+    else if (event.key === "Enter" && models[active]) choose(models[active]);
+    else return;
+    event.preventDefault();
+    setActive(next);
+    if (!searchable) (list.current!.children[next] as HTMLButtonElement | undefined)?.focus();
   };
 
   const setLevel = async (index: number) => {
@@ -56,7 +72,7 @@ export function ModelPicker({
     <>
       <button
         type="button"
-        className="model-picker"
+        className="select-picker model-picker"
         aria-haspopup="dialog"
         popoverTarget="model-menu"
         style={{ anchorName: "--model-picker" }}
@@ -76,51 +92,66 @@ export function ModelPicker({
         onToggle={(event) => {
           if (event.newState !== "open") return;
           setQuery("");
-          setActive(0);
-          search.current?.focus();
+          if (searchable) {
+            setActive(0);
+            search.current!.focus();
+          } else {
+            const index = Math.max(
+              0,
+              allModels.findIndex((choice) => choice.value === model.currentValue),
+            );
+            setActive(index);
+            (list.current!.children[index] as HTMLButtonElement | undefined)?.focus();
+          }
         }}
       >
-        <label className="search">
-          <Search />
-          <input
-            ref={search}
-            type="text"
-            role="combobox"
-            aria-label="Search models"
-            aria-controls="model-list"
-            aria-expanded="true"
-            aria-activedescendant={models[active] && `model-${models[active].value}`}
-            placeholder="Search models"
-            value={query}
-            onChange={(event) => {
-              setQuery(event.target.value);
-              setActive(0);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === "ArrowDown") setActive(Math.min(active + 1, models.length - 1));
-              else if (event.key === "ArrowUp") setActive(Math.max(active - 1, 0));
-              else if (event.key === "Enter" && models[active]) choose(models[active]);
-              else return;
-              event.preventDefault();
-            }}
-          />
-        </label>
-        <div id="model-list" className="menu-list" role="listbox" aria-label={model.name}>
+        {searchable && (
+          <label className="search">
+            <Search />
+            <input
+              ref={search}
+              type="text"
+              role="combobox"
+              aria-label="Search models"
+              aria-controls="model-list"
+              aria-expanded="true"
+              aria-activedescendant={models[active] && `model-${models[active].value}`}
+              placeholder="Search models"
+              value={query}
+              onChange={(event) => {
+                setQuery(event.target.value);
+                setActive(0);
+              }}
+              onKeyDown={navigate}
+            />
+          </label>
+        )}
+        <div
+          ref={list}
+          id="model-list"
+          className="menu-list"
+          role="listbox"
+          aria-label={model.name}
+          onKeyDown={searchable ? undefined : navigate}
+        >
           {models.map((choice, index) => (
             <button
               key={choice.value}
               id={`model-${choice.value}`}
               type="button"
               role="option"
-              tabIndex={-1}
+              tabIndex={!searchable && index === active ? 0 : -1}
               aria-selected={choice.value === model.currentValue}
               className={index === active ? "active" : undefined}
-              onMouseEnter={() => setActive(index)}
+              onMouseEnter={(event) => {
+                setActive(index);
+                if (!searchable) event.currentTarget.focus();
+              }}
+              onFocus={() => setActive(index)}
               onClick={() => choose(choice)}
             >
               <ClaudeLogo />
               {choice.name}
-              {choice.value === model.currentValue && <Check />}
             </button>
           ))}
         </div>

@@ -1,4 +1,3 @@
-/* The model menu, placed above the left edge of the model picker. */
 .model-menu {
   top: auto;
   right: auto;
@@ -8,7 +7,6 @@
   margin: 0 0 var(--spacing);
 }
 
-.model-picker svg,
 .model-menu svg {
   flex: none;
   width: var(--icon-size);
@@ -98,10 +96,6 @@
   background: transparent;
   color: inherit;
   font: inherit;
-}
-
-.model-menu .lucide-check {
-  margin-left: auto;
 }
 
 .command-menu {
@@ -199,26 +193,23 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
+  min-height: var(--select-picker-height);
   gap: calc(var(--spacing) * 3);
-  padding-left: var(--spacing);
+  padding-left: calc(
+    var(--border-width) +
+    var(--composer-padding) +
+    (var(--icon-button-size) - var(--icon-size)) /
+    2
+  );
   font-size: var(--text-xs);
   color: var(--muted-foreground);
 }
 
-.composer .settings select,
-.composer .settings label,
-.model-picker {
+.composer .settings > .choice {
+  box-sizing: border-box;
+  height: var(--select-picker-height);
   font: inherit;
   color: inherit;
-}
-
-.model-picker {
-  display: inline-flex;
-  align-items: center;
-  gap: calc(var(--spacing) * 1.5);
-  padding: 0;
-  border: none;
-  background: transparent;
 }
 
 .model-picker .effort-name {

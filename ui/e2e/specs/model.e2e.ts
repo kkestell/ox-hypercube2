@@ -1,4 +1,13 @@
-import { agentText, openSession, send, slide, startSession } from "../helpers.ts";
+import {
+  agentText,
+  composer,
+  deleteSessions,
+  openSession,
+  send,
+  sessionEntry,
+  slide,
+  startSession,
+} from "../helpers.ts";
 
 const picker = () => $("button.model-picker");
 const menu = () => $("#model-menu");
@@ -8,27 +17,68 @@ const sliderSelector = '#model-menu input[type="range"]';
 const slider = () => $(sliderSelector);
 
 describe("The model picker", () => {
+  let cwd: string;
+
   beforeEach(async () => {
-    await openSession(await startSession());
+    cwd = await startSession();
+    await openSession(cwd);
   });
 
   it("shows the session's model and effort", async () => {
     await expect(picker()).toHaveText("SmartMedium");
+    const paperclip = $('.composer button[aria-label="Attach Files"] svg');
+    expect(await picker().$(".claude-logo").getLocation("x")).toBe(
+      await paperclip.getLocation("x"),
+    );
   });
 
-  it("finds a model by its name and chooses it with Enter, staying open", async () => {
+  it("reserves the settings row before the agent reports its configuration", async () => {
+    // oxctl waits for startup; view the published Starting row while it waits.
+    const opening = startSession("--hang-initialize").catch((error: unknown) => error);
+    const row = $(".session:has(.status.starting) button.select");
+    await expect(row).toBeDisplayed();
+    const starting = (await row.getAttribute("title"))!;
+    await openSession(starting);
+    await expect(sessionEntry(starting).$('[aria-label="Starting"]')).toBeDisplayed();
+    await expect($(".composer .settings")).toHaveText("");
+    const before = await composer().getLocation("y");
+    await openSession(cwd);
+    await expect(picker()).toBeDisplayed();
+    expect(await composer().getLocation("y")).toBe(before);
+    await deleteSessions(starting);
+    expect(await opening).toBeInstanceOf(Error);
+  });
+
+  it("omits search for a short list and chooses with the keyboard, staying open", async () => {
     await picker().click();
     await expect(menu()).toBeDisplayed();
-    await expect(search()).toBeFocused();
+    await expect(search()).not.toBeExisting();
     await expect(options()).toBeElementsArrayOfSize(2);
     await expect(menu().$('[role="option"][aria-selected="true"]')).toHaveText("Smart");
-
-    await search().setValue("fa");
-    await expect(options()).toBeElementsArrayOfSize(1);
+    await expect(menu().$('[role="option"][aria-selected="true"]')).toBeFocused();
+    await browser.keys("ArrowUp");
     await browser.keys("Enter");
     await expect(picker()).toHaveText("FastMedium");
     await expect(menu()).toBeDisplayed();
     await expect(menu().$('[role="option"][aria-selected="true"]')).toHaveText("Fast");
+    await send("config model");
+    await expect(agentText()[0]).toHaveText("fast");
+  });
+
+  it("chooses the hovered model with Enter", async () => {
+    await picker().click();
+    await expect(menu().$('[aria-selected="true"]')).toBeFocused();
+    const fast = menu().$("button=Fast");
+    // The embedded driver moves the pointer without sending mouseover.
+    await browser.execute(
+      (element) => {
+        element.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+      },
+      await fast,
+    );
+    await expect(fast).toBeFocused();
+    await browser.keys("Enter");
+    await expect(picker()).toHaveText("FastMedium");
     await send("config model");
     await expect(agentText()[0]).toHaveText("fast");
   });

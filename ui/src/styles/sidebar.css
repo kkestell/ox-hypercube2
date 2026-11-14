@@ -34,14 +34,6 @@
   border-radius: var(--radius-md);
 }
 
-.sidebar-row:hover {
-  background: var(--hover);
-}
-
-.sidebar-row:has(.select[aria-current="true"]) {
-  background: var(--selected);
-}
-
 .sidebar-row .select {
   display: flex;
   flex: 1;
@@ -69,10 +61,4 @@
 /* A tree row indents by its depth. */
 .tree-row .select {
   padding-inline-start: calc(var(--sidebar-row-padding) + var(--depth) * var(--tree-indent));
-}
-
-/* A file row leaves the chevron's place empty. */
-.tree-spacer {
-  flex: none;
-  width: var(--icon-size);
 }

@@ -85,7 +85,7 @@
   left: anchor(right);
   min-width: var(--menu-min-width);
   margin: 0 0 0 var(--spacing);
-  padding: var(--spacing);
+  padding: var(--menu-padding);
 }
 
 .menu:popover-open {
@@ -93,26 +93,71 @@
   flex-direction: column;
 }
 
-.menu button {
+.menu button,
+.menu-field {
   padding: var(--menu-item-padding);
+}
+
+.menu button {
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--foreground);
   font: inherit;
   text-align: left;
 }
 
+.sidebar-row:hover,
 .menu button:hover,
 .menu button:focus-visible,
 .menu button.active {
-  background: var(--accent);
+  background: var(--hover);
 }
 
-/* A menu's select, above its items. */
-.menu select {
+.sidebar-row:has(.select[aria-current="true"]),
+.menu-list [role="option"][aria-selected="true"] {
+  background: var(--selected);
+}
+
+/* Native selects and the model picker share their closed appearance. */
+.select-picker {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
+  box-sizing: border-box;
+  height: max(1lh, var(--select-picker-height));
+  padding: 0;
+  border: none;
+  background: transparent;
   font: inherit;
   color: inherit;
+}
+
+.select-picker svg {
+  flex: none;
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+.select-picker select {
+  appearance: none;
+  field-sizing: content;
+  box-sizing: border-box;
+  height: 100%;
+  margin: 0;
+  padding: 0 calc(var(--icon-size) + var(--spacing) * 1.5) 0 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font: inherit;
+  color: inherit;
+}
+
+.select-picker select + svg {
+  position: absolute;
+  right: 0;
+  pointer-events: none;
 }
 
 .menu-list {

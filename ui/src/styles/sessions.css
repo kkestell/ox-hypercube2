@@ -29,38 +29,3 @@
 .archived-toggle .select {
   color: var(--muted-foreground);
 }
-
-.row-actions {
-  position: absolute;
-  top: calc((var(--sidebar-row-height) - var(--icon-button-size)) / 2);
-  right: var(--row-action-inset);
-  display: flex;
-  opacity: 0;
-  transition: opacity var(--transition-duration);
-}
-
-.session:hover .row-actions,
-.session:focus-within .row-actions {
-  opacity: 1;
-}
-
-/* A row's git status sits where the row actions show, and fades out as
-   they fade in. */
-.branch-status {
-  transition: opacity var(--transition-duration);
-}
-
-.session:is(:hover, :focus-within) .select > .status.branch-status {
-  opacity: 0;
-}
-
-/* While the row actions show, the title fades out under them, over whatever
-   background the row has. */
-.session:where(:hover, :focus-within) .title {
-  --covered: calc(var(--row-action-inset) + var(--icon-button-size) - var(--sidebar-row-padding));
-  mask-image: linear-gradient(
-    to left,
-    transparent var(--covered),
-    black calc(var(--covered) + var(--icon-button-size))
-  );
-}

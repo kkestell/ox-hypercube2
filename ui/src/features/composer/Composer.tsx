@@ -2,7 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { useState } from "react";
-import type { ConfigOption, Item, SelectOption, SessionInfo } from "../../lib/protocol";
+import { SelectPicker } from "../../components/SelectPicker";
+import type { ConfigOption, Item, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
 import { Elicitation } from "./Elicitation";
@@ -132,18 +133,16 @@ export function Composer({
           </form>
         </div>
       </div>
-      {session.config_options.length > 0 && (
-        <div className="settings">
-          {model && <ModelPicker model={model} effort={effort} onChange={setOption} />}
-          {others.map((option) => (
-            <ConfigPicker
-              key={option.configId}
-              option={option}
-              onChange={(value) => setOption(option, value)}
-            />
-          ))}
-        </div>
-      )}
+      <div className="settings">
+        {model && <ModelPicker model={model} effort={effort} onChange={setOption} />}
+        {others.map((option) => (
+          <ConfigPicker
+            key={option.configId}
+            option={option}
+            onChange={(value) => setOption(option, value)}
+          />
+        ))}
+      </div>
     </div>
   );
 }
@@ -168,27 +167,12 @@ function ConfigPicker({
     );
   }
   if (option.type !== "select") return null;
-  const choice = (choice: SelectOption) => (
-    <option key={choice.value} value={choice.value}>
-      {choice.name}
-    </option>
-  );
   return (
-    <select
-      aria-label={option.name}
-      title={option.name}
+    <SelectPicker
+      label={option.name}
       value={option.currentValue}
-      onChange={(event) => onChange(event.target.value)}
-    >
-      {option.options.map((entry) =>
-        "group" in entry ? (
-          <optgroup key={entry.group} label={entry.name}>
-            {entry.options.map(choice)}
-          </optgroup>
-        ) : (
-          choice(entry)
-        ),
-      )}
-    </select>
+      options={option.options}
+      onChange={onChange}
+    />
   );
 }

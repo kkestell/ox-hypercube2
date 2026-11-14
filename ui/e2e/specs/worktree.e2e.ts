@@ -1,4 +1,5 @@
 import {
+  choose,
   compareSession,
   git,
   gitWorkspace,
@@ -13,7 +14,10 @@ describe("The New Task menu", () => {
   it("offers only a session in the checkout outside Git", async () => {
     const cwd = await startSession();
     const menu = await openMenu(cwd);
-    await expect(menu.$('select[aria-label="Agent"]')).toHaveValue("claude");
+    const harness = '.new-session-menu:popover-open select[aria-label="Harness"]';
+    await expect($(harness)).toHaveValue("claude");
+    await choose(harness, "claude");
+    await expect(menu).toBeDisplayed();
     await expect(menu.$$('[role="menuitem"]')).toBeElementsArrayOfSize(1);
     await expect(menu.$('[role="menuitem"]')).toHaveText("Session in Checkout");
     await menu.$("button=Session in Checkout").click();

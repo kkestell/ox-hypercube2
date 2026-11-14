@@ -16,10 +16,10 @@ export function binary(name: string): string {
  * session's entry shows on hover. Each line of a prompt to the fake agent is a
  * directive, such as `say 3 0`; its module documentation lists them.
  */
-export async function startSession(): Promise<string> {
+export async function startSession(...agentArgs: string[]): Promise<string> {
   const cwd = await realpath(await mkdtemp(join(process.env.OX_E2E_DIR!, "session-")));
   const workspace = (await oxctl("workspace", "add", cwd)).trim();
-  await oxctl("new", "--workspace", workspace, "--", binary("oxd-fake-agent"));
+  await oxctl("new", "--workspace", workspace, "--", binary("oxd-fake-agent"), ...agentArgs);
   return cwd;
 }
 
