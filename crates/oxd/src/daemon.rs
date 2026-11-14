@@ -13,6 +13,7 @@ use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::branches;
 use crate::directories::Directories;
+use crate::mcp::OxServer;
 use crate::session::Session;
 use crate::state::Change;
 use crate::store::{SavedSession, SavedWorkspace, SavedWorktree, Store};
@@ -49,6 +50,8 @@ pub struct Daemon {
     unstarted: Mutex<Vec<(Arc<Session>, OwnedMutexGuard<()>)>>,
     /// The directories that directory watches follow.
     directories: Arc<Directories>,
+    /// The `ox` MCP server each session's agent is given.
+    ox_server: Arc<OxServer>,
 }
 
 /// Counts one connected client for as long as it lives.
@@ -94,8 +97,8 @@ impl Daemon {
     /// A daemon with the workspaces and sessions `store` holds, which adds
     /// sessions' worktrees in `worktrees_dir`, and parks the agent of a session
     /// that has been idle, with no background work, and unviewed for
-    /// `park_after`, and whose directory watches follow `directories`. Each
-    /// saved session is
+    /// `park_after`, whose directory watches follow `directories`, and whose
+    /// sessions' agents are given `ox_server`. Each saved session is
     /// `exited`, with no agent, until it loads. A saved session that never
     /// started has nothing to load. One without a worktree is deleted; one
     /// with a worktree waits, `exited`, for `clean_up`.
@@ -104,6 +107,7 @@ impl Daemon {
         worktrees_dir: PathBuf,
         park_after: Duration,
         directories: Arc<Directories>,
+        ox_server: Arc<OxServer>,
     ) -> rusqlite::Result<Self> {
         let store = Arc::new(store);
         let changed = watch::Sender::new(());
@@ -116,7 +120,13 @@ impl Daemon {
                 store.remove_session(&saved.id)?;
                 continue;
             }
-            let session = Session::restore(store.clone(), changed.clone(), park_after, saved);
+            let session = Session::restore(
+                store.clone(),
+                changed.clone(),
+                park_after,
+                ox_server.clone(),
+                saved,
+            );
             if !started {
                 let guard = session.hold_lifecycle();
                 unstarted.push((session.clone(), guard));
@@ -139,6 +149,7 @@ impl Daemon {
             fetches: Arc::default(),
             unstarted: Mutex::new(unstarted),
             directories,
+            ox_server,
         })
     }
 
@@ -362,6 +373,10 @@ impl Daemon {
                 session.compare().await;
                 Ok(to_value(session.info()))
             }
+            Method::SessionSetTitle { session_id, title } => {
+                self.session(&session_id)?.set_title(&title)?;
+                Ok(Value::Null)
+            }
             Method::Hello { .. }
             | Method::SessionSubscribe { .. }
             | Method::Watch
@@ -533,6 +548,7 @@ impl Daemon {
                 self.store.clone(),
                 self.changed.clone(),
                 self.park_after,
+                self.ox_server.clone(),
                 saved,
                 env,
                 worktree.take(),

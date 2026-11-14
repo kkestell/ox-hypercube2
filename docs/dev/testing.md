@@ -117,6 +117,10 @@ Run commands from the repository root for the parts that changed:
 
 `make fix` applies the formatters and safe lint fixes.
 
+`make check-rust` builds `ox-mcp` before running the tests because the daemon
+integration tests launch it beside `oxd`. Before running those tests directly
+with `cargo test`, run `cargo build -p ox-mcp`.
+
 After changing behavior in `crates/ox` or the UI's TypeScript, also run
 `make e2e` and report its result. It builds the app with its embedded WebDriver
 server and drives the tests in `ui/e2e` against sessions of `oxd-fake-agent`

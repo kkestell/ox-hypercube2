@@ -366,6 +366,7 @@ class SmokeRun:
         self.check_background_wake()
         self.check_cancellation()
         self.verify_model()
+        self.check_title_tool()
         self.check_load_after_restart()
         self.check_parking()
         self.check_archive()
@@ -442,6 +443,21 @@ class SmokeRun:
         state, directory, command, title, and agent session id."""
         row = next(r for r in self.ctl("ls").splitlines() if r.startswith(self.session))
         return row.split("\t")
+
+    def check_title_tool(self):
+        """Has Claude retitle the session with the `ox` MCP server's
+        `set_title` tool. A permission request would stall the turn."""
+        title = f"Smoke {self.directory.name}"
+        self.ctl(
+            "prompt",
+            self.session,
+            f"Call the set_title tool of the ox MCP server with the title {title} "
+            "and do nothing else.",
+        )
+        self.finish()
+        row = self.session_row()
+        check(row[5] == title, f"The title tool did not set the title: {row}")
+        self.report("agent_set_title_through_ox_mcp", title=title)
 
     def check_load_after_restart(self):
         token = self.directory.name
@@ -909,7 +925,7 @@ def main():
     )
     args = parser.parse_args()
     check(shutil.which("claude"), "claude is not installed or is not on PATH")
-    packages = ["oxd", "oxctl", "claude-code-acp"]
+    packages = ["oxd", "ox-mcp", "oxctl", "claude-code-acp"]
     subprocess.run(
         ["cargo", "build", *[flag for p in packages for flag in ("-p", p)]],
         cwd=REPO,

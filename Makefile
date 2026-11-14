@@ -15,7 +15,7 @@ DEV_OXD := pkill -f "[o]xd --socket $(DEV_SOCKET)$$"
 # including on Ctrl-C.
 dev:
 	-$(DEV_OXD)
-	cargo build -p oxd -p claude-code-acp
+	cargo build -p oxd -p ox-mcp -p claude-code-acp
 	trap '$(DEV_OXD)' EXIT; cd ui && OX_SOCKET="$(DEV_SOCKET)" npm run tauri dev
 
 check: check-rust check-ui check-scripts
@@ -23,6 +23,7 @@ check: check-rust check-ui check-scripts
 check-rust:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo build -p ox-mcp
 	cargo test --workspace
 
 check-ui:
@@ -41,7 +42,7 @@ fix:
 # The app is built with the embedded WebDriver server and the UI bundled
 # into it, beside the oxd, oxctl, and fake agent binaries the tests use.
 e2e:
-	cargo build -p oxd -p oxctl
+	cargo build -p oxd -p ox-mcp -p oxctl
 	cd ui && npm run tauri -- build --debug --no-bundle --features webdriver
 	cd ui && npm run e2e
 

@@ -21,6 +21,7 @@ use tokio::sync::{Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::branches;
+use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, SavedWorktree, Store};
 use crate::worktree::{self, Git, WorktreePlan};
@@ -58,6 +59,8 @@ pub struct Session {
     /// while it loads, and while it is deleted.
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     store: Arc<Store>,
+    /// The `ox` MCP server the agent is given.
+    ox_server: Arc<OxServer>,
     state: Mutex<State>,
     /// Set once the stored history is in the state.
     history: tokio::sync::OnceCell<()>,
@@ -111,6 +114,7 @@ impl Session {
     fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
+        ox_server: Arc<OxServer>,
         saved: SavedSession,
         state: State,
         park_after: Duration,
@@ -128,6 +132,7 @@ impl Session {
             archived: Mutex::new(saved.archived),
             lifecycle: Arc::default(),
             store,
+            ox_server,
             changed,
             commands: Mutex::new(mpsc::unbounded_channel().0),
             task: Mutex::new(None),
@@ -226,12 +231,13 @@ impl Session {
         store: Arc<Store>,
         changed: watch::Sender<()>,
         park_after: Duration,
+        ox_server: Arc<OxServer>,
         saved: SavedSession,
         env: BTreeMap<String, String>,
         worktree: Option<(Git, WorktreePlan)>,
     ) -> Arc<Self> {
         let state = State::new(saved.id.clone());
-        let session = Self::new(store, changed, saved, state, park_after);
+        let session = Self::new(store, changed, ox_server, saved, state, park_after);
         match worktree {
             None => session.launch(&mut session.task.lock().unwrap(), env, None),
             Some((git, plan)) => {
@@ -286,6 +292,7 @@ impl Session {
         store: Arc<Store>,
         changed: watch::Sender<()>,
         park_after: Duration,
+        ox_server: Arc<OxServer>,
         saved: SavedSession,
     ) -> Arc<Self> {
         let state = match saved.agent_session_id.clone() {
@@ -297,7 +304,7 @@ impl Session {
             ),
             None => State::unstarted(saved.id.clone(), saved.title.clone()),
         };
-        Self::new(store, changed, saved, state, park_after)
+        Self::new(store, changed, ox_server, saved, state, park_after)
     }
 
     /// Starts the agent task in `task`, which opens or resumes an ACP session.
@@ -345,6 +352,20 @@ impl Session {
 
     pub fn archived(&self) -> bool {
         *self.archived.lock().unwrap()
+    }
+
+    /// Sets the title, with runs of whitespace collapsed to one space, and
+    /// saves and publishes it. A title left empty is refused.
+    pub fn set_title(&self, title: &str) -> Result<(), ErrorBody> {
+        let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+        if title.is_empty() {
+            return Err(ErrorBody {
+                code: code::INVALID_REQUEST,
+                message: "the title is empty".into(),
+            });
+        }
+        self.update(|state| state.set_title(title));
+        Ok(())
     }
 
     /// Marks the session archived, or not, and signals the change.
@@ -764,6 +785,11 @@ impl Session {
                     // the agent sends next (the SDK's `concepts::ordering`
                     // chapter), so every later update finds it live.
                     let prompt_capabilities = capabilities.prompt.unwrap_or_default();
+                    let mcp_servers = if capabilities.mcp.is_some_and(|mcp| mcp.stdio.is_some()) {
+                        vec![session.ox_server.for_session(&session.id)]
+                    } else {
+                        Vec::new()
+                    };
                     let (opened, open) = oneshot::channel();
                     let start = {
                         let session = session.clone();
@@ -782,7 +808,8 @@ impl Session {
                                 ResumeSessionRequest::new(session_id.clone(), session.cwd.clone())
                                     .replay_from(
                                         replay.then(|| ReplayFrom::Start(ReplayFromStart::new())),
-                                    ),
+                                    )
+                                    .mcp_servers(mcp_servers),
                             )
                             .on_receiving_result(async move |result| {
                                 start(result.map(|resumed| state::Agent {
@@ -794,7 +821,10 @@ impl Session {
                                 Ok(())
                             })?,
                         None => connection
-                            .prepare_request(NewSessionRequest::new(session.cwd.clone()))
+                            .prepare_request(
+                                NewSessionRequest::new(session.cwd.clone())
+                                    .mcp_servers(mcp_servers),
+                            )
                             .on_receiving_result(async move |result| {
                                 start(result.map(|created| state::Agent {
                                     session_id: created.session_id.to_string(),

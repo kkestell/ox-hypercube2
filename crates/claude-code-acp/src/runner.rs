@@ -181,9 +181,18 @@ impl Claude {
             ])
             .args(["--model", request.model])
             .args(["--effort", request.effort]);
-        // The tool list is variadic, so another flag follows it.
+        // The tool lists are variadic, so another flag follows them.
         if !request.ask_user_question {
             command.args(["--disallowedTools", "AskUserQuestion"]);
+        }
+        // Claude uses every tool of the client's MCP servers without asking.
+        if !request.mcp_servers.is_empty() {
+            command.arg("--allowedTools").args(
+                request
+                    .mcp_servers
+                    .iter()
+                    .map(|server| format!("mcp__{}", server.name)),
+            );
         }
         command.args([
             "--permission-mode",

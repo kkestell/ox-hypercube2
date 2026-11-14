@@ -13,15 +13,19 @@ flowchart TB
     oxd["oxd"]
     bridge["claude-code-acp<br/>(one per session)"]
     claude["claude<br/>(one per session)"]
+    oxmcp["ox-mcp<br/>(one per session)"]
 
     ox -.-> oxd
     oxctl -.-> oxd
     oxd --> bridge
     bridge --> claude
+    claude --> oxmcp
+    oxmcp -.-> oxd
 ```
 
 Solid arrows point from a parent to the processes it owns. Dotted arrows
-start `oxd` detached, so it outlives the client that started it.
+point from a client to `oxd`; `ox` and `oxctl` start it detached, so it
+outlives the client that started it.
 
 ## What belongs in oxd
 
@@ -345,3 +349,15 @@ the next prompt starts another with `--resume` and the Claude session ID.
 `replayFrom: start`.
 
 **claude.** The Claude Code CLI, authenticated with the user's subscription.
+
+**ox-mcp.** The MCP server named `ox` that `oxd` gives each agent it starts.
+`oxd` finds `ox-mcp` beside its own executable and, to an agent that
+advertises `session.mcp.stdio`, sends it on `session/new` and
+`session/resume` as a stdio server run as `ox-mcp --socket <socket> --session
+<session id>`, with the daemon's absolute socket path and the `oxd` session
+ID. The agent starts it and talks MCP to it over stdio. Each tool call opens a
+connection to `oxd`, calls a daemon method for the session, and closes the
+connection, so `ox-mcp` does not keep the daemon from exiting idle. Its tool
+`set_title` calls `session.set_title`, which collapses runs of whitespace,
+refuses an empty title, saves the title with the session, and publishes it
+in the lists. It records no event.

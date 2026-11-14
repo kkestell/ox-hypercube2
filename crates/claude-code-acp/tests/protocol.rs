@@ -1118,6 +1118,7 @@ async fn passes_stdio_mcp_servers_to_claude() {
         &bin,
         &format!(
             r#"
+printf '%s\n' "$@" > args.txt
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "--mcp-config" ]; then printf '%s' "$2" > mcp-config.json; break; fi
   shift
@@ -1159,6 +1160,14 @@ next_message
             "command":"/opt/tools/mcp-filesystem","args":args,"env":{"TOKEN":"test"}
         }}})
     );
+    let claude_args = fs::read_to_string(project.join("args.txt")).unwrap();
+    let claude_args: Vec<&str> = claude_args.lines().collect();
+    let allowed = claude_args
+        .iter()
+        .position(|arg| *arg == "--allowedTools")
+        .expect("--allowedTools");
+    assert_eq!(claude_args[allowed + 1], "mcp__filesystem");
+    assert_eq!(claude_args[allowed + 2], "--permission-mode");
 }
 
 #[tokio::test]

@@ -58,8 +58,13 @@
 //!   the line, which means the agent did not insert it
 //! - `deferred-reject`: report `running` and `idle` without inserting the
 //!   prompt, and answer it with an error only when the next prompt arrives
+//! - `mcp-title <text>`: start the session's stdio MCP server named `ox`,
+//!   call its `set_title` tool with the rest of the line, and send the tool
+//!   result's text, or the error, as one chunk
 //!
-//! The agent accepts image and embedded resource prompts, and has three
+//! The agent advertises `session.mcp.stdio` and keeps the MCP servers of
+//! `session/new` and `session/resume`. It accepts image and embedded
+//! resource prompts, and has three
 //! select config options: `mode`, with values `ask` and `code`; `model`, in
 //! the `model` category, with values `fast` and `smart`; and `effort`, in the
 //! `thought_level` category, with values `low`, `medium`, and `high`. Setting
@@ -101,6 +106,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::v2::schema as acp;
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error, Stdio};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::watch;
 
 /// A select config option: its ID, name, category, values by ID and name,
@@ -165,6 +171,8 @@ struct State {
     deferred_rejection: Mutex<Option<Responder<acp::PromptResponse>>>,
     /// Whether the client advertised form elicitation.
     form_elicitation: AtomicBool,
+    /// Each session's MCP servers, by session ID.
+    mcp_servers: Mutex<HashMap<String, Vec<acp::McpServer>>>,
 }
 
 impl State {
@@ -356,6 +364,7 @@ async fn main() -> agent_client_protocol::Result<()> {
         tools: AtomicU64::new(0),
         deferred_rejection: Mutex::new(None),
         form_elicitation: AtomicBool::new(false),
+        mcp_servers: Mutex::default(),
     });
     agent_client_protocol::Agent
         .v2()
@@ -383,7 +392,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                     }
                     let mut capabilities = acp::AgentCapabilities::new();
                     if !flag("--no-sessions") {
-                        let mut session = acp::SessionCapabilities::new();
+                        let mut session = acp::SessionCapabilities::new().mcp(
+                            acp::McpCapabilities::new().stdio(acp::McpStdioCapabilities::new()),
+                        );
                         if !flag("--text-only") {
                             session =
                                 session.prompt(
@@ -412,6 +423,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     let id = acp::SessionId::new(format!("fake-{}", uuid::Uuid::new_v4()));
                     state.open_log(&id, &request.cwd.0);
+                    state
+                        .mcp_servers
+                        .lock()
+                        .unwrap()
+                        .insert(id.to_string(), request.mcp_servers);
                     responder.respond(
                         acp::NewSessionResponse::new(id.clone())
                             .config_options(state.config_options())
@@ -469,6 +485,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                         return responder
                             .respond_with_error(Error::invalid_params().data("no such session"));
                     };
+                    state
+                        .mcp_servers
+                        .lock()
+                        .unwrap()
+                        .insert(request.session_id.to_string(), request.mcp_servers);
                     let session_id = request.session_id;
                     for line in log.lines().filter(|_| replay) {
                         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -649,6 +670,7 @@ enum Directive {
     TitleNull,
     Touch,
     Tool(String),
+    McpTitle(String),
     BackgroundStart(String),
     BackgroundEnd(String),
     Exit(i32),
@@ -694,6 +716,7 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["title-null"] => Directive::TitleNull,
             ["touch"] => Directive::Touch,
             ["tool", ..] => Directive::Tool(rest("tool")),
+            ["mcp-title", ..] => Directive::McpTitle(rest("mcp-title")),
             ["background-start", name] => Directive::BackgroundStart((*name).to_owned()),
             ["background-end", name] => Directive::BackgroundEnd((*name).to_owned()),
             ["exit", code] => Directive::Exit(parse_number(code)?),
@@ -895,6 +918,26 @@ async fn run(
                         ]),
                 )?;
             }
+            Directive::McpTitle(title) => {
+                let server = state
+                    .mcp_servers
+                    .lock()
+                    .unwrap()
+                    .get(&session_id.to_string())
+                    .into_iter()
+                    .flatten()
+                    .find_map(|server| match server {
+                        acp::McpServer::Stdio(stdio) if stdio.name == "ox" => Some(stdio.clone()),
+                        _ => None,
+                    });
+                let text = match server {
+                    Some(server) => call_set_title(&server, &title)
+                        .await
+                        .unwrap_or_else(|error| error.to_string()),
+                    None => "no ox MCP server".to_owned(),
+                };
+                say(text)?;
+            }
             Directive::BackgroundStart(name) => {
                 let tool = format!("bg-{name}");
                 notify(
@@ -936,6 +979,60 @@ async fn run(
     } else {
         Ok(acp::StopReason::EndTurn)
     }
+}
+
+/// Starts `server`, calls its `set_title` tool with `title`, and returns
+/// the result's text or the error's message. The server exits once its
+/// stdin closes.
+async fn call_set_title(server: &acp::McpServerStdio, title: &str) -> std::io::Result<String> {
+    let mut child = tokio::process::Command::new(&server.command.0)
+        .args(&server.args)
+        .envs(server.env.iter().map(|var| (&var.name, &var.value)))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+    for message in [
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "oxd-fake-agent", "version": env!("CARGO_PKG_VERSION")},
+            },
+        }),
+        serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "set_title", "arguments": {"title": title}},
+        }),
+    ] {
+        stdin.write_all(format!("{message}\n").as_bytes()).await?;
+    }
+    stdin.flush().await?;
+    let text = loop {
+        let Some(line) = stdout.next_line().await? else {
+            break "the ox MCP server closed its output".to_owned();
+        };
+        let answer: serde_json::Value = serde_json::from_str(&line)?;
+        if answer["id"] != 2 {
+            continue;
+        }
+        let text = match answer["result"]["content"][0]["text"].as_str() {
+            Some(text) => text,
+            None => answer["error"]["message"].as_str().unwrap_or("no text"),
+        };
+        break text.to_owned();
+    };
+    drop(stdin);
+    child.wait().await?;
+    Ok(text)
 }
 
 /// A 1×1 PNG.

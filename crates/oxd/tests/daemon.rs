@@ -2320,6 +2320,26 @@ async fn session_info_updates_set_the_title() {
     }
 }
 
+/// An agent's `set_title` call on the `ox` MCP server oxd gives it retitles
+/// its session. Needs `ox-mcp` built beside `oxd`.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_sets_title_through_ox_mcp_server() {
+    let daemon = Daemon::start(1000).await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .prompt(&session.id, text("mcp-title Renamed  by\tagent"))
+        .await
+        .unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&turn), ["Title set."]);
+    assert_eq!(
+        info(&client, &session.id).await.title.as_deref(),
+        Some("Renamed by agent")
+    );
+}
+
 /// After a watch's `unsubscribe` is answered, the connection receives no more
 /// listings.
 #[tokio::test(flavor = "multi_thread")]

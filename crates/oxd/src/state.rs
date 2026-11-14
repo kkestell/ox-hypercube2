@@ -512,7 +512,7 @@ pub struct State {
     session_id: String,
     phase: Phase,
     /// The title from the last recorded `session_info_update` that set or
-    /// cleared it.
+    /// cleared it, or from `set_title`, whichever came last.
     title: Option<String>,
     events: Option<Vec<Event>>,
     last_seq: u64,
@@ -686,6 +686,11 @@ impl State {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Replaces the title, recording no event.
+    pub fn set_title(&mut self, title: String) {
+        self.title = Some(title);
     }
 
     pub fn state(&self) -> SessionState {

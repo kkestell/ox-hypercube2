@@ -51,6 +51,6 @@ Run the app from the repository root:
 make dev
 ```
 
-`make dev` builds `oxd` and the Claude bridge and runs the app against its own
-`oxd` on `target/dev/oxd.sock`, which it stops before building and after the
-app exits.
+`make dev` builds `oxd`, its `ox-mcp` server, and the Claude bridge and runs
+the app against its own `oxd` on `target/dev/oxd.sock`, which it stops before
+building and after the app exits.

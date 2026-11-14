@@ -597,6 +597,15 @@ impl Client {
         .await
     }
 
+    /// Sets the session's title.
+    pub async fn set_title(&self, session_id: &str, title: &str) -> Result<(), Error> {
+        self.ack(Method::SessionSetTitle {
+            session_id: session_id.into(),
+            title: title.into(),
+        })
+        .await
+    }
+
     async fn ack(&self, method: Method) -> Result<(), Error> {
         self.call::<Value>(method).await.map(drop)
     }

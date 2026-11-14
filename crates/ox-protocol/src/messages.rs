@@ -228,6 +228,11 @@ pub enum Method {
     /// Recomputes the session's comparison and answers the session.
     #[serde(rename = "session.refresh")]
     SessionRefresh { session_id: String },
+    /// Sets the session's title, shown in the session list and saved with
+    /// the session. Runs of whitespace become one space, and a title left
+    /// empty is refused with `invalid_request`. Answers `null`.
+    #[serde(rename = "session.set_title")]
+    SessionSetTitle { session_id: String, title: String },
 }
 
 /// Where a new session runs.
