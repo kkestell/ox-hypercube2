@@ -92,6 +92,7 @@
 //!   when none is running, starting after `session/new`, and accept the
 //!   `background-start` and `background-end` directives
 //! - `--no-commands`: omit commands from setup responses
+//! - `--model-providers`: include provider labels in the model choices
 //! - `--silent-config`: send no `config_option_update` when an option is set
 //! - `--late-config-update`: send the `config_option_update` after the
 //!   response
@@ -220,7 +221,21 @@ impl State {
                     option
                         .values
                         .iter()
-                        .map(|(value, name)| acp::SessionConfigSelectOption::new(*value, *name))
+                        .map(|(value, name)| {
+                            let choice = acp::SessionConfigSelectOption::new(*value, *name);
+                            if option.id == "model" && flag("--model-providers") {
+                                let provider = match *value {
+                                    "fast" => "OpenRouter",
+                                    _ => "OpenAI subscription",
+                                };
+                                choice.meta(serde_json::Map::from_iter([(
+                                    "ox/provider".into(),
+                                    serde_json::json!(provider),
+                                )]))
+                            } else {
+                                choice
+                            }
+                        })
                         .collect::<Vec<_>>(),
                 );
                 match option.category {

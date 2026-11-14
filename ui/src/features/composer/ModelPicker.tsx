@@ -36,7 +36,11 @@ export function ModelPicker({
   const allModels = choices(model);
   const searchable = allModels.length >= 6;
   const models = allModels.filter(
-    (choice) => !searchable || choice.name.toLowerCase().includes(query.trim().toLowerCase()),
+    (choice) =>
+      !searchable ||
+      `${choice.name} ${choice._meta?.["ox/provider"] ?? ""}`
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
   );
   const current = allModels.find((choice) => choice.value === selectedModel);
   const levels = effort ? choices(effort) : [];
@@ -67,6 +71,9 @@ export function ModelPicker({
         style={{ anchorName: "--model-picker" }}
       >
         <span>{current?.name ?? selectedModel}</span>
+        {current?._meta?.["ox/provider"] && (
+          <span className="provider-name">{current._meta["ox/provider"]}</span>
+        )}
         {levels[level] && <span className="effort-name">{levels[level].name}</span>}
         <ChevronDown />
       </button>
@@ -139,6 +146,9 @@ export function ModelPicker({
               onClick={() => choose(choice)}
             >
               <span title={choice.name}>{choice.name}</span>
+              {choice._meta?.["ox/provider"] && (
+                <span className="provider-name">{choice._meta["ox/provider"]}</span>
+              )}
             </button>
           ))}
         </div>

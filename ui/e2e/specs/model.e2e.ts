@@ -45,6 +45,32 @@ describe("The model picker", () => {
     await expect($(".composer .harness-logo")).not.toBeExisting();
   });
 
+  it("shows providers in a muted column and updates the selected provider", async () => {
+    await openSession(await startSession("--model-providers"));
+    await expect(picker().$(".provider-name")).toHaveText("OpenAI subscription");
+    await picker().click();
+    const providers = menu().$$(".provider-name");
+    await expect(providers[0]!).toHaveText("OpenRouter");
+    await expect(providers[1]!).toHaveText("OpenAI subscription");
+    expect(await providers[0]!.getLocation("x")).toBe(await providers[1]!.getLocation("x"));
+    const colors = await browser.execute(() => {
+      const row = document.querySelector('#model-menu [role="option"]')!;
+      return {
+        model: getComputedStyle(row.firstElementChild!).color,
+        provider: getComputedStyle(row.lastElementChild!).color,
+        muted: getComputedStyle(document.querySelector(".effort .stops")!).color,
+      };
+    });
+    expect(colors.provider).toBe(colors.muted);
+    expect(colors.provider).not.toBe(colors.model);
+    await menu().$("#model-fast").click();
+    await expect(picker().$(".provider-name")).toHaveText("OpenRouter");
+    await expect(picker().$("span")).toHaveText("Fast");
+    await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "model-providers.png"));
+    await send("config model");
+    await expect(agentText()[0]).toHaveText("fast");
+  });
+
   it("shows the harness beside the selected model and leaves model options icon-free", async () => {
     for (const [bridge, label] of [
       ["claude-code-acp", "Claude Code"],

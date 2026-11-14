@@ -1,7 +1,5 @@
 //! Pi's model and thinking choices as ACP session configuration.
 
-use std::collections::HashMap;
-
 use agent_client_protocol::v2::schema::{
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
 };
@@ -25,27 +23,24 @@ pub fn build(state: &Value, models: &Value, levels: &Value) -> Vec<SessionConfig
         return Vec::new();
     };
     let models = models.as_array().map(Vec::as_slice).unwrap_or_default();
-    let mut names = HashMap::new();
-    for model in models {
-        if let Some(name) = model["name"].as_str() {
-            *names.entry(name).or_insert(0) += 1;
-        }
-    }
     let choices = models
         .iter()
         .filter_map(|model| {
             let provider = model["provider"].as_str()?;
             let id = model["id"].as_str()?;
             let name = model["name"].as_str()?;
-            let name = if names[name] > 1 {
-                format!("{name} ({provider})")
-            } else {
-                name.to_owned()
+            let label = match provider {
+                "openai-codex" => "OpenAI subscription",
+                "openai" => "OpenAI",
+                "openrouter" => "OpenRouter",
+                "opencode-go" => "OpenCode Go",
+                _ => provider,
             };
-            Some(SessionConfigSelectOption::new(
-                format!("{provider}/{id}"),
-                name,
-            ))
+            Some(
+                SessionConfigSelectOption::new(format!("{provider}/{id}"), name).meta(
+                    serde_json::Map::from_iter([("ox/provider".into(), json!(label))]),
+                ),
+            )
         })
         .collect::<Vec<_>>();
     let mut options = vec![
@@ -93,25 +88,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_values_preserve_ids_and_disambiguate_only_shared_names() {
+    fn model_choices_preserve_ids_and_names_with_separate_providers() {
         let options = serde_json::to_value(build(
-            &json!({"model":{"provider":"a","id":"org/one"},"thinkingLevel":"high"}),
+            &json!({"model":{"provider":"openai-codex","id":"org/one"},"thinkingLevel":"high"}),
             &json!([
-                {"provider":"a","id":"org/one","name":"Shared"},
-                {"provider":"b","id":"two","name":"Shared"},
-                {"provider":"b","id":"three","name":"Unique"}
+                {"provider":"openai-codex","id":"org/one","name":"Shared"},
+                {"provider":"openrouter","id":"two","name":"Shared"},
+                {"provider":"opencode-go","id":"three","name":"Unique"},
+                {"provider":"custom","id":"four","name":"Custom"}
             ]),
             &json!(["off", "minimal", "low", "medium", "high", "xhigh", "max"]),
         ))
         .unwrap();
-        assert_eq!(options[0]["currentValue"], "a/org/one");
+        assert_eq!(options[0]["currentValue"], "openai-codex/org/one");
         assert_eq!(options[0]["category"], "model");
         assert_eq!(
             options[0]["options"],
             json!([
-                {"value":"a/org/one", "name":"Shared (a)"},
-                {"value":"b/two", "name":"Shared (b)"},
-                {"value":"b/three", "name":"Unique"}
+                {"value":"openai-codex/org/one", "name":"Shared", "_meta":{"ox/provider":"OpenAI subscription"}},
+                {"value":"openrouter/two", "name":"Shared", "_meta":{"ox/provider":"OpenRouter"}},
+                {"value":"opencode-go/three", "name":"Unique", "_meta":{"ox/provider":"OpenCode Go"}},
+                {"value":"custom/four", "name":"Custom", "_meta":{"ox/provider":"custom"}}
             ])
         );
         assert_eq!(options[1]["category"], "thought_level");

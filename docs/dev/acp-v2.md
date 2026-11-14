@@ -33,7 +33,7 @@ relays the update or acts on it as the protocol requires.
 | `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. Pi also rejects a changed `cwd` or MCP servers. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ✅ | ✅ | Both bridges leave the session resumable. Ox deletes sessions by stopping the agent process. |
 | `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude waits to accept the next prompt; Pi queues it as a follow-up. |
-| `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Ox supports select and boolean options. |
+| `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Pi model choices carry a provider display label in `_meta["ox/provider"]`. Ox supports select and boolean options. |
 | `session/delete` | ❌ | ❌ | ❌ | |
 | `session/fork` (unstable) | ❌ | ❌ | ❌ | |
 | `session/archive` (unstable) | ❌ | ❌ | ❌ | |

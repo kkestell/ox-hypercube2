@@ -11,6 +11,7 @@ export type SessionState =
 export interface SelectOption {
   value: string;
   name: string;
+  _meta?: { "ox/provider"?: string } | null;
 }
 
 export interface SelectGroup {

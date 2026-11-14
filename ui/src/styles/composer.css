@@ -20,6 +20,21 @@
   white-space: nowrap;
 }
 
+.model-menu .menu-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+
+.model-menu [role="option"] {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+}
+
+.provider-name {
+  color: var(--muted-foreground);
+}
+
 /* A slider whose stops are named below it. Its fill and each stop sit at
    --position, from 0 to 1, along the thumb's travel. */
 .effort {
@@ -208,6 +223,7 @@
   gap: calc(var(--spacing) * 1.5);
 }
 
+.model-picker .provider-name,
 .model-picker .effort-name {
   opacity: var(--dimmed-opacity);
 }
