@@ -7,6 +7,9 @@ description = "ACP bridge for the Pi CLI"
 
 [dependencies]
 agent-client-protocol = { version = "=5.2.0", features = ["stdio", "unstable_protocol_v2"] }
+dirs = "7"
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 libc = "0.2"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync"] }

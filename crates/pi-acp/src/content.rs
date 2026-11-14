@@ -48,3 +48,26 @@ pub fn prompt_text(prompt: &[ContentBlock]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Text and image blocks recorded by Pi in user messages and tool results.
+pub fn from_pi(content: &Value) -> Vec<ContentBlock> {
+    use agent_client_protocol::v2::schema::{ImageContent, TextContent};
+    if let Some(text) = content.as_str() {
+        return vec![ContentBlock::Text(TextContent::new(text))];
+    }
+    content
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block["type"].as_str()? {
+            "text" => Some(ContentBlock::Text(TextContent::new(
+                block["text"].as_str()?,
+            ))),
+            "image" => Some(ContentBlock::Image(ImageContent::new(
+                block["data"].as_str()?,
+                block["mimeType"].as_str()?,
+            ))),
+            _ => None,
+        })
+        .collect()
+}

@@ -8,8 +8,7 @@ use std::{
 
 use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
-    self as acp, ContentBlock, ErrorStopReason, PromptResponse, StopReason, TextContent,
-    ToolCallContent,
+    self as acp, ContentBlock, ErrorStopReason, PromptResponse, StopReason, ToolCallContent,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -33,6 +32,7 @@ struct Prompt {
 enum Pending {
     Prompt(Box<Prompt>),
     Abort,
+    SessionFile(oneshot::Sender<Result<Option<PathBuf>, String>>),
 }
 
 #[derive(Default)]
@@ -67,6 +67,7 @@ impl State {
 /// prompt is waiting. Dropping it closes Pi's stdin, which ends Pi.
 pub struct Pi {
     input: mpsc::UnboundedSender<Value>,
+    updates: Updates,
     state: Arc<Mutex<State>>,
     /// Closes once Pi has exited.
     exited: oneshot::Receiver<()>,
@@ -93,7 +94,7 @@ impl Pi {
         let state = Arc::new(Mutex::new(State::default()));
         let (exit, exited) = oneshot::channel();
         let output = Output {
-            updates,
+            updates: updates.clone(),
             state: state.clone(),
             input: input.downgrade(),
             cwd: cwd.to_owned(),
@@ -106,9 +107,29 @@ impl Pi {
         tokio::spawn(output.read(child));
         Ok(Self {
             input,
+            updates,
             state,
             exited,
         })
+    }
+
+    pub fn snapshot(&self) -> acp::StateUpdate {
+        self.updates.snapshot()
+    }
+
+    pub fn session_file(&self) -> oneshot::Receiver<Result<Option<PathBuf>, String>> {
+        let (send, receive) = oneshot::channel();
+        let mut state = self.state.lock().unwrap();
+        if let Some(error) = &state.exited {
+            let _ = send.send(Err(error.clone()));
+        } else {
+            state.send(
+                &self.input,
+                json!({"type":"get_state"}),
+                Pending::SessionFile(send),
+            );
+        }
+        receive
     }
 
     pub fn has_exited(&self) -> bool {
@@ -265,12 +286,22 @@ impl Output {
             (std::mem::take(&mut state.pending), state.closing)
         };
         for (_, pending) in pending {
-            if let Pending::Prompt(prompt) = pending {
-                let _ = prompt
-                    .responder
-                    .respond_with_error(agent_client_protocol::Error::new(-32603, error.clone()));
+            match pending {
+                Pending::Prompt(prompt) => {
+                    let _ = prompt
+                        .responder
+                        .respond_with_error(agent_client_protocol::Error::new(
+                            -32603,
+                            error.clone(),
+                        ));
+                }
+                Pending::SessionFile(send) => {
+                    let _ = send.send(Err(error.clone()));
+                }
+                Pending::Abort => {}
             }
         }
+
         self.updates.fail_open_tools();
         self.updates.idle(if closing {
             StopReason::Cancelled
@@ -340,6 +371,17 @@ impl Output {
         let pending = self.state.lock().unwrap().pending.remove(id);
         match pending {
             Some(Pending::Prompt(prompt)) => self.prompt_answered(prompt, response),
+            Some(Pending::SessionFile(send)) => {
+                let result = if response["success"] == true {
+                    Ok(response["data"]["sessionFile"].as_str().map(PathBuf::from))
+                } else {
+                    Err(response["error"]
+                        .as_str()
+                        .unwrap_or("pi refused get_state")
+                        .to_owned())
+                };
+                let _ = send.send(result);
+            }
             Some(Pending::Abort) => {
                 if response["success"] != true {
                     eprintln!("pi refused to abort: {}", response["error"]);
@@ -505,26 +547,14 @@ impl Output {
                     &tool.args,
                     &result["details"],
                     &self.cwd,
-                    tool.existed,
+                    Some(tool.existed),
                 )
             })
             .into_iter()
             .collect();
         content.extend(
-            result["content"]
-                .as_array()
+            crate::content::from_pi(&result["content"])
                 .into_iter()
-                .flatten()
-                .filter_map(|block| match block["type"].as_str()? {
-                    "text" => Some(ContentBlock::Text(TextContent::new(
-                        block["text"].as_str()?,
-                    ))),
-                    "image" => Some(ContentBlock::Image(acp::ImageContent::new(
-                        block["data"].as_str()?,
-                        block["mimeType"].as_str()?,
-                    ))),
-                    _ => None,
-                })
                 .map(ToolCallContent::from),
         );
         self.updates.tool_ended(id, failed, content);

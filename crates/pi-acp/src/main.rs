@@ -1,6 +1,9 @@
 mod bridge;
+mod config;
 mod content;
+mod history;
 mod pi;
+mod store;
 mod tools;
 mod updates;
 mod validation;
@@ -44,6 +47,18 @@ async fn main() -> Result<()> {
                         bridge.start_new(&id, &connection);
                     }
                     Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::ResumeSessionRequest,
+                            responder: Responder<acp::ResumeSessionResponse>,
+                            connection: ConnectionTo<Client>| {
+                    let opening = bridge.resume_session(&request, &connection);
+                    connection.spawn(async move { respond(responder, opening.await) })
                 }
             },
             agent_client_protocol::on_receive_request!(),

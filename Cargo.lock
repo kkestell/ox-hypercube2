@@ -3236,7 +3236,9 @@ name = "pi-acp"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "dirs",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

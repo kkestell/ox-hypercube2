@@ -1,4 +1,8 @@
-use std::{collections::HashSet, path::Path, sync::Mutex};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 use agent_client_protocol::Client;
 use agent_client_protocol::v2::ConnectionTo;
@@ -19,10 +23,11 @@ struct State {
 }
 
 /// Sends one session's updates to the client.
+#[derive(Clone)]
 pub struct Updates {
     connection: ConnectionTo<Client>,
     session_id: String,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 impl Updates {
@@ -30,12 +35,16 @@ impl Updates {
         Self {
             connection,
             session_id: session_id.to_owned(),
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
         }
     }
 
     fn send(&self, update: SessionUpdate) {
         notify(&self.connection, &self.session_id, update);
+    }
+
+    pub fn snapshot(&self) -> StateUpdate {
+        state_update(self.state.lock().unwrap().working, None)
     }
 
     /// Tells the client that Pi started working, if it has not said so.

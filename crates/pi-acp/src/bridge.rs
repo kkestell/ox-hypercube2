@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -11,30 +10,31 @@ use agent_client_protocol::{Client, Error};
 use uuid::Uuid;
 
 use crate::{
-    content,
+    config::Config,
+    content, history,
     pi::Pi,
+    store::{Session as Metadata, Store},
     updates::{Updates, notify},
     validation,
 };
 
 /// A session opened on this connection.
 struct Session {
-    cwd: PathBuf,
-    /// The Pi session every Pi of this session opens.
-    pi_session_id: String,
-    title: Option<String>,
+    metadata: Metadata,
     /// The session's Pi, once started.
     pi: Option<Pi>,
 }
 
 pub struct Bridge {
     sessions: Mutex<HashMap<String, Session>>,
+    store: Store,
 }
 
 impl Bridge {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
+            store: Store::new(Config::from_env().store_dir),
         })
     }
 
@@ -63,15 +63,18 @@ impl Bridge {
             return Err(invalid("MCP servers are not supported"));
         }
         let id = Uuid::new_v4().simple().to_string();
-        self.sessions.lock().unwrap().insert(
-            id.clone(),
-            Session {
-                cwd,
-                pi_session_id: Uuid::new_v4().to_string(),
-                title: None,
-                pi: None,
-            },
-        );
+        let metadata = Metadata {
+            cwd,
+            pi_session_id: Uuid::new_v4().to_string(),
+            title: None,
+        };
+        self.store
+            .create(id.clone(), &metadata)
+            .map_err(|error| store_error(&error))?;
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Session { metadata, pi: None });
         Ok(acp::NewSessionResponse::new(id))
     }
 
@@ -130,9 +133,33 @@ impl Bridge {
         if let Err(error) = self.start_pi(&id, connection) {
             return responder.respond_with_error(error);
         }
-        let message_id = Uuid::new_v4().to_string();
+        // Save the title before submitting a prompt so registry errors can be
+        // returned to its caller without accepting work first.
+        let text = content::prompt_text(&request.prompt);
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(&id).expect("start_pi found the session");
+        let title = if session.metadata.title.is_none() && !text.trim().is_empty() {
+            Some(
+                text.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(120)
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        };
+        if let Some(title) = &title {
+            if let Err(error) = self
+                .store
+                .update(&id, |metadata| metadata.title = Some(title.clone()))
+            {
+                return responder.respond_with_error(store_error(&error));
+            }
+            session.metadata.title = Some(title.clone());
+        }
+        let message_id = Uuid::new_v4().to_string();
         let pi = session.pi.as_ref().expect("start_pi started pi");
         if let Err(responder) = pi.prompt(
             &message_id,
@@ -144,16 +171,7 @@ impl Bridge {
             return responder.respond_with_error(Error::new(-32603, "pi exited"));
         }
 
-        let text = content::prompt_text(&request.prompt);
-        if session.title.is_none() && !text.trim().is_empty() {
-            let title: String = text
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(120)
-                .collect();
-            session.title = Some(title.clone());
+        if let Some(title) = title {
             drop(sessions);
             notify(
                 connection,
@@ -162,6 +180,68 @@ impl Bridge {
             );
         }
         Ok(())
+    }
+
+    pub fn resume_session(
+        self: &Arc<Self>,
+        request: &acp::ResumeSessionRequest,
+        connection: &ConnectionTo<Client>,
+    ) -> impl Future<Output = Result<acp::ResumeSessionResponse, Error>> + Send + 'static {
+        let prepared = (|| {
+            let replay = match request.replay_from {
+                None => false,
+                Some(acp::ReplayFrom::Start(_)) => true,
+                Some(_) => return Err(invalid("Unsupported replay cursor")),
+            };
+            let cwd = validation::cwd(&request.cwd.0).map_err(invalid)?;
+            if !request.mcp_servers.is_empty() {
+                return Err(invalid("MCP servers are not supported"));
+            }
+            let id = request.session_id.to_string();
+            let metadata = self
+                .store
+                .get(&id)
+                .map_err(|error| store_error(&error))?
+                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.clone())))?;
+            if metadata.cwd != cwd {
+                return Err(invalid("Session cwd does not match"));
+            }
+            self.sessions
+                .lock()
+                .unwrap()
+                .entry(id.clone())
+                .or_insert(Session { metadata, pi: None });
+            self.start_pi(&id, connection)?;
+            let sessions = self.sessions.lock().unwrap();
+            let pi = sessions[&id].pi.as_ref().expect("start_pi started pi");
+            let path = replay.then(|| pi.session_file());
+            Ok((id, cwd, path))
+        })();
+        let bridge = self.clone();
+        let connection = connection.clone();
+        async move {
+            let (id, cwd, path) = prepared?;
+            if let Some(path) = path {
+                let path = path
+                    .await
+                    .map_err(|_| Error::new(-32603, "pi exited"))?
+                    .map_err(|error| Error::new(-32603, error))?;
+                if let Some(path) = path {
+                    history::replay(&path, &cwd, &Updates::new(connection.clone(), &id))
+                        .map_err(|error| store_error(&error))?;
+                }
+            }
+            let sessions = bridge.sessions.lock().unwrap();
+            let session = sessions
+                .get(&id)
+                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.clone())))?;
+            notify(
+                &connection,
+                &id,
+                SessionUpdate::StateUpdate(session.pi.as_ref().expect("started pi").snapshot()),
+            );
+            Ok(acp::ResumeSessionResponse::new())
+        }
     }
 
     /// Starts the session's Pi unless one is running.
@@ -174,8 +254,8 @@ impl Bridge {
             return Ok(());
         }
         let pi = Pi::start(
-            &session.cwd,
-            &session.pi_session_id,
+            &session.metadata.cwd,
+            &session.metadata.pi_session_id,
             Updates::new(connection.clone(), id),
         )
         .map_err(|error| Error::new(-32603, error))?;
@@ -186,4 +266,8 @@ impl Bridge {
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::new(-32602, message)
+}
+
+fn store_error(error: &std::io::Error) -> Error {
+    Error::new(-32603, error.to_string())
 }

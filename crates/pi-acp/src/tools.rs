@@ -83,13 +83,13 @@ pub fn locations(name: &str, args: &Value, cwd: &Path) -> Vec<ToolCallLocation> 
 
 /// The change a successful `edit` or `write` made, from its arguments and
 /// result `details`. `existed` says whether the file existed when the tool
-/// call opened.
+/// call opened; `None` means historical existence is unknown.
 pub fn diff(
     name: &str,
     args: &Value,
     details: &Value,
     cwd: &Path,
-    existed: bool,
+    existed: Option<bool>,
 ) -> Option<ToolCallContent> {
     let file = path(args, cwd)?;
     let diff = match name {
@@ -99,8 +99,8 @@ pub fn diff(
             }
             None => Diff::new(vec![DiffChange::modify(file)]),
         },
-        "write" if existed => Diff::new(vec![DiffChange::modify(file)]),
-        "write" => Diff::patch(
+        "write" if existed == Some(true) => Diff::new(vec![DiffChange::modify(file)]),
+        "write" if existed == Some(false) => Diff::patch(
             new_file_patch(&file, args["content"].as_str().unwrap_or("")),
             vec![DiffChange::add(&*file)],
         ),

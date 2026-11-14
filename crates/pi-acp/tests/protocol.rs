@@ -88,6 +88,7 @@ fn start(bin: &Path) -> (Child, BufReader<ChildStdout>) {
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
+        .env("PI_ACP_STORE_DIR", bin.join("store"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -656,5 +657,215 @@ accept handled
     .await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+    child.kill().await.unwrap();
+}
+
+fn resume_request(id: i64, session: &Value, project: &Path, replay: Option<Value>) -> Value {
+    let mut request = json!({"jsonrpc":"2.0","id":id,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}});
+    if let Some(replay) = replay {
+        request["params"]["replayFrom"] = replay;
+    }
+    request
+}
+
+#[tokio::test]
+async fn replacement_bridge_and_close_retain_native_identity() {
+    let (temp, project, mut child, mut reader, session) = session(
+        r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+settled
+"#,
+    )
+    .await;
+    prompt(&mut child, &mut reader, 3, &session).await;
+    child.kill().await.unwrap();
+    let (mut child, mut reader) = start(&temp.path().join("bin"));
+    initialize(&mut child, &mut reader).await;
+    send(&mut child, resume_request(2, &session, &project, None)).await;
+    let (resumed, notifications) = response(&mut reader, 2).await;
+    assert!(resumed["result"].is_object(), "{resumed}");
+    assert_eq!(notifications.len(), 1, "{notifications:?}");
+    assert!(is_state(&notifications[0], "idle"));
+    prompt(&mut child, &mut reader, 3, &session).await;
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":session}}),
+    )
+    .await;
+    response(&mut reader, 4).await;
+    send(&mut child, resume_request(5, &session, &project, None)).await;
+    let (resumed, _) = response(&mut reader, 5).await;
+    assert!(resumed["result"].is_object(), "{resumed}");
+    prompt(&mut child, &mut reader, 6, &session).await;
+    let calls = lines(&project, "calls", 6).await;
+    assert_eq!(calls[0], calls[2]);
+    assert_eq!(calls[0], calls[4]);
+    let registry: Value =
+        serde_json::from_slice(&fs::read(temp.path().join("bin/store/acp-sessions.json")).unwrap())
+            .unwrap();
+    assert_eq!(registry[session.as_str().unwrap()]["title"], "hello");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn replay_recovers_recorded_messages_tools_and_patches_before_state_and_response() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+while :; do
+  next_command
+  expect get_state
+  answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
+done
+"#,
+    )
+    .await;
+    let entries = [
+        json!({"type":"session","id":"native"}),
+        json!({"type":"message","id":"u1","message":{"role":"user","content":[{"type":"text","text":"old question"},{"type":"image","data":"aW1n","mimeType":"image/png"}]}}),
+        json!({"type":"compaction","summary":"summary","firstKeptEntryId":"a1"}),
+        json!({"type":"message","id":"a1","message":{"role":"assistant","content":[{"type":"thinking","thinking":"thinking"},{"type":"text","text":"answer"},{"type":"toolCall","id":"edit-1","name":"edit","arguments":{"path":"a.txt","edits":[{"oldText":"old","newText":"new"}]}},{"type":"toolCall","id":"write-1","name":"write","arguments":{"path":"missing.txt","content":"historical"}}]}}),
+        json!({"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"edit-1","isError":false,"content":[{"type":"text","text":"edited"}],"details":{"patch":"--- a.txt\n+++ a.txt\n@@ -1 +1 @@\n-old\n+new\n"}}}),
+        json!({"type":"message","id":"r2","message":{"role":"toolResult","toolCallId":"write-1","isError":true,"content":[{"type":"text","text":"failed"}]}}),
+    ];
+    fs::write(
+        project.join("history.jsonl"),
+        entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    send(
+        &mut child,
+        resume_request(3, &session, &project, Some(json!({"type":"start"}))),
+    )
+    .await;
+    let (resumed, notifications) = response(&mut reader, 3).await;
+    assert!(resumed["result"].is_object(), "{resumed}");
+    assert!(is_state(notifications.last().unwrap(), "idle"));
+    assert_eq!(notifications.len(), 8, "{notifications:?}");
+    assert_eq!(update(&notifications[0])["messageId"], "u1");
+    assert_eq!(update(&notifications[0])["content"][1]["data"], "aW1n");
+    assert_eq!(update(&notifications[1])["messageId"], "a1:0");
+    assert_eq!(kind(&notifications[1]), "agent_thought");
+    assert_eq!(update(&notifications[2])["messageId"], "a1:1");
+    let edit = tool_updates(&notifications, "edit-1");
+    assert_eq!(statuses(&edit), ["pending", "completed"]);
+    assert!(
+        edit[1]["content"][0]["patch"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("-old\n+new")
+    );
+    let write = tool_updates(&notifications, "write-1");
+    assert_eq!(statuses(&write), ["pending", "failed"]);
+    assert_eq!(write[0]["rawInput"]["content"], "historical");
+    assert_eq!(write[1]["content"][0]["type"], "content");
+    // Replaying again must not infer that a past write created today's file.
+    let mut entries = entries;
+    entries[5]["message"]["isError"] = json!(false);
+    fs::write(
+        project.join("history.jsonl"),
+        entries
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    send(
+        &mut child,
+        resume_request(4, &session, &project, Some(json!({"type":"start"}))),
+    )
+    .await;
+    let (_, notifications) = response(&mut reader, 4).await;
+    let write = tool_updates(&notifications, "write-1");
+    assert_eq!(statuses(&write), ["pending", "completed"]);
+    assert_eq!(write[1]["content"][0]["type"], "content");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn replay_empty_and_invalid_history_and_exited_pi() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_command
+expect get_state
+answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
+next_command
+expect get_state
+answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
+next_command
+expect get_state
+exit 3
+"#,
+    )
+    .await;
+    send(
+        &mut child,
+        resume_request(3, &session, &project, Some(json!({"type":"start"}))),
+    )
+    .await;
+    let (result, notifications) = response(&mut reader, 3).await;
+    assert!(result["result"].is_object(), "{result}");
+    assert_eq!(notifications.len(), 1);
+    assert!(is_state(&notifications[0], "idle"));
+    fs::write(project.join("history.jsonl"), "broken json").unwrap();
+    send(
+        &mut child,
+        resume_request(4, &session, &project, Some(json!({"type":"start"}))),
+    )
+    .await;
+    let (result, notifications) = response(&mut reader, 4).await;
+    assert_eq!(result["error"]["code"], -32603, "{result}");
+    assert!(notifications.is_empty());
+    send(
+        &mut child,
+        resume_request(5, &session, &project, Some(json!({"type":"start"}))),
+    )
+    .await;
+    let (result, _) = response(&mut reader, 5).await;
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pi exited"),
+        "{result}"
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn resume_rejects_unknown_ids_cursors_and_mismatched_cwd() {
+    let (_temp, project, mut child, mut reader, session) = session("").await;
+    for (id, request, code) in [
+        (
+            3,
+            resume_request(3, &json!("unknown"), &project, None),
+            -32002,
+        ),
+        (
+            4,
+            resume_request(
+                4,
+                &session,
+                &project,
+                Some(json!({"type":"cursor","cursor":"a"})),
+            ),
+            -32602,
+        ),
+        (
+            5,
+            resume_request(5, &session, project.parent().unwrap(), None),
+            -32602,
+        ),
+    ] {
+        send(&mut child, request).await;
+        let (result, _) = response(&mut reader, id).await;
+        assert_eq!(result["error"]["code"], code, "{result}");
+    }
     child.kill().await.unwrap();
 }
