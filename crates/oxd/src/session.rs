@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -69,6 +70,9 @@ pub struct Session {
     /// The daemon's signal that the lists or the sessions' states changed,
     /// sent when this session's `SessionInfo` changes.
     changed: watch::Sender<()>,
+    /// Counts the changes to the session's `SessionInfo`. Changed under the
+    /// state lock.
+    info_version: AtomicU64,
     /// Sends to the running agent task. A load replaces it.
     commands: Mutex<mpsc::UnboundedSender<Command>>,
     task: Mutex<Option<JoinHandle<()>>>,
@@ -134,6 +138,7 @@ impl Session {
             store,
             ox_server,
             changed,
+            info_version: AtomicU64::new(0),
             commands: Mutex::new(mpsc::unbounded_channel().0),
             task: Mutex::new(None),
             viewers: Mutex::new(0),
@@ -348,6 +353,18 @@ impl Session {
 
     pub fn info(&self) -> SessionInfo {
         self.info_of(&self.lock())
+    }
+
+    /// The number of changes to the session's `SessionInfo` so far, which
+    /// grows with each change.
+    pub fn info_version(&self) -> u64 {
+        self.info_version.load(Ordering::Acquire)
+    }
+
+    /// The session's `SessionInfo` and its version.
+    pub fn versioned_info(&self) -> (SessionInfo, u64) {
+        let state = self.lock();
+        (self.info_of(&state), self.info_version())
     }
 
     pub fn archived(&self) -> bool {
@@ -645,6 +662,7 @@ impl Session {
         let after = self.info_of(&state);
         if after != before {
             self.save(&before, &after);
+            self.info_version.fetch_add(1, Ordering::Release);
             self.changed.send_replace(());
         }
         result

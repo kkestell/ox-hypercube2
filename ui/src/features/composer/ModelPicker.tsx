@@ -13,8 +13,9 @@ function choices(option: SelectConfig): SelectOption[] {
 /**
  * The session's model and effort: a button showing both, which opens a menu
  * to search for and choose a model and to set the effort. The menu stays open
- * after a model is chosen, so the effort can be set next. An effort level
- * being set shows until the agent reports it or refuses it.
+ * after a model is chosen, so the effort can be set next. A model or effort
+ * level shows as soon as it is chosen, until the agent reports it or refuses
+ * it.
  */
 export function ModelPicker({
   model,
@@ -30,24 +31,19 @@ export function ModelPicker({
   const list = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
-  const [pendingEffort, setPendingEffort] = useState<string | null>(null);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new current level ends the pending one
-  useEffect(() => setPendingEffort(null), [effort?.currentValue]);
+  const [selectedModel, setModel] = useChosen(model, onChange);
+  const [selectedEffort, setEffort] = useChosen(effort, onChange);
 
   const allModels = choices(model);
   const searchable = allModels.length >= 6;
   const models = allModels.filter(
     (choice) => !searchable || choice.name.toLowerCase().includes(query.trim().toLowerCase()),
   );
-  const current = allModels.find((choice) => choice.value === model.currentValue);
+  const current = allModels.find((choice) => choice.value === selectedModel);
   const levels = effort ? choices(effort) : [];
-  const level = levels.findIndex(
-    (choice) => choice.value === (pendingEffort ?? effort?.currentValue),
-  );
+  const level = levels.findIndex((choice) => choice.value === selectedEffort);
 
-  const choose = (choice: SelectOption) => {
-    if (choice.value !== model.currentValue) onChange(model, choice.value);
-  };
+  const choose = (choice: SelectOption) => setModel(choice.value);
 
   const navigate = (event: KeyboardEvent<HTMLElement>) => {
     let next = active;
@@ -62,12 +58,6 @@ export function ModelPicker({
     if (!searchable) (list.current!.children[next] as HTMLButtonElement | undefined)?.focus();
   };
 
-  const setLevel = async (index: number) => {
-    const value = levels[index]!.value;
-    setPendingEffort(value);
-    if (!(await onChange(effort!, value))) setPendingEffort(null);
-  };
-
   return (
     <>
       <button
@@ -78,7 +68,7 @@ export function ModelPicker({
         style={{ anchorName: "--model-picker" }}
       >
         <ClaudeLogo />
-        <span>{current?.name ?? model.currentValue}</span>
+        <span>{current?.name ?? selectedModel}</span>
         {levels[level] && <span className="effort-name">{levels[level].name}</span>}
         <ChevronDown />
       </button>
@@ -98,7 +88,7 @@ export function ModelPicker({
           } else {
             const index = Math.max(
               0,
-              allModels.findIndex((choice) => choice.value === model.currentValue),
+              allModels.findIndex((choice) => choice.value === selectedModel),
             );
             setActive(index);
             (list.current!.children[index] as HTMLButtonElement | undefined)?.focus();
@@ -141,7 +131,7 @@ export function ModelPicker({
               type="button"
               role="option"
               tabIndex={!searchable && index === active ? 0 : -1}
-              aria-selected={choice.value === model.currentValue}
+              aria-selected={choice.value === selectedModel}
               className={index === active ? "active" : undefined}
               onMouseEnter={(event) => {
                 setActive(index);
@@ -167,7 +157,7 @@ export function ModelPicker({
               value={level}
               aria-valuetext={levels[level]?.name}
               style={{ "--position": position(level, levels.length) } as CSSProperties}
-              onChange={(event) => setLevel(Number(event.target.value))}
+              onChange={(event) => setEffort(levels[Number(event.target.value)]!.value)}
             />
             <div className="stops" aria-hidden="true">
               {levels.map((choice, index) => (
@@ -184,6 +174,30 @@ export function ModelPicker({
       </div>
     </>
   );
+}
+
+/**
+ * The value of `option` to show, and a function that chooses one: the value
+ * chosen last until the agent reports it, or until it refuses it, and
+ * otherwise the agent's current value.
+ */
+function useChosen(
+  option: SelectConfig | undefined,
+  onChange: (option: SelectConfig, value: string) => Promise<boolean>,
+) {
+  const [chosen, setChosen] = useState<string | null>(null);
+  const current = option?.currentValue;
+  useEffect(() => {
+    if (chosen === current) setChosen(null);
+  }, [chosen, current]);
+
+  const choose = async (value: string) => {
+    if (!option || value === (chosen ?? current)) return;
+    setChosen(value);
+    const accepted = await onChange(option, value);
+    if (!accepted) setChosen((latest) => (latest === value ? null : latest));
+  };
+  return [chosen ?? current, choose] as const;
 }
 
 /** Where stop `index` of `count` sits along a slider, from 0 to 1. */

@@ -15,8 +15,8 @@ use ox_protocol::schema::{
 };
 use ox_protocol::{
     Checkout, Client, ConfigValue, DirEntry, DirectoryWatch, End, EntryKind, Error, Event,
-    EventKind, Listing, PROTOCOL_VERSION, SessionInfo, SessionState, Subscription, Watch,
-    WorkspaceInfo, code,
+    EventKind, Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Subscription,
+    Watch, WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -400,18 +400,65 @@ async fn until(subscription: &mut Subscription, last: impl Fn(&EventKind) -> boo
     }
 }
 
-/// Listings from a watch up to and including the first one matching `last`.
-async fn listings_until(watch: &mut Watch, is_last: impl Fn(&Listing) -> bool) -> Vec<Listing> {
-    let mut listings = Vec::new();
-    loop {
-        let listing = timeout(TIMEOUT, watch.next())
-            .await
-            .expect("timed out waiting for a listing")
-            .expect("the watch ended");
-        let done = is_last(&listing);
-        listings.push(listing);
-        if done {
-            return listings;
+/// A watch and the listing its changes add up to.
+struct Listings {
+    watch: Watch,
+    current: Listing,
+}
+
+async fn listings(client: &Client) -> Listings {
+    Listings {
+        watch: client.watch().await.unwrap(),
+        current: Listing::default(),
+    }
+}
+
+impl Listings {
+    /// The listing after each of the watch's messages, up to and including
+    /// the first one matching `is_last`.
+    async fn until(&mut self, is_last: impl Fn(&Listing) -> bool) -> Vec<Listing> {
+        let mut listings = Vec::new();
+        loop {
+            let changes = next_changes(&mut self.watch).await;
+            for change in changes {
+                apply(&mut self.current, change);
+            }
+            let done = is_last(&self.current);
+            listings.push(self.current.clone());
+            if done {
+                return listings;
+            }
+        }
+    }
+}
+
+async fn next_changes(watch: &mut Watch) -> Vec<ListingChange> {
+    timeout(TIMEOUT, watch.next())
+        .await
+        .expect("timed out waiting for listing changes")
+        .expect("the watch ended")
+}
+
+/// Applies a watch's change to `listing`, as a client keeps its listing.
+fn apply(listing: &mut Listing, change: ListingChange) {
+    match change {
+        ListingChange::Workspace { workspace } => {
+            match listing.workspaces.iter_mut().find(|w| w.id == workspace.id) {
+                Some(listed) => *listed = workspace,
+                None => listing.workspaces.push(workspace),
+            }
+        }
+        ListingChange::WorkspaceRemoved { workspace_id } => {
+            listing.workspaces.retain(|w| w.id != workspace_id);
+        }
+        ListingChange::Session { session } => {
+            match listing.sessions.iter_mut().find(|s| s.id == session.id) {
+                Some(listed) => *listed = *session,
+                None => listing.sessions.push(*session),
+            }
+        }
+        ListingChange::SessionRemoved { session_id } => {
+            listing.sessions.retain(|s| s.id != session_id);
         }
     }
 }
@@ -2137,8 +2184,8 @@ async fn watch_starts_with_the_workspaces_and_sessions() {
     let client = daemon.client().await;
     let (session, _) = daemon.new_session(&client).await;
     let workspace = daemon.workspace(&client).await;
-    let mut watch = client.watch().await.unwrap();
-    let first = listings_until(&mut watch, |_| true).await.remove(0);
+    let mut watch = listings(&client).await;
+    let first = watch.until(|_| true).await.remove(0);
     assert_eq!(first.workspaces, [workspace]);
     assert_eq!(first.sessions, [session]);
 }
@@ -2150,8 +2197,8 @@ async fn command_catalogs_reach_current_and_reconnecting_watchers() {
     let (session, seq) = daemon.new_session(&client).await;
     assert_eq!(session.available_commands.len(), 3);
     let mut events = client.subscribe(&session.id, seq).await.unwrap();
-    let mut watch = client.watch().await.unwrap();
-    let initial = listings_until(&mut watch, |_| true).await.remove(0);
+    let mut watch = listings(&client).await;
+    let initial = watch.until(|_| true).await.remove(0);
     assert_eq!(
         initial.sessions[0].available_commands,
         session.available_commands
@@ -2165,20 +2212,19 @@ async fn command_catalogs_reach_current_and_reconnecting_watchers() {
         matches!(kind, EventKind::TurnEnded { .. })
     })
     .await;
-    let changed = listings_until(&mut watch, |listing| {
-        listing.sessions[0].available_commands.len() == 1
-    })
-    .await
-    .pop()
-    .unwrap();
+    let changed = watch
+        .until(|listing| listing.sessions[0].available_commands.len() == 1)
+        .await
+        .pop()
+        .unwrap();
     assert_eq!(
         serde_json::to_value(&changed.sessions[0].available_commands).unwrap(),
         replacement
     );
 
     let reconnected = daemon.client().await;
-    let mut fresh = reconnected.watch().await.unwrap();
-    let snapshot = listings_until(&mut fresh, |_| true).await.remove(0);
+    let mut fresh = listings(&reconnected).await;
+    let snapshot = fresh.until(|_| true).await.remove(0);
     assert_eq!(
         snapshot.sessions[0].available_commands,
         changed.sessions[0].available_commands
@@ -2192,10 +2238,9 @@ async fn command_catalogs_reach_current_and_reconnecting_watchers() {
         matches!(kind, EventKind::TurnEnded { .. })
     })
     .await;
-    listings_until(&mut watch, |listing| {
-        listing.sessions[0].available_commands.is_empty()
-    })
-    .await;
+    watch
+        .until(|listing| listing.sessions[0].available_commands.is_empty())
+        .await;
     assert!(
         info(&client, &session.id)
             .await
@@ -2210,24 +2255,23 @@ async fn command_catalogs_reach_current_and_reconnecting_watchers() {
 async fn watch_follows_workspaces() {
     let daemon = Daemon::start(1000).await;
     let client = daemon.client().await;
-    let mut watch = client.watch().await.unwrap();
-    listings_until(&mut watch, |listing| listing.workspaces.is_empty()).await;
+    let mut watch = listings(&client).await;
+    watch.until(|listing| listing.workspaces.is_empty()).await;
 
     let workspace = client.add_workspace(daemon.cwd()).await.unwrap();
-    listings_until(&mut watch, |listing| {
-        listing.workspaces == [workspace.clone()]
-    })
-    .await;
+    watch
+        .until(|listing| listing.workspaces == [workspace.clone()])
+        .await;
     client.remove_workspace(&workspace.id).await.unwrap();
-    listings_until(&mut watch, |listing| listing.workspaces.is_empty()).await;
+    watch.until(|listing| listing.workspaces.is_empty()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_follows_a_session() {
     let daemon = Daemon::start(1000).await;
     let client = daemon.client().await;
-    let mut watch = client.watch().await.unwrap();
-    listings_until(&mut watch, |listing| listing.sessions.is_empty()).await;
+    let mut watch = listings(&client).await;
+    watch.until(|listing| listing.sessions.is_empty()).await;
 
     let workspace = daemon.workspace(&client).await;
     let session = client
@@ -2242,10 +2286,9 @@ async fn watch_follows_a_session() {
     let id = session.id.as_str();
     let mut events = client.subscribe(id, 0).await.unwrap();
     let mut reach = async |state: SessionState| {
-        listings_until(&mut watch, |listing| {
-            state_in(&listing.sessions, id) == Some(state)
-        })
-        .await;
+        watch
+            .until(|listing| state_in(&listing.sessions, id) == Some(state))
+            .await;
     };
     reach(SessionState::Idle).await;
 
@@ -2267,28 +2310,53 @@ async fn watch_follows_a_session() {
     reach(SessionState::Idle).await;
 
     client.delete(id, false, BTreeMap::new()).await.unwrap();
-    listings_until(&mut watch, |listing| {
-        state_in(&listing.sessions, id).is_none()
-    })
-    .await;
+    watch
+        .until(|listing| state_in(&listing.sessions, id).is_none())
+        .await;
 }
 
+/// After its first message, a watch sends a session only when its info
+/// changed, and never the sessions that did not change.
 #[tokio::test(flavor = "multi_thread")]
-async fn watch_sends_only_changed_listings() {
+async fn watch_sends_only_sessions_whose_info_changed() {
     let daemon = Daemon::start(1000).await;
     let client = daemon.client().await;
-    let (session, started) = daemon.new_session(&client).await;
+    let (quiet, _) = daemon.new_session(&client).await;
+    let (busy, started) = daemon.new_session(&client).await;
     let mut watch = client.watch().await.unwrap();
-    let mut events = client.subscribe(&session.id, started).await.unwrap();
-    client.prompt(&session.id, text("say 200 0")).await.unwrap();
-    until(&mut events, turn_ended).await;
+    let mut listing = Listing::default();
+    for change in next_changes(&mut watch).await {
+        apply(&mut listing, change);
+    }
+    assert_eq!(listing.sessions, [quiet, busy.clone()]);
+
+    let mut events = client.subscribe(&busy.id, started).await.unwrap();
     client
-        .delete(&session.id, false, BTreeMap::new())
+        .prompt(&busy.id, text("title One\nsay 200 0\ntitle Two"))
         .await
         .unwrap();
-    let lists = listings_until(&mut watch, |listing| listing.sessions.is_empty()).await;
-    for pair in lists.windows(2) {
-        assert_ne!(pair[0], pair[1]);
+    until(&mut events, turn_ended).await;
+    client
+        .delete(&busy.id, false, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut last = busy.clone();
+    loop {
+        for change in next_changes(&mut watch).await {
+            match change {
+                ListingChange::Session { session } => {
+                    assert_eq!(session.id, busy.id);
+                    assert_ne!(*session, last, "an unchanged session was sent");
+                    last = *session;
+                }
+                ListingChange::SessionRemoved { session_id } => {
+                    assert_eq!(session_id, busy.id);
+                    assert_eq!(last.title.as_deref(), Some("Two"));
+                    return;
+                }
+                change => panic!("unexpected change {change:?}"),
+            }
+        }
     }
 }
 
@@ -2298,7 +2366,7 @@ async fn session_info_updates_set_the_title() {
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     assert_eq!(session.title, None);
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     for (script, title) in [
         ("title Fix the build", Some("Fix the build")),
@@ -2312,11 +2380,12 @@ async fn session_info_updates_set_the_title() {
             title,
             "{script}"
         );
-        listings_until(&mut watch, |listing| {
-            listing.sessions[0].title.as_deref() == title
-                && listing.sessions[0].state == SessionState::Idle
-        })
-        .await;
+        watch
+            .until(|listing| {
+                listing.sessions[0].title.as_deref() == title
+                    && listing.sessions[0].state == SessionState::Idle
+            })
+            .await;
     }
 }
 
@@ -2352,7 +2421,7 @@ async fn unsubscribe_ends_a_watch() {
     raw.answer(watch).await;
     let first = raw.read().await;
     assert_eq!(first["subscription"], watch);
-    assert_eq!(first["sessions"][0]["id"], session.id.as_str());
+    assert_eq!(first["changes"][1]["session"]["id"], session.id.as_str());
     let unsubscribe = raw
         .send("unsubscribe", json!({"subscription": watch}))
         .await;
@@ -2365,18 +2434,17 @@ async fn unsubscribe_ends_a_watch() {
 
     // A turn held open changes the session's state long enough for a watch
     // to send the list.
-    let mut running = client.watch().await.unwrap();
+    let mut running = listings(&client).await;
     client.prompt(&session.id, text("wait")).await.unwrap();
-    listings_until(&mut running, |listing| {
-        listing.sessions[0].state == SessionState::Running
-    })
-    .await;
+    running
+        .until(|listing| listing.sessions[0].state == SessionState::Running)
+        .await;
     client.cancel(&session.id).await.unwrap();
     let messages = raw.messages_until(raw_turn_ended).await;
     assert!(
         messages
             .iter()
-            .all(|message| message.get("sessions").is_none()),
+            .all(|message| message.get("changes").is_none()),
         "{messages:?}"
     );
 }
@@ -2391,11 +2459,10 @@ async fn parking_session(daemon: &Daemon, client: &Client, args: &[&str]) -> (Se
 }
 
 /// Waits until the watch lists session `id` as `exited`.
-async fn parked(watch: &mut Watch, id: &str) {
-    listings_until(watch, |listing| {
-        state_in(&listing.sessions, id) == Some(SessionState::Exited)
-    })
-    .await;
+async fn parked(watch: &mut Listings, id: &str) {
+    watch
+        .until(|listing| state_in(&listing.sessions, id) == Some(SessionState::Exited))
+        .await;
 }
 
 /// The message chunks in a session's first `seq` events.
@@ -2424,7 +2491,7 @@ async fn an_idle_unviewed_session_is_parked_and_its_agent_exits() {
     let client = daemon.client().await;
     let agent = ExitWatch::new(daemon.dir.path());
     let (session, _) = parking_session(&daemon, &client, &agent.arg()).await;
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     parked(&mut watch, &session.id).await;
     agent.exited().await;
     parked_seq(&client, &session.id).await;
@@ -2439,7 +2506,7 @@ async fn a_parked_session_loads_again() {
     client.prompt(&session.id, text("say 1 0")).await.unwrap();
     until(&mut events, turn_ended).await;
     drop(events);
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     parked(&mut watch, &session.id).await;
     let seq = parked_seq(&client, &session.id).await;
 
@@ -2465,7 +2532,7 @@ async fn a_viewed_session_is_not_parked() {
     let (viewed, started) = parking_session(&daemon, &client, &[]).await;
     let view = client.subscribe(&viewed.id, started).await.unwrap();
     let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
     assert_ne!(info(&client, &viewed.id).await.state, SessionState::Exited);
 
@@ -2486,7 +2553,7 @@ async fn a_session_with_background_work_is_not_parked() {
     until(&mut events, turn_ended).await;
     drop(events);
     let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
     assert_eq!(info(&client, &busy.id).await.state, SessionState::Idle);
 
@@ -2506,7 +2573,7 @@ async fn a_session_whose_agent_reports_no_background_work_is_not_parked() {
     let client = daemon.client().await;
     let (silent, _) = daemon.new_session(&client).await;
     let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
     assert_eq!(info(&client, &silent.id).await.state, SessionState::Idle);
 }
@@ -2517,7 +2584,7 @@ async fn becoming_busy_restarts_the_park_delay() {
     let client = daemon.client().await;
     let (restarted, _) = parking_session(&daemon, &client, &[]).await;
     let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = client.watch().await.unwrap();
+    let mut watch = listings(&client).await;
     // The delay is the behavior under test: prompt the session part-way
     // through it.
     tokio::time::sleep(Duration::from_millis(500)).await;

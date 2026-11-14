@@ -9,7 +9,9 @@ use clap::{Parser, Subcommand};
 use ox_protocol::schema::{
     ContentBlock, ElicitationAcceptAction, ElicitationAction, SessionConfigKind, TextContent,
 };
-use ox_protocol::{Checkout, Client, Comparison, ConfigValue, End, EventKind, SessionState};
+use ox_protocol::{
+    Checkout, Client, Comparison, ConfigValue, End, EventKind, ListingChange, SessionState,
+};
 
 #[derive(Parser)]
 #[command(name = "oxctl", about = "Daemon client for Ox integration tests")]
@@ -284,25 +286,37 @@ async fn started(client: &Client, session_id: &str) -> Result<String, Box<dyn Er
 /// Waits for a loading session's agent to start and returns the session's id.
 /// A session whose agent fails to start stays exited, and can be loaded again.
 async fn loaded(client: &Client, session_id: &str) -> Result<String, Box<dyn Error>> {
+    let closed = || "the session closed while its agent was starting".into();
     let mut watch = client.watch().await?;
+    // The watch's first changes list every session.
+    let mut listed = false;
     loop {
-        let listing = watch.next().await.map_err(|_| ox_protocol::Error::Closed)?;
-        let Some(session) = listing
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-        else {
-            return Err("the session closed while its agent was starting".into());
-        };
-        match session.state {
-            SessionState::Starting => {}
-            SessionState::Exited => {
+        let changes = watch.next().await.map_err(|_| ox_protocol::Error::Closed)?;
+        let mut state = None;
+        for change in changes {
+            match change {
+                ListingChange::Session { session } if session.id == session_id => {
+                    state = Some(session.state);
+                }
+                ListingChange::SessionRemoved { session_id: id } if id == session_id => {
+                    return Err(closed());
+                }
+                _ => {}
+            }
+        }
+        if !listed && state.is_none() {
+            return Err(closed());
+        }
+        listed = true;
+        match state {
+            None | Some(SessionState::Starting) => {}
+            Some(SessionState::Exited) => {
                 return Err(format!(
                     "the agent did not start; `oxctl attach {session_id}` shows why"
                 )
                 .into());
             }
-            _ => return Ok(session_id.to_owned()),
+            Some(_) => return Ok(session_id.to_owned()),
         }
     }
 }

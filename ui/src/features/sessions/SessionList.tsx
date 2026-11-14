@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
-import { type MouseEvent, useState } from "react";
+import { type MouseEvent, memo, useCallback, useState } from "react";
 import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
 import type {
@@ -44,7 +44,15 @@ function directoryName(path: string) {
   return path.split("/").filter(Boolean).pop() ?? path;
 }
 
-export function SessionList({
+async function run(action: () => Promise<unknown>) {
+  try {
+    await action();
+  } catch (e) {
+    await showError(e);
+  }
+}
+
+export const SessionList = memo(function SessionList({
   workspaces,
   sessions,
   selected,
@@ -61,14 +69,6 @@ export function SessionList({
   const [agent, setAgent] = useState(agents[0].id);
   // The workspaces whose Archived groups are open.
   const [openArchives, setOpenArchives] = useState<ReadonlySet<string>>(new Set());
-
-  const run = async (action: () => Promise<unknown>) => {
-    try {
-      await action();
-    } catch (e) {
-      await showError(e);
-    }
-  };
 
   const addWorkspace = async () => {
     const path = await open({ directory: true, title: "Add Workspace" });
@@ -107,12 +107,15 @@ export function SessionList({
 
   // Viewing a saved session whose agent is not running starts its agent, which
   // replays the conversation.
-  const select = async (session: SessionInfo) => {
-    if (session.state === "exited" && !session.archived && session.agent_session_id !== null) {
-      await run(() => invoke("load_session", { sessionId: session.id }));
-    }
-    onSelect(session.id);
-  };
+  const select = useCallback(
+    async (session: SessionInfo) => {
+      if (session.state === "exited" && !session.archived && session.agent_session_id !== null) {
+        await run(() => invoke("load_session", { sessionId: session.id }));
+      }
+      onSelect(session.id);
+    },
+    [onSelect],
+  );
 
   const toggleArchive = (workspaceId: string) =>
     setOpenArchives((open) => {
@@ -121,53 +124,18 @@ export function SessionList({
       return next;
     });
 
-  const sessionRow = (session: SessionInfo) => {
-    const state = stateLabels[session.state];
-    const merge = localMerge(session);
-    const status = merge && branchStatus(merge.compare, merge.comparison);
-    return (
-      <li
-        key={session.id}
-        className="sidebar-row session"
-        onContextMenu={(event) =>
-          contextMenu(event, [
-            {
-              text: session.archived ? "Unarchive Session" : "Archive Session",
-              enabled: !busy.has(session.id) && session.state !== "starting",
-              action: () =>
-                session.archived ? unarchiveSession(session.id) : archiveSession(session.id, false),
-            },
-            {
-              text: "Delete Session",
-              enabled: !busy.has(session.id),
-              action: () => deleteSession(session.id, false),
-            },
-          ])
-        }
-      >
-        <button
-          type="button"
-          className="select"
-          title={session.cwd}
-          aria-current={session.id === selected}
-          onClick={() => select(session)}
-        >
-          <span className={`status ${session.state}`} role="img" aria-label={state} title={state} />
-          <span className="title">{session.title ?? "New session"}</span>
-          {status && (
-            <span
-              className={`status branch-status${status.attention ? " attention" : ""}`}
-              role="img"
-              aria-label={status.tooltip}
-              title={status.tooltip}
-            >
-              <GitBranch />
-            </span>
-          )}
-        </button>
-      </li>
-    );
-  };
+  const sessionRow = (session: SessionInfo) => (
+    <SessionRow
+      key={session.id}
+      session={session}
+      selected={session.id === selected}
+      busy={busy.has(session.id)}
+      onSelect={select}
+      deleteSession={deleteSession}
+      archiveSession={archiveSession}
+      unarchiveSession={unarchiveSession}
+    />
+  );
 
   return (
     <Sidebar
@@ -283,4 +251,66 @@ export function SessionList({
       })}
     </Sidebar>
   );
-}
+});
+
+/** A session's row, which renders again only when its props change. */
+const SessionRow = memo(function SessionRow({
+  session,
+  selected,
+  busy,
+  onSelect,
+  deleteSession,
+  archiveSession,
+  unarchiveSession,
+}: {
+  session: SessionInfo;
+  selected: boolean;
+  /** Whether an action on the session is in flight. */
+  busy: boolean;
+  onSelect: (session: SessionInfo) => void;
+} & Omit<SessionActions, "busy">) {
+  const state = stateLabels[session.state];
+  const merge = localMerge(session);
+  const status = merge && branchStatus(merge.compare, merge.comparison);
+  return (
+    <li
+      className="sidebar-row session"
+      onContextMenu={(event) =>
+        contextMenu(event, [
+          {
+            text: session.archived ? "Unarchive Session" : "Archive Session",
+            enabled: !busy && session.state !== "starting",
+            action: () =>
+              session.archived ? unarchiveSession(session.id) : archiveSession(session.id, false),
+          },
+          {
+            text: "Delete Session",
+            enabled: !busy,
+            action: () => deleteSession(session.id, false),
+          },
+        ])
+      }
+    >
+      <button
+        type="button"
+        className="select"
+        title={session.cwd}
+        aria-current={selected}
+        onClick={() => onSelect(session)}
+      >
+        <span className={`status ${session.state}`} role="img" aria-label={state} title={state} />
+        <span className="title">{session.title ?? "New session"}</span>
+        {status && (
+          <span
+            className={`status branch-status${status.attention ? " attention" : ""}`}
+            role="img"
+            aria-label={status.tooltip}
+            title={status.tooltip}
+          >
+            <GitBranch />
+          </span>
+        )}
+      </button>
+    </li>
+  );
+});

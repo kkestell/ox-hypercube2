@@ -6,7 +6,8 @@
 //! same `id`. The daemon also pushes three kinds of stream, each named in
 //! every message by the `id` of the request that started it: a subscription
 //! (`session.subscribe`) delivers one session's [`Event`]s, a watch (`watch`)
-//! delivers the workspaces and sessions lists whenever either changes, and a
+//! delivers every workspace and session, then each one that is added,
+//! changes, or is removed, and a
 //! directory watch (`directory.watch`) delivers a directory's entries whenever
 //! they change. `unsubscribe` ends any of them.
 

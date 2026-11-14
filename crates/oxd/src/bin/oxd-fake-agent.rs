@@ -7,6 +7,10 @@
 //!
 //! - `say <n> <delay_ms>`: n `agent_message_chunk` updates `chunk-1..n` of
 //!   one message, spaced by the delay
+//! - `stream <n> <delay_ms> <JSON string>`: n chunks of the turn's message,
+//!   each the decoded text, spaced by the delay
+//! - `messages <n> <JSON string>`: n agent messages of their own, each the
+//!   decoded text
 //! - `text <JSON string>`: append the decoded text to the turn's message
 //! - `thought <JSON string>`: append the decoded text to the turn's thinking
 //! - `pid`: one chunk containing the process id
@@ -654,7 +658,15 @@ async fn main() -> agent_client_protocol::Result<()> {
 }
 
 enum Directive {
-    Say { count: u64, delay: Duration },
+    Say {
+        count: u64,
+        delay: Duration,
+        text: Option<String>,
+    },
+    Messages {
+        count: u64,
+        text: String,
+    },
     Thought(String),
     Pid,
     Permission,
@@ -689,6 +701,16 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["say", count, delay] => Directive::Say {
                 count: parse_number(count)?,
                 delay: Duration::from_millis(parse_number(delay)?),
+                text: None,
+            },
+            ["stream", count, delay, ..] => Directive::Say {
+                count: parse_number(count)?,
+                delay: Duration::from_millis(parse_number(delay)?),
+                text: Some(json_after(line, 3)?),
+            },
+            ["messages", count, ..] => Directive::Messages {
+                count: parse_number(count)?,
+                text: json_after(line, 2)?,
             },
             ["pid"] => Directive::Pid,
             ["text" | "thought", ..] => {
@@ -788,15 +810,25 @@ async fn run(
     };
     for directive in directives {
         match directive {
-            Directive::Say { count, delay } => {
+            Directive::Say { count, delay, text } => {
                 for i in 1..=count {
                     if *state.cancelled.borrow() {
                         return Ok(acp::StopReason::Cancelled);
                     }
-                    say(format!("chunk-{i}"))?;
+                    say(text.clone().unwrap_or_else(|| format!("chunk-{i}")))?;
                     if i < count {
                         tokio::time::sleep(delay).await;
                     }
+                }
+            }
+            Directive::Messages { count, text } => {
+                for _ in 0..count {
+                    state.record(&session_id, "agent", &text);
+                    notify(
+                        connection,
+                        &session_id,
+                        message_chunk(&message_id(), text.clone()),
+                    )?;
                 }
             }
             Directive::Pid => say(std::process::id().to_string())?,
@@ -1182,6 +1214,15 @@ fn order(session_id: acp::SessionId) -> acp::CreateElicitationRequest {
         acp::ElicitationFormMode::new(acp::ElicitationSessionScope::new(session_id), schema),
         "Order",
     )
+}
+
+/// The JSON string that follows a line's first `words` words, decoded.
+fn json_after(line: &str, words: usize) -> Result<String, Error> {
+    let json = line
+        .splitn(words + 1, char::is_whitespace)
+        .nth(words)
+        .unwrap_or("");
+    serde_json::from_str(json).map_err(|error| Error::invalid_params().data(error.to_string()))
 }
 
 fn parse_number<T: std::str::FromStr>(word: &str) -> Result<T, Error> {

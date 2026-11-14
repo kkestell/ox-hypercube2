@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ox_protocol::{
-    Branches, Checkout, Deleted, ErrorBody, Listing, Method, SessionInfo, SessionState,
-    WorkspaceInfo, code,
+    Branches, Checkout, Deleted, ErrorBody, Listing, ListingChange, Method, SessionInfo,
+    SessionState, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -29,6 +29,8 @@ struct Registry {
     moving_checkouts: HashSet<PathBuf>,
     /// Whether the startup cleanup is still running.
     cleaning: bool,
+    /// Counts the changes to the registry.
+    version: u64,
 }
 
 pub struct Daemon {
@@ -52,6 +54,15 @@ pub struct Daemon {
     directories: Arc<Directories>,
     /// The `ox` MCP server each session's agent is given.
     ox_server: Arc<OxServer>,
+}
+
+/// What a watch has sent: the workspaces, as of a version of the registry,
+/// and the version of each session's info.
+#[derive(Default)]
+pub struct Sent {
+    registry_version: Option<u64>,
+    workspaces: Vec<WorkspaceInfo>,
+    sessions: HashMap<String, u64>,
 }
 
 /// Counts one connected client for as long as it lives.
@@ -139,6 +150,7 @@ impl Daemon {
             clients: 0,
             moving_checkouts: HashSet::new(),
             cleaning: !unstarted.is_empty(),
+            version: 0,
         };
         Ok(Self {
             registry: Mutex::new(registry),
@@ -396,6 +408,7 @@ impl Daemon {
     fn update<R>(&self, change: impl FnOnce(&mut Registry) -> R) -> R {
         let mut registry = self.lock();
         let result = change(&mut registry);
+        registry.version += 1;
         self.changed.send_replace(());
         result
     }
@@ -413,6 +426,65 @@ impl Daemon {
             workspaces: workspaces.into_iter().map(workspace_info).collect(),
             sessions: sessions.iter().map(|session| session.info()).collect(),
         }
+    }
+
+    /// The changes to the workspaces and sessions since `sent`, which then
+    /// records them: removals first, then additions and changes, in the order
+    /// the listing has them. Only sessions whose info changed are read, and
+    /// the workspaces only when the registry changed, such as when a client
+    /// connects.
+    pub fn listing_changes(&self, sent: &mut Sent) -> Vec<ListingChange> {
+        let registry = self.lock();
+        let workspaces =
+            (sent.registry_version != Some(registry.version)).then(|| registry.workspaces.clone());
+        sent.registry_version = Some(registry.version);
+        let mut outdated: Vec<Arc<Session>> = registry
+            .sessions
+            .values()
+            .filter(|session| sent.sessions.get(&session.id) != Some(&session.info_version()))
+            .cloned()
+            .collect();
+        let removed: Vec<String> = sent
+            .sessions
+            .keys()
+            .filter(|id| !registry.sessions.contains_key(*id))
+            .cloned()
+            .collect();
+        drop(registry);
+
+        let mut changes = Vec::new();
+        for id in removed {
+            sent.sessions.remove(&id);
+            changes.push(ListingChange::SessionRemoved { session_id: id });
+        }
+        if let Some(workspaces) = workspaces {
+            let workspaces: Vec<WorkspaceInfo> =
+                workspaces.into_iter().map(workspace_info).collect();
+            for workspace in &sent.workspaces {
+                if !workspaces.iter().any(|current| current.id == workspace.id) {
+                    changes.push(ListingChange::WorkspaceRemoved {
+                        workspace_id: workspace.id.clone(),
+                    });
+                }
+            }
+            for workspace in &workspaces {
+                if !sent.workspaces.contains(workspace) {
+                    changes.push(ListingChange::Workspace {
+                        workspace: workspace.clone(),
+                    });
+                }
+            }
+            sent.workspaces = workspaces;
+        }
+        outdated.sort_by_key(|session| session.number);
+        for session in outdated {
+            let (info, version) = session.versioned_info();
+            sent.sessions.insert(session.id.clone(), version);
+            changes.push(ListingChange::Session {
+                session: Box::new(info),
+            });
+        }
+        changes
     }
 
     fn add_workspace(&self, path: PathBuf) -> Result<WorkspaceInfo, ErrorBody> {

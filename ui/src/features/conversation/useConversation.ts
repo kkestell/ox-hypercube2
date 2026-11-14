@@ -1,5 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
-import { useEffect, useReducer } from "react";
+import { useEffect, useMemo, useReducer } from "react";
 import type { ConversationUpdate, Item } from "../../lib/protocol";
 
 // The viewed session's items by key, in the order their keys first appeared.
@@ -10,27 +10,33 @@ interface State {
 
 type Action =
   | { type: "view"; sessionId: string | null }
-  | { type: "update"; update: ConversationUpdate };
+  | { type: "updates"; updates: ConversationUpdate[] };
 
-// Viewing a session starts it empty. Updates insert or replace items by key,
-// append text chunks, or remove resolved requests.
+// Viewing a session starts it empty. Each batch of updates inserts or
+// replaces items by key, appends text chunks, or removes resolved requests.
 function reduce(state: State, action: Action): State {
   if (action.type === "view") return { sessionId: action.sessionId, items: new Map() };
-  const { update } = action;
   const items = new Map(state.items);
-  if (update.type === "request_resolved") {
-    return items.delete(`request:${update.request_id}`) ? { ...state, items } : state;
+  for (const update of action.updates) {
+    if (update.type === "request_resolved") {
+      items.delete(`request:${update.request_id}`);
+      continue;
+    }
+    const existing = items.get(update.key);
+    items.set(
+      update.key,
+      existing !== undefined &&
+        (update.type === "text" || update.type === "thought") &&
+        !update.replace &&
+        existing.type === update.type
+        ? { ...update, text: existing.text + update.text }
+        : update,
+    );
   }
-  const existing = items.get(update.key);
-  const next =
-    existing !== undefined &&
-    (update.type === "text" || update.type === "thought") &&
-    !update.replace &&
-    existing.type === update.type
-      ? { ...update, text: existing.text + update.text }
-      : update;
-  return { ...state, items: items.set(update.key, next) };
+  return { ...state, items };
 }
+
+const noItems: Item[] = [];
 
 /**
  * The items of a session's conversation, replayed from its first event and
@@ -46,9 +52,9 @@ export function useConversation(sessionId: string | null, connection: number): I
     // Only the latest view's channel is read. Viewing no session ends the
     // previous view, such as one left by a webview reload.
     let current = true;
-    const channel = new Channel<ConversationUpdate>();
-    channel.onmessage = (update) => {
-      if (current) dispatch({ type: "update", update });
+    const channel = new Channel<ConversationUpdate[]>();
+    channel.onmessage = (updates) => {
+      if (current) dispatch({ type: "updates", updates });
     };
     invoke("view_session", { sessionId, channel });
     return () => {
@@ -56,7 +62,10 @@ export function useConversation(sessionId: string | null, connection: number): I
     };
   }, [sessionId, connection]);
 
+  // The same items until they change, so that what renders them can skip
+  // rendering them again.
+  const items = useMemo(() => [...state.items.values()], [state.items]);
   // Until the effect views a newly chosen session, the state holds the
   // previous one's items.
-  return state.sessionId === sessionId ? [...state.items.values()] : [];
+  return state.sessionId === sessionId ? items : noItems;
 }

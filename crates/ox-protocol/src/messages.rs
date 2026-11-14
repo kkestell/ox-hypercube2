@@ -27,9 +27,11 @@ pub enum Method {
     Hello { protocol_version: u32 },
     #[serde(rename = "session.list")]
     SessionList,
-    /// Starts a watch: after the answer, the daemon sends the workspaces and
-    /// sessions lists at once and again each time either differs from the
-    /// last it sent. The request's `id` names the watch in every list.
+    /// Starts a watch: after the answer, the daemon sends every workspace and
+    /// session at once, then each workspace and session that is added,
+    /// changes, or is removed. A workspace's info is worked out again each
+    /// time a workspace or session is added or removed or a client connects
+    /// or disconnects. The request's `id` names the watch in every message.
     #[serde(rename = "watch")]
     Watch,
     /// Adds a workspace. `path` must be an absolute path to a directory that
@@ -364,7 +366,7 @@ pub struct WorkspaceInfo {
     /// Whether the directory looks like it is in a Git working tree: it is
     /// not inside a `.git` directory, and it or a parent has a `.git`. Only
     /// then can a session run in a worktree of it. The daemon works this out
-    /// each time it sends the workspace, without running git.
+    /// without running git each time it lists the workspace.
     pub git_working_tree: bool,
 }
 
@@ -393,12 +395,33 @@ pub struct LocalBranch {
     pub worktree: Option<PathBuf>,
 }
 
-/// What a watch delivers: the daemon's workspaces, in the order they were
-/// added, and its sessions, in the order they were created.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// The daemon's workspaces, in the order they were added, and its sessions,
+/// in the order they were created.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listing {
     pub workspaces: Vec<WorkspaceInfo>,
     pub sessions: Vec<SessionInfo>,
+}
+
+/// One change a watch delivers. A workspace or session that is new comes
+/// after every one listed before it; one that changed keeps its place.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ListingChange {
+    /// A workspace that was added, or whose info changed.
+    Workspace {
+        workspace: WorkspaceInfo,
+    },
+    WorkspaceRemoved {
+        workspace_id: String,
+    },
+    /// A session that was added, or whose info changed.
+    Session {
+        session: Box<SessionInfo>,
+    },
+    SessionRemoved {
+        session_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -568,10 +591,11 @@ pub enum ServerMessage {
         subscription: u64,
         event: Box<Event>,
     },
+    /// A watch's changes, in order. The first lists every workspace and
+    /// session.
     List {
         subscription: u64,
-        workspaces: Vec<WorkspaceInfo>,
-        sessions: Vec<SessionInfo>,
+        changes: Vec<ListingChange>,
     },
     Directory {
         subscription: u64,
@@ -1064,8 +1088,9 @@ mod tests {
             },
             ServerMessage::List {
                 subscription: 4,
-                workspaces: Vec::new(),
-                sessions: Vec::new(),
+                changes: vec![ListingChange::SessionRemoved {
+                    session_id: "s".into(),
+                }],
             },
             ServerMessage::Directory {
                 subscription: 6,
@@ -1089,8 +1114,13 @@ mod tests {
 
         let message: ServerMessage = serde_json::from_value(json!({
             "subscription": 5,
-            "workspaces": [{"id": "w", "path": "/tmp", "git_working_tree": true}],
-            "sessions": [{
+            "changes": [
+                {
+                    "type": "workspace",
+                    "workspace": {"id": "w", "path": "/tmp", "git_working_tree": true}
+                },
+                {"type": "workspace_removed", "workspace_id": "v"},
+                {"type": "session", "session": {
                 "id": "s",
                 "workspace_id": "w",
                 "command": ["agent"],
@@ -1116,28 +1146,46 @@ mod tests {
                     "ahead": 1,
                     "behind": 2
                 }
-            }]
+                }},
+                {"type": "session_removed", "session_id": "r"}
+            ]
         }))
         .unwrap();
-        assert!(matches!(
-            message,
-            ServerMessage::List { subscription: 5, ref workspaces, ref sessions }
-                if workspaces[0].id == "w"
-                    && workspaces[0].git_working_tree
-                    && sessions[0].workspace_id == "w"
-                    && sessions[0].title.as_deref() == Some("Fix the build")
-                    && sessions[0].worktree.as_ref().is_some_and(|worktree| {
-                        worktree.branch == "ox/01234567"
-                            && worktree.created_branch
-                            && worktree.compare.as_deref() == Some("main")
-                    })
-                    && sessions[0].comparison == Some(Comparison::Compared {
-                        tip: "abc".into(),
-                        compare_tip: "def".into(),
-                        ahead: 1,
-                        behind: 2,
-                    })
-        ));
+        let ServerMessage::List {
+            subscription: 5,
+            changes,
+        } = message
+        else {
+            panic!("not a list: {message:?}");
+        };
+        let [
+            ListingChange::Workspace { workspace },
+            ListingChange::WorkspaceRemoved { workspace_id },
+            ListingChange::Session { session },
+            ListingChange::SessionRemoved { session_id },
+        ] = &changes[..]
+        else {
+            panic!("unexpected changes: {changes:?}");
+        };
+        assert!(workspace.id == "w" && workspace.git_working_tree);
+        assert_eq!(workspace_id, "v");
+        assert_eq!(session_id, "r");
+        assert_eq!(session.workspace_id, "w");
+        assert_eq!(session.title.as_deref(), Some("Fix the build"));
+        assert!(session.worktree.as_ref().is_some_and(|worktree| {
+            worktree.branch == "ox/01234567"
+                && worktree.created_branch
+                && worktree.compare.as_deref() == Some("main")
+        }));
+        assert_eq!(
+            session.comparison,
+            Some(Comparison::Compared {
+                tip: "abc".into(),
+                compare_tip: "def".into(),
+                ahead: 1,
+                behind: 2,
+            })
+        );
         let failed = Comparison::Failed {
             error: "main is not a commit".into(),
         };

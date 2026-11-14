@@ -189,22 +189,29 @@ class Watch:
         line, self.buffer = self.buffer.split(b"\n", 1)
         return json.loads(line)
 
-    def until(self, state):
-        """Waits for a listing that shows the session in `state` and returns
-        the states listed on the way."""
-        deadline = time.monotonic() + self.timeout
-        states = []
+    def session_changes(self, deadline):
+        """The session's info from each of the next listing changes that
+        names it."""
         while True:
             message = self.read(deadline)
-            if "sessions" not in message:
-                continue
-            current = next(
-                (s["state"] for s in message["sessions"] if s["id"] == self.session),
-                None,
-            )
-            check(current is not None, "The session left the listing")
-            states.append(current)
-            if current == state:
+            for change in message.get("changes", []):
+                if (
+                    change["type"] == "session"
+                    and change["session"]["id"] == self.session
+                ):
+                    yield change["session"]
+                check(
+                    change != {"type": "session_removed", "session_id": self.session},
+                    "The session left the listing",
+                )
+
+    def until(self, state):
+        """Waits for a change that shows the session in `state` and returns
+        the states changed through on the way."""
+        states = []
+        for session in self.session_changes(time.monotonic() + self.timeout):
+            states.append(session["state"])
+            if session["state"] == state:
                 return states
 
     def close(self):
@@ -348,8 +355,8 @@ class SmokeRun:
 
         watch = Watch(self.socket, self.session, self.args.timeout)
         try:
-            listing = watch.read(time.monotonic() + self.args.timeout)
-            current = next(s for s in listing["sessions"] if s["id"] == self.session)
+            # The watch's first changes list every session.
+            current = next(watch.session_changes(time.monotonic() + self.args.timeout))
             commands = current["available_commands"]
             probe = next(c for c in commands if c["name"] == "ox-command-probe")
             check(probe["input"] == {"type": "text", "hint": "value"}, probe)

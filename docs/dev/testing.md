@@ -85,6 +85,12 @@ in [Code style](code-style.md#implementation) applies to tests too.
 - When a native boundary cannot be driven, simulate only that boundary in
   test code, preserve the real application path around it, and restore any
   interception after use. Document and report what the test cannot verify.
+- `ui/e2e/specs/stress.e2e.ts` holds the app to time budgets with hundreds of
+  sessions and a transcript of thousands of long Markdown replies, far beyond
+  everyday use. It measures inside the webview and waits on the daemon through
+  `oxctl`, because finding thousands of elements through the driver occupies
+  the webview's main thread. A change whose work grows with the session list
+  or the transcript fails it.
 - Isolate a failure with the smallest relevant test before rerunning a broad
   suite. Distinguish fixture and driver failures from product failures; fix
   the cause rather than adding timeouts, retries, or recovery machinery.

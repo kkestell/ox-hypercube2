@@ -1,5 +1,5 @@
 import { FileIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
-import { type CSSProperties, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { type CSSProperties, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Sidebar } from "../../components/Sidebar";
 import type { DirEntry } from "../../lib/protocol";
 import { loadTreeState, saveTreeState } from "./treeState";
@@ -24,7 +24,7 @@ const userScrolls = ["wheel", "pointerdown", "keydown"] as const;
  * The file tree of the directory at `root`, with the open folders and scroll
  * position saved for `sessionId`.
  */
-export function FileTree({
+export const FileTree = memo(function FileTree({
   sessionId,
   root,
   connection,
@@ -98,7 +98,7 @@ export function FileTree({
       </ul>
     </Sidebar>
   );
-}
+});
 
 /** The rows of an open folder's entries, each open folder's below it. */
 function Folder({

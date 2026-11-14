@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::messages::{
     Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, HelloResult,
-    Listing, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo, WorkspaceInfo,
+    ListingChange, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo, WorkspaceInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -111,12 +111,12 @@ struct Routes {
     streams: HashMap<u64, Route>,
 }
 
-/// A stream's messages: a subscription's events, a watch's listings, or a
+/// A stream's messages: a subscription's events, a watch's changes, or a
 /// directory watch's entries.
 #[derive(Debug)]
 enum Route {
     Events(mpsc::UnboundedSender<Event>),
-    Listings(mpsc::UnboundedSender<Listing>),
+    Changes(mpsc::UnboundedSender<Vec<ListingChange>>),
     Entries(mpsc::UnboundedSender<Vec<DirEntry>>),
 }
 
@@ -212,22 +212,35 @@ impl Subscription {
         self.session_closed = matches!(event.kind, EventKind::SessionClosed);
         Ok(event)
     }
+
+    /// The next event and every event already received after it, waiting
+    /// only for the first.
+    pub async fn next_batch(&mut self) -> Result<Vec<Event>, End> {
+        let mut batch = vec![self.next().await?];
+        while !self.session_closed
+            && let Ok(event) = self.events.try_recv()
+        {
+            self.session_closed = matches!(event.kind, EventKind::SessionClosed);
+            batch.push(event);
+        }
+        Ok(batch)
+    }
 }
 
-/// The daemon's workspaces and sessions, each time either changes. Dropping
-/// it unsubscribes.
+/// The changes to the daemon's workspaces and sessions. Dropping it
+/// unsubscribes.
 #[derive(Debug)]
 pub struct Watch {
-    listings: mpsc::UnboundedReceiver<Listing>,
+    changes: mpsc::UnboundedReceiver<Vec<ListingChange>>,
     _unsubscribe: Unsubscribe,
 }
 
 impl Watch {
-    /// The next listing, which differs from the one before it. The first is
-    /// the listing when the watch started. A watch ends only with
+    /// The next changes, in order. The first lists every workspace and
+    /// session when the watch started. A watch ends only with
     /// [`End::Disconnected`].
-    pub async fn next(&mut self) -> Result<Listing, End> {
-        self.listings.recv().await.ok_or(End::Disconnected)
+    pub async fn next(&mut self) -> Result<Vec<ListingChange>, End> {
+        self.changes.recv().await.ok_or(End::Disconnected)
     }
 }
 
@@ -422,13 +435,13 @@ impl Client {
         Ok(subscription)
     }
 
-    /// Watches the daemon's workspaces and sessions.
+    /// Watches the changes to the daemon's workspaces and sessions.
     pub async fn watch(&self) -> Result<Watch, Error> {
         let id = self.connection.next_id();
-        let (sender, listings) = mpsc::unbounded_channel();
+        let (sender, changes) = mpsc::unbounded_channel();
         let watch = Watch {
-            listings,
-            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Listings(sender)),
+            changes,
+            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Changes(sender)),
         };
         self.send::<Value>(id, Method::Watch).await?;
         Ok(watch)
@@ -665,14 +678,10 @@ async fn read_loop(read: OwnedReadHalf, connection: Arc<Connection>) {
             }
             ServerMessage::List {
                 subscription,
-                workspaces,
-                sessions,
+                changes,
             } => {
-                if let Some(Route::Listings(listings)) = routes.streams.get(&subscription) {
-                    let _ = listings.send(Listing {
-                        workspaces,
-                        sessions,
-                    });
+                if let Some(Route::Changes(sender)) = routes.streams.get(&subscription) {
+                    let _ = sender.send(changes);
                 }
             }
             ServerMessage::Directory {
@@ -880,18 +889,11 @@ mod tests {
         daemon
             .send(ServerMessage::List {
                 subscription: request.id,
-                workspaces: Vec::new(),
-                sessions: Vec::new(),
+                changes: Vec::new(),
             })
             .await;
-        let listing = timeout(TIMEOUT, watch.next()).await.unwrap().unwrap();
-        assert_eq!(
-            listing,
-            Listing {
-                workspaces: Vec::new(),
-                sessions: Vec::new()
-            }
-        );
+        let changes = timeout(TIMEOUT, watch.next()).await.unwrap().unwrap();
+        assert_eq!(changes, []);
         assert!(!client.is_closed());
         drop(daemon);
         let end = timeout(TIMEOUT, watch.next()).await.unwrap();

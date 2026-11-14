@@ -65,6 +65,27 @@ describe("The model picker", () => {
     await expect(agentText()[0]).toHaveText("fast");
   });
 
+  it("shows a chosen model at once, before the agent reports it", async () => {
+    await picker().click();
+    await expect(menu()).toBeDisplayed();
+    // React commits a click's update in a microtask the click queues. The
+    // label is read in the microtask after it, before any task, and so before
+    // any answer from the agent.
+    const shown = await browser.execute(
+      () =>
+        new Promise<string | null>((done) => {
+          [...document.querySelectorAll<HTMLButtonElement>('#model-menu [role="option"]')]
+            .find((option) => option.textContent === "Fast")!
+            .click();
+          queueMicrotask(() => done(document.querySelector("button.model-picker")!.textContent));
+        }),
+    );
+    expect(shown).toBe("FastMedium");
+    await send("config model");
+    await expect(agentText()[0]).toHaveText("fast");
+    await expect(picker()).toHaveText("FastMedium");
+  });
+
   it("chooses the hovered model with Enter", async () => {
     await picker().click();
     await expect(menu().$('[aria-selected="true"]')).toBeFocused();

@@ -45,8 +45,8 @@ steps. Those choices make up a workflow, and workflows belong to the clients.
 
 **ox.** The Tauri 2 desktop app. The React UI in the webview calls Tauri commands
 in the Rust core, which forwards them to `oxd` through one
-`ox_protocol::Client` and streams the workspaces and sessions lists and the
-open session's conversation back over Tauri channels. The sidebar groups
+`ox_protocol::Client` and streams changes to the workspaces and sessions and
+the open session's conversation back over Tauri channels. The sidebar groups
 sessions under their workspaces; a workspace is added by choosing a directory.
 A workspace's **+** menu opens beside its button with an agent select above
 **New Task**, offered in a Git working tree, and **Session in Checkout**,
@@ -82,6 +82,15 @@ relative to the root, and its scroll position are kept in the webview's
 `localStorage` under `fileTree:<session id>`, and the tree restores them when
 it is shown again, after a switch or a restart. The app removes a session's
 saved tree once a listing no longer has the session.
+
+The UI's work follows what changed. A watch sends every workspace and
+session once, then only those added, changed or removed, and the UI replaces
+just those entries. Each session row, the composer, the file tree and each
+conversation item renders again only when its own data changes. The open
+session's conversation arrives in batches of the items from the events the
+core received together, with a message's text chunks joined. A message's
+Markdown renders per top-level block, so appended text parses and renders
+only its last block again.
 
 **oxctl.** The [integration tests](testing.md#running-checks) use this
 command-line client to drive `oxd` through the same `ox_protocol::Client`
@@ -226,11 +235,12 @@ answers the error and the session stays `exited` and loadable. Deleting a
 session not in a worktree stops its agent and deletes its row.
 
 Each workspace `oxd` sends carries `git_working_tree`, which says whether to
-offer worktrees for it. `oxd` works it out from the filesystem each time it
-builds the lists, without running git: it is true when no component of the
-workspace's path is `.git` and the path or one of its parents has a `.git`
-entry. A `git init` therefore shows in the next lists `oxd` sends, on the
-next session change or client connection. `workspace.branches` answers the
+offer worktrees for it. `oxd` works it out from the filesystem, without
+running git, when a watch starts and again after a workspace or session is
+added or removed or a client connects or disconnects: it is true when no
+component of the workspace's path is `.git` and the path or one of its
+parents has a `.git` entry. A `git init` therefore shows on the next of
+those changes. `workspace.branches` answers the
 local and remote-tracking branches of a workspace's repository, each most
 recently committed first, without symbolic refs such as `origin/HEAD`, with
 the worktree that has each local branch checked out, and `head`, the branch
@@ -360,4 +370,4 @@ connection to `oxd`, calls a daemon method for the session, and closes the
 connection, so `ox-mcp` does not keep the daemon from exiting idle. Its tool
 `set_title` calls `session.set_title`, which collapses runs of whitespace,
 refuses an empty title, saves the title with the session, and publishes it
-in the lists. It records no event.
+to every watch. It records no event.

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { memo, useState } from "react";
 import { Dialog } from "../../components/Dialog";
 import type { Comparison, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -9,7 +9,7 @@ import { mergeBlocker } from "./localMerge";
  * Merge into `compare`: fast-forwards the ref's branch to the session's
  * branch, then offers to delete the session.
  */
-export function MergeButton({
+export const MergeButton = memo(function MergeButton({
   session,
   compare,
   comparison,
@@ -84,4 +84,4 @@ export function MergeButton({
       )}
     </>
   );
-}
+});

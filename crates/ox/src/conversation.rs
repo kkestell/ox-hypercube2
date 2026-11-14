@@ -420,6 +420,65 @@ fn add_content(block: &ContentBlock, text: &mut Vec<String>, attachments: &mut V
     }
 }
 
+impl Item {
+    /// The key of the item the UI inserts or updates; none for a removal.
+    fn key(&self) -> Option<&str> {
+        match self {
+            Self::Prompt { key, .. }
+            | Self::Text { key, .. }
+            | Self::Thought { key, .. }
+            | Self::ToolCall { key, .. }
+            | Self::Permission { key, .. }
+            | Self::Elicitation { key, .. }
+            | Self::TurnError { key, .. }
+            | Self::AgentExited { key, .. }
+            | Self::SessionClosed { key } => Some(key),
+            Self::RequestResolved { .. } => None,
+        }
+    }
+}
+
+/// `items` with each item merged into the earlier one with its key: text
+/// appended to text of the same kind, and anything else in its place. The UI
+/// ends with the same items applying the result as applying `items` one by
+/// one.
+pub fn coalesce(items: impl IntoIterator<Item = Item>) -> Vec<Item> {
+    let mut merged: Vec<Item> = Vec::new();
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    for item in items {
+        if let Item::RequestResolved { request_id } = &item {
+            positions.remove(&format!("request:{request_id}"));
+        }
+        let Some(&position) = item.key().and_then(|key| positions.get(key)) else {
+            if let Some(key) = item.key() {
+                positions.insert(key.to_owned(), merged.len());
+            }
+            merged.push(item);
+            continue;
+        };
+        match (&mut merged[position], item) {
+            (
+                Item::Text { text, .. },
+                Item::Text {
+                    text: more,
+                    replace: false,
+                    ..
+                },
+            )
+            | (
+                Item::Thought { text, .. },
+                Item::Thought {
+                    text: more,
+                    replace: false,
+                    ..
+                },
+            ) => text.push_str(&more),
+            (earlier, item) => *earlier = item,
+        }
+    }
+    merged
+}
+
 #[cfg(test)]
 mod tests {
     use ox_protocol::schema::{
@@ -894,5 +953,59 @@ mod tests {
             }
         }
         assert_eq!(keys, ["user:first", "user:second"]);
+    }
+
+    #[test]
+    fn coalescing_merges_each_item_into_the_first_with_its_key() {
+        let permission = |request_id: &str| Item::Permission {
+            key: format!("request:{request_id}"),
+            request_id: request_id.into(),
+            title: "Allow?".into(),
+            options: Vec::new(),
+        };
+        let resolved = |request_id: &str| Item::RequestResolved {
+            request_id: request_id.into(),
+        };
+        let cases = [
+            (
+                "appended text joins",
+                vec![item_text("a", "x", false), item_text("a", "y", false)],
+                vec![item_text("a", "xy", false)],
+            ),
+            (
+                "appended text keeps a replacement",
+                vec![item_text("a", "x", true), item_text("a", "y", false)],
+                vec![item_text("a", "xy", true)],
+            ),
+            (
+                "a replacement takes the place of earlier text",
+                vec![
+                    item_text("a", "x", false),
+                    item_thought("b", "t"),
+                    item_text("a", "y", true),
+                ],
+                vec![item_text("a", "y", true), item_thought("b", "t")],
+            ),
+            (
+                "a tool call update takes the place of the earlier state",
+                vec![
+                    tool(ToolCallStatus::Pending, Vec::new()),
+                    item_text("a", "x", false),
+                    tool(ToolCallStatus::Completed, Vec::new()),
+                ],
+                vec![
+                    tool(ToolCallStatus::Completed, Vec::new()),
+                    item_text("a", "x", false),
+                ],
+            ),
+            (
+                "a resolved request stays between its request and a later one",
+                vec![permission("1"), resolved("1"), permission("1")],
+                vec![permission("1"), resolved("1"), permission("1")],
+            ),
+        ];
+        for (name, items, expected) in cases {
+            assert_eq!(coalesce(items), expected, "{name}");
+        }
     }
 }

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
-use crate::daemon::{ClientGuard, Daemon};
+use crate::daemon::{ClientGuard, Daemon, Sent};
 use crate::directories::{self, Changes};
 use crate::session::Session;
 
@@ -220,28 +220,28 @@ async fn forward(
     }
 }
 
-/// Sends watch `subscription` the workspaces and sessions lists, then both
-/// lists each time either differs from the last ones sent.
+/// Sends watch `subscription` every workspace and session, then the
+/// workspaces and sessions that are added, change, or are removed.
 async fn watch(daemon: Arc<Daemon>, subscription: u64, outgoing: mpsc::Sender<ServerMessage>) {
-    let mut changed = daemon.changed();
-    let mut sent = None;
+    let mut signal = daemon.changed();
+    let mut sent = Sent::default();
+    let mut first = true;
     loop {
-        // Marking the change seen before reading the lists means a change
-        // made while they are built wakes the watch again.
-        changed.borrow_and_update();
-        let listing = daemon.list();
-        if sent.as_ref() != Some(&listing) {
+        // Marking the change seen before reading the changes means a change
+        // made while they are read wakes the watch again.
+        signal.borrow_and_update();
+        let changes = daemon.listing_changes(&mut sent);
+        if first || !changes.is_empty() {
+            first = false;
             let message = ServerMessage::List {
                 subscription,
-                workspaces: listing.workspaces.clone(),
-                sessions: listing.sessions.clone(),
+                changes,
             };
             if outgoing.send(message).await.is_err() {
                 return;
             }
-            sent = Some(listing);
         }
-        if changed.changed().await.is_err() {
+        if signal.changed().await.is_err() {
             return;
         }
     }

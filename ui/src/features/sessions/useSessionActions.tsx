@@ -1,13 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { Dialog } from "../../components/Dialog";
 import type { Archival, Deletion } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 
 /**
  * Deleting, archiving and unarchiving sessions, with the dialogs that ask
- * before losing unsaved work and report a kept branch. `busy` holds the
- * sessions whose actions are in flight; the caller renders `dialogs`.
+ * before losing unsaved work and report a kept branch. `actions.busy` holds
+ * the sessions whose actions are in flight, and `actions` changes only with
+ * it; the caller renders `dialogs`.
  */
 export function useSessionActions() {
   // The sessions whose archives, unarchives or deletes are in flight.
@@ -20,42 +21,40 @@ export function useSessionActions() {
   } | null>(null);
   const [keptBranch, setKeptBranch] = useState<string | null>(null);
 
-  // Runs `action` with the session's actions disabled.
-  const withBusy = async (sessionId: string, action: () => Promise<void>) => {
-    setBusy((busy) => new Set(busy).add(sessionId));
-    try {
-      await action();
-    } catch (e) {
-      await showError(e);
-    } finally {
-      setBusy((busy) => {
-        const rest = new Set(busy);
-        rest.delete(sessionId);
-        return rest;
-      });
-    }
-  };
+  const deleteSession = useCallback(
+    (sessionId: string, discard: boolean) =>
+      withBusy(setBusy, sessionId, async () => {
+        const deletion = await invoke<Deletion>("delete_session", { sessionId, discard });
+        if (deletion.type === "unsaved_work") {
+          setUnsaved({ sessionId, action: "delete", message: deletion.message });
+        } else if (deletion.kept_branch !== null) {
+          setKeptBranch(deletion.kept_branch);
+        }
+      }),
+    [],
+  );
 
-  const deleteSession = (sessionId: string, discard: boolean) =>
-    withBusy(sessionId, async () => {
-      const deletion = await invoke<Deletion>("delete_session", { sessionId, discard });
-      if (deletion.type === "unsaved_work") {
-        setUnsaved({ sessionId, action: "delete", message: deletion.message });
-      } else if (deletion.kept_branch !== null) {
-        setKeptBranch(deletion.kept_branch);
-      }
-    });
+  const archiveSession = useCallback(
+    (sessionId: string, discard: boolean) =>
+      withBusy(setBusy, sessionId, async () => {
+        const archival = await invoke<Archival>("archive_session", { sessionId, discard });
+        if (archival.type === "unsaved_work") {
+          setUnsaved({ sessionId, action: "archive", message: archival.message });
+        }
+      }),
+    [],
+  );
 
-  const archiveSession = (sessionId: string, discard: boolean) =>
-    withBusy(sessionId, async () => {
-      const archival = await invoke<Archival>("archive_session", { sessionId, discard });
-      if (archival.type === "unsaved_work") {
-        setUnsaved({ sessionId, action: "archive", message: archival.message });
-      }
-    });
+  const unarchiveSession = useCallback(
+    (sessionId: string) =>
+      withBusy(setBusy, sessionId, () => invoke("unarchive_session", { sessionId })),
+    [],
+  );
 
-  const unarchiveSession = (sessionId: string) =>
-    withBusy(sessionId, () => invoke("unarchive_session", { sessionId }));
+  const actions = useMemo(
+    () => ({ busy, deleteSession, archiveSession, unarchiveSession }),
+    [busy, deleteSession, archiveSession, unarchiveSession],
+  );
 
   const dialogs = (
     <>
@@ -103,7 +102,27 @@ export function useSessionActions() {
     </>
   );
 
-  return { busy, deleteSession, archiveSession, unarchiveSession, dialogs };
+  return { actions, dialogs };
 }
 
-export type SessionActions = ReturnType<typeof useSessionActions>;
+export type SessionActions = ReturnType<typeof useSessionActions>["actions"];
+
+/** Runs `action` with the session's actions disabled. */
+async function withBusy(
+  setBusy: (change: (busy: ReadonlySet<string>) => ReadonlySet<string>) => void,
+  sessionId: string,
+  action: () => Promise<unknown>,
+) {
+  setBusy((busy) => new Set(busy).add(sessionId));
+  try {
+    await action();
+  } catch (e) {
+    await showError(e);
+  } finally {
+    setBusy((busy) => {
+      const rest = new Set(busy);
+      rest.delete(sessionId);
+      return rest;
+    });
+  }
+}

@@ -180,7 +180,18 @@ export type Item =
 
 export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
 
+/**
+ * A change to the listing: a workspace or session added or changed, or one
+ * removed. One that is new comes last; one that changed keeps its place.
+ */
+export type ListingChange =
+  | { type: "workspace"; workspace: WorkspaceInfo }
+  | { type: "workspace_removed"; workspace_id: string }
+  | { type: "session"; session: SessionInfo }
+  | { type: "session_removed"; session_id: string };
+
 export type WatchMessage =
-  | { type: "list"; workspaces: WorkspaceInfo[]; sessions: SessionInfo[] }
+  /** A watch's first changes list every workspace and session. */
+  | { type: "changes"; changes: ListingChange[] }
   | { type: "error"; message: string }
   | { type: "disconnected" };

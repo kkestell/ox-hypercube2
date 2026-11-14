@@ -7,15 +7,15 @@ use std::sync::{Arc, Mutex};
 
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, SessionInfo, WorkspaceInfo,
-    code, content, default_socket_path,
+    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, ListingChange, SessionInfo,
+    WorkspaceInfo, code, content, default_socket_path,
 };
 use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
-use crate::conversation::{Conversation, Item};
+use crate::conversation::{Conversation, Item, coalesce};
 
 /// A task that stops when dropped.
 struct Task(JoinHandle<()>);
@@ -58,9 +58,10 @@ impl App {
 #[derive(Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WatchMessage {
-    List {
-        workspaces: Vec<WorkspaceInfo>,
-        sessions: Vec<SessionInfo>,
+    /// Changes to the listing. A watch's first lists every workspace and
+    /// session.
+    Changes {
+        changes: Vec<ListingChange>,
     },
     /// The watch could not start.
     Error {
@@ -103,15 +104,11 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
             }
         };
         loop {
-            let Ok(listing) = watch.next().await else {
+            let Ok(changes) = watch.next().await else {
                 let _ = channel.send(WatchMessage::Disconnected);
                 return;
             };
-            let list = WatchMessage::List {
-                workspaces: listing.workspaces,
-                sessions: listing.sessions,
-            };
-            if channel.send(list).is_err() {
+            if channel.send(WatchMessage::Changes { changes }).is_err() {
                 return;
             }
         }
@@ -120,8 +117,9 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
     app.directories.lock().unwrap().clear();
 }
 
-/// Sends a session's conversation on `channel` from its first event,
-/// replacing the previous view; with no session, ends the previous view. The
+/// Sends a session's conversation on `channel` from its first event, in
+/// batches of the items from the events received together, replacing the
+/// previous view; with no session, ends the previous view. The
 /// view ends when the session closes or the connection drops, and a view that
 /// cannot connect or subscribe sends nothing. The workspace watch reports the
 /// connection, and the webview views the session again once the watch
@@ -135,7 +133,7 @@ fn view_session(
     handle: AppHandle,
     app: State<'_, App>,
     session_id: Option<String>,
-    channel: Channel<Item>,
+    channel: Channel<Vec<Item>>,
 ) {
     let task = session_id.map(|session_id| {
         Task(tauri::async_runtime::spawn(async move {
@@ -147,11 +145,10 @@ fn view_session(
                 return;
             };
             let mut conversation = Conversation::default();
-            while let Ok(event) = events.next().await {
-                for item in conversation.apply(&event) {
-                    if channel.send(item).is_err() {
-                        return;
-                    }
+            while let Ok(events) = events.next_batch().await {
+                let items = coalesce(events.iter().flat_map(|event| conversation.apply(event)));
+                if !items.is_empty() && channel.send(items).is_err() {
+                    return;
                 }
             }
         }))

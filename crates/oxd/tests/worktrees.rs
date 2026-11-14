@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_protocol::schema::{ContentBlock, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, Comparison, Deleted, Error, ErrorBody, EventKind, SessionInfo,
-    SessionState, WorktreeBranch, WorktreeInfo, code,
+    Branches, Checkout, Client, Comparison, Deleted, Error, ErrorBody, EventKind, ListingChange,
+    SessionInfo, SessionState, Watch, WorktreeBranch, WorktreeInfo, code,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -577,41 +577,60 @@ async fn answers(client: &Client, session_id: &str) {
     }
 }
 
+/// The session's info from each watch change that names it, from a new
+/// watch, until one `done` accepts, which it returns; `None` if the session
+/// is not listed or is removed first.
+async fn until_session(
+    client: &Client,
+    session_id: &str,
+    done: impl Fn(&SessionInfo) -> bool,
+) -> Option<SessionInfo> {
+    let mut watch = client.watch().await.unwrap();
+    // The watch's first changes list every session.
+    let mut listed = false;
+    loop {
+        let changes = next_changes(&mut watch).await;
+        let mut named = false;
+        for change in changes {
+            match change {
+                ListingChange::Session { session } if session.id == session_id => {
+                    named = true;
+                    if done(&session) {
+                        return Some(*session);
+                    }
+                }
+                ListingChange::SessionRemoved { session_id: id } if id == session_id => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if !listed && !named {
+            return None;
+        }
+        listed = true;
+    }
+}
+
+async fn next_changes(watch: &mut Watch) -> Vec<ListingChange> {
+    timeout(TIMEOUT, watch.next())
+        .await
+        .expect("timed out waiting for listing changes")
+        .unwrap()
+}
+
 /// Waits until the session is no longer listed.
 async fn until_gone(client: &Client, session_id: &str) {
-    let mut watch = client.watch().await.unwrap();
-    loop {
-        let listing = timeout(TIMEOUT, watch.next())
-            .await
-            .expect("timed out waiting for the session to go")
-            .unwrap();
-        if listing
-            .sessions
-            .iter()
-            .all(|session| session.id != session_id)
-        {
-            return;
-        }
+    if let Some(session) = until_session(client, session_id, |_| false).await {
+        panic!("the session is still listed: {session:?}");
     }
 }
 
 /// Waits until the session is in `state`.
 async fn until_state(client: &Client, session_id: &str, state: SessionState) {
-    let mut watch = client.watch().await.unwrap();
-    loop {
-        let listing = timeout(TIMEOUT, watch.next())
-            .await
-            .expect("timed out waiting for the session's state")
-            .unwrap();
-        let session = listing
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .expect("the session is listed");
-        if session.state == state {
-            return;
-        }
-    }
+    until_session(client, session_id, |session| session.state == state)
+        .await
+        .expect("the session is listed");
 }
 
 /// Waits for the session's agent to start and returns the session.
@@ -1453,25 +1472,23 @@ async fn workspaces_say_whether_they_are_in_a_git_working_tree() {
     client.remove_workspace(&workspace.id).await.unwrap();
     let workspace = client.add_workspace(plain.path().to_owned()).await.unwrap();
     assert!(!workspace.git_working_tree);
-    let flags = |workspaces: &[ox_protocol::WorkspaceInfo]| {
-        workspaces
-            .iter()
-            .map(|workspace| workspace.git_working_tree)
+    let flags = |changes: Vec<ListingChange>| {
+        changes
+            .into_iter()
+            .filter_map(|change| match change {
+                ListingChange::Workspace { workspace } => Some(workspace.git_working_tree),
+                _ => None,
+            })
             .collect::<Vec<_>>()
     };
     let mut watch = client.watch().await.unwrap();
-    let listing = timeout(TIMEOUT, watch.next()).await.unwrap().unwrap();
-    assert_eq!(flags(&listing.workspaces), [true, true, false]);
+    assert_eq!(flags(next_changes(&mut watch).await), [true, true, false]);
 
-    // The flag follows `git init` in the next listing oxd sends, such as the
-    // one a client connecting brings.
+    // The flag follows `git init` once the workspaces are listed again, such
+    // as when a client connects.
     init(plain.path());
     let _connected = daemon.client().await;
-    let listing = timeout(TIMEOUT, watch.next())
-        .await
-        .expect("no listing followed the connection")
-        .unwrap();
-    assert_eq!(flags(&listing.workspaces), [true, true, true]);
+    assert_eq!(flags(next_changes(&mut watch).await), [true]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2412,21 +2429,11 @@ async fn until_compared(
     session_id: &str,
     done: impl Fn(&Comparison) -> bool,
 ) -> SessionInfo {
-    let mut watch = client.watch().await.unwrap();
-    loop {
-        let listing = timeout(TIMEOUT, watch.next())
-            .await
-            .expect("timed out waiting for the comparison")
-            .unwrap();
-        let session = listing
-            .sessions
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .expect("the session is listed");
-        if session.comparison.as_ref().is_some_and(&done) {
-            return session;
-        }
-    }
+    until_session(client, session_id, |session| {
+        session.comparison.as_ref().is_some_and(&done)
+    })
+    .await
+    .expect("the session is listed")
 }
 
 /// Whether the comparison counts `ahead` and `behind`.

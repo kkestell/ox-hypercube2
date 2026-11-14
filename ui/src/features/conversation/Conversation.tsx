@@ -1,10 +1,20 @@
 import { Check, X } from "lucide-react";
-import { useLayoutEffect, useRef } from "react";
+import { memo, useLayoutEffect, useRef } from "react";
 import { CodeSpans } from "../../components/CodeSpans";
 import type { Item, ToolCallStatus } from "../../lib/protocol";
 import { Markdown } from "./Markdown";
 
-export function Conversation({ sessionId, items }: { sessionId: string; items: Item[] }) {
+/**
+ * A session's items. An item renders again only when it changes, so
+ * appending to the conversation leaves the rest of it alone.
+ */
+export const Conversation = memo(function Conversation({
+  sessionId,
+  items,
+}: {
+  sessionId: string;
+  items: Item[];
+}) {
   const element = useRef<HTMLDivElement>(null);
   // Whether the view follows the end of the conversation as it grows.
   const following = useRef(true);
@@ -34,9 +44,9 @@ export function Conversation({ sessionId, items }: { sessionId: string; items: I
       ))}
     </div>
   );
-}
+});
 
-function ItemView({ item }: { item: Item }) {
+const ItemView = memo(function ItemView({ item }: { item: Item }) {
   switch (item.type) {
     case "prompt":
       return (
@@ -78,7 +88,7 @@ function ItemView({ item }: { item: Item }) {
     case "session_closed":
       return <p className="session-closed">Session closed</p>;
   }
-}
+});
 
 function ToolStatus({ status }: { status: ToolCallStatus }) {
   switch (status) {

@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
+import { memo } from "react";
 import { SelectPicker } from "../../components/SelectPicker";
 import type { ConfigOption, Item, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -10,7 +11,7 @@ import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { Permission } from "./Permission";
 import type { Drafts } from "./useDrafts";
 
-export function Composer({
+export const Composer = memo(function Composer({
   session,
   request,
   drafts,
@@ -157,7 +158,7 @@ export function Composer({
       </div>
     </div>
   );
-}
+});
 
 function ConfigPicker({
   option,

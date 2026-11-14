@@ -1,10 +1,13 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { SessionInfo } from "../../lib/protocol";
 
 type Draft = { text: string; attachments: string[] };
 const emptyDraft: Draft = { text: "", attachments: [] };
 
-/** Keeps drafts across session switches for the lifetime of the webview. */
+/**
+ * Keeps drafts across session switches for the lifetime of the webview. The
+ * result changes only when a draft does.
+ */
 export function useDrafts(sessions: SessionInfo[], connected: boolean) {
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   useEffect(() => {
@@ -17,9 +20,8 @@ export function useDrafts(sessions: SessionInfo[], connected: boolean) {
     });
   }, [sessions, connected]);
 
-  return {
-    get: (id: string) => drafts[id] ?? emptyDraft,
-    update: (id: string, change: (draft: Draft) => Draft | undefined) =>
+  const update = useCallback(
+    (id: string, change: (draft: Draft) => Draft | undefined) =>
       setDrafts((current) => {
         const previous = current[id] ?? emptyDraft;
         const draft = change(previous);
@@ -32,7 +34,13 @@ export function useDrafts(sessions: SessionInfo[], connected: boolean) {
         delete next[id];
         return next;
       }),
-  };
+    [],
+  );
+
+  return useMemo(
+    () => ({ get: (id: string) => drafts[id] ?? emptyDraft, update }),
+    [drafts, update],
+  );
 }
 
 export type Drafts = ReturnType<typeof useDrafts>;

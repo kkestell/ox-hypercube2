@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Workbench } from "./components/Workbench";
 import { Composer } from "./features/composer/Composer";
 import { useDrafts } from "./features/composer/useDrafts";
@@ -29,11 +29,15 @@ export function App() {
   }, [sessions, connection]);
   const session = sessions.find((session) => session.id === viewed);
   const merge = session && localMerge(session);
-  const actions = useSessionActions();
+  const { actions, dialogs } = useSessionActions();
   const items = useConversation(session?.id ?? null, connection);
-  const request = items.find(
-    (item): item is Extract<Item, { type: "permission" | "elicitation" }> =>
-      item.type === "permission" || item.type === "elicitation",
+  const request = useMemo(
+    () =>
+      items.find(
+        (item): item is Extract<Item, { type: "permission" | "elicitation" }> =>
+          item.type === "permission" || item.type === "elicitation",
+      ),
+    [items],
   );
 
   return (
@@ -78,7 +82,7 @@ export function App() {
           </>
         )}
       </Workbench>
-      {actions.dialogs}
+      {dialogs}
     </>
   );
 }
