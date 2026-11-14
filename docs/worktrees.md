@@ -19,7 +19,8 @@ directory. When the workspace is a subdirectory of its checkout, the session
 runs in the same subdirectory of the worktree.
 
 A New Task branch has no upstream. A workspace subdirectory must exist at the
-starting commit.
+starting commit. The worktree contains committed files only; uncommitted
+changes stay in the workspace's checkout.
 
 ## Comparing a session's branch
 
@@ -39,6 +40,8 @@ for uncommitted tracked changes, untracked files the move would overwrite
 (including ignored files), and agents starting, working, or waiting for an
 answer. While the move runs, Ox refuses requests to start, load, or prompt a
 session in that checkout.
+
+Submodule checkouts stay at their current commits when the branch moves.
 
 ## Deleting and archiving
 

@@ -1,10 +1,11 @@
 # Architecture
 
-Ox runs as a tree of processes. The desktop app and `oxctl` are clients of
-`oxd`, a per-user daemon that owns every session's agent process. Sessions
-outlive the clients that started them, so closing and reopening the app
-reconnects to the same sessions. `oxd` also saves its workspaces and sessions,
-so they outlive the daemon.
+Ox separates the desktop interface from session execution. The desktop app
+and `oxctl` are clients of `oxd`, a per-user daemon that owns session state
+and agent processes. Closing a client leaves its sessions running. Saved
+sessions and conversations also survive a daemon restart.
+
+## Processes and communication
 
 ```mermaid
 flowchart TB
@@ -23,345 +24,148 @@ flowchart TB
     oxmcp -.-> oxd
 ```
 
-Solid arrows point from a parent to the processes it owns. Dotted arrows
-point from a client to `oxd`; `ox` and `oxctl` start it detached, so it
-outlives the client that started it.
+Solid arrows show process ownership. Dotted arrows show connections to the
+daemon over a Unix socket. Clients start the daemon detached when needed;
+startup and instance locks keep one daemon per socket. The daemon accepts
+connections only from its own user.
 
-## What belongs in oxd
+### Desktop and command-line clients
 
-`oxd` owns shared state and shared work:
+The desktop app uses Tauri 2. Its React webview calls the Rust core through
+Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
+streams updates back over Tauri channels. `oxctl` uses the same daemon client
+and gives the integration tests access to the same operations.
 
-- everything persisted;
-- everything that every client must see kept up to date;
-- anything long-running, or anything that has to complete or be undone even
-  if the client goes away;
-- every write to a repository.
+### Daemon and agents
 
-Clients hold presentation and choose the parameters. `oxd`'s operations are
-generic: it never decides which ref, which branch name, or which order of
-steps. Those choices make up a workflow, and workflows belong to the clients.
+`oxd` runs each session's agent in a separate process group and speaks ACP
+over its standard input and output. Stopping the agent terminates that
+process group, including its children.
 
-## Processes
+The bundled agent is `claude-code-acp`, a bridge between draft ACP v2 and the
+Claude Code CLI. Each bridge keeps one Claude process running between
+prompts, exchanging stream-json messages and control requests with it.
+Claude authenticates with the user's subscription. The bridge can restart
+an exited Claude process using its native session ID.
 
-**ox.** The Tauri 2 desktop app. The React UI in the webview calls Tauri commands
-in the Rust core, which forwards them to `oxd` through one
-`ox_protocol::Client` and streams changes to the workspaces and sessions and
-the open session's conversation back over Tauri channels. The sidebar groups
-sessions under their workspaces; a workspace is added by choosing a directory.
-A workspace's **+** menu opens beside its button with an agent select above
-**New Task**, offered in a Git working tree, and **Session in Checkout**,
-which runs the session in the workspace's directory. New Task follows the
-local merge workflow: it reads the branch the workspace's checkout is on from
-`workspace.branches` and starts a session in a new worktree on its own
-`ox/<id8>` branch from `HEAD`, compared with that branch; when the checkout
-is on no branch it shows "<workspace> is not on a branch" and creates
-nothing. A session that is not archived and has a comparison ref follows
-local merge. Its row shows its git status as a `GitBranch` icon at the row's
-end, which fades out as the row actions fade in over it: none with no
-commits ahead, plain at one commit ahead and none behind, and in the
-attention colour otherwise or when git could not compare them, with the
-detail in its tooltip. The conversation header holds its **Merge into
-<ref>** button, enabled only at one commit ahead and none behind, with the
-reason in its tooltip otherwise. It fast-forwards the ref's branch to the
-session's branch with `branch.move`, from the ref's commit in the comparison,
-then offers to delete the session, which removes the merged branch.
-Selecting a saved session whose
-agent is not running loads it. A new session runs `claude-code-acp` from
-beside the app's executable. The app passes its environment to the session
-and to every request that runs git. **Delete Session** asks before discarding
-a worktree's unsaved work, says which branch `oxd` kept, and counts a session
-that is already gone as deleted. The app's dialogs are in-window `<dialog>`
-elements; errors show in a native message box.
+[ACP v2 support](acp-v2.md) owns protocol details and integration caveats.
 
-The right sidebar shows a file tree of the viewed session's `cwd`, rendered
-only while the sidebar is shown. Each open folder watches its directory with
-`directory.watch`, so only open folders are read, and collapsing a folder ends
-the watches below it. The tree sorts folders first, then names in natural
-order, as VS Code's explorer does. Each session's open folders, as paths
-relative to the root, and its scroll position are kept in the webview's
-`localStorage` under `fileTree:<session id>`, and the tree restores them when
-it is shown again, after a switch or a restart. The app removes a session's
-saved tree once a listing no longer has the session.
+### ox-mcp
 
-The daemon, the core and the UI each do work in proportion to what changed;
-[Performance](../performance.md) describes how.
+`oxd` supplies each compatible agent with a session-scoped `ox-mcp` stdio
+server. The agent launches it. Its tools call back into the daemon for that
+session; the current tool lets the agent set the session title.
 
-**oxctl.** The [integration tests](testing.md#running-checks) use this
-command-line client to drive `oxd` through the same `ox_protocol::Client`
-as the desktop app.
+Each tool call opens and closes its own daemon connection, so the MCP server
+does not keep the daemon alive between calls.
 
-**oxd.** A per-user daemon on `$OX_SOCKET`, or `oxd.sock` in Ox's data
-directory: `$XDG_DATA_HOME/ox` when `XDG_DATA_HOME` is an absolute path, else
-`~/.local/share/ox`.
-`Client::connect_or_start` starts `oxd` from beside the client's executable
-when no daemon answers, in a new session (`setsid`) with stderr appended to
-`oxd.log` beside the socket, and reads the `ready` line it prints once a
-daemon is listening. A startup lock and an instance lock keep one daemon per
-socket. `oxd` accepts connections only from its own user, and exits after an
-idle period with no clients and no running agents; a session whose agent has
-exited is saved and does not keep `oxd` alive. Each session runs its agent
-command in its own process group and speaks ACP to it over stdio; closing the
-session kills that group.
+## Ownership boundaries
 
-`oxd` speaks draft ACP protocol v2 to its agents; [`acp-v2.md`](acp-v2.md)
-charts its support. A turn starts and ends on the agent's `state_update`
-session updates, whether a prompt or the agent started it. A prompt makes the
-session running at once and records `prompt_started`; `running`,
-`requires_action`, and a state `oxd` does not know start a turn the agent
-began by itself, recorded as `turn_started`. The agent's `idle` ends the
-turn, recorded as `turn_ended` with the stop reason it reports, and `oxd`
-takes no prompt until then. After a prompt, only an `idle` that follows the
-agent reporting work ends the turn, since the agent may repeat an idle
-snapshot first. The agent answers `session/prompt` when it inserts the
-prompt; an error answer means it did not, and ends the turn with that error
-unless the agent already reported work for the prompt. `oxd` opens a session
-only with an agent that advertises `sessionCapabilities`.
+`oxd` owns:
 
-`oxd` records an agent's permission requests and form elicitations as
-session events and relays clients' answers. A session with an open
-permission request is `awaiting_permission`; one with only an open
-elicitation is `awaiting_input`. Both kinds of request take their IDs from one
-sequence per session. Cancelling the turn cancels open permission requests;
-an elicitation stays open until a client answers it or the agent withdraws it
-with `$/cancel_request`. When the agent exits or the session is parked or
-closed, every open request ends cancelled.
+- Shared persistent state: workspaces, sessions, and conversation history.
+- Agent processes and work that must continue when a client disconnects.
+- State updates and pending requests that every connected client must see.
+- Repository writes and the coordination needed to complete or undo them.
 
-**Directory watches.** `directory.watch` streams the entries of a directory
-at an absolute path: at once, then each time they change. Entries are sorted
-by name and leave out `.git`, `.hg`, `.svn`, `.jj`, `CVS`, `.DS_Store`,
-`Thumbs.db`, and names that are not UTF-8; a symlink has its target's kind.
-`oxd` holds one `notify` watcher (FSEvents on macOS) and watches each
-directory non-recursively, once however many streams want it, until its last
-stream ends. A directory that does not exist or cannot be read lists no
-entries. Its stream watches the nearest existing ancestor and moves the watch
-each time that changes, so a worktree that is still being added, or a folder
-that is deleted and comes back, is listed once it can be read.
+Clients own presentation and workflow choices: which branch to use, which
+comparison ref to select, and which daemon operations to request in what
+order. The daemon exposes repository operations without choosing the user's
+workflow. Local presentation state, such as file-tree expansion and scroll
+position, stays in the webview's storage.
 
-**Workspaces and saved sessions.** A workspace is a directory the user
-added. A session belongs to a workspace by ID and runs in the workspace's
-directory or in a worktree of it, a directory the session stores
-separately. `workspace.remove` is refused
-while any session, exited ones included, belongs to the workspace. `oxd`
-saves workspaces and sessions in one SQLite database beside the socket,
-`<socket>.db`, and is the only process that writes it. A session's row holds
-its workspace, command, directory, title, and the agent's session ID, and is
-written when the session is created and again when its title or agent session
-ID changes. The database holds no environment variables: a client passes its
-environment each time it starts an agent, with `session.new` and
-`session.load`. The schema has no migrations.
+Clients pass their environment when starting an agent and requesting Git
+operations. The daemon does not persist that environment. For Git operations
+that take a client's environment, it overlays the daemon's environment,
+removing Git variables that would redirect an operation to another repository.
 
-**Event log.** `oxd` queues session events for SQLite except `session_closed`.
-The writer commits batches keyed by session and sequence number. Graceful
-shutdown drains the queue. A forced stop can lose queued events, and a
-failed batch is logged and dropped, leaving gaps in saved history.
+Directory watches also belong to the daemon. Clients request the directories
+they need; the daemon shares one non-recursive watch per directory across
+consumers and releases it when the last consumer stops watching. The file tree
+subscribes only for open folders.
 
-Ox loads saved events on the first subscription or load after a restart.
-It closes interrupted turns with an error, cancels unresolved requests, and
-continues request IDs after the largest saved ID. The saved history includes
-tool output and images and can be read without starting an agent. Deleting a
-session deletes its events. Continuing a Claude conversation still requires
-its native transcript, which can expire under Claude's
-[`cleanupPeriodDays` setting](https://code.claude.com/docs/en/data-usage#data-retention).
+[Performance](../performance.md) describes how changes flow through the
+daemon, desktop core, and UI without reprocessing unrelated state.
 
-**Worktrees.** `session.new` takes a `checkout`: the workspace's directory, or
-a new worktree of the workspace's Git repository. `oxd` runs every Git
-operation as the `git` CLI, with the client's environment over its own and
-without the variables that point git at one repository (`GIT_DIR` and the
-rest of `git rev-parse --local-env-vars`). The request says which branch the
-worktree is on: none, an existing branch, or a new one. A worktree's branch
-is one of three kinds:
+## Persistence and recovery
 
-- **New**: with no branch, `ox/<first 8 digits of the session ID>` from
-  `HEAD`, or a new branch the request names, which starts at its `start`, or
-  `HEAD`, and is refused when a local branch, a remote branch's full name, or
-  a branch on any remote has the name. It has no upstream.
-- **Existing**: an existing local branch, which is refused while any worktree
-  has it checked out.
-- **Track**: an existing branch found only on a remote, as `<branch>` or
-  `<remote>/<branch>`, which becomes a local branch tracking it. A name on
-  several remotes takes the one `checkout.defaultRemote` names, and is
-  otherwise refused.
+`oxd` is the only writer of the SQLite database beside its socket. The
+database holds workspace and session metadata, worktree ownership,
+comparison refs, archive state, and conversation events.
+The database schema has no migrations.
 
-An existing branch that is neither local nor on a remote is refused. The
-worktree is
-`worktrees/<checkout name>-<first 8 digits of the session ID>` beside the
-socket, where the checkout name is the final component of the top level of
-the workspace's checkout, and the session runs in the same subdirectory of
-it that the workspace is of its checkout. It holds committed files only;
-uncommitted changes stay in the workspace, and `oxd` writes nothing into the
-repository but the worktree's administrative files and the branch.
+Session metadata is saved as sessions are created or changed. Conversation
+events are queued and committed in batches, ordered by session and sequence
+number. Graceful shutdown drains the queue. A forced stop can lose queued
+events; a failed batch is logged and dropped, leaving gaps in saved history.
 
-Creation has two phases. Before answering, `oxd` resolves and checks the
-branch, refuses a worktree directory that already exists, creates a new or
-tracking branch with `git branch`, which fails if the branch exists, and
-saves the session's row and its `worktrees` row (path, branch, the commit
-it started at, whether `oxd` created the branch, and the repository's
-absolute common Git directory) in one transaction. Any
-failure there answers with an error and leaves nothing behind. The answer is
-the session in `starting`. The session's startup then runs `git worktree
-add` and launches the agent in the worktree. If the worktree cannot be added,
-`oxd` removes what git left, deletes a branch it created if the branch still
-points where it started, and forgets the worktree; the session is `exited`
-with git's error and, never having started, is deleted at the next start of
-`oxd`. `workspace.remove` is refused while the database has a session row for
-the workspace, which covers a session being created. `session.load` refuses
-a session whose directory no longer exists.
+Saved history includes tool output and images and can be read without
+starting an agent. It is loaded on demand after a daemon restart, with
+interrupted turns ended as errors and unresolved requests cancelled.
 
-`session.delete` deletes a session. For a session in a worktree it first
-waits for the session's startup to finish; a load or another delete of the
-session waits for it in turn. Unless the request sets `discard`, it refuses
-with `UNSAVED_WORK`, listing what would be lost and leaving the session as it
-was, while the worktree has uncommitted changes (`git status`, untracked
-files included, ignored files not), commits on no branch, remote branch or
-tag, or an initialized submodule has commits on no remote branch. It also
-refuses while git cannot use the worktree, so that nothing can be checked:
-its repository is gone, or the repository no longer knows the worktree. It
-then stops the agent and waits for its task to end, and removes the
-worktree, ignored files included, with `git worktree remove --force`. A
-worktree git cannot use is deleted as a directory, which `oxd` owns, and a
-worktree directory deleted outside Ox is unregistered from the repository.
-Last it applies the [branch cleanup rule](../worktrees.md#deleting-and-archiving).
-Removal and branch cleanup run git in the recorded common Git directory with
-`--git-dir` set to it, and the unsaved checks run in the worktree, so none of them
-depends on the workspace's directory still existing. If work appears
-after the check, or git fails, such as on a locked worktree, the delete
-answers the error and the session stays `exited` and loadable. Deleting a
-session not in a worktree stops its agent and deletes its row.
+Ox's saved conversation and the agent's resumable conversation are separate.
+Continuing a Claude session requires its native transcript even when Ox still
+has the displayed history. Claude's transcript retention is controlled by
+its [`cleanupPeriodDays` setting](https://code.claude.com/docs/en/data-usage#data-retention).
+The bridge keeps its session records separately from the daemon's database.
 
-Each workspace `oxd` sends carries `git_working_tree`, which says whether to
-offer worktrees for it. `oxd` works it out from the filesystem, without
-running git, when a watch starts and again after a workspace or session is
-added or removed or a client connects or disconnects: it is true when no
-component of the workspace's path is `.git` and the path or one of its
-parents has a `.git` entry. A `git init` therefore shows on the next of
-those changes. `workspace.branches` answers the
-local and remote-tracking branches of a workspace's repository, each most
-recently committed first, without symbolic refs such as `origin/HEAD`, with
-the worktree that has each local branch checked out, and `head`, the branch
-the workspace's checkout is on, unset when its `HEAD` is detached or unborn.
-The same `for-each-ref` reports it, through `%(HEAD)`.
-`workspace.branches` and `session.new` with a worktree refuse a workspace
-git finds in no working tree, including one whose `.git` git rejects, with
-git's reason in the message. With `fetch`, `oxd` first runs `git
-fetch --all`, which follows the user's prune settings. Requests for one
-repository, keyed by its common Git directory, share the fetch running for
-it, which uses the environment of the request that started it and runs in a
-task of its own. A fetch runs in its own process group and is sent
-`SIGTERM` after 60 seconds. A fetch that fails or is stopped is reported in
-`fetch_error`, beside the lists as they stand. Session creation never waits
-on a fetch.
+## Session lifecycle
 
-A worktree session can have a comparison ref, such as `main` or
-`origin/main`: `session.new` takes it as the checkout's `compare`, and
-`session.set_compare` sets or clears it. Both refuse a ref that names no
-commit, and `session.set_compare` refuses a session with no worktree. The
-ref is saved in the `compare_refs` table, deleted with the session, and
-sent as the worktree's `compare`. The session's `comparison` carries the
-branch's commit, the ref's commit, and the counts of commits ahead of and
-behind the ref, from `git rev-list --left-right --count` in the recorded
-common Git directory with `oxd`'s own environment; a ref or branch that no
-longer names a commit makes it `failed`, with the reason. A task of each
-worktree session computes it when the session is created or restored, and
-again when the session's agent ends a turn, after a successful `branch.move`,
-after a move with a source branch even if it fails, after a session delete,
-or after a fetch in the session's repository whether or not it succeeded.
-Triggers that arrive while it computes make one more computation,
-and a changed comparison goes to every watch. `session.set_compare` and
-`session.refresh` answer the session with the comparison computed for the
-request.
+A saved session belongs to a workspace and records its agent command,
+working directory, and agent session ID. Its lifetime is independent of any
+client connection and of the agent process currently serving it. A workspace
+cannot be removed while sessions still belong to it.
 
-`oxd` updates the ref and checkout in `branch.move`. The request supplies
-the expected commit, which `git update-ref` checks when it writes the ref.
-When the client also supplies a source branch, the same ref transaction
-checks that it still points at the target commit.
-If updating the checkout with `git read-tree` fails, `oxd` tries to restore
-the branch at its previous tip and reports the error. Submodule checkouts
-stay at their current commits. See
-[moving a branch](../worktrees.md#moving-a-branch) for the checks and their
-current limitations.
+The daemon owns turn state, including turns the agent starts without a
+client prompt. Agent state updates drive the turn lifecycle; the prompt
+response acknowledges insertion rather than turn completion. Permission
+requests and form elicitations are recorded with the session and can be
+answered by clients.
 
-Shutdown on SIGTERM, SIGINT, or idle exit kills the agents and keeps every
-row. When `oxd` starts it registers each saved session in state `exited`,
-with no agent and no events, and deletes the sessions that never started,
-which have no agent session ID to load, and have no worktree. After it
-reports `ready`, a background task cleans up those that never started in a
-worktree, one at a time, holding each one's lifecycle lock, so that a load
-or delete of it waits. It removes the worktree and applies the branch rule
-with `oxd`'s own environment, as a delete without `discard` does, and then
-deletes the session. A session whose worktree would lose work, or cannot be
-removed, is kept as `exited`, with the reason in `oxd`'s log, and can only
-be deleted. `oxd` does not idle-exit while this runs, and a shutdown does
-not wait for it; sessions it has not reached are cleaned up at the next
-start.
-**Parking.** `oxd` stops the agent of a session that has stayed parkable for
-the park delay, `--park-after-ms` (default 15 minutes), without a break. A
-session is parkable when its agent is idle, no request is pending,
-the agent last reported no background work (`background` is `[]`; an agent
-that reports none never parks), and no client subscribes to the session; a
-watch is not a subscription. Any change that ends one of these restarts the
-delay. A parked session keeps its conversation, worktree, and branch, records
-`agent_parked`, and is `exited`; no subscription ends. `session.load` wakes
-it, as it does any exited session. Parking holds the session's lifecycle lock,
-so a load, delete, or startup in progress finishes first.
+### Loading and stopping agents
 
-**Archiving.** `session.archive` refuses immediately while the agent is
-starting. It checks for unsaved work as `session.delete` does, then
-stops the agent (ending an open turn and pending requests with the
-error "the agent was stopped", and recording `agent_parked`), removes the
-worktree, and marks the session archived in the `archived` table. The branch is
-always kept and the branch rule is not applied. The session is `exited` with
-`SessionInfo.archived` true; subscribing to it delivers its stored history
-with no agent, and `session.load` refuses it. A refusal or git failure leaves
-the session not archived. `session.unarchive` runs `git worktree add <path>
-<branch>` in the recorded repository, answering `GIT` and leaving the session
-archived if git refuses, such as for a deleted branch or one checked out
-elsewhere, then clears the mark. The session is then an ordinary `exited`
-session that `session.load` resumes, from Claude's transcript. `session.delete`
-deletes an archived session as any other.
+After a daemon restart, saved sessions begin without running agents. Loading
+a session starts its stored command in its stored directory and resumes the
+agent's conversation, retaining the Ox session ID and subscriptions. Missing
+history can be recovered through the agent's replay support.
 
-`session.load` restarts the agent of an exited session that has an agent
-session ID, from the session's stored command and directory, on the same
-session: the session ID, subscriptions, and sidebar selection stay the same,
-and the session goes through `starting` to `idle` as a new one does. The
-daemon sends `replayFrom: start` on `session/resume` only if the history lacks
-an `agent_started` event. The agent sends any requested replay, then reports
-its state before answering. The daemon records the replay once the agent
-starts, so a load that fails partway saves no replay. An agent that reports
-it is working leaves the session `running` until its `idle`, with no
-`turn_started` or `turn_ended` for work the history did not see start.
+An idle session with no subscribers, pending requests, or reported background
+work can have its agent parked. Parking preserves the session's conversation
+and checkout; loading the session starts its agent again. Agents that do not
+report background-work state are never parked.
 
-**claude-code-acp.** An ACP agent, speaking draft protocol v2, that bridges to
-the Claude Code CLI. [`acp-v2.md`](acp-v2.md) charts its support of the
-protocol. Opening a session answers at once with the session's settings, then
-starts and initializes one `claude -p`, in the bridge's process group, whose
-commands follow as an update; a `claude` that fails to start fails the next
-prompt with its error. The session keeps that process: the bridge holds its stdin open,
-writes each prompt to it as a stream-json message, reads streamed output and
-permission requests from its stdout, and answers permission requests with the
-client's decision. A prompt is answered when Claude takes it into a turn: the
-bridge sends it as a user message and answers with that message's ID. The
-turn's output, and its end as a `state_update` of `idle` with a stop reason,
-arrive as updates. A subagent's tool calls show as lines of the content of
-the tool call that started it, and a tool call's result as its content.
-`session/cancel` interrupts the running turn, and a model or mode change goes
-to the running process as a control request. Claude keeps running between
-prompts, and the turns it starts by itself, when a background task reports
-back, stream to the client as a prompt's turn does. When `claude` has exited,
-the next prompt starts another with `--resume` and the Claude session ID.
-`session/close` stops `claude`. The bridge records its sessions in
-`acp-sessions.json` and replays Claude's transcripts on `session/resume` with
-`replayFrom: start`.
+Archiving stops the agent and removes its worktree while retaining the
+conversation and branch. An archived session cannot load until unarchived.
+Deleting a session stops the agent and removes its saved history, with
+repository cleanup governed by the
+[worktree deletion and archiving rules](../worktrees.md#deleting-and-archiving).
 
-**claude.** The Claude Code CLI, authenticated with the user's subscription.
+Startup, load, parking, and deletion coordinate through a per-session
+lifecycle lock. Shutdown stops agents but preserves saved sessions. The
+daemon can exit when it has no clients or running agents; exited sessions
+do not keep it alive.
 
-**ox-mcp.** The MCP server named `ox` that `oxd` gives each agent it starts.
-`oxd` finds `ox-mcp` beside its own executable and, to an agent that
-advertises `session.mcp.stdio`, sends it on `session/new` and
-`session/resume` as a stdio server run as `ox-mcp --socket <socket> --session
-<session id>`, with the daemon's absolute socket path and the `oxd` session
-ID. The agent starts it and talks MCP to it over stdio. Each tool call opens a
-connection to `oxd`, calls a daemon method for the session, and closes the
-connection, so `ox-mcp` does not keep the daemon from exiting idle. Its tool
-`set_title` calls `session.set_title`, which collapses runs of whitespace,
-refuses an empty title, saves the title with the session, and publishes it
-to every watch. It records no event.
+## Repository ownership
+
+A session runs in the workspace's existing checkout or in an additional Git
+worktree owned by Ox. The daemon uses the Git CLI for repository operations.
+[Where sessions run](../worktrees.md) owns checkout choices, branch
+comparisons, merge behavior, and cleanup rules.
+
+Worktree creation separates reserving and saving the session from adding
+the worktree and launching the agent. The daemon records the worktree and
+branch ownership before returning a starting session. Failure to add the
+worktree triggers cleanup of the partial worktree and of a newly created
+branch still at its starting commit. Restart cleanup revisits sessions that
+never started, preserving worktrees whose removal would lose work.
+
+Each worktree records the repository's common Git directory, so cleanup and
+branch operations do not depend on the workspace directory still existing.
+Deletion waits for startup, checks for unsaved work before removing the
+checkout, and applies the branch cleanup rule separately.
+
+Branch moves use Git ref transactions to check the commits the client
+expected, including a source branch when supplied. If updating a checked-out
+branch's files fails, the daemon attempts to restore its previous tip and
+reports the failure. The user guide documents the
+[checks and limitations](../worktrees.md#moving-a-branch).

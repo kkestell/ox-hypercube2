@@ -54,3 +54,14 @@ make dev
 `make dev` builds `oxd`, its `ox-mcp` server, and the Claude bridge and runs
 the app against its own `oxd` on `target/dev/oxd.sock`, which it stops before
 building and after the app exits.
+
+### Daemon configuration and data
+
+`oxd` listens on `$OX_SOCKET` when set. Otherwise it uses `oxd.sock` in
+`$XDG_DATA_HOME/ox` when `XDG_DATA_HOME` is an absolute path, or
+`~/.local/share/ox`. The database is `<socket>.db`; daemon stderr is appended
+to `oxd.log` beside the socket. Clients start `oxd` from beside their own
+executable when no daemon answers.
+
+The daemon's `--park-after-ms` option sets the idle agent parking delay;
+the default is 15 minutes.

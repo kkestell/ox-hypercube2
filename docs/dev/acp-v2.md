@@ -28,9 +28,9 @@ relays the update or acts on it as the protocol requires.
 | `providers/list` (unstable) | unsupported | unsupported | |
 | `providers/set` (unstable) | unsupported | unsupported | |
 | `providers/disable` (unstable) | unsupported | unsupported | |
-| `session/new` | supported | supported | claude-code-acp: Answers with the session's config options, reports the session idle, then starts its Claude process, whose native command catalog follows as `available_commands_update`. A Claude process that fails to start fails the next prompt with its error. MCP servers are stdio only; see `session.mcp`. oxd: Sends the session's directory, and the [`ox` MCP server](architecture.md#processes) to an agent that advertises `session.mcp.stdio`. |
+| `session/new` | supported | supported | claude-code-acp: Answers with the session's config options, reports the session idle, then starts its Claude process, whose native command catalog follows as `available_commands_update`. A Claude process that fails to start fails the next prompt with its error. MCP servers are stdio only; see `session.mcp`. oxd: Sends the session's directory, and the [`ox` MCP server](architecture.md#ox-mcp) to an agent that advertises `session.mcp.stdio`. |
 | `session/list` | unsupported | supported | claude-code-acp: Lists the bridge's sessions and Claude's native transcripts, 50 per page. oxd: `oxd` keeps its own sessions. |
-| `session/resume` | supported | supported | claude-code-acp: Starts a Claude process if needed. A spawn failure fails the resume request. The bridge proceeds while native initialization runs. With `replayFrom: start` it replays Claude's transcript. It sends the session's state and replies with the command catalog available so far whether replay was requested or omitted. Later catalog updates arrive as `available_commands_update`. Any other cursor is rejected with `-32602`. oxd: [Requests replay to recover missing history](architecture.md#processes), and sends the `ox` MCP server as `session/new` does. |
+| `session/resume` | supported | supported | claude-code-acp: Starts a Claude process if needed. A spawn failure fails the resume request. The bridge proceeds while native initialization runs. With `replayFrom: start` it replays Claude's transcript. It sends the session's state and replies with the command catalog available so far whether replay was requested or omitted. Later catalog updates arrive as `available_commands_update`. Any other cursor is rejected with `-32602`. oxd: See [Resume and replay](#resume-and-replay) for history recovery. Sends the `ox` MCP server as `session/new` does. |
 | `session/close` | unsupported | supported | claude-code-acp: Interrupts and stops the session's `claude`, answers once it has exited, and leaves the session resumable. Closing a session that is not open succeeds. oxd: Deleting a session kills the agent's process group. |
 | `session/prompt` | supported | supported | claude-code-acp: Answers with the `messageId` of the user message the prompt becomes, once `claude` takes the prompt into a turn. A prompt sent during a turn waits for it. A prompt dropped by `session/cancel` before that is answered with `-32800`. oxd: Checks the prompt against the agent's prompt capabilities first. The answer matters only when it is an error: the prompt was not inserted, and the turn ends with that error unless the agent already reported work for it. |
 | `session/set_config_option` | supported | supported | claude-code-acp: Options `model`, `effort`, and `mode`, all selects. oxd: Selects and booleans. |
@@ -177,3 +177,14 @@ shows slash-command completion in the composer from the current catalog: typing 
 | `auth.terminal` | unsupported | unsupported | |
 | `elicitation.form` | supported | supported | claude-code-acp: Decides whether Claude can call AskUserQuestion; see `elicitation/create`. oxd: Advertised in `initialize`; see `elicitation/create`. |
 | `elicitation.url` | unsupported | unsupported | |
+
+## Resume and replay
+
+`oxd` requests `replayFrom: start` on `session/resume` only when its saved
+history lacks an `agent_started` event. The agent sends any requested replay,
+then reports its state before answering. The daemon records the replay once
+the agent starts, so a load that fails partway saves no replay.
+
+An agent that reports it is working leaves the session `running` until its
+`idle`, with no `turn_started` or `turn_ended` for work the history did not
+see start.
