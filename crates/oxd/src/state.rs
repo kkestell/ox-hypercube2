@@ -257,13 +257,10 @@ impl Live {
 }
 
 enum Phase {
-    /// The agent is starting. A resuming agent replays the conversation as
-    /// updates, then reports its state, before it starts. `replay` holds
-    /// them until the agent starts, when they are recorded, or is `None`
-    /// when the session keeps its history and drops the replay. `busy` is
-    /// whether the last state reported was not `idle`, and `background` the
-    /// work it listed. `previous` is the
-    /// agent the session had before it resumed.
+    /// The agent is starting. `replay` buffers updates until the agent starts
+    /// when recovering missing history. On resume, `busy` and `background`
+    /// track the state the agent reports before it starts. `previous` holds
+    /// the saved agent session ID.
     Starting {
         replay: Option<Vec<SessionUpdate>>,
         busy: bool,
@@ -322,9 +319,6 @@ impl Phase {
                 };
                 (Self::Live(live), events)
             }
-            // A resuming agent replays its conversation and reports its state
-            // before it starts. A session that has a history keeps it and
-            // drops the replay.
             (
                 Self::Starting {
                     mut replay,
@@ -530,6 +524,12 @@ pub struct State {
     next_request: u64,
 }
 
+#[derive(Debug)]
+pub struct Resume {
+    pub session_id: String,
+    pub replay: bool,
+}
+
 impl State {
     pub fn new(session_id: String) -> Self {
         Self {
@@ -648,10 +648,9 @@ impl State {
     }
 
     /// Starts a load: the session goes from `exited` to `starting` and
-    /// returns the agent session ID to load. A session whose agent has never
-    /// started records the agent's replay as its history; one whose agent
-    /// has started already has the conversation in its history.
-    pub fn load(&mut self) -> Result<String, ErrorBody> {
+    /// returns what to request from the agent. A session without a recorded
+    /// agent start requests and records replay to recover its conversation.
+    pub fn load(&mut self) -> Result<Resume, ErrorBody> {
         let id = match &self.phase {
             Phase::Exited(Some(agent)) => agent.session_id.clone(),
             Phase::Exited(None) => {
@@ -662,18 +661,21 @@ impl State {
             }
             phase => return Err(invalid_state(phase.state())),
         };
+        let replay = !self
+            .events
+            .iter()
+            .flatten()
+            .any(|event| matches!(event.kind, EventKind::AgentStarted { .. }));
         self.phase = Phase::Starting {
             busy: false,
             background: None,
-            replay: (!self
-                .events
-                .iter()
-                .flatten()
-                .any(|event| matches!(event.kind, EventKind::AgentStarted { .. })))
-            .then(Vec::new),
+            replay: replay.then(Vec::new),
             previous: Some(Agent::saved(id.clone())),
         };
-        Ok(id)
+        Ok(Resume {
+            session_id: id,
+            replay,
+        })
     }
 
     /// Whether the agent is running with nothing to do: no turn, no pending
@@ -1688,7 +1690,9 @@ mod tests {
         assert_eq!(state.last_seq(), 0);
         assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
 
-        assert_eq!(state.load().unwrap(), "agent");
+        let resume = state.load().unwrap();
+        assert_eq!(resume.session_id, "agent");
+        assert!(resume.replay);
         assert_eq!(state.state(), SessionState::Starting);
         state.record(replayed("hello"));
         state.record(Change::Started(Agent {
@@ -1763,7 +1767,7 @@ mod tests {
             kinds(&state, 0),
             ["agent_started", "update", "agent_parked"]
         );
-        assert_eq!(state.load().unwrap(), "agent");
+        assert_eq!(state.load().unwrap().session_id, "agent");
 
         let mut state = State::new("s".into());
         state.record(Change::Parked);
@@ -1774,7 +1778,7 @@ mod tests {
     #[test]
     fn the_resume_snapshot_sets_the_state_without_recording_a_turn() {
         let resumed = |state: &mut State, snapshot: Change| {
-            assert_eq!(state.load().unwrap(), "agent");
+            state.load().unwrap();
             state.record(replayed("hello"));
             state.record(snapshot);
             state.record(Change::Started(Agent {
@@ -1825,7 +1829,7 @@ mod tests {
     fn a_session_with_a_history_loads_without_duplicating_it() {
         let mut state = started();
         state.record(Change::Exited(None));
-        assert_eq!(state.load().unwrap(), "agent");
+        assert!(!state.load().unwrap().replay);
         state.record(replayed("hello"));
         state.record(Change::Started(Agent {
             session_id: "agent".into(),
@@ -1864,7 +1868,7 @@ mod tests {
         assert_eq!(kinds(&state, 0), ["agent_exited"]);
 
         // The failed load recorded no conversation, so the next one does.
-        assert_eq!(state.load().unwrap(), "agent");
+        assert!(state.load().unwrap().replay);
         state.record(replayed("hello"));
         state.record(Change::Started(Agent {
             session_id: "agent".into(),

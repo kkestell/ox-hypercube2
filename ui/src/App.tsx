@@ -31,7 +31,7 @@ export function App() {
   const items = useConversation(session?.id ?? null, connection);
   const request = items.find(
     (item): item is Extract<Item, { type: "permission" | "elicitation" }> =>
-      (item.type === "permission" || item.type === "elicitation") && !item.answered,
+      item.type === "permission" || item.type === "elicitation",
   );
 
   return (

@@ -166,7 +166,6 @@ export type Item =
       request_id: string;
       title: string;
       options: PermissionOption[];
-      answered: boolean;
     }
   | {
       type: "elicitation";
@@ -174,11 +173,12 @@ export type Item =
       request_id: string;
       message: string;
       fields: Field[];
-      answered: boolean;
     }
   | { type: "turn_error"; key: string; message: string }
   | { type: "agent_exited"; key: string; error: string | null }
   | { type: "session_closed"; key: string };
+
+export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
 
 export type WatchMessage =
   | { type: "list"; workspaces: WorkspaceInfo[]; sessions: SessionInfo[] }

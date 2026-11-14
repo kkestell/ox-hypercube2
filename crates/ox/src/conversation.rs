@@ -11,8 +11,7 @@ use ox_protocol::schema::{
 use ox_protocol::{Event, EventKind, MaybeUndefined};
 use serde::Serialize;
 
-/// One element of a conversation. Every item has a `key`; the UI creates
-/// the element for a key it has not seen and updates the one it has.
+/// An item for the UI to insert or update by key, or a request to remove.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
@@ -44,23 +43,22 @@ pub enum Item {
         raw_input: Option<serde_json::Value>,
         content: Vec<ToolContent>,
     },
-    /// A permission request, with its Markdown title. `answered` is set once
-    /// it is resolved.
+    /// A permission request, with its Markdown title.
     Permission {
         key: String,
         request_id: String,
         title: String,
         options: Vec<PermissionOption>,
-        answered: bool,
     },
-    /// A form the agent asks the user to fill in, with its message and
-    /// fields. `answered` is set once it is resolved.
+    /// A form the agent asks the user to fill in, with its message and fields.
     Elicitation {
         key: String,
         request_id: String,
         message: String,
         fields: Vec<Field>,
-        answered: bool,
+    },
+    RequestResolved {
+        request_id: String,
     },
     /// A turn that ended with an error, or stopped short of its end.
     TurnError {
@@ -92,39 +90,6 @@ pub struct Field {
     pub required: bool,
     #[serde(flatten)]
     pub schema: ElicitationPropertySchema,
-}
-
-/// An open request awaiting its outcome.
-enum Request {
-    Permission {
-        title: String,
-        options: Vec<PermissionOption>,
-    },
-    Elicitation {
-        message: String,
-        fields: Vec<Field>,
-    },
-}
-
-impl Request {
-    fn item(&self, request_id: &str, answered: bool) -> Item {
-        match self {
-            Self::Permission { title, options } => Item::Permission {
-                key: format!("permission:{request_id}"),
-                request_id: request_id.into(),
-                title: title.clone(),
-                options: options.clone(),
-                answered,
-            },
-            Self::Elicitation { message, fields } => Item::Elicitation {
-                key: format!("elicitation:{request_id}"),
-                request_id: request_id.into(),
-                message: message.clone(),
-                fields: fields.clone(),
-                answered,
-            },
-        }
-    }
 }
 
 /// A form's properties, in the order of the schema's property map.
@@ -215,11 +180,10 @@ pub struct Conversation {
     in_turn: bool,
     tool_calls: HashMap<ToolCallId, Call>,
     user_messages: HashMap<String, UserMessage>,
-    requests: HashMap<String, Request>,
 }
 
 impl Conversation {
-    /// The items that the next event creates or updates, in order.
+    /// The changes to the conversation from the next event, in order.
     pub fn apply(&mut self, event: &Event) -> Vec<Item> {
         let key = event.seq.to_string();
         match &event.kind {
@@ -254,12 +218,12 @@ impl Conversation {
                     }
                     _ => Vec::new(),
                 };
-                let request = Request::Permission {
+                items.push(Item::Permission {
+                    key: format!("request:{request_id}"),
+                    request_id: request_id.clone(),
                     title: title.clone(),
                     options: options.clone(),
-                };
-                items.push(request.item(request_id, false));
-                self.requests.insert(request_id.clone(), request);
+                });
                 items
             }
             EventKind::ElicitationRequested {
@@ -267,21 +231,17 @@ impl Conversation {
                 message,
                 requested_schema,
                 ..
-            } => {
-                let request = Request::Elicitation {
-                    message: message.clone(),
-                    fields: fields(requested_schema),
-                };
-                let item = request.item(request_id, false);
-                self.requests.insert(request_id.clone(), request);
-                vec![item]
-            }
+            } => vec![Item::Elicitation {
+                key: format!("request:{request_id}"),
+                request_id: request_id.clone(),
+                message: message.clone(),
+                fields: fields(requested_schema),
+            }],
             EventKind::PermissionResolved { request_id, .. }
             | EventKind::ElicitationResolved { request_id, .. } => {
-                let Some(request) = self.requests.remove(request_id) else {
-                    return Vec::new();
-                };
-                vec![request.item(request_id, true)]
+                vec![Item::RequestResolved {
+                    request_id: request_id.clone(),
+                }]
             }
             EventKind::TurnEnded { stop_reason, error } => {
                 self.in_turn = false;
@@ -775,22 +735,15 @@ mod tests {
                 )),
             },
         ]);
-        let answers: Vec<(String, bool)> = items
-            .into_iter()
-            .map(|item| match item {
-                Item::Permission { key, answered, .. } => (key, answered),
-                other => panic!("{other:?}"),
-            })
-            .collect();
-        assert_eq!(
-            answers,
+        assert!(matches!(
+            &items[..],
             [
-                ("permission:1".into(), false),
-                ("permission:2".into(), false),
-                ("permission:2".into(), true),
-                ("permission:1".into(), true),
-            ]
-        );
+                Item::Permission { request_id: first, .. },
+                Item::Permission { request_id: second, .. },
+                Item::RequestResolved { request_id: resolved_second },
+                Item::RequestResolved { request_id: resolved_first },
+            ] if first == "1" && second == "2" && second == resolved_second && first == resolved_first
+        ));
     }
 
     #[test]
@@ -825,37 +778,41 @@ mod tests {
                 action: ElicitationAction::Decline,
             },
         ]);
-        let item = |answered: bool| {
-            json!({
-                "type": "elicitation",
-                "key": "elicitation:1",
-                "request_id": "1",
-                "message": "Order",
-                "fields": [
-                    {
-                        "name": "color",
-                        "required": true,
-                        "type": "string",
-                        "title": "Color",
-                        "oneOf": [{"const": "red", "title": "Red", "description": "Warm"}]
-                    },
-                    {"name": "count", "required": false, "type": "integer", "minimum": 1},
-                    {
-                        "name": "note",
-                        "required": false,
-                        "type": "string",
-                        "title": "Note",
-                        "maxLength": 20
-                    }
-                ],
-                "answered": answered
-            })
-        };
+        let item = json!({
+            "type": "elicitation",
+            "key": "request:1",
+            "request_id": "1",
+            "message": "Order",
+            "fields": [
+                {
+                    "name": "color",
+                    "required": true,
+                    "type": "string",
+                    "title": "Color",
+                    "oneOf": [{"const": "red", "title": "Red", "description": "Warm"}]
+                },
+                {"name": "count", "required": false, "type": "integer", "minimum": 1},
+                {
+                    "name": "note",
+                    "required": false,
+                    "type": "string",
+                    "title": "Note",
+                    "maxLength": 20
+                }
+            ]
+        });
         let items: Vec<serde_json::Value> = items
             .iter()
             .map(|item| serde_json::to_value(item).unwrap())
             .collect();
-        assert_eq!(items, [item(false), item(true)]);
+        assert_eq!(
+            items,
+            [
+                item,
+                json!({"type": "request_resolved", "request_id": "2"}),
+                json!({"type": "request_resolved", "request_id": "1"}),
+            ]
+        );
     }
 
     #[test]

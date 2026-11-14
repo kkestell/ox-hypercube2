@@ -74,6 +74,7 @@
 //! - `--hang-initialize`: never answer `initialize`
 //! - `--text-only`: advertise no prompt capabilities
 //! - `--no-sessions`: advertise no session capabilities
+//! - `--no-resume-replay`: reject a resume request that asks for replay
 //! - `--busy-on-resume`: report `running` when a session resumes, and
 //!   `idle` with the stop reason `cancelled` once it is cancelled
 //! - `--turn-after-resume`: after answering `session/resume`, run a turn of
@@ -456,7 +457,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     let replay = match request.replay_from {
                         None => false,
-                        Some(acp::ReplayFrom::Start(_)) => true,
+                        Some(acp::ReplayFrom::Start(_)) if !flag("--no-resume-replay") => true,
                         Some(_) => {
                             return responder.respond_with_error(
                                 Error::invalid_params().data("unsupported replay cursor"),

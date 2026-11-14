@@ -21,7 +21,7 @@ use tokio::sync::{Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::branches;
-use crate::state::{self, Change, Request, State, invalid_state};
+use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, SavedWorktree, Store};
 use crate::worktree::{self, Git, WorktreePlan};
 
@@ -300,23 +300,21 @@ impl Session {
         Self::new(store, changed, saved, state, park_after)
     }
 
-    /// Starts the agent task in `task`, which opens a new ACP session or
-    /// resumes the agent session `load`.
+    /// Starts the agent task in `task`, which opens or resumes an ACP session.
     fn launch(
         self: &Arc<Self>,
         task: &mut Option<JoinHandle<()>>,
         env: BTreeMap<String, String>,
-        load: Option<String>,
+        resume: Option<Resume>,
     ) {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         *self.commands.lock().unwrap() = commands;
-        *task = Some(tokio::spawn(self.clone().run(commands_rx, env, load)));
+        *task = Some(tokio::spawn(self.clone().run(commands_rx, env, resume)));
     }
 
     /// Starts a new agent on an exited session that has an agent session ID,
-    /// which resumes the session and replays its conversation. The session
-    /// records `AgentStarted` once the agent has resumed it, or `AgentExited`
-    /// if it cannot.
+    /// resuming it with replay if the history has no recorded agent start.
+    /// Records `AgentStarted` on success or `AgentExited` on failure.
     pub fn load(self: &Arc<Self>, env: BTreeMap<String, String>) -> Result<(), ErrorBody> {
         if self.archived() {
             return Err(ErrorBody {
@@ -336,8 +334,8 @@ impl Session {
         // Holding the task slot keeps a concurrent `close` from missing the
         // new task.
         let mut task = self.task.lock().unwrap();
-        let agent_session_id = self.update(State::load)?;
-        self.launch(&mut task, env, Some(agent_session_id));
+        let resume = self.update(State::load)?;
+        self.launch(&mut task, env, Some(resume));
         Ok(())
     }
 
@@ -670,7 +668,7 @@ impl Session {
         self: Arc<Self>,
         mut commands: mpsc::UnboundedReceiver<Command>,
         env: BTreeMap<String, String>,
-        load: Option<String>,
+        resume: Option<Resume>,
     ) {
         let config = AcpAgentConfig::new(&self.command[0])
             .args(self.command[1..].iter().cloned())
@@ -771,7 +769,7 @@ impl Session {
                         return Err(agent_client_protocol::Error::invalid_request()
                             .data("the agent does not support sessions"));
                     };
-                    // A resuming agent replays the conversation and reports
+                    // A resuming agent sends any requested replay and reports
                     // its state as notifications before it answers. The
                     // session starts in an ordered callback on the answer,
                     // which the dispatch loop finishes before it reads what
@@ -790,15 +788,17 @@ impl Session {
                             let _ = opened.send(result);
                         }
                     };
-                    match load {
-                        Some(id) => connection
+                    match resume {
+                        Some(Resume { session_id, replay }) => connection
                             .prepare_request(
-                                ResumeSessionRequest::new(id.clone(), session.cwd.clone())
-                                    .replay_from(ReplayFrom::Start(ReplayFromStart::new())),
+                                ResumeSessionRequest::new(session_id.clone(), session.cwd.clone())
+                                    .replay_from(
+                                        replay.then(|| ReplayFrom::Start(ReplayFromStart::new())),
+                                    ),
                             )
                             .on_receiving_result(async move |result| {
                                 start(result.map(|resumed| state::Agent {
-                                    session_id: id,
+                                    session_id,
                                     prompt_capabilities,
                                     config_options: resumed.config_options,
                                     available_commands: resumed.available_commands,

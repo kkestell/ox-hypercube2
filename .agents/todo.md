@@ -199,13 +199,13 @@ agent can begin work after the move's busy check.
 
 ## Simplifications
 
-- [ ] Request ACP conversation replay only when the saved history needs it.
+- [x] Request ACP conversation replay only when the saved history needs it.
   Use the existing `AgentStarted` check when choosing whether to send a
   replay cursor. Preserve the fallback for missing history and the live
   state, settings, and command updates on resume.
   [History check](../crates/oxd/src/state.rs) ·
   [Resume request](../crates/oxd/src/session.rs)
-- [ ] Resolve desktop questions and permissions by request ID. Send the ID
+- [x] Resolve desktop questions and permissions by request ID. Send the ID
   when a request is resolved so React can remove its existing item. Drop
   the duplicate request map from the Rust transcript fold and keep the
   saved events and CLI stream as they are.

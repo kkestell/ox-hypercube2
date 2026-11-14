@@ -61,6 +61,10 @@ describe("A session", () => {
     await expect(permission).not.toBeExisting();
     await expect($(".conversation .request-panel")).not.toBeExisting();
     await expect(sessionEntry(cwd).$('[aria-label="Awaiting permission"]')).not.toBeExisting();
+
+    await browser.refresh();
+    await expect(agentText()[0]).toHaveText("allowed");
+    await expect(permission).not.toBeExisting();
   });
 
   it("asks the agent's questions above the composer", async () => {

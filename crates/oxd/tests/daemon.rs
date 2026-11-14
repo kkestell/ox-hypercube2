@@ -1663,7 +1663,9 @@ async fn a_deleted_session_is_not_saved() {
 async fn loading_a_restored_session_keeps_its_stored_history() {
     let mut first = Daemon::start(1000).await;
     let client = first.client().await;
-    let (session, started) = first.new_session(&client).await;
+    let (session, started) = first
+        .new_session_with(&client, &["--no-resume-replay"])
+        .await;
     let agent_session_id = session.agent_session_id.clone().unwrap();
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     client
@@ -1709,7 +1711,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
         .await
         .unwrap();
     assert_eq!(loaded.state, SessionState::Starting);
-    // The agent's replay is not recorded again.
+    // The fake agent only accepts a resume without a replay cursor.
     let restarted = next(&mut events).await;
     assert_eq!(restarted.seq, last_seq + 1);
     assert!(matches!(
@@ -1719,11 +1721,42 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
     let loaded = info(&client, &loaded.id).await;
     assert_eq!(loaded.state, SessionState::Idle);
     assert_eq!(loaded.title.as_deref(), Some("Replay me"));
+    assert_eq!(loaded.config_options, session.config_options);
+    assert_eq!(loaded.available_commands, session.available_commands);
 
     client.prompt(&loaded.id, text("say 1 0")).await.unwrap();
     let turn = until(&mut events, turn_ended).await;
     assert_eq!(chunks(&turn), ["chunk-1"]);
     assert_contiguous(&turn, last_seq + 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loading_a_restored_session_recovers_missing_history_from_the_agent() {
+    let mut first = Daemon::start(1000).await;
+    let client = first.client().await;
+    let (session, started) = first.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client.prompt(&session.id, text("say 1 0")).await.unwrap();
+    until(&mut events, turn_ended).await;
+    drop(events);
+    drop(client);
+    first.stop().await;
+
+    let database = rusqlite::Connection::open(first.dir.path().join("oxd.sock.db")).unwrap();
+    database
+        .execute("DELETE FROM events WHERE session_id = ?1", [&session.id])
+        .unwrap();
+    drop(database);
+
+    let second = first.again(1000).await;
+    let client = second.client().await;
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    client
+        .load_session(&session.id, BTreeMap::new())
+        .await
+        .unwrap();
+    let recovered = until(&mut events, agent_started).await;
+    assert_eq!(replayed(&recovered), ["user: say 1 0", "agent: chunk-1"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

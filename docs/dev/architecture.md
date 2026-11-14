@@ -311,16 +311,13 @@ deletes an archived session as any other.
 `session.load` restarts the agent of an exited session that has an agent
 session ID, from the session's stored command and directory, on the same
 session: the session ID, subscriptions, and sidebar selection stay the same,
-and the session goes through `starting` to `idle` as a new one does. The agent
-replays the conversation, then reports its state, before it answers
-`session/resume` with `replayFrom: start`. An agent that reports it is working
-leaves the session `running` until its `idle`, with no `turn_started` or
-`turn_ended` for work the history did not see start. A session whose
-agent has not started yet, or has no stored events, records the replay as
-its history once the agent starts, so a load that fails partway records none
-of it; one whose agent has started, such as one that crashed or was
-restored from the database, keeps its history and drops the replay, and its history shows a second `agent_started` after the
-`agent_exited`.
+and the session goes through `starting` to `idle` as a new one does. The
+daemon sends `replayFrom: start` on `session/resume` only if the history lacks
+an `agent_started` event. The agent sends any requested replay, then reports
+its state before answering. The daemon records the replay once the agent
+starts, so a load that fails partway saves no replay. An agent that reports
+it is working leaves the session `running` until its `idle`, with no
+`turn_started` or `turn_ended` for work the history did not see start.
 
 **claude-code-acp.** An ACP agent, speaking draft protocol v2, that bridges to
 the Claude Code CLI. [`acp-v2.md`](acp-v2.md) charts its support of the
