@@ -1,27 +1,18 @@
-//! oxctl: a command-line client for oxd.
+//! Daemon client for the desktop end-to-end and live Claude smoke tests.
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use clap::{Parser, Subcommand};
 use ox_protocol::schema::{
-    ContentBlock, ElicitationAcceptAction, ElicitationAction, ElicitationPropertySchema,
-    ElicitationSchema, EmbeddedResourceResource, ImageContent, MultiSelectItems,
-    RequestPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigSelectOptions,
-    SessionUpdate, StateUpdate, StopReason, TextContent, ToolCallStatus,
+    ContentBlock, ElicitationAcceptAction, ElicitationAction, SessionConfigKind, TextContent,
 };
-use ox_protocol::{
-    Checkout, Client, Comparison, ConfigValue, End, Event, EventKind, SessionState, WorktreeBranch,
-    content,
-};
+use ox_protocol::{Checkout, Client, Comparison, ConfigValue, End, EventKind, SessionState};
 
 #[derive(Parser)]
-#[command(name = "oxctl", about = "Control oxd sessions")]
+#[command(name = "oxctl", about = "Daemon client for Ox integration tests")]
 struct Cli {
     /// oxd socket [default: $`OX_SOCKET`, else oxd.sock in $`XDG_DATA_HOME`/ox, else ~/.local/share/ox]
     #[arg(long, global = true)]
@@ -46,23 +37,10 @@ enum Command {
         workspace: String,
         /// Run in a new worktree of the workspace's repository, on a new
         /// branch named for the session
-        #[arg(long, group = "checkout")]
+        #[arg(long)]
         worktree: bool,
-        /// Run in a new worktree on this existing branch: a local branch, or
-        /// a remote branch to track
-        #[arg(long, group = "checkout")]
-        branch: Option<String>,
-        /// Run in a new worktree on this new branch
-        #[arg(long, group = "checkout")]
-        new_branch: Option<String>,
-        /// Start the new branch at this commit [default: HEAD]
-        #[arg(long, requires = "new_branch")]
-        start: Option<String>,
-        /// Compare the worktree's branch with this ref, such as main
-        #[arg(long, requires = "checkout")]
-        compare: Option<String>,
-        /// Agent command [default: claude-code-acp]
-        #[arg(last = true)]
+        /// Agent command
+        #[arg(last = true, required = true)]
         command: Vec<String>,
     },
     /// Restart the agent of an exited session, replaying its conversation,
@@ -71,35 +49,20 @@ enum Command {
         /// The session's id, as `ls` shows it
         session: String,
     },
-    /// Send a prompt
-    Prompt {
-        session: String,
-        text: String,
-        /// Attach an image (PNG, JPEG, GIF or WebP)
-        #[arg(long)]
-        image: Vec<PathBuf>,
-        /// Reference a file the agent can read
-        #[arg(long)]
-        file: Vec<PathBuf>,
-    },
-    /// Print a session's config options, or set one
+    /// Send a text prompt
+    Prompt { session: String, text: String },
+    /// Set a session's select option and print its current value
     Config {
         session: String,
-        /// Option to set
-        #[arg(requires = "value")]
-        option: Option<String>,
-        /// New value: a value id, or true or false
-        value: Option<String>,
+        option: String,
+        value: String,
     },
-    /// Print a session's events, then follow live events
+    /// Replay a session's events and follow live events as JSON lines
     Attach {
         session: String,
         /// Print only events after this seq
         #[arg(long, default_value_t = 0)]
         after: u64,
-        /// Print each event as a JSON line
-        #[arg(long)]
-        json: bool,
     },
     /// Answer a permission request
     Permit {
@@ -107,19 +70,12 @@ enum Command {
         request_id: String,
         option_id: String,
     },
-    /// Answer an elicitation
+    /// Accept an elicitation
     Answer {
         session: String,
         request_id: String,
         /// The form's content as a JSON object, such as '{"color": "blue"}'
-        #[arg(required_unless_present_any = ["decline", "cancel"])]
-        content: Option<String>,
-        /// Decline the elicitation
-        #[arg(long, conflicts_with_all = ["content", "cancel"])]
-        decline: bool,
-        /// Cancel the elicitation
-        #[arg(long, conflicts_with = "content")]
-        cancel: bool,
+        content: String,
     },
     /// Cancel the running turn
     Cancel { session: String },
@@ -135,44 +91,11 @@ enum Command {
     },
     /// Stop a session's agent and remove its worktree, keeping the branch
     /// and the conversation
-    Archive {
-        session: String,
-        /// Remove the worktree even if that loses uncommitted changes or
-        /// commits
-        #[arg(long)]
-        discard: bool,
-    },
+    Archive { session: String },
     /// Add an archived session's worktree again
     Unarchive { session: String },
-    /// Print how a worktree session's branch compares with its comparison
-    /// ref, after setting the ref, clearing it, or comparing again: the ref,
-    /// the branch's commit, the ref's commit, and the commits ahead and
-    /// behind
-    Compare {
-        session: String,
-        /// Compare with this ref, such as main
-        #[arg(value_name = "REF")]
-        reference: Option<String>,
-        /// Stop comparing the session's branch
-        #[arg(long, conflicts_with = "reference")]
-        clear: bool,
-    },
-    /// Set a branch of a workspace's repository to a commit, moving the
-    /// checkout that has the branch along with it
-    MoveBranch {
-        /// The workspace's id, as `workspace ls` shows it
-        #[arg(long)]
-        workspace: String,
-        branch: String,
-        /// The commit to move the branch to
-        to: String,
-        /// The commit the branch must be at
-        #[arg(long)]
-        expected: String,
-        /// Move the branch even if that is not a fast-forward
-        #[arg(long)]
-        force: bool,
-    },
+    /// Refresh and print a worktree session's branch comparison
+    Compare { session: String },
 }
 
 #[derive(Subcommand)]
@@ -234,31 +157,15 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::New {
             workspace,
             worktree,
-            branch,
-            new_branch,
-            start,
-            compare,
             command,
         } => {
-            let command = if command.is_empty() {
-                vec!["claude-code-acp".to_owned()]
-            } else {
-                command
-            };
-            let checkout = match (branch, new_branch) {
-                (Some(name), _) => Checkout::Worktree {
-                    branch: Some(WorktreeBranch::Existing { name }),
-                    compare,
-                },
-                (_, Some(name)) => Checkout::Worktree {
-                    branch: Some(WorktreeBranch::New { name, start }),
-                    compare,
-                },
-                (None, None) if worktree => Checkout::Worktree {
+            let checkout = if worktree {
+                Checkout::Worktree {
                     branch: None,
-                    compare,
-                },
-                (None, None) => Checkout::Workspace,
+                    compare: None,
+                }
+            } else {
+                Checkout::Workspace
             };
             let session = client
                 .new_session(&workspace, command, utf8_env(), checkout)
@@ -269,19 +176,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             client.load_session(&session, utf8_env()).await?;
             println!("{}", loaded(&client, &session).await?);
         }
-        Command::Prompt {
-            session,
-            text,
-            image,
-            file,
-        } => {
-            let mut prompt = vec![ContentBlock::Text(TextContent::new(text))];
-            for path in image {
-                prompt.push(image_block(&path)?);
-            }
-            for path in file {
-                prompt.push(content::file_link(&path)?);
-            }
+        Command::Prompt { session, text } => {
+            let prompt = vec![ContentBlock::Text(TextContent::new(text))];
             client.prompt(&session, prompt).await?;
         }
         Command::Config {
@@ -289,45 +185,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             option,
             value,
         } => {
-            let info = client
-                .list()
-                .await?
+            let options = client
+                .set_config_option(&session, &option, ConfigValue::Id(value))
+                .await?;
+            let current = options
                 .into_iter()
-                .find(|info| info.id == session)
-                .ok_or_else(|| format!("no session {session}"))?;
-            let options = match (option, value) {
-                (Some(option), Some(value)) => {
-                    let boolean = info.config_options.iter().any(|candidate| {
-                        *candidate.config_id.0 == *option
-                            && matches!(candidate.kind, SessionConfigKind::Boolean(_))
-                    });
-                    let value =
-                        if boolean {
-                            ConfigValue::Boolean(value.parse().map_err(|_| {
-                                format!("{option} takes true or false, not {value}")
-                            })?)
-                        } else {
-                            ConfigValue::Id(value)
-                        };
-                    client.set_config_option(&session, &option, value).await?
-                }
-                _ => info.config_options,
+                .find(|candidate| *candidate.config_id.0 == *option);
+            let Some(SessionConfigKind::Select(select)) = current.map(|config| config.kind) else {
+                return Err(
+                    format!("the agent did not return a select option for {option}").into(),
+                );
             };
-            for option in &options {
-                println!("{}", describe_option(option));
-            }
+            println!("{}", select.current_value);
         }
-        Command::Attach {
-            session,
-            after,
-            json,
-        } => {
+        Command::Attach { session, after } => {
             let mut events = client.subscribe(&session, after).await?;
-            let mut printer = Printer::default();
             loop {
                 match events.next().await {
-                    Ok(event) if json => println!("{}", serde_json::to_string(&event)?),
-                    Ok(event) => printer.print(&event),
+                    Ok(event) => println!("{}", serde_json::to_string(&event)?),
                     Err(End::SessionClosed) => break,
                     Err(End::Disconnected) => return Err(ox_protocol::Error::Closed.into()),
                 }
@@ -342,48 +217,26 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             session,
             request_id,
             content,
-            decline,
-            cancel,
         } => {
-            let action = match content {
-                _ if decline => ElicitationAction::Decline,
-                _ if cancel => ElicitationAction::Cancel,
-                Some(content) => {
-                    ElicitationAction::Accept(ElicitationAcceptAction::new().content(
-                        serde_json::from_str::<BTreeMap<_, _>>(&content).map_err(|error| {
-                            format!("the content is not a JSON object: {error}")
-                        })?,
-                    ))
-                }
-                None => unreachable!("clap requires content without --decline or --cancel"),
-            };
+            let fields = serde_json::from_str::<BTreeMap<_, _>>(&content)
+                .map_err(|error| format!("the content is not a JSON object: {error}"))?;
+            let action = ElicitationAction::Accept(ElicitationAcceptAction::new().content(fields));
             client
                 .respond_elicitation(&session, &request_id, action)
                 .await?;
         }
         Command::Cancel { session } => client.cancel(&session).await?,
         Command::Delete { session, discard } => {
-            let deleted = client.delete(&session, discard, utf8_env()).await?;
-            if let Some(branch) = deleted.kept_branch {
-                println!("kept branch {branch}");
-            }
+            client.delete(&session, discard, utf8_env()).await?;
         }
-        Command::Archive { session, discard } => {
-            client.archive(&session, discard, utf8_env()).await?;
+        Command::Archive { session } => {
+            client.archive(&session, false, utf8_env()).await?;
         }
         Command::Unarchive { session } => {
             client.unarchive(&session, utf8_env()).await?;
         }
-        Command::Compare {
-            session,
-            reference,
-            clear,
-        } => {
-            let info = match reference {
-                Some(reference) => client.set_compare(&session, Some(reference)).await?,
-                None if clear => client.set_compare(&session, None).await?,
-                None => client.refresh(&session).await?,
-            };
+        Command::Compare { session } => {
+            let info = client.refresh(&session).await?;
             let reference = info.worktree.and_then(|worktree| worktree.compare);
             match (reference, info.comparison) {
                 (
@@ -399,72 +252,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 _ => {}
             }
         }
-        Command::MoveBranch {
-            workspace,
-            branch,
-            to,
-            expected,
-            force,
-        } => {
-            client
-                .move_branch(&workspace, &branch, &to, &expected, force, utf8_env())
-                .await?;
-        }
     }
     Ok(())
-}
-
-fn image_block(path: &Path) -> Result<ContentBlock, Box<dyn Error>> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(str::to_ascii_lowercase);
-    let mime_type = match extension.as_deref() {
-        Some("png") => "image/png",
-        Some("jpg" | "jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        _ => {
-            return Err(format!("{} is not a PNG, JPEG, GIF or WebP image", path.display()).into());
-        }
-    };
-    let data = std::fs::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
-    Ok(ContentBlock::Image(ImageContent::new(
-        STANDARD.encode(data),
-        mime_type,
-    )))
-}
-
-/// One line per option: id, current value, and the values it takes.
-fn describe_option(option: &SessionConfigOption) -> String {
-    match &option.kind {
-        SessionConfigKind::Select(select) => {
-            let values: Vec<String> = match &select.options {
-                SessionConfigSelectOptions::Ungrouped(options) => {
-                    options.iter().map(|o| o.value.to_string()).collect()
-                }
-                SessionConfigSelectOptions::Grouped(groups) => groups
-                    .iter()
-                    .flat_map(|group| &group.options)
-                    .map(|o| o.value.to_string())
-                    .collect(),
-                _ => Vec::new(),
-            };
-            format!(
-                "{}\t{}\t{}",
-                option.config_id.0,
-                select.current_value,
-                values.join(", ")
-            )
-        }
-        SessionConfigKind::Boolean(boolean) => {
-            format!(
-                "{}\t{}\ttrue, false",
-                option.config_id.0, boolean.current_value
-            )
-        }
-        _ => format!("{}\t?", option.config_id.0),
-    }
 }
 
 /// Waits for a session's agent to start and returns the session's id. A
@@ -523,353 +312,4 @@ fn utf8_env() -> BTreeMap<String, String> {
     std::env::vars_os()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect()
-}
-
-/// Prints agent message chunks as running text and every other event on a
-/// line of its own, prefixed with its seq.
-#[derive(Default)]
-struct Printer {
-    mid_line: bool,
-}
-
-impl Printer {
-    fn print(&mut self, event: &Event) {
-        let mut stdout = std::io::stdout().lock();
-        if let EventKind::Update(SessionUpdate::AgentMessageChunk(chunk)) = &event.kind
-            && let ContentBlock::Text(text) = &chunk.content
-        {
-            let _ = write!(stdout, "{}", text.text);
-            let _ = stdout.flush();
-            self.mid_line = !text.text.ends_with('\n');
-            return;
-        }
-        if self.mid_line {
-            let _ = writeln!(stdout);
-            self.mid_line = false;
-        }
-        let _ = writeln!(stdout, "{} {}", event.seq, describe(&event.kind));
-    }
-}
-
-fn describe(kind: &EventKind) -> String {
-    match kind {
-        EventKind::AgentStarted { .. } => "agent started".into(),
-        EventKind::PromptStarted { prompt } => {
-            let parts: Vec<String> = prompt.iter().map(describe_block).collect();
-            format!("prompt: {}", parts.join(" "))
-        }
-        EventKind::TurnStarted => "turn started".into(),
-        EventKind::Update(update) => describe_update(update),
-        EventKind::PermissionRequested {
-            request_id,
-            title,
-            options,
-            ..
-        } => {
-            let options: Vec<String> = options
-                .iter()
-                .map(|option| format!("{} ({})", option.option_id.0, option.name))
-                .collect();
-            format!(
-                "permission {request_id}: {title}; options: {}",
-                options.join(", ")
-            )
-        }
-        EventKind::PermissionResolved {
-            request_id,
-            outcome,
-        } => match outcome {
-            RequestPermissionOutcome::Selected(selected) => {
-                format!("permission {request_id}: {}", selected.option_id.0)
-            }
-            _ => format!("permission {request_id}: cancelled"),
-        },
-        EventKind::ElicitationRequested {
-            request_id,
-            message,
-            requested_schema,
-            ..
-        } => format!(
-            "elicitation {request_id}: {message}; fields: {}",
-            describe_fields(requested_schema)
-        ),
-        EventKind::ElicitationResolved { request_id, action } => match action {
-            ElicitationAction::Accept(accepted) => format!(
-                "elicitation {request_id}: accepted {}",
-                serde_json::to_string(&accepted.content.clone().unwrap_or_default())
-                    .expect("content serializes")
-            ),
-            ElicitationAction::Decline => format!("elicitation {request_id}: declined"),
-            _ => format!("elicitation {request_id}: cancelled"),
-        },
-        EventKind::TurnEnded { stop_reason, error } => match (stop_reason, error) {
-            (_, Some(error)) => format!("turn ended: {error}"),
-            (Some(reason), None) => format!("turn ended: {}", stop_reason_name(reason)),
-            (None, None) => "turn ended".into(),
-        },
-        EventKind::AgentExited { error: Some(error) } => format!("agent exited: {error}"),
-        EventKind::AgentExited { error: None } => "agent exited".into(),
-        EventKind::AgentParked => "agent parked".into(),
-        EventKind::SessionClosed => "session closed".into(),
-    }
-}
-
-/// A form's fields, in the schema's order: `name (title: kind)`.
-fn describe_fields(schema: &ElicitationSchema) -> String {
-    let fields: Vec<String> = schema
-        .properties
-        .iter()
-        .map(|(name, property)| {
-            let (title, kind) = match property {
-                ElicitationPropertySchema::String(string) => {
-                    let choices = string
-                        .enum_values
-                        .clone()
-                        .or_else(|| {
-                            string
-                                .one_of
-                                .as_ref()
-                                .map(|options| options.iter().map(|o| o.value.clone()).collect())
-                        })
-                        .map(|choices| format!("one of {}", choices.join(", ")));
-                    (&string.title, choices.unwrap_or_else(|| "text".into()))
-                }
-                ElicitationPropertySchema::Number(number) => (&number.title, "number".into()),
-                ElicitationPropertySchema::Integer(integer) => (&integer.title, "integer".into()),
-                ElicitationPropertySchema::Boolean(boolean) => (&boolean.title, "boolean".into()),
-                ElicitationPropertySchema::Array(array) => {
-                    let choices: Vec<&str> = match &array.items {
-                        MultiSelectItems::String(items) => {
-                            items.values.iter().map(String::as_str).collect()
-                        }
-                        MultiSelectItems::Titled(items) => {
-                            items.options.iter().map(|o| o.value.as_str()).collect()
-                        }
-                        _ => Vec::new(),
-                    };
-                    (&array.title, format!("any of {}", choices.join(", ")))
-                }
-                ElicitationPropertySchema::Other(other) => (&None, other.type_.clone()),
-                _ => (&None, "unknown".into()),
-            };
-            match title {
-                Some(title) => format!("{name} ({title}: {kind})"),
-                None => format!("{name} ({kind})"),
-            }
-        })
-        .collect();
-    fields.join(", ")
-}
-
-fn describe_block(block: &ContentBlock) -> String {
-    match block {
-        ContentBlock::Text(text) => text.text.clone(),
-        ContentBlock::Image(image) => format!("[image {}]", image.mime_type),
-        ContentBlock::Audio(audio) => format!("[audio {}]", audio.mime_type),
-        ContentBlock::ResourceLink(link) => format!("[{}]", link.uri),
-        ContentBlock::Resource(resource) => match &resource.resource {
-            EmbeddedResourceResource::TextResourceContents(text) => format!("[{}]", text.uri),
-            EmbeddedResourceResource::BlobResourceContents(blob) => format!("[{}]", blob.uri),
-            _ => "[resource]".into(),
-        },
-        _ => "[content]".into(),
-    }
-}
-
-fn describe_update(update: &SessionUpdate) -> String {
-    match update {
-        SessionUpdate::AgentThoughtChunk(chunk)
-        | SessionUpdate::UserMessageChunk(chunk)
-        | SessionUpdate::AgentMessageChunk(chunk) => {
-            format!("{}: {}", update_name(update), block_text(&chunk.content))
-        }
-        SessionUpdate::UserMessage(message) => {
-            format!(
-                "{}: {}",
-                update_name(update),
-                blocks_text(message.content.clone().take().as_deref())
-            )
-        }
-        SessionUpdate::AgentMessage(message) => {
-            format!(
-                "{}: {}",
-                update_name(update),
-                blocks_text(message.content.clone().take().as_deref())
-            )
-        }
-        SessionUpdate::AgentThought(thought) => {
-            format!(
-                "{}: {}",
-                update_name(update),
-                blocks_text(thought.content.clone().take().as_deref())
-            )
-        }
-        SessionUpdate::StateUpdate(state) => match state {
-            StateUpdate::Idle(idle) => match &idle.stop_reason {
-                Some(reason) => format!("state: idle ({})", stop_reason_name(reason)),
-                None => "state: idle".into(),
-            },
-            StateUpdate::Running(_) => "state: running".into(),
-            StateUpdate::RequiresAction(_) => "state: requires_action".into(),
-            _ => "state: other".into(),
-        },
-        SessionUpdate::ConfigOptionUpdate(update) => {
-            let options: Vec<String> = update
-                .config_options
-                .iter()
-                .map(|option| match &option.kind {
-                    SessionConfigKind::Select(select) => {
-                        format!("{}={}", option.config_id.0, select.current_value)
-                    }
-                    SessionConfigKind::Boolean(boolean) => {
-                        format!("{}={}", option.config_id.0, boolean.current_value)
-                    }
-                    _ => option.config_id.0.to_string(),
-                })
-                .collect();
-            format!("config: {}", options.join(", "))
-        }
-        SessionUpdate::ToolCallUpdate(call) => {
-            let detail = match (call.title.clone().take(), call.status.clone().take()) {
-                (Some(title), _) => title,
-                (None, Some(status)) => status_name(&status).into(),
-                (None, None) => "updated".into(),
-            };
-            format!("tool call {}: {detail}", call.tool_call_id.0)
-        }
-        _ => update_name(update).into(),
-    }
-}
-
-/// The text of a content block, empty for a block that is not text.
-fn block_text(block: &ContentBlock) -> &str {
-    match block {
-        ContentBlock::Text(text) => text.text.as_str(),
-        _ => "",
-    }
-}
-
-/// The text of a message's content, which a snapshot may leave unchanged or
-/// clear.
-fn blocks_text(content: Option<&[ContentBlock]>) -> String {
-    content.unwrap_or_default().iter().map(block_text).collect()
-}
-
-/// The `sessionUpdate` name of an update.
-fn update_name(update: &SessionUpdate) -> &'static str {
-    match update {
-        SessionUpdate::UserMessageChunk(_) => "user_message_chunk",
-        SessionUpdate::UserMessage(_) => "user_message",
-        SessionUpdate::AgentMessageChunk(_) => "agent_message_chunk",
-        SessionUpdate::AgentMessage(_) => "agent_message",
-        SessionUpdate::AgentThoughtChunk(_) => "agent_thought_chunk",
-        SessionUpdate::AgentThought(_) => "agent_thought",
-        SessionUpdate::StateUpdate(_) => "state_update",
-        SessionUpdate::ToolCallContentChunk(_) => "tool_call_content_chunk",
-        SessionUpdate::ToolCallUpdate(_) => "tool_call_update",
-        SessionUpdate::TerminalUpdate(_) => "terminal_update",
-        SessionUpdate::TerminalOutputChunk(_) => "terminal_output_chunk",
-        SessionUpdate::PlanUpdate(_) => "plan_update",
-        SessionUpdate::AvailableCommandsUpdate(_) => "available_commands_update",
-        SessionUpdate::ConfigOptionUpdate(_) => "config_option_update",
-        SessionUpdate::SessionInfoUpdate(_) => "session_info_update",
-        SessionUpdate::UsageUpdate(_) => "usage_update",
-        SessionUpdate::Notice(_) => "notice",
-        SessionUpdate::CompactionUpdate(_) => "compaction_update",
-        SessionUpdate::CompactionSummaryChunk(_) => "compaction_summary_chunk",
-        _ => "update",
-    }
-}
-
-/// The name of a stop reason, with the failure's message for `error`.
-fn stop_reason_name(reason: &StopReason) -> String {
-    match reason {
-        StopReason::EndTurn => "end_turn".into(),
-        StopReason::MaxTokens => "max_tokens".into(),
-        StopReason::MaxTurnRequests => "max_turn_requests".into(),
-        StopReason::Refusal => "refusal".into(),
-        StopReason::Cancelled => "cancelled".into(),
-        StopReason::Error(details) => match &details.error {
-            Some(error) => format!("error: {}", error.message),
-            None => "error".into(),
-        },
-        StopReason::Other(other) => other.stop_reason.clone(),
-        _ => "other".into(),
-    }
-}
-
-fn status_name(status: &ToolCallStatus) -> &'static str {
-    match status {
-        ToolCallStatus::Pending => "pending",
-        ToolCallStatus::InProgress => "in_progress",
-        ToolCallStatus::Completed => "completed",
-        ToolCallStatus::Failed => "failed",
-        _ => "other",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn elicitations_are_described() {
-        let requested: EventKind = serde_json::from_value(json!({
-            "type": "elicitation_requested",
-            "data": {
-                "request_id": "3",
-                "message": "Order",
-                "tool_call_id": null,
-                "requested_schema": {
-                    "type": "object",
-                    "properties": {
-                        "color": {
-                            "type": "string",
-                            "title": "Color",
-                            "oneOf": [{"const": "red", "title": "Red"}, {"const": "blue", "title": "Blue"}]
-                        },
-                        "count": {"type": "integer", "title": "Count"},
-                        "extras": {
-                            "type": "array",
-                            "title": "Extras",
-                            "items": {"anyOf": [{"const": "nuts", "title": "Nuts"}]}
-                        },
-                        "location": {"type": "_point"},
-                        "note": {"type": "string"},
-                        "ratio": {"type": "number", "title": "Ratio"},
-                        "rush": {"type": "boolean", "title": "Rush"}
-                    },
-                    "required": ["color"]
-                }
-            }
-        }))
-        .unwrap();
-        assert_eq!(
-            describe(&requested),
-            "elicitation 3: Order; fields: color (Color: one of red, blue), \
-             count (Count: integer), extras (Extras: any of nuts), location (_point), \
-             note (text), ratio (Ratio: number), rush (Rush: boolean)"
-        );
-        let resolved = |action: serde_json::Value| {
-            let kind: EventKind = serde_json::from_value(json!({
-                "type": "elicitation_resolved",
-                "data": {"request_id": "3", "action": action}
-            }))
-            .unwrap();
-            describe(&kind)
-        };
-        assert_eq!(
-            resolved(json!({"action": "accept", "content": {"color": "blue", "count": 2}})),
-            r#"elicitation 3: accepted {"color":"blue","count":2}"#
-        );
-        assert_eq!(
-            resolved(json!({"action": "decline"})),
-            "elicitation 3: declined"
-        );
-        assert_eq!(
-            resolved(json!({"action": "cancel"})),
-            "elicitation 3: cancelled"
-        );
-    }
 }

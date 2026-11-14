@@ -9,7 +9,7 @@ Code ACP bridge.
 | `crates/claude-code-acp/` | ACP bridge for the Claude Code CLI                                                |
 | `crates/oxd/`             | Session daemon that owns ACP agent processes and serves Ox UIs over a Unix socket |
 | `crates/ox-protocol/`     | oxd wire types and client                                                         |
-| `crates/oxctl/`           | Command-line client agents use to test `oxd`                                      |
+| `crates/oxctl/`           | Daemon client for the desktop end-to-end and live Claude smoke tests               |
 | `ui/`                     | Ox frontend (TypeScript, Vite)                                                    |
 
 See [architecture](docs/dev/architecture.md), [where sessions run](docs/worktrees.md),
@@ -53,8 +53,4 @@ make dev
 
 `make dev` builds `oxd` and the Claude bridge and runs the app against its own
 `oxd` on `target/dev/oxd.sock`, which it stops before building and after the
-app exits. `oxctl` reaches that daemon with `OX_SOCKET` set to the same path:
-
-```sh
-OX_SOCKET="$PWD/target/dev/oxd.sock" cargo run -p oxctl -- ls
-```
+app exits.

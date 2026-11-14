@@ -260,7 +260,7 @@ class SmokeRun:
         if self.attachment is not None:
             self.attachment.close()
         self.attachment = Attachment(
-            self.cli + ["attach", self.session, "--after", str(after), "--json"],
+            self.cli + ["attach", self.session, "--after", str(after)],
             self.env,
             self.stderr,
             self.events,
@@ -433,14 +433,9 @@ class SmokeRun:
 
     def check_effort(self):
         """Sets the effort of the session's running Claude."""
-        options = self.ctl("config", self.session, "effort", "low")
-        effort = next(
-            line.split("\t")
-            for line in options.splitlines()
-            if line.startswith("effort\t")
-        )
-        check(effort[1] == "low", f"Effort was not set: {effort}")
-        self.report("effort_set_on_running_claude", effort=effort[1])
+        effort = self.ctl("config", self.session, "effort", "low")
+        check(effort == "low", f"Effort was not set: {effort}")
+        self.report("effort_set_on_running_claude", effort=effort)
 
     def session_row(self):
         """The fields of the session's row in `oxctl ls`: id, workspace id,

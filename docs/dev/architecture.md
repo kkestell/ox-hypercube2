@@ -79,22 +79,9 @@ relative to the root, and its scroll position are kept in the webview's
 it is shown again, after a switch or a restart. The app removes a session's
 saved tree once a listing no longer has the session.
 
-**oxctl.** A command-line client of `oxd` that speaks the same protocol as
-the app. `oxctl new --worktree` starts a session in a new worktree on its own
-branch, `--branch` in one on an existing branch, and `--new-branch` in one on
-a new branch started at `--start`; with any of them, `--compare <ref>` sets
-the session's comparison ref. `oxctl compare <session>` prints the ref, the
-branch's commit, the ref's commit, and the commits ahead and behind, after
-refreshing the comparison, or after setting the ref it is given or clearing
-it with `--clear`. `oxctl move-branch --workspace <id> <branch> <to>
---expected <commit>` moves a branch, with `--force` when the move is not a
-fast-forward. `oxctl delete` deletes a
-session, and with `--discard` gives up its worktree's unsaved work; it prints
-the branch it kept, if any. `oxctl archive` archives a session, with
-`--discard` as for delete, and `oxctl unarchive` undoes it; `oxctl ls` shows
-`archived` in place of an archived session's state. `oxctl attach` prints an
-elicitation's fields, and `oxctl answer` accepts it with its content as a JSON
-object, or declines or cancels it with `--decline` or `--cancel`.
+**oxctl.** The [integration tests](testing.md#running-checks) use this
+command-line client to drive `oxd` through the same `ox_protocol::Client`
+as the desktop app.
 
 **oxd.** A per-user daemon on `$OX_SOCKET`, or `oxd.sock` in Ox's data
 directory: `$XDG_DATA_HOME/ox` when `XDG_DATA_HOME` is an absolute path, else
