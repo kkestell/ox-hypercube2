@@ -707,25 +707,52 @@ fn tool_status(id: String, status: ToolCallStatus) -> SessionUpdate {
     SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id).status(status))
 }
 
-/// The title of a call of tool `name`: the tool's name, followed by its
-/// argument as Markdown inline code.
+/// The title of a call of tool `name`: the tool's display name, followed by
+/// its argument as Markdown inline code.
 fn tool_title(name: &str, input: &Value) -> String {
-    match tool_argument(input) {
-        Some(argument) => format!("{name} {}", code_span(&argument)),
-        None => name.to_owned(),
+    let display = tool_display_name(name);
+    match tool_argument(name, input) {
+        Some(argument) => format!("{display} {}", code_span(&argument)),
+        None => display,
     }
 }
 
-/// A plain line for a call of tool `name`: the tool's name and its argument.
+/// A plain line for a call of tool `name`: the tool's display name and its
+/// argument.
 fn tool_line(name: &str, input: &Value) -> String {
-    match tool_argument(input) {
-        Some(argument) => format!("{name} {argument}"),
+    let display = tool_display_name(name);
+    match tool_argument(name, input) {
+        Some(argument) => format!("{display} {argument}"),
+        None => display,
+    }
+}
+
+/// The server and tool of MCP tool `name`, which Claude names
+/// `mcp__<server>__<tool>`.
+fn mcp_tool(name: &str) -> Option<(&str, &str)> {
+    name.strip_prefix("mcp__")?.split_once("__")
+}
+
+/// The name a call of tool `name` shows: for an MCP tool, the tool's name in
+/// the capitalized words of Claude's own tools, so `mcp__ox__set_title` shows as
+/// `SetTitle`; otherwise the tool's name.
+fn tool_display_name(name: &str) -> String {
+    match mcp_tool(name) {
+        Some((_, tool)) => tool
+            .split(['_', '-'])
+            .filter_map(|word| {
+                let mut chars = word.chars();
+                chars.next().map(|first| first.to_uppercase().chain(chars))
+            })
+            .flatten()
+            .collect(),
         None => name.to_owned(),
     }
 }
 
-/// The first line of a tool call's main argument.
-fn tool_argument(input: &Value) -> Option<String> {
+/// The first line of the main argument of a call of tool `name`. An MCP
+/// tool's main argument is its first string argument.
+fn tool_argument(name: &str, input: &Value) -> Option<String> {
     let argument = [
         "command",
         "file_path",
@@ -738,7 +765,11 @@ fn tool_argument(input: &Value) -> Option<String> {
         "description",
     ]
     .iter()
-    .find_map(|key| input.get(key).and_then(Value::as_str));
+    .find_map(|key| input.get(key).and_then(Value::as_str))
+    .or_else(|| {
+        mcp_tool(name)?;
+        input.as_object()?.values().find_map(Value::as_str)
+    });
     argument
         .and_then(|text| text.trim().lines().next())
         .map(|first_line| {
@@ -785,5 +816,15 @@ mod tests {
         assert_eq!(code_span("echo `date`"), "`` echo `date` ``");
         assert_eq!(code_span(" a "), "`  a  `");
         assert_eq!(code_span("  "), "`  `");
+    }
+
+    #[test]
+    fn an_mcp_tool_is_titled_like_claudes_own_tools() {
+        assert_eq!(
+            tool_title("mcp__ox__set_title", &json!({"title": "Fix login"})),
+            "SetTitle `Fix login`"
+        );
+        assert_eq!(tool_title("mcp__x__act", &json!({"n": 1})), "Act");
+        assert_eq!(tool_title("Read", &json!({"limit": "10"})), "Read");
     }
 }

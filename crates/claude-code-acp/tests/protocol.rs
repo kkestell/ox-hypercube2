@@ -835,7 +835,7 @@ next_message
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"act"}]}})).await;
     let (permission, _) = until_permission(&mut reader).await;
-    assert_eq!(permission["params"]["title"], "mcp__x__act");
+    assert_eq!(permission["params"]["title"], "Act");
     child.kill().await.unwrap();
 }
 
