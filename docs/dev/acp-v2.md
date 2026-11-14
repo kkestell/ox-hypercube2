@@ -12,10 +12,10 @@ agent, and caveats. Each cell is *supported*, *partial*, or *unsupported*; a
 partial cell says in the caveats what works and what does not.
 `oxd-fake-agent` is a test fixture and has no column.
 
-`oxd` records every session update it receives, in the order received, and
-relays it unchanged to its clients. "Supported" in the `oxd` column means
-`oxd` records and relays the update, or acts on it as the protocol requires of
-a client; a caveat says where `oxd` only records it.
+`oxd` records and relays live session updates unchanged and in order. During
+resume it keeps the existing conversation when it has one and discards the
+agent's replay. "Supported" in the `oxd` column means `oxd` records and
+relays the update or acts on it as the protocol requires.
 
 ## Methods the client sends
 
@@ -30,7 +30,7 @@ a client; a caveat says where `oxd` only records it.
 | `providers/disable` (unstable) | unsupported | unsupported | |
 | `session/new` | supported | supported | claude-code-acp: Answers with the session's config options, reports the session idle, then starts its Claude process, whose native command catalog follows as `available_commands_update`. A Claude process that fails to start fails the next prompt with its error. MCP servers are stdio only; see `session.mcp`. oxd: Sends the session's directory and no MCP servers. |
 | `session/list` | unsupported | supported | claude-code-acp: Lists the bridge's sessions and Claude's native transcripts, 50 per page. oxd: `oxd` keeps its own sessions. |
-| `session/resume` | supported | supported | claude-code-acp: `replayFrom: start` replays the conversation from Claude's transcript, then the session's state is sent, then the response, with the native command catalog so far. Opens a Claude process if needed, without waiting for it; its catalog follows as `available_commands_update`, and a process that fails to start fails the next prompt with its error. Without `replayFrom` nothing replays. Any other cursor is rejected with `-32602`. oxd: Sends `replayFrom: start` for a saved session. The replay is recorded as the session's history unless the session already has one. |
+| `session/resume` | supported | supported | claude-code-acp: Starts a Claude process if needed. A spawn failure fails the resume request. The bridge proceeds while native initialization runs. With `replayFrom: start` it replays Claude's transcript, sends the session's state, then replies with the command catalog available so far. Later catalog updates arrive as `available_commands_update`. Without `replayFrom` nothing replays. Any other cursor is rejected with `-32602`. oxd: Requests replay from the start for a saved session and uses it when there is no existing history. |
 | `session/close` | unsupported | supported | claude-code-acp: Interrupts and stops the session's `claude`, answers once it has exited, and leaves the session resumable. Closing a session that is not open succeeds. oxd: Deleting a session kills the agent's process group. |
 | `session/prompt` | supported | supported | claude-code-acp: Answers with the `messageId` of the user message the prompt becomes, once `claude` takes the prompt into a turn. A prompt sent during a turn waits for it. A prompt dropped by `session/cancel` before that is answered with `-32800`. oxd: Checks the prompt against the agent's prompt capabilities first. The answer matters only when it is an error: the prompt was not inserted, and the turn ends with that error unless the agent already reported work for it. |
 | `session/set_config_option` | supported | supported | claude-code-acp: Options `model`, `effort`, and `mode`, all selects. oxd: Selects and booleans. |

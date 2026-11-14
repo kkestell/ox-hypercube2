@@ -23,9 +23,9 @@ The worktree options appear only for a workspace in a Git working tree. In
 ## Worktrees
 
 Each worktree is the directory `worktrees/<checkout name>-<first 8 digits of
-the session ID>` in Ox's data directory, `$XDG_DATA_HOME/ox` or
-`~/.local/share/ox`. When the workspace is a subdirectory of its checkout, the
-session runs in the same subdirectory of the worktree.
+the session ID>` beside the daemon socket. By default that is in Ox's data
+directory. When the workspace is a subdirectory of its checkout, the session
+runs in the same subdirectory of the worktree.
 
 A new branch has no upstream. A branch made from a remote branch tracks it.
 
@@ -77,21 +77,28 @@ given.
 oxctl move-branch --workspace <id> main <session branch tip> --expected <main's commit>
 ```
 
-When the workspace's checkout or a worktree has the branch, its files and
-index move with it. Ox refuses the move while tracked files there have
-uncommitted changes, while a session's agent there is starting, in a turn, or
-waiting for an answer, and when the move would overwrite an untracked file.
-Untracked files the move leaves alone, and idle agents, don't stop it.
+When the branch is checked out, its files and index move with it. Ox checks
+for uncommitted tracked changes and for an agent starting, working, or
+waiting for an answer before it moves the branch. An agent can still start
+work after that check. Git refuses to overwrite untracked files it does not
+ignore. An ignored file can be overwritten if the incoming commit tracks
+that path.
 
 ## Deleting and archiving
 
 | Action | Worktree | Branch Ox created | Branch that existed before the session |
 |---|---|---|---|
-| Delete | Removed | Deleted when every commit on it is on another branch, a remote branch or a tag; otherwise kept, and Ox names it | Kept |
+| Delete | Removed | Deleted when it passes the branch cleanup rule below | Kept |
 | Archive | Removed | Kept | Kept |
 | Unarchive | Added again, on the session's branch | — | — |
 
 Ox creates the branch for every worktree session except one on an existing
-local branch. Delete and archive refuse to remove a worktree that has
+local branch. Delete removes an Ox-created branch when no worktree has it
+checked out and every commit on it outside the ancestry of the session's
+starting commit is reachable from another branch, a remote branch, or a tag.
+If those conditions fail or the repository is missing, Ox keeps the branch
+and reports its name.
+
+Delete and archive refuse to remove a worktree that has
 uncommitted changes, commits on no branch, remote branch or tag, or submodule
 commits on no remote branch. Discarding (`--discard` in `oxctl`) removes it anyway.

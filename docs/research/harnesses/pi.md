@@ -1,6 +1,6 @@
 # Pi
 
-> Imported Hypercube research; see [provenance and scope](../README.md).
+> Historical observations apply to the versions cited below.
 
 ## 1. Overview
 
@@ -139,9 +139,9 @@
 - **[help] [verified]** Repeatable **`--skill PATH`** accepts a skill file, one skill directory, or a directory containing **many** skill directories. A single `--skill /temporary/skills` loaded two sibling skills in an ephemeral RPC process. Ordinary native user/project sources remained present when discovery was enabled. Even `--no-skills --skill PATH` loaded the explicit source in installed 1.4.0; the disabling flag suppresses automatic sources rather than explicit paths. No real settings file or `HOME` change is required.
 - **[docs]** SDK `DefaultResourceLoader({additionalSkillPaths:[DIR]})` adds paths; `getSkills()` exposes the result after `reload()`. Extension `resources_discover` can return `skillPaths` for the resource loader. These paths are processed as native skills, not merely appended host instructions. Sources: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/sdk.md and https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
 
-### Invocation through Hypercube's input path
+### Invocation through RPC
 
-- **[verified]** `plugins/pi/main.go` sends RPC `prompt {message:text,streamingBehavior:"steer"}`. Installed `dist/modes/rpc/rpc-mode.js` delegates to `AgentSession.prompt` without disabling expansion. Its native skill syntax is **`/skill:name args`**, not `/name args`. It expands before streaming input is queued, so this is not limited to the interactive TUI.
+- **[verified]** When Pi receives RPC `prompt {message:text,streamingBehavior:"steer"}`, installed `dist/modes/rpc/rpc-mode.js` delegates to `AgentSession.prompt` with expansion enabled. The native skill syntax is **`/skill:name args`**. Pi expands it before queuing streaming input.
 - **[verified]** A no-model call into installed `AgentSession.prompt`, with its streaming queue captured, left `/hc-probe-one argument` unchanged but expanded `/skill:hc-probe-one argument` to `<skill name="hc-probe-one" location=".../SKILL.md">`, a base-directory instruction, the frontmatter-stripped body, and appended argument text. Extension commands are checked first and may consume or transform input; a bare `/name` could instead name an extension command or prompt template. Unknown `/skill:name` stays ordinary text. Source: installed `dist/core/agent-session.js`; counterpart https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/agent-session.ts
 - **[docs] [verified]** `enableSkillCommands` controls interactive skill-command discovery, not manually entered `/skill:name` expansion. RPC has no separate structured skill-activation field established here: unknown beyond the native command text and SDK's same prompt method. Sources: skills guide and installed expansion code above.
 

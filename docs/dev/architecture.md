@@ -156,27 +156,18 @@ ID changes. The database holds no environment variables: a client passes its
 environment each time it starts an agent, with `session.new` and
 `session.load`. The schema has no migrations.
 
-**Event log.** `oxd` stores every event a session records, except
-`session_closed`, in the database's `events` table, keyed by session and
-`seq`, as the event's JSON. A thread of its own writes them, batching whatever
-is queued into one transaction, so recording an event never waits on SQLite;
-`oxd` flushes the queue on shutdown, and events still queued when it is killed
-are lost. The database runs in WAL mode with `synchronous = NORMAL`. A restored
-session knows its last `seq` from the table and reads its events the first
-time a client subscribes to it or loads it. Reading closes what a stop left
-open: a turn without a `turn_ended` ends with the error "oxd stopped during
-the turn", and a permission request or elicitation without a resolution is
-cancelled. Request IDs continue after the largest in the log. So every
-session's history, with its original `seq`s, survives `oxd` restarts and does
-not need an agent or Claude's transcript. Deleting a session deletes its
-events.
+**Event log.** `oxd` queues session events for SQLite except `session_closed`.
+The writer commits batches keyed by session and sequence number. Graceful
+shutdown drains the queue. A forced stop can lose queued events, and a
+failed batch is logged and dropped, leaving gaps in saved history.
 
-The database keeps every session's full history, tool output and images
-included, until the session is deleted. Continuing a conversation still needs
-Claude's transcript, so a session older than Claude's `cleanupPeriodDays`
-(default 30 days,
-https://code.claude.com/docs/en/data-usage#data-retention) can be read but
-cannot resume.
+Ox loads saved events on the first subscription or load after a restart.
+It closes interrupted turns with an error, cancels unresolved requests, and
+continues request IDs after the largest saved ID. The saved history includes
+tool output and images and can be read without starting an agent. Deleting a
+session deletes its events. Continuing a Claude conversation still requires
+its native transcript, which can expire under Claude's
+[`cleanupPeriodDays` setting](https://code.claude.com/docs/en/data-usage#data-retention).
 
 **Worktrees.** `session.new` takes a `checkout`: the workspace's directory, or
 a new worktree of the workspace's Git repository. `oxd` runs every Git
@@ -235,14 +226,9 @@ then stops the agent and waits for its task to end, and removes the
 worktree, ignored files included, with `git worktree remove --force`. A
 worktree git cannot use is deleted as a directory, which `oxd` owns, and a
 worktree directory deleted outside Ox is unregistered from the repository.
-Last it applies the branch rule: a branch `oxd` created is deleted, at the
-tip it read, when every commit on it since the session's starting commit is
-on another branch, a remote branch or a tag, and no worktree has it checked
-out. Otherwise the branch is kept and named in the answer's `kept_branch`,
-as it is when the repository is gone and the branch cannot be checked. A
-branch that existed before the session is never deleted. Removal and the
-branch rule run git in the recorded common Git directory with `--git-dir`
-set to it, and the unsaved checks run in the worktree, so none of them
+Last it applies the [branch cleanup rule](../worktrees.md#deleting-and-archiving).
+Removal and branch cleanup run git in the recorded common Git directory with
+`--git-dir` set to it, and the unsaved checks run in the worktree, so none of them
 depends on the workspace's directory still existing. If work appears
 after the check, or git fails, such as on a locked worktree, the delete
 answers the error and the session stays `exited` and loadable. Deleting a
@@ -288,20 +274,13 @@ and a changed comparison goes to every watch. `session.set_compare` and
 `session.refresh` answer the session with the comparison computed for the
 request.
 
-`branch.move` sets a local branch of the workspace's repository to a commit.
-It is refused, changing nothing, when the branch is not at the request's
-`expected` commit (`INVALID_STATE`), or when the new commit does not descend
-from `expected` and `force` is not set (`INVALID_REQUEST`). When a checkout,
-the workspace's own or a worktree, has the branch, the move is refused while
-a session whose directory is in that checkout is `starting`, `running`,
-`awaiting_permission` or `awaiting_input`, and with `UNSAVED_WORK` while
-tracked files there have uncommitted changes (`git status
---untracked-files=no`). `oxd` then moves the branch with `git update-ref`,
-which fails if the branch moved since it was read, and moves the checkout's
-index and files with `git read-tree -u -m <expected> <to>`, which refuses to
-overwrite an untracked file. When that fails, `oxd` puts the branch back and
-answers git's error with `GIT`. Untracked files the move does not touch stay
-as they are. Submodule checkouts are not updated.
+`oxd` updates the ref and checkout in `branch.move`. The request supplies
+the expected commit, which `git update-ref` checks when it writes the ref.
+If updating the checkout with `git read-tree` fails, `oxd` tries to restore
+the branch at its previous tip and reports the error. Submodule checkouts
+stay at their current commits. See
+[moving a branch](../worktrees.md#moving-a-branch) for the checks and their
+current limitations.
 
 Shutdown on SIGTERM, SIGINT, or idle exit kills the agents and keeps every
 row. When `oxd` starts it registers each saved session in state `exited`,

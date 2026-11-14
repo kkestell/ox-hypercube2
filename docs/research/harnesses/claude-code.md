@@ -1,6 +1,7 @@
 # Claude Code
 
-> Imported Hypercube research; see [provenance and scope](../README.md).
+> Historical observations apply to the versions cited below. See
+> [ACP v2 support](../../dev/acp-v2.md) for the current Ox integration.
 
 ## 1. Overview
 
@@ -150,10 +151,10 @@
 - **[help] [docs]** `--plugin-dir PLUGIN` is session-only; a plugin's `skills/` can contain many skills. Manifest `skills` paths add other skill directories. SDK `plugins:[{type:"local",path:PLUGIN}]` loads the same plugin form. This is a plugin directory, not a general raw-skills-directory flag. Sources: local help, https://code.claude.com/docs/en/plugins/components#skills and https://code.claude.com/docs/en/agent-sdk/skills
 - **[verified]** Initialize discovered a temporary added-directory skill in `<dir>/.claude/skills/hc-probe/SKILL.md`. Passing a raw directory containing `hc-probe/SKILL.md` to `--add-dir` did **not** discover it. A local `--plugin-dir` plugin whose `skills` directory was a symlink to that raw directory did discover it, returning command `hc-probe-plugin:hc-probe` with alias `hc-probe`. No setting/env/SDK option for adding an arbitrary raw skills root directly was established: unknown beyond these layout-based mechanisms.
 
-### Invocation through Hypercube's input path
+### Invocation through stream JSON
 
-- **[verified]** `plugins/claude/main.go` launches `-p --input-format stream-json --output-format stream-json` and sends `{type:"user",message:{role:"user",content:text}}` (content blocks when images are present). A probe using that text-message shape and `/hc-probe TEST` returned the marker produced by the skill's `$ARGUMENTS` substitution. The probe disabled model invocation for that skill and all tools, so this was direct harness dispatch, not a model deciding to read the file. A leading `/name args` therefore works outside the TUI on the plugin's text-only path.
-- **[docs]** SDK prompt dispatch likewise supports `/<name>` independently of the SDK's model-invocation `skills` allowlist. `user-invocable: false` disables that direct dispatch; `disable-model-invocation: true` does not. SDK `verbatimPrompts` / streamed `client_composed:true` bypass slash dispatch; the current Hypercube plugin does not set that field. An unknown command can become ordinary model text rather than a command error. `--disable-slash-commands` disables both skills and commands. Sources: https://code.claude.com/docs/en/agent-sdk/skills#commands-in-agent-sdk-sessions , https://code.claude.com/docs/en/agent-sdk/typescript#sdkusermessage and local help.
+- **[verified]** A probe launched Claude with `-p --input-format stream-json --output-format stream-json` and sent `{type:"user",message:{role:"user",content:"/hc-probe TEST"}}`. The response contained the marker produced by the skill's `$ARGUMENTS` substitution. The probe disabled model invocation for that skill and all tools, confirming direct dispatch for a text-only stream JSON message.
+- **[docs]** SDK prompt dispatch likewise supports `/<name>` independently of the SDK's model-invocation `skills` allowlist. `user-invocable: false` disables that direct dispatch; `disable-model-invocation: true` does not. SDK `verbatimPrompts` / streamed `client_composed:true` bypass slash dispatch. An unknown command can become ordinary model text rather than a command error. `--disable-slash-commands` disables both skills and commands. Sources: https://code.claude.com/docs/en/agent-sdk/skills#commands-in-agent-sdk-sessions , https://code.claude.com/docs/en/agent-sdk/typescript#sdkusermessage and local help.
 - Slash dispatch with image-bearing content-block messages, and behavior when the user invokes a skill while another turn is running: not live-tested here; unknown beyond the SDK's general streaming-input contract.
 
 ### Context and model invocation

@@ -1,94 +1,49 @@
 # Agent instructions
 
-## Project scope
+Read the relevant guidance below before planning or changing code. These files
+own their respective subjects; this file is the entry point and working
+workflow.
 
-- Ox is a hobby project with one user. The desktop app is the normal
-  interface. Agents use `oxctl` to test the daemon and handle occasional tasks
-  on the user's behalf. Custom daemon sockets, including `--socket` and `OX_SOCKET`,
-  are development and test tools. A CLI option alone does not establish a
-  user workflow or a compatibility promise.
-- Prioritize failures the user can encounter in the desktop and in the workflows
-  the user asks agents to run. Rank findings by likelihood in those workflows and
-  the cost of failure. Protect work and preserve required guarantees with
-  the simplest mechanism that covers the demonstrated problem.
-- Defer unusual inputs, unlikely combinations of failures, and recovery
-  machinery until there is evidence of a practical need. A short, local
-  TODO may record a credible concern and the condition that would make it
-  worth revisiting.
+## Guidance
 
-## Writing code
+| Document | Owns |
+| --- | --- |
+| [Code style](docs/dev/code-style.md) | Implementation, architecture, scope, and edge-case decisions |
+| [Testing](docs/dev/testing.md) | Test design, verification procedures, and evidence of completion |
+| [Documentation](docs/dev/documentation.md) | Document ownership, maintenance, writing, and naming rules |
+| [Glossary](docs/dev/glossary.md) | Project vocabulary and distinctions between terms |
 
-- Wait on events. A process announces readiness, state changes publish to a
-  channel or watch, and code that needs to know a process exited waits on it
-  or on a pipe it holds. Timers serve only as timeouts on a wait, or where the
-  passage of time is itself the behavior, such as an idle period.
-  - `oxd` prints `ready` once it listens; `connect_or_start` reads that line.
-  - Idle exit watches a `watch::Sender<()>` signalled whenever clients,
-    sessions, or a session's state change, then starts its idle timer.
-- Change an interface by updating every caller in the repository.
-- Versions stay at 1 until the project is in production. The client–daemon
-  `hello` handshake checks the protocol version, but no change bumps it, and
-  there are no backwards-compatibility paths.
-  - `session.prompt` changed from `text` to content blocks, and every caller
-    changed with it.
-- Fix causes. A fix that needs a grace period, a retry loop, or a change to
-  process-wide state points at a structural cause; find it and fix that.
-  - After `claude` exits, everything it wrote is already in the stderr pipe,
-    so the bridge reads what is buffered instead of waiting a grace period.
-  - The socket's mode is set with `chmod` after `bind`, and the peer-uid
-    check is what keeps other users out, so the process umask stays as is.
-- Use what the language and libraries provide: derived serialization, `match`
-  on enums, the library's ordering and lifecycle guarantees. Read the
-  library's documentation for the guarantee before relying on it or working
-  around its absence.
-  - `ServerMessage` derives `Deserialize`; `oxctl` names a `StopReason` with
-    a `match`.
-  - The ACP library dispatches a notification before the response that
-    follows it, so the response handler knows whether a notification already
-    reported a config change.
-- Take a plan's goals as the requirement and its mechanisms as suggestions.
-  When a mechanism in the plan is weak, use a better one and say so.
-  - The plan said `connect_or_start` "retries until it accepts"; the goal is
-    connecting to a running daemon, which the `ready` line provides.
-- A capability the code advertises is implemented in full.
-  - An agent that advertises the baseline session methods replays the
-    conversation on `session/resume` with `replayFrom: {"type": "start"}`.
-  - The bridge advertises the `image` prompt capability and sends images to
-    Claude.
-- The UI is idiomatic React (`ui/src/`) with icons from `lucide-react`.
-  The user designs the app's look: UI changes add only the CSS a layout needs
-  to work, such as a scrolling region or `white-space: pre-wrap`, and styling
-  only where the user asks for it or where it makes an element match its peers.
-- Elements of the same kind look the same everywhere. A new element takes its
-  class and tokens from the existing elements of its kind, and the CSS states
-  each shared value once, in one rule for the kind. Elements in neighbouring
-  regions that nearly line up share an edge or a centre line exactly.
-- UI changes go through the shared abstractions: a class per kind of element,
-  tokens for sizes and colours, and shared layout components for regions that
-  line up. A requested change that would make one element differ from its
-  peers, or that adjusts a value by a few pixels to make things line up,
-  points at a missing or wrong abstraction. Say so, propose the abstraction,
-  and build it before making the change, so the change lands in the shared
-  rule rather than as a one-off. Hold that position through follow-up
-  requests; a value that has to be nudged into place is a structural problem
-  to solve first.
-  - Every icon button has the `icon-button` class, which sets its size, its
-    icon's size, and its colour; a panel toggle that is off is muted.
-  - Icon buttons in a group sit flush, like the panel toggles.
-  - The sidebar and content headers share the `pane-header` class, so their
-    buttons share a centre line; only the content header has a bottom border.
-  - Workspace and session actions sit `--row-action-inset` from the row's
-    end, and the sidebar header uses the same inset, so all three line up.
+## Project documents
 
-## Testing
+| Document | Owns |
+| --- | --- |
+| [README](README.md) | Project overview and development setup |
+| [Architecture](docs/dev/architecture.md) | Process ownership, boundaries, persistence, and session lifecycle |
+| [ACP v2 support](docs/dev/acp-v2.md) | Protocol support and integration caveats |
+| [Where sessions run](docs/worktrees.md) | Checkout selection, branches, comparisons, and worktree cleanup |
+| [Claude Code research](docs/research/harnesses/claude-code.md) and [Pi research](docs/research/harnesses/pi.md) | Historical harness observations |
 
-Read [.agents/testing.md](.agents/testing.md) for test design, fixtures, and
-required verification commands before writing tests or running checks.
+## Working approach
 
-## Reporting
+- Establish the requested outcome and read the relevant code and project
+  documents. Distinguish requirements from assumptions and possible future
+  work.
+- Resolve ordinary implementation decisions yourself. Ask when a missing
+  decision materially changes the requested outcome or scope.
+- Use a plan when the work needs design decisions or sequencing. Routine work
+  does not require a plan, report, or prescribed sequence of agent sessions.
+- Preserve unrelated working-tree changes. Commit or publish only when the user
+  requests it.
+- Complete verification according to [Testing](docs/dev/testing.md#running-checks) and
+  reconcile changed facts according to
+  [Documentation](docs/dev/documentation.md#when-to-edit-documentation).
 
-- Name every shortcut, workaround, and unimplemented part in the report, in
-  plain terms.
-  - "`session/resume` ignores `replayFrom` although the bridge advertises the
-    session methods."
-  - "`prompt_text` exists only so tests can send one string."
+## Communication
+
+- Lead with the substantive result. Use plain language and concrete names.
+- Share findings, material uncertainty, blockers, and decisions that need the
+  user. Skip opening acknowledgements and routine progress narration.
+- Distinguish observations, conclusions, and assumptions. Do not claim an action
+  succeeded until its result confirms it.
+- When corrected, revisit the underlying judgment and apply the correction to
+  the work, rather than patching only the example the user identified.
