@@ -83,14 +83,8 @@ relative to the root, and its scroll position are kept in the webview's
 it is shown again, after a switch or a restart. The app removes a session's
 saved tree once a listing no longer has the session.
 
-The UI's work follows what changed. A watch sends every workspace and
-session once, then only those added, changed or removed, and the UI replaces
-just those entries. Each session row, the composer, the file tree and each
-conversation item renders again only when its own data changes. The open
-session's conversation arrives in batches of the items from the events the
-core received together, with a message's text chunks joined. A message's
-Markdown renders per top-level block, so appended text parses and renders
-only its last block again.
+The daemon, the core and the UI each do work in proportion to what changed;
+[Performance](../performance.md) describes how.
 
 **oxctl.** The [integration tests](testing.md#running-checks) use this
 command-line client to drive `oxd` through the same `ox_protocol::Client`
