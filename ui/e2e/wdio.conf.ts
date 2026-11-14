@@ -1,7 +1,7 @@
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { binary, resetDaemon } from "./helpers.ts";
+import { binary, harnesses, resetDaemon } from "./helpers.ts";
 
 // The launcher makes the run's directory and points the run at an oxd socket
 // in it. The app it launches, the oxd the app starts, and the workers it
@@ -11,6 +11,10 @@ process.env.OX_SOCKET = join(process.env.OX_E2E_DIR, "oxd.sock");
 // The sessions the app starts run the Claude bridge, which keeps its store
 // in the run's directory.
 process.env.CLAUDE_ACP_STORE_DIR = process.env.OX_E2E_DIR;
+// The app reads its `PATH` from the login shell at startup. This stub shell
+// runs the app's command with the environment it inherits, so the app keeps
+// the `PATH` below: the system directories and a directory of harness stubs.
+const loginShell = join(process.env.OX_E2E_DIR, "login-shell");
 
 export const config: WebdriverIO.Config = {
   runner: "local",
@@ -24,10 +28,23 @@ export const config: WebdriverIO.Config = {
   services: [
     [
       "@wdio/tauri-service",
-      { appBinaryPath: binary("ox"), driverProvider: "embedded", captureBackendLogs: true },
+      {
+        appBinaryPath: binary("ox"),
+        driverProvider: "embedded",
+        captureBackendLogs: true,
+        env: { PATH: `${harnesses()}:/usr/bin:/bin:/usr/sbin:/sbin`, SHELL: loginShell },
+      },
     ],
   ],
   capabilities: [{ browserName: "tauri" }],
+
+  // `harnesses/` holds a `claude` stub unless a test changes it with
+  // `setHarnesses`.
+  onPrepare() {
+    mkdirSync(harnesses(), { recursive: true });
+    writeFileSync(join(harnesses(), "claude"), "#!/bin/sh\n", { mode: 0o755 });
+    writeFileSync(loginShell, '#!/bin/sh\nexec /bin/sh -c "$2"\n', { mode: 0o755 });
+  },
 
   // The webview loads the UI after the WebDriver session starts; each spec
   // begins once the sidebar has rendered. Choosing the app's one window

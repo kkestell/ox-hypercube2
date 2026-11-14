@@ -11,6 +11,7 @@ ownership and lifecycle.
 - **Agent**: The ACP-speaking process that `oxd` runs for a session.
 - **Bridge**: An ACP agent that adapts another tool's interface. `claude-code-acp`
   bridges the Claude Code CLI to ACP.
+- **Harness**: The coding-agent CLI a bridge drives, `claude` or `pi`.
 - **Daemon**: `oxd`, the per-user process that owns sessions and agent processes.
 - **Client**: The desktop app or `oxctl` when discussing the daemon protocol;
   `oxd` when discussing ACP. Qualify as daemon client or ACP client when ambiguous.

@@ -36,6 +36,9 @@ Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
 streams updates back over Tauri channels. `oxctl` uses the same daemon client
 and gives the integration tests access to the same operations.
 
+The app offers an agent for each [harness](glossary.md) on the `PATH` it
+passes to sessions, and checks again each time its window gains focus.
+
 ### Daemon and agents
 
 `oxd` runs each session's agent in a separate process group and speaks ACP

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,26 @@ const target = resolve(import.meta.dirname, "../../target/debug");
 /** The path of a binary the workspace builds. */
 export function binary(name: string): string {
   return join(target, name);
+}
+
+/** The directory of harness stubs on the app's `PATH`. */
+export function harnesses(): string {
+  return join(process.env.OX_E2E_DIR!, "harnesses");
+}
+
+/**
+ * Makes the app's `PATH` hold exactly the harnesses `names`, as executable
+ * stubs, and dispatches `focus` on the webview's window, which the app checks
+ * the harnesses again on.
+ */
+export async function setHarnesses(...names: ("claude" | "pi")[]) {
+  for (const name of await readdir(harnesses())) {
+    await rm(join(harnesses(), name));
+  }
+  for (const name of names) {
+    await writeFile(join(harnesses(), name), "#!/bin/sh\n", { mode: 0o755 });
+  }
+  await browser.execute(() => window.dispatchEvent(new Event("focus")));
 }
 
 /**

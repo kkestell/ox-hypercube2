@@ -14,11 +14,8 @@ import type {
 } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { branchStatus, localMerge } from "./localMerge";
+import { type AgentId, agentNames, useAgents } from "./useAgents";
 import type { SessionActions } from "./useSessionActions";
-
-type Agent = { id: string; name: string };
-
-const agents: [Agent, ...Agent[]] = [{ id: "claude", name: "Claude" }];
 
 const stateLabels: Record<SessionState, string> = {
   starting: "Starting",
@@ -65,8 +62,11 @@ export const SessionList = memo(function SessionList({
   onSelect: (sessionId: string) => void;
   actions: SessionActions;
 }) {
-  // The agent the New Task menus start.
-  const [agent, setAgent] = useState(agents[0].id);
+  const agents = useAgents();
+  // The agent the user chose, and the agent the New Task menus start: the
+  // chosen one while it is installed, otherwise the first installed agent.
+  const [chosen, setChosen] = useState<AgentId | null>(null);
+  const agent = chosen !== null && agents.includes(chosen) ? chosen : agents[0];
   // The workspaces whose Archived groups are open.
   const [openArchives, setOpenArchives] = useState<ReadonlySet<string>>(new Set());
 
@@ -79,7 +79,7 @@ export const SessionList = memo(function SessionList({
   const removeWorkspace = (workspaceId: string) =>
     run(() => invoke("remove_workspace", { workspaceId }));
 
-  const newSession = (workspaceId: string, agent: string, checkout: Checkout) =>
+  const newSession = (workspaceId: string, agent: AgentId, checkout: Checkout) =>
     run(async () => {
       const session = await invoke<SessionInfo>("new_session", { agent, workspaceId, checkout });
       onSelect(session.id);
@@ -87,7 +87,7 @@ export const SessionList = memo(function SessionList({
 
   // A worktree session on a new `ox/<id8>` branch from `HEAD`, compared with
   // the branch the workspace's checkout is on.
-  const newTask = (workspace: WorkspaceInfo, agent: string) =>
+  const newTask = (workspace: WorkspaceInfo, agent: AgentId) =>
     run(async () => {
       const { head } = await invoke<Branches>("workspace_branches", {
         workspaceId: workspace.id,
@@ -185,47 +185,52 @@ export const SessionList = memo(function SessionList({
                 className="icon-button"
                 title="New Task"
                 aria-label="New Task"
+                disabled={agent === undefined}
                 popoverTarget={`new-session-${workspace.id}`}
                 style={{ anchorName: `--new-session-${workspace.id}` }}
               >
                 <Plus />
               </button>
-              <div
-                id={`new-session-${workspace.id}`}
-                className="menu new-session-menu"
-                role="menu"
-                popover="auto"
-                style={{ positionAnchor: `--new-session-${workspace.id}` }}
-              >
-                <div className="menu-field">
-                  <SelectPicker
-                    label="Harness"
-                    value={agent}
-                    options={agents.map(({ id, name }) => ({ value: id, name }))}
-                    onChange={setAgent}
-                  />
-                </div>
-                {workspace.git_working_tree && (
+              {agent !== undefined && (
+                <div
+                  id={`new-session-${workspace.id}`}
+                  className="menu new-session-menu"
+                  role="menu"
+                  popover="auto"
+                  style={{ positionAnchor: `--new-session-${workspace.id}` }}
+                >
+                  {agents.length > 1 && (
+                    <div className="menu-field">
+                      <SelectPicker
+                        label="Harness"
+                        value={agent}
+                        options={agents.map((id) => ({ value: id, name: agentNames[id] }))}
+                        onChange={(id) => setChosen(id as AgentId)}
+                      />
+                    </div>
+                  )}
+                  {workspace.git_working_tree && (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      popoverTarget={`new-session-${workspace.id}`}
+                      popoverTargetAction="hide"
+                      onClick={() => newTask(workspace, agent)}
+                    >
+                      New Task
+                    </button>
+                  )}
                   <button
                     type="button"
                     role="menuitem"
                     popoverTarget={`new-session-${workspace.id}`}
                     popoverTargetAction="hide"
-                    onClick={() => newTask(workspace, agent)}
+                    onClick={() => newSession(workspace.id, agent, { type: "workspace" })}
                   >
-                    New Task
+                    Session in Checkout
                   </button>
-                )}
-                <button
-                  type="button"
-                  role="menuitem"
-                  popoverTarget={`new-session-${workspace.id}`}
-                  popoverTargetAction="hide"
-                  onClick={() => newSession(workspace.id, agent, { type: "workspace" })}
-                >
-                  Session in Checkout
-                </button>
-              </div>
+                </div>
+              )}
             </div>
             <ul>
               {active.map(sessionRow)}

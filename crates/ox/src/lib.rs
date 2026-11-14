@@ -1,7 +1,9 @@
 mod conversation;
 
 use std::collections::{BTreeMap, HashMap};
+use std::ffi::OsStr;
 use std::fmt::Display;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -70,10 +72,52 @@ enum WatchMessage {
     Disconnected,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Agent {
     Claude,
+    Pi,
+}
+
+impl Agent {
+    const ALL: [Agent; 2] = [Agent::Claude, Agent::Pi];
+
+    /// The name of the coding-agent CLI the agent's bridge drives.
+    fn harness(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Pi => "pi",
+        }
+    }
+
+    /// The name of the agent's ACP bridge, which ships beside the app's
+    /// executable.
+    fn bridge(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude-code-acp",
+            Agent::Pi => "pi-acp",
+        }
+    }
+}
+
+/// Whether a directory of `path` holds an executable file named `name`.
+fn on_path(path: &OsStr, name: &str) -> bool {
+    std::env::split_paths(path).any(|directory| {
+        std::fs::metadata(directory.join(name))
+            .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// The agents whose harnesses are on the `PATH` sessions get.
+#[tauri::command]
+fn agents() -> Vec<Agent> {
+    let Some(path) = utf8_env().remove("PATH") else {
+        return Vec::new();
+    };
+    Agent::ALL
+        .into_iter()
+        .filter(|agent| on_path(path.as_ref(), agent.harness()))
+        .collect()
 }
 
 // `watch`, `view_session`, `watch_directory`, and `unwatch_directory` are
@@ -259,14 +303,10 @@ async fn new_session(
     workspace_id: String,
     checkout: Checkout,
 ) -> Result<SessionInfo, String> {
-    let command = match agent {
-        Agent::Claude => {
-            let bridge = std::env::current_exe()
-                .map_err(message)?
-                .with_file_name("claude-code-acp");
-            vec![bridge.to_string_lossy().into_owned()]
-        }
-    };
+    let bridge = std::env::current_exe()
+        .map_err(message)?
+        .with_file_name(agent.bridge());
+    let command = vec![bridge.to_string_lossy().into_owned()];
     app.client()
         .await?
         .new_session(&workspace_id, command, utf8_env(), checkout)
@@ -476,6 +516,7 @@ pub fn run() {
     builder
         .manage(App::default())
         .invoke_handler(tauri::generate_handler![
+            agents,
             watch,
             view_session,
             watch_directory,
@@ -510,6 +551,31 @@ mod tests {
             code,
             message: message.into(),
         }))
+    }
+
+    #[test]
+    fn finds_executable_harnesses_on_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let file = |directory: &tempfile::TempDir, name: &str, mode: u32| {
+            let path = directory.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        file(&first, "claude", 0o755);
+        file(&first, "pi", 0o644);
+        std::fs::create_dir(second.path().join("pi")).unwrap();
+        file(&second, "codex", 0o755);
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+
+        for (name, found) in [
+            ("claude", true),
+            ("pi", false),
+            ("codex", true),
+            ("gemini", false),
+        ] {
+            assert_eq!(on_path(&path, name), found, "{name}");
+        }
     }
 
     #[test]

@@ -132,8 +132,10 @@ After changing behavior in `crates/ox` or the UI's TypeScript, also run
 `make e2e` and report its result. It builds the app with its embedded WebDriver
 server and drives the tests in `ui/e2e` against sessions of `oxd-fake-agent`
 that the tests start with `oxctl`. Tests that create sessions through the
-desktop start the Claude bridge without sending it prompts. A change only
-to `ui/src/styles/` requires `make check-ui`.
+desktop start the Claude bridge without sending it prompts. The app runs with
+a stub login shell and a `PATH` of the system directories and a directory of
+harness stubs, which holds `claude` unless a test changes it with
+`setHarnesses`. A change only to `ui/src/styles/` requires `make check-ui`.
 
 After changing `oxd`, `ox-protocol`, `oxctl`, `claude-code-acp`, or
 `scripts/smoke-acp.py`, also run `make smoke-claude` and report its result.
