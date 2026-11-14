@@ -14,6 +14,29 @@ body {
   color: var(--text);
 }
 
+/* Scrollbars are a thin thumb with no track. */
+::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: var(--scrollbar-inset) solid transparent;
+  border-radius: var(--scrollbar-size);
+  background-clip: padding-box;
+  background-color: var(--scrollbar-thumb);
+}
+
+::-webkit-scrollbar-thumb:hover,
+::-webkit-scrollbar-thumb:active {
+  background-color: var(--scrollbar-thumb-hover);
+}
+
 /* Focus does not add a border or ring to any control. */
 :focus {
   outline: none;
