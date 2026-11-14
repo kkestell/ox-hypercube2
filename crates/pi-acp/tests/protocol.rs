@@ -33,6 +33,29 @@ answer() {
   id=$(printf '%s\n' "$command" | sed 's/.*"id":"\([^"]*\)".*/\1/')
   printf '{"id":"%s","type":"response","command":"%s","success":true%s}\n' "$id" "$1" "$2"
 }
+# Reads all four description queries before answering them out of order.
+describe() {
+  for query in 1 2 3 4; do
+    next_command
+    printf '%s\n' "$command" >> queries
+    case "$command" in
+      *'"type":"get_state"'*) state_command=$command;;
+      *'"type":"get_available_models"'*) models_command=$command;;
+      *'"type":"get_available_thinking_levels"'*) levels_command=$command;;
+      *'"type":"get_commands"'*) commands_command=$command;;
+      *) printf 'unexpected query: %s\n' "$command" >&2; exit 21;;
+    esac
+  done
+  command=$commands_command
+  answer get_commands ',"data":{"commands":[{"name":"template","description":"A template","source":"prompt"},{"name":"extension","source":"extension"},{"name":"skill:review","description":"Review","source":"skill"}]}'
+  command=$levels_command
+  answer get_available_thinking_levels ',"data":{"levels":["off","low","high"]}'
+  command=$models_command
+  answer get_available_models ',"data":{"models":[{"provider":"first","id":"one","name":"One"},{"provider":"second","id":"org/two","name":"Two"}]}'
+  command=$state_command
+  model=${current_model:-'{"provider":"first","id":"one","name":"One"}'}
+  answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\",\"model\":$model,\"thinkingLevel\":\"${thinking:-high}\"}"
+}
 # Reads a prompt and records it in `prompts`.
 next_prompt() {
   next_command
@@ -65,6 +88,10 @@ settled() {
 "#;
 
 fn fake_pi(dir: &Path, script: &str) {
+    fake_pi_script(dir, &format!("describe\n{script}"));
+}
+
+fn fake_pi_script(dir: &Path, script: &str) {
     let path = dir.join("pi");
     fs::write(
         &path,
@@ -207,6 +234,14 @@ async fn new_session(
     session
 }
 
+async fn startup_catalog(reader: &mut BufReader<ChildStdout>) -> [Value; 2] {
+    let options = receive(reader).await;
+    assert_eq!(kind(&options), "config_option_update", "{options}");
+    let commands = receive(reader).await;
+    assert_eq!(kind(&commands), "available_commands_update", "{commands}");
+    [options, commands]
+}
+
 /// Starts the bridge with a fake pi running `script`, and opens a session.
 async fn session(
     script: &str,
@@ -223,6 +258,7 @@ async fn session(
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
+    startup_catalog(&mut reader).await;
     (temp, project, child, reader, session)
 }
 
@@ -288,7 +324,33 @@ fn statuses(updates: &[&Value]) -> Vec<String> {
 
 #[tokio::test]
 async fn a_new_session_starts_pi_and_reports_idle() {
-    let (_temp, project, mut child, _reader, _session) = session("").await;
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi(&bin, "");
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    let session = new_session(&mut child, &mut reader, 2, &project).await;
+    let [options, commands] = startup_catalog(&mut reader).await;
+    assert_eq!(options["params"]["sessionId"], session);
+    assert_eq!(commands["params"]["sessionId"], session);
+    assert_eq!(update(&options)["configOptions"][0]["category"], "model");
+    assert_eq!(
+        update(&options)["configOptions"][0]["currentValue"],
+        "first/one"
+    );
+    assert_eq!(
+        update(&options)["configOptions"][1]["category"],
+        "thought_level"
+    );
+    assert_eq!(update(&options)["configOptions"][1]["currentValue"], "high");
+    assert_eq!(
+        update(&commands)["availableCommands"],
+        json!([
+            {"type":"command","name":"template","description":"A template"},
+            {"type":"command","name":"extension","description":""},
+            {"type":"command","name":"skill:review","description":"Review"}
+        ])
+    );
     let calls = lines(&project, "calls", 2).await;
     let session_id = calls[0]
         .strip_prefix("--mode rpc --approve --session-id ")
@@ -596,8 +658,19 @@ settled
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     let error = error_message(&idle).unwrap_or_else(|| panic!("{idle}"));
     assert!(error.contains("model crashed"), "{error}");
-    let (idle, _) = prompt(&mut child, &mut reader, 4, &session).await;
+    let (idle, mut updates) = prompt(&mut child, &mut reader, 4, &session).await;
     assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+    while !updates
+        .iter()
+        .any(|value| kind(value) == "available_commands_update")
+    {
+        updates.push(receive(&mut reader).await);
+    }
+    assert!(
+        updates
+            .iter()
+            .any(|value| kind(value) == "config_option_update")
+    );
     let calls = lines(&project, "calls", 4).await;
     assert_eq!(calls[0], calls[2], "the same Pi session: {calls:?}");
     child.kill().await.unwrap();
@@ -712,13 +785,9 @@ settled
 #[tokio::test]
 async fn replay_recovers_recorded_messages_tools_and_patches_before_state_and_response() {
     let (_temp, project, mut child, mut reader, session) = session(
-        r#"
-while :; do
-  next_command
-  expect get_state
-  answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
-done
-"#,
+        r"
+while :; do describe; done
+",
     )
     .await;
     let entries = [
@@ -747,6 +816,23 @@ done
     assert!(resumed["result"].is_object(), "{resumed}");
     assert!(is_state(notifications.last().unwrap(), "idle"));
     assert_eq!(notifications.len(), 8, "{notifications:?}");
+    assert_eq!(
+        resumed["result"]["configOptions"][0]["currentValue"],
+        "first/one"
+    );
+    assert_eq!(
+        resumed["result"]["availableCommands"][2]["name"],
+        "skill:review"
+    );
+    let queries = lines(&project, "queries", 8).await;
+    let states = queries
+        .iter()
+        .filter(|line| line.contains("\"type\":\"get_state\""))
+        .count();
+    assert_eq!(
+        states, 2,
+        "one get_state at startup and one at resume: {queries:?}"
+    );
     assert_eq!(update(&notifications[0])["messageId"], "u1");
     assert_eq!(update(&notifications[0])["content"][1]["data"], "aW1n");
     assert_eq!(update(&notifications[1])["messageId"], "a1:0");
@@ -791,17 +877,13 @@ done
 #[tokio::test]
 async fn replay_empty_and_invalid_history_and_exited_pi() {
     let (_temp, project, mut child, mut reader, session) = session(
-        r#"
-next_command
-expect get_state
-answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
-next_command
-expect get_state
-answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\"}"
+        r"
+describe
+describe
 next_command
 expect get_state
 exit 3
-"#,
+",
     )
     .await;
     send(
@@ -867,5 +949,152 @@ async fn resume_rejects_unknown_ids_cursors_and_mismatched_cwd() {
         let (result, _) = response(&mut reader, id).await;
         assert_eq!(result["error"]["code"], code, "{result}");
     }
+    child.kill().await.unwrap();
+}
+
+fn config_request(id: i64, session: &Value, config: &str, value: &str) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/set_config_option","params":{
+        "sessionId":session,"configId":config,"type":"id","value":value
+    }})
+}
+
+#[tokio::test]
+async fn a_config_change_restarts_pi_and_refreshes_its_commands() {
+    let (_temp, project, mut child, mut reader, session) =
+        session("next_prompt\naccept\nexit 3").await;
+    let (exited, _) = prompt(&mut child, &mut reader, 3, &session).await;
+    assert_eq!(exited["stopReason"], "error", "{exited}");
+    fake_pi_script(
+        &project.parent().unwrap().join("bin"),
+        r#"
+while :; do
+  next_command
+  case "$command" in
+    *'"type":"set_thinking_level"'*) answer set_thinking_level;;
+    *'"type":"get_state"'*) answer get_state ',"data":{"model":{"provider":"first","id":"one"},"thinkingLevel":"high"}';;
+    *'"type":"get_available_models"'*) answer get_available_models ',"data":{"models":[{"provider":"first","id":"one","name":"One"}]}';;
+    *'"type":"get_available_thinking_levels"'*) answer get_available_thinking_levels ',"data":{"levels":["off","high"]}';;
+    *'"type":"get_commands"'*) answer get_commands ',"data":{"commands":[{"name":"skill:new","description":"New skill"}]}';;
+    *) exit 20;;
+  esac
+done
+"#,
+    );
+    send(&mut child, config_request(4, &session, "thinking", "high")).await;
+    let (result, mut notifications) = response(&mut reader, 4).await;
+    assert!(result["result"].is_object(), "{result}");
+    while !notifications
+        .iter()
+        .any(|value| kind(value) == "available_commands_update")
+    {
+        notifications.push(receive(&mut reader).await);
+    }
+    let catalog = notifications
+        .iter()
+        .find(|value| kind(value) == "available_commands_update")
+        .unwrap();
+    assert_eq!(update(catalog)["availableCommands"][0]["name"], "skill:new");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_changes_use_pi_values_and_publish_the_resulting_options() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_command
+expect set_model
+printf '%s\n' "$command" >> changes
+current_model='{"provider":"second","id":"org/two","name":"Two"}'
+thinking=low
+answer set_model
+describe
+next_command
+expect set_thinking_level
+printf '%s\n' "$command" >> changes
+thinking=high
+answer set_thinking_level
+describe
+"#,
+    )
+    .await;
+    for (id, config, value, level) in [
+        (3, "model", "second/org/two", "low"),
+        (4, "thinking", "high", "high"),
+    ] {
+        send(&mut child, config_request(id, &session, config, value)).await;
+        let (result, notifications) = response(&mut reader, id).await;
+        assert!(result["result"].is_object(), "{result}");
+        let options = &result["result"]["configOptions"];
+        assert_eq!(options[0]["currentValue"], "second/org/two");
+        assert_eq!(options[1]["currentValue"], level);
+        assert_eq!(notifications.len(), 1, "{notifications:?}");
+        assert_eq!(kind(&notifications[0]), "config_option_update");
+        assert_eq!(update(&notifications[0])["configOptions"], *options);
+    }
+    let changes = lines(&project, "changes", 2).await;
+    let model: Value = serde_json::from_str(&changes[0]).unwrap();
+    assert_eq!(model["provider"], "second");
+    assert_eq!(model["modelId"], "org/two");
+    let thinking: Value = serde_json::from_str(&changes[1]).unwrap();
+    assert_eq!(thinking["level"], "high");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_changes_reject_invalid_values_and_report_pi_errors() {
+    let (_temp, _project, mut child, mut reader, session) = session(
+        r#"
+next_command
+expect set_model
+id=$(printf '%s\n' "$command" | sed 's/.*"id":"\([^"]*\)".*/\1/')
+printf '{"id":"%s","type":"response","command":"set_model","success":false,"error":"Model not found: first/missing"}\n' "$id"
+"#,
+    )
+    .await;
+    for (id, request) in [
+        (3, config_request(3, &session, "unknown", "high")),
+        (4, config_request(4, &session, "thinking", "huge")),
+        (5, config_request(5, &session, "model", "no-provider")),
+        (
+            6,
+            json!({"jsonrpc":"2.0","id":6,"method":"session/set_config_option","params":{
+                "sessionId":session,"configId":"thinking","type":"boolean","value":true
+            }}),
+        ),
+    ] {
+        send(&mut child, request).await;
+        let (result, notifications) = response(&mut reader, id).await;
+        assert_eq!(result["error"]["code"], -32602, "{result}");
+        assert!(notifications.is_empty(), "{notifications:?}");
+    }
+    send(
+        &mut child,
+        config_request(7, &json!("unknown"), "thinking", "high"),
+    )
+    .await;
+    let (result, _) = response(&mut reader, 7).await;
+    assert_eq!(result["error"]["code"], -32002, "{result}");
+    send(
+        &mut child,
+        config_request(8, &session, "model", "first/missing"),
+    )
+    .await;
+    let (result, notifications) = response(&mut reader, 8).await;
+    assert_eq!(result["error"]["code"], -32603, "{result}");
+    assert_eq!(result["error"]["message"], "Model not found: first/missing");
+    assert!(notifications.is_empty(), "{notifications:?}");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn skill_commands_reach_pi_with_their_native_name() {
+    let (_temp, project, mut child, mut reader, session) =
+        session("next_prompt\naccept handled").await;
+    let mut request = prompt_request(3, &session);
+    request["params"]["prompt"][0]["text"] = json!("/skill:review src/main.rs");
+    send(&mut child, request).await;
+    finish(&mut reader, 3, Vec::new()).await;
+    let sent: Value = serde_json::from_str(&lines(&project, "prompts", 1).await[0]).unwrap();
+    assert_eq!(sent["message"], "/skill:review src/main.rs");
     child.kill().await.unwrap();
 }

@@ -32,7 +32,7 @@ struct Prompt {
 enum Pending {
     Prompt(Box<Prompt>),
     Abort,
-    SessionFile(oneshot::Sender<Result<Option<PathBuf>, String>>),
+    Request(oneshot::Sender<Result<Value, String>>),
 }
 
 #[derive(Default)]
@@ -117,17 +117,13 @@ impl Pi {
         self.updates.snapshot()
     }
 
-    pub fn session_file(&self) -> oneshot::Receiver<Result<Option<PathBuf>, String>> {
+    pub fn request(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
         let (send, receive) = oneshot::channel();
         let mut state = self.state.lock().unwrap();
         if let Some(error) = &state.exited {
             let _ = send.send(Err(error.clone()));
         } else {
-            state.send(
-                &self.input,
-                json!({"type":"get_state"}),
-                Pending::SessionFile(send),
-            );
+            state.send(&self.input, command, Pending::Request(send));
         }
         receive
     }
@@ -295,7 +291,7 @@ impl Output {
                             error.clone(),
                         ));
                 }
-                Pending::SessionFile(send) => {
+                Pending::Request(send) => {
                     let _ = send.send(Err(error.clone()));
                 }
                 Pending::Abort => {}
@@ -371,13 +367,13 @@ impl Output {
         let pending = self.state.lock().unwrap().pending.remove(id);
         match pending {
             Some(Pending::Prompt(prompt)) => self.prompt_answered(prompt, response),
-            Some(Pending::SessionFile(send)) => {
+            Some(Pending::Request(send)) => {
                 let result = if response["success"] == true {
-                    Ok(response["data"]["sessionFile"].as_str().map(PathBuf::from))
+                    Ok(response["data"].clone())
                 } else {
                     Err(response["error"]
                         .as_str()
-                        .unwrap_or("pi refused get_state")
+                        .unwrap_or("pi refused the command")
                         .to_owned())
                 };
                 let _ = send.send(result);

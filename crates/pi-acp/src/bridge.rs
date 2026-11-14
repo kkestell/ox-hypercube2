@@ -7,11 +7,14 @@ use std::{
 use agent_client_protocol::v2::schema::{self as acp, SessionUpdate};
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error};
+use serde_json::{Value, json};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
+    commands,
     config::Config,
-    content, history,
+    content, history, options,
     pi::Pi,
     store::{Session as Metadata, Store},
     updates::{Updates, notify},
@@ -23,6 +26,12 @@ struct Session {
     metadata: Metadata,
     /// The session's Pi, once started.
     pi: Option<Pi>,
+}
+
+struct Description {
+    state: Value,
+    config_options: Vec<acp::SessionConfigOption>,
+    available_commands: Vec<acp::AvailableCommand>,
 }
 
 pub struct Bridge {
@@ -81,8 +90,10 @@ impl Bridge {
     /// Starts a new session's Pi once the client knows the session. A Pi that
     /// fails to start is started again by the session's first prompt.
     pub fn start_new(&self, id: &str, connection: &ConnectionTo<Client>) {
-        if let Err(error) = self.start_pi(id, connection) {
-            eprintln!("failed to start pi for session {id}: {}", error.message);
+        match self.start_pi(id, connection) {
+            Ok(true) => self.publish_description(id, connection),
+            Ok(false) => {}
+            Err(error) => eprintln!("failed to start pi for session {id}: {}", error.message),
         }
     }
 
@@ -130,8 +141,10 @@ impl Bridge {
             Ok(prompt) => prompt,
             Err(error) => return responder.respond_with_error(invalid(error)),
         };
-        if let Err(error) = self.start_pi(&id, connection) {
-            return responder.respond_with_error(error);
+        match self.start_pi(&id, connection) {
+            Ok(true) => self.publish_description(&id, connection),
+            Ok(false) => {}
+            Err(error) => return responder.respond_with_error(error),
         }
         // Save the title before submitting a prompt so registry errors can be
         // returned to its caller without accepting work first.
@@ -212,24 +225,21 @@ impl Bridge {
                 .entry(id.clone())
                 .or_insert(Session { metadata, pi: None });
             self.start_pi(&id, connection)?;
-            let sessions = self.sessions.lock().unwrap();
-            let pi = sessions[&id].pi.as_ref().expect("start_pi started pi");
-            let path = replay.then(|| pi.session_file());
-            Ok((id, cwd, path))
+            let description = self.describe(&id);
+            Ok((id, cwd, replay, description))
         })();
         let bridge = self.clone();
         let connection = connection.clone();
         async move {
-            let (id, cwd, path) = prepared?;
-            if let Some(path) = path {
-                let path = path
-                    .await
-                    .map_err(|_| Error::new(-32603, "pi exited"))?
-                    .map_err(|error| Error::new(-32603, error))?;
-                if let Some(path) = path {
-                    history::replay(&path, &cwd, &Updates::new(connection.clone(), &id))
-                        .map_err(|error| store_error(&error))?;
-                }
+            let (id, cwd, replay, description) = prepared?;
+            let description = description.await?;
+            if replay && let Some(path) = description.state["sessionFile"].as_str() {
+                history::replay(
+                    std::path::Path::new(path),
+                    &cwd,
+                    &Updates::new(connection.clone(), &id),
+                )
+                .map_err(|error| store_error(&error))?;
             }
             let sessions = bridge.sessions.lock().unwrap();
             let session = sessions
@@ -240,18 +250,125 @@ impl Bridge {
                 &id,
                 SessionUpdate::StateUpdate(session.pi.as_ref().expect("started pi").snapshot()),
             );
-            Ok(acp::ResumeSessionResponse::new())
+            Ok(acp::ResumeSessionResponse::new()
+                .config_options(description.config_options)
+                .available_commands(description.available_commands))
+        }
+    }
+
+    /// Sends all description queries before returning, so later requests do
+    /// not overtake their submission to Pi.
+    fn describe(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
+        let queries = (|| {
+            let sessions = self.sessions.lock().unwrap();
+            let session = sessions
+                .get(id)
+                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.to_owned())))?;
+            let pi = session.pi.as_ref().expect("started pi");
+            Ok::<_, Error>([
+                pi.request(json!({"type":"get_state"})),
+                pi.request(json!({"type":"get_available_models"})),
+                pi.request(json!({"type":"get_available_thinking_levels"})),
+                pi.request(json!({"type":"get_commands"})),
+            ])
+        })();
+        async move {
+            let [state, models, levels, catalog] = queries?;
+            let state = answer(state).await?;
+            let models = answer(models).await?;
+            let levels = answer(levels).await?;
+            let catalog = answer(catalog).await?;
+            Ok(Description {
+                config_options: options::build(&state, &models["models"], &levels["levels"]),
+                available_commands: commands::catalog(&catalog["commands"]),
+                state,
+            })
+        }
+    }
+
+    fn publish_description(&self, id: &str, connection: &ConnectionTo<Client>) {
+        let description = self.describe(id);
+        let id = id.to_owned();
+        let connection = connection.clone();
+        tokio::spawn(async move {
+            match description.await {
+                Ok(description) => {
+                    notify(
+                        &connection,
+                        &id,
+                        SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
+                            description.config_options,
+                        )),
+                    );
+                    notify(
+                        &connection,
+                        &id,
+                        SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                            description.available_commands,
+                        )),
+                    );
+                }
+                Err(error) => {
+                    eprintln!("failed to describe pi for session {id}: {}", error.message);
+                }
+            }
+        });
+    }
+
+    /// Sends the change before returning its completion future.
+    pub fn set_config(
+        self: &Arc<Self>,
+        request: &acp::SetSessionConfigOptionRequest,
+        connection: ConnectionTo<Client>,
+    ) -> impl Future<Output = Result<acp::SetSessionConfigOptionResponse, Error>> + Send + 'static
+    {
+        let id = request.session_id.to_string();
+        let change = (|| {
+            if !self.sessions.lock().unwrap().contains_key(&id) {
+                return Err(Error::from(acp::Error::session_not_found(id.clone())));
+            }
+            let acp::SessionConfigOptionValue::Id { value } = &request.value else {
+                return Err(invalid("Expected a select value"));
+            };
+            let command = options::command(&request.config_id.to_string(), &value.to_string())
+                .ok_or_else(|| invalid("Unknown configuration option or value"))?;
+            if self.start_pi(&id, &connection)? {
+                self.publish_description(&id, &connection);
+            }
+            let sessions = self.sessions.lock().unwrap();
+            let pi = sessions[&id].pi.as_ref().expect("started pi");
+            // TODO: Pi handles RPC lines concurrently; a following prompt can
+            // start on the previous model while set_model awaits authentication.
+            Ok(pi.request(command))
+        })();
+        let bridge = self.clone();
+        async move {
+            answer(change?).await?;
+            let description = bridge.describe(&id).await?;
+            notify(
+                &connection,
+                &id,
+                SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
+                    description.config_options.clone(),
+                )),
+            );
+            Ok(acp::SetSessionConfigOptionResponse::new(
+                description.config_options,
+            ))
         }
     }
 
     /// Starts the session's Pi unless one is running.
-    fn start_pi(&self, id: &str, connection: &ConnectionTo<Client>) -> Result<(), Error> {
+    fn start_pi(&self, id: &str, connection: &ConnectionTo<Client>) -> Result<bool, Error> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions
             .get_mut(id)
             .ok_or_else(|| Error::from(acp::Error::session_not_found(id.to_owned())))?;
         if session.pi.as_ref().is_some_and(|pi| !pi.has_exited()) {
-            return Ok(());
+            return Ok(false);
         }
         let pi = Pi::start(
             &session.metadata.cwd,
@@ -260,7 +377,7 @@ impl Bridge {
         )
         .map_err(|error| Error::new(-32603, error))?;
         session.pi = Some(pi);
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -270,4 +387,11 @@ fn invalid(message: impl Into<String>) -> Error {
 
 fn store_error(error: &std::io::Error) -> Error {
     Error::new(-32603, error.to_string())
+}
+
+async fn answer(response: oneshot::Receiver<Result<Value, String>>) -> Result<Value, Error> {
+    response
+        .await
+        .map_err(|_| Error::new(-32603, "pi exited"))?
+        .map_err(|error| Error::new(-32603, error))
 }

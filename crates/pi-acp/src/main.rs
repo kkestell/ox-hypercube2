@@ -1,7 +1,9 @@
 mod bridge;
+mod commands;
 mod config;
 mod content;
 mod history;
+mod options;
 mod pi;
 mod store;
 mod tools;
@@ -74,6 +76,18 @@ async fn main() -> Result<()> {
                         closed.await;
                         responder.respond(acp::CloseSessionResponse::new())
                     })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::SetSessionConfigOptionRequest,
+                            responder: Responder<acp::SetSessionConfigOptionResponse>,
+                            connection: ConnectionTo<Client>| {
+                    let change = bridge.set_config(&request, connection.clone());
+                    connection.spawn(async move { respond(responder, change.await) })
                 }
             },
             agent_client_protocol::on_receive_request!(),
