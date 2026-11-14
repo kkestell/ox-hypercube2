@@ -1,12 +1,13 @@
 # Ox
 
-A Cargo workspace containing the Ox desktop app, its session daemon, and the Claude
-Code ACP bridge.
+A Cargo workspace containing the Ox desktop app, its session daemon, and the ACP
+bridges for Claude Code and Pi.
 
 | Path                      | Description                                                                       |
 | ------------------------- | --------------------------------------------------------------------------------- |
 | `crates/ox/`              | Ox desktop app (Tauri 2)                                                          |
 | `crates/claude-code-acp/` | ACP bridge for the Claude Code CLI                                                |
+| `crates/pi-acp/`          | ACP bridge for the Pi CLI                                                         |
 | `crates/oxd/`             | Session daemon that owns ACP agent processes and serves Ox UIs over a Unix socket |
 | `crates/ox-protocol/`     | oxd wire types and client                                                         |
 | `crates/oxctl/`           | Daemon client for the desktop end-to-end and live Claude smoke tests               |
@@ -48,12 +49,12 @@ On macOS, with Rust, Node.js, and the Xcode Command Line Tools installed:
 make install
 ```
 
-This builds a release `Ox.app` with the daemon, MCP server, and Claude bridge,
-signs it with an ad hoc signature (no certificate required), and copies it to
-`~/Applications/Ox.app`, replacing any previous installation. Claude Code must
-be installed and authenticated to use the Claude bridge. The macOS app reads
-`PATH` from your interactive login shell so it can find tools when opened from
-Finder or the Dock.
+This builds a release `Ox.app` with the daemon, MCP server, and the Claude and
+Pi bridges, signs it with an ad hoc signature (no certificate required), and
+copies it to `~/Applications/Ox.app`, replacing any previous installation.
+Claude Code must be installed and authenticated to use the Claude bridge. The
+macOS app reads `PATH` from your interactive login shell so it can find tools
+when opened from Finder or the Dock.
 
 ## Development
 

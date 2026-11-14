@@ -1,0 +1,97 @@
+mod bridge;
+mod content;
+mod pi;
+mod tools;
+mod updates;
+mod validation;
+
+use agent_client_protocol::v2::schema as acp;
+use agent_client_protocol::v2::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client, Result, Stdio};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let bridge = bridge::Bridge::new();
+    Agent
+        .v2()
+        .name("pi-acp")
+        .on_receive_request(
+            async move |request: acp::InitializeRequest,
+                        responder: Responder<acp::InitializeResponse>,
+                        _connection: ConnectionTo<Client>| {
+                responder.respond(bridge::Bridge::initialize(&request))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::NewSessionRequest,
+                            responder: Responder<acp::NewSessionResponse>,
+                            connection: ConnectionTo<Client>| {
+                    let response = bridge.new_session(&request);
+                    // A new session is idle with nothing running, which it
+                    // reports once the client knows its ID, and then starts
+                    // its Pi.
+                    let id = response.as_ref().ok().map(|new| new.session_id.to_string());
+                    respond(responder, response)?;
+                    if let Some(id) = id {
+                        updates::notify(
+                            &connection,
+                            &id,
+                            acp::SessionUpdate::StateUpdate(updates::idle_state()),
+                        );
+                        bridge.start_new(&id, &connection);
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::CloseSessionRequest,
+                            responder: Responder<acp::CloseSessionResponse>,
+                            connection: ConnectionTo<Client>| {
+                    let closed = bridge.close_session(&request.session_id.to_string());
+                    connection.spawn(async move {
+                        closed.await;
+                        responder.respond(acp::CloseSessionResponse::new())
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::PromptRequest,
+                            responder: Responder<acp::PromptResponse>,
+                            connection: ConnectionTo<Client>| {
+                    bridge.prompt(&request, responder, &connection)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            async move |notification: acp::CancelSessionNotification,
+                        _connection: ConnectionTo<Client>| {
+                bridge.cancel(&notification.session_id.to_string());
+                Ok(())
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_to(Stdio::new())
+        .await
+}
+
+fn respond<T: agent_client_protocol::JsonRpcResponse>(
+    responder: Responder<T>,
+    result: std::result::Result<T, agent_client_protocol::Error>,
+) -> Result<()> {
+    match result {
+        Ok(response) => responder.respond(response),
+        Err(error) => responder.respond_with_error(error),
+    }
+}
