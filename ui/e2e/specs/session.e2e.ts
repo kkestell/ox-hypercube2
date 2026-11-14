@@ -112,15 +112,18 @@ describe("A session", () => {
     await expect(awaiting).toBeDisplayed();
     await form.$("label*=Blue").click();
     await form.$("label*=Nuts").click();
-    await form.$('input[aria-label="Note"]').setValue("hi");
+    const note = form.$('textarea[aria-label="Note"]');
+    await expect(note).toHaveValue("first\nsecond");
+    await note.setValue("edited\nsecond");
     await form.$('input[aria-label="Count"]').setValue("2");
+    await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "elicitation-text-fields.png"));
     // The date and time's default shows in local time and goes back as the
     // same instant.
     await expect(form.$('input[aria-label="When"]')).toHaveValue(/^2026-11-1[123]T\d\d:\d\d$/);
     await form.$("button=Submit").click();
     // Had the first Submit gone out, the agent would have answered it alone.
     await expect(agentText()[0]).toHaveText(
-      'accepted {"color":"blue","count":2,"extras":["nuts"],"note":"hi","rush":false,' +
+      'accepted {"color":"blue","count":2,"extras":["nuts"],"note":"edited\\nsecond","rush":false,' +
         '"when":"2026-11-12T08:30:00.000Z"}',
     );
     await expect(form).not.toBeExisting();
@@ -132,16 +135,17 @@ describe("A session", () => {
     const form = $(".composer .request-panel");
     const invalid = (selector: string) => form.$(`${selector}:invalid`);
     await form.$("label*=Blue").click();
+    await form.$('textarea[aria-label="Note"]').clearValue();
     await form.$('input[aria-label="Weight"]').setValue("0.25");
     await form.$('input[aria-label="Email"]').setValue("nope");
-    await form.$('input[aria-label="Code"]').setValue("ab12");
+    await form.$('textarea[aria-label="Code"]').setValue("ab12");
     await form.$("label*=Sprinkles").click();
     await form.$("label*=Nuts").click();
     await form.$("label*=Cherries").click();
     await form.$("label*=ketchup").click();
     await expect(invalid('input[aria-label="Weight"]')).toBeExisting();
     await expect(invalid('input[aria-label="Email"]')).toBeExisting();
-    await expect(invalid('input[aria-label="Code"]')).toBeExisting();
+    await expect(invalid('textarea[aria-label="Code"]')).toBeExisting();
     // At most two extras and at least two sauces.
     await expect(invalid('input[name="extras"]')).toBeExisting();
     await expect(invalid('input[name="sauces"]')).toBeExisting();
@@ -151,8 +155,8 @@ describe("A session", () => {
     await form.$('input[aria-label="Weight"]').setValue("1.5");
     await form.$('input[aria-label="Email"]').setValue("a@b.co");
     // A schema pattern matches anywhere in the value.
-    await form.$('input[aria-label="Code"]').setValue("x123y");
-    await expect(invalid('input[aria-label="Code"]')).not.toBeExisting();
+    await form.$('textarea[aria-label="Code"]').setValue("x123y");
+    await expect(invalid('textarea[aria-label="Code"]')).not.toBeExisting();
     await form.$("label*=Sprinkles").click();
     await form.$("label*=mustard").click();
     await form.$("label*=large").click();

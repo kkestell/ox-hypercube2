@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    future::Future,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -18,8 +19,18 @@ use crate::tools;
 struct State {
     /// Pi is working on a turn, as the client was last told.
     working: bool,
+    asking: usize,
+    sent: Sent,
     /// Tool calls that have opened and not ended.
     open: HashSet<String>,
+}
+
+#[derive(Default, PartialEq, Clone, Copy)]
+enum Sent {
+    #[default]
+    Idle,
+    Running,
+    RequiresAction,
 }
 
 /// Sends one session's updates to the client.
@@ -27,14 +38,16 @@ struct State {
 pub struct Updates {
     connection: ConnectionTo<Client>,
     session_id: String,
+    forms: bool,
     state: Arc<Mutex<State>>,
 }
 
 impl Updates {
-    pub fn new(connection: ConnectionTo<Client>, session_id: &str) -> Self {
+    pub fn new(connection: ConnectionTo<Client>, session_id: &str, forms: bool) -> Self {
         Self {
             connection,
             session_id: session_id.to_owned(),
+            forms,
             state: Arc::new(Mutex::new(State::default())),
         }
     }
@@ -43,28 +56,68 @@ impl Updates {
         notify(&self.connection, &self.session_id, update);
     }
 
-    pub fn snapshot(&self) -> StateUpdate {
-        state_update(self.state.lock().unwrap().working, None)
+    pub fn forms(&self) -> bool {
+        self.forms
     }
 
-    /// Tells the client that Pi started working, if it has not said so.
-    pub fn working(&self) {
-        let mut state = self.state.lock().unwrap();
+    pub fn snapshot(&self) -> StateUpdate {
+        state_update(Self::current(&self.state.lock().unwrap()), None)
+    }
+
+    fn current(state: &State) -> Sent {
         if !state.working {
-            state.working = true;
-            self.send(SessionUpdate::StateUpdate(state_update(true, None)));
+            Sent::Idle
+        } else if state.asking > 0 {
+            Sent::RequiresAction
+        } else {
+            Sent::Running
         }
     }
 
-    /// Tells the client that Pi stopped working, with why.
+    fn publish(&self, state: &mut State, stop_reason: Option<StopReason>) {
+        let current = Self::current(state);
+        if current != state.sent {
+            state.sent = current;
+            self.send(SessionUpdate::StateUpdate(state_update(
+                current,
+                stop_reason,
+            )));
+        }
+    }
+
+    pub fn working(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.working = true;
+        self.publish(&mut state, None);
+    }
+
     pub fn idle(&self, stop_reason: StopReason) {
         let mut state = self.state.lock().unwrap();
-        if state.working {
-            state.working = false;
-            self.send(SessionUpdate::StateUpdate(state_update(
-                false,
-                Some(stop_reason),
-            )));
+        state.working = false;
+        self.publish(&mut state, Some(stop_reason));
+    }
+
+    pub fn ask(
+        &self,
+        message: String,
+        schema: acp::ElicitationSchema,
+    ) -> impl Future<Output = Option<acp::ElicitationAction>> + Send + 'static {
+        let updates = self.clone();
+        async move {
+            let _asking = Asking::new(updates.clone());
+            updates
+                .connection
+                .send_request(acp::CreateElicitationRequest::new(
+                    acp::ElicitationFormMode::new(
+                        acp::ElicitationSessionScope::new(updates.session_id.clone()),
+                        schema,
+                    ),
+                    message,
+                ))
+                .block_task()
+                .await
+                .ok()
+                .map(|response| response.action)
         }
     }
 
@@ -154,23 +207,48 @@ fn tool_status(id: String, status: ToolCallStatus) -> SessionUpdate {
     SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(id).status(status))
 }
 
-/// A running or idle state. Pi has no background work, so the session can
-/// park whenever it is idle.
-fn state_update(running: bool, stop_reason: Option<StopReason>) -> StateUpdate {
-    if running {
-        StateUpdate::Running(acp::RunningStateUpdate::new().background(Some(Vec::new())))
-    } else {
-        StateUpdate::Idle(
+/// Holds the requires-action state for the life of a client request.
+struct Asking(Updates);
+
+impl Asking {
+    fn new(updates: Updates) -> Self {
+        {
+            let mut state = updates.state.lock().unwrap();
+            state.asking += 1;
+            updates.publish(&mut state, None);
+        }
+        Self(updates)
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap();
+        state.asking -= 1;
+        self.0.publish(&mut state, None);
+    }
+}
+
+/// Pi has no background work, so an idle session can park.
+fn state_update(state: Sent, stop_reason: Option<StopReason>) -> StateUpdate {
+    match state {
+        Sent::Idle => StateUpdate::Idle(
             acp::IdleStateUpdate::new()
                 .stop_reason(stop_reason)
                 .background(Some(Vec::new())),
-        )
+        ),
+        Sent::Running => {
+            StateUpdate::Running(acp::RunningStateUpdate::new().background(Some(Vec::new())))
+        }
+        Sent::RequiresAction => StateUpdate::RequiresAction(
+            acp::RequiresActionStateUpdate::new().background(Some(Vec::new())),
+        ),
     }
 }
 
 /// The state of a session that is idle with nothing running.
 pub fn idle_state() -> StateUpdate {
-    state_update(false, None)
+    state_update(Sent::Idle, None)
 }
 
 pub fn notify(connection: &ConnectionTo<Client>, id: &str, update: SessionUpdate) {

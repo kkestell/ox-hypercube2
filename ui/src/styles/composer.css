@@ -143,7 +143,7 @@
   margin-bottom: var(--spacing);
 }
 
-.composer textarea {
+.composer .input textarea {
   flex: 1;
   field-sizing: content;
   min-height: 0;

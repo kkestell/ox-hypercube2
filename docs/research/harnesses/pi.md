@@ -72,6 +72,8 @@
 - **[docs]** Pi is not a built-in per-command approval/sandbox security boundary; extensions can intercept `tool_call` to request UI confirmation or block. Project trust is separate from execution sandboxing. Source: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
 - **[docs]** RPC extension UI request/response records carry IDs for select/confirm/input/editor interactions; `extension_ui_response` answers that ID, not an ordinary command. Unsupported full custom TUI operations require a richer host/SDK UI. Source: https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md
 
+- **[verified]** Extension-dialog follow-up on 2026-11-14 inspected installed 1.4.0 `dist/modes/rpc/rpc-mode.js` (`createDialogPromise`) and upstream `main` RPC types. A timeout or the extension's private `AbortSignal` resolves the dialog's default and forgets its ID without emitting a withdrawal record; a later response to that ID is ignored. The bridge can mirror the request's `timeout` and observe session cancellation, aborted runs, and process exit. An independently aborted private signal is unobservable over RPC, so its form remains until answered or the session is cancelled. Extension commands open dialogs before `prompt` returns, and Pi's `abort` does not end those dialogs; the host must send `extension_ui_response` with `cancelled: true`. Sources: installed RPC implementation and https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/modes/rpc/rpc-types.ts
+
 ## 10. Subagents and delegation
 
 - **[docs]** Pi intentionally omits native subagents and plan mode; extensions/packages implement them. Source: https://github.com/earendil-works/pi/tree/main/packages/coding-agent

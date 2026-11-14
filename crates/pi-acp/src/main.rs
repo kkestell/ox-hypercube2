@@ -2,6 +2,7 @@ mod bridge;
 mod commands;
 mod config;
 mod content;
+mod dialogs;
 mod history;
 mod options;
 mod pi;
@@ -21,10 +22,13 @@ async fn main() -> Result<()> {
         .v2()
         .name("pi-acp")
         .on_receive_request(
-            async move |request: acp::InitializeRequest,
-                        responder: Responder<acp::InitializeResponse>,
-                        _connection: ConnectionTo<Client>| {
-                responder.respond(bridge::Bridge::initialize(&request))
+            {
+                let bridge = bridge.clone();
+                async move |request: acp::InitializeRequest,
+                            responder: Responder<acp::InitializeResponse>,
+                            _connection: ConnectionTo<Client>| {
+                    responder.respond(bridge.initialize(&request))
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )

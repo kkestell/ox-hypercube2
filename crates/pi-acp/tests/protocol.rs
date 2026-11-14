@@ -156,6 +156,25 @@ async fn response(reader: &mut BufReader<ChildStdout>, id: i64) -> (Value, Vec<V
     }
 }
 
+async fn until_method(reader: &mut BufReader<ChildStdout>, method: &str) -> (Value, Vec<Value>) {
+    let mut seen = Vec::new();
+    loop {
+        let value = receive(reader).await;
+        if value["method"] == method {
+            return (value, seen);
+        }
+        seen.push(value);
+    }
+}
+
+async fn answer_form(child: &mut Child, request: &Value, action: Value) {
+    send(
+        child,
+        json!({"jsonrpc":"2.0", "id":request["id"], "result": action}),
+    )
+    .await;
+}
+
 /// The `session/update` update of a notification.
 fn update(notification: &Value) -> &Value {
     &notification["params"]["update"]
@@ -200,11 +219,11 @@ async fn finish(
     (idle, seen)
 }
 
-async fn initialize(child: &mut Child, reader: &mut BufReader<ChildStdout>) {
+async fn initialize(child: &mut Child, reader: &mut BufReader<ChildStdout>, capabilities: Value) {
     send(
         child,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
-            "protocolVersion":2,"capabilities":{},"info":{"name":"test","version":"1"}
+            "protocolVersion":2,"capabilities":capabilities,"info":{"name":"test","version":"1"}
         }}),
     )
     .await;
@@ -252,11 +271,24 @@ async fn session(
     BufReader<ChildStdout>,
     Value,
 ) {
+    session_with_capabilities(script, json!({"elicitation":{"form":{}}})).await
+}
+
+async fn session_with_capabilities(
+    script: &str,
+    capabilities: Value,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    Child,
+    BufReader<ChildStdout>,
+    Value,
+) {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_pi(&bin, script);
     let (mut child, mut reader) = start(&bin);
-    initialize(&mut child, &mut reader).await;
+    initialize(&mut child, &mut reader, capabilities).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     startup_catalog(&mut reader).await;
     (temp, project, child, reader, session)
@@ -328,7 +360,7 @@ async fn a_new_session_starts_pi_and_reports_idle() {
     let (bin, project) = dirs(temp.path());
     fake_pi(&bin, "");
     let (mut child, mut reader) = start(&bin);
-    initialize(&mut child, &mut reader).await;
+    initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let [options, commands] = startup_catalog(&mut reader).await;
     assert_eq!(options["params"]["sessionId"], session);
@@ -695,8 +727,8 @@ async fn closing_a_session_stops_pi() {
 }
 
 #[tokio::test]
-async fn extension_dialogs_are_dismissed() {
-    let (_temp, project, mut child, mut reader, session) = session(
+async fn clients_without_forms_get_no_dialogs() {
+    let (_temp, project, mut child, mut reader, session) = session_with_capabilities(
         r#"
 next_prompt
 accept
@@ -707,6 +739,7 @@ next_command
 printf '%s\n' "$command" > dialog
 settled
 "#,
+        json!({}),
     )
     .await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -717,6 +750,229 @@ settled
         json!({"type": "extension_ui_response", "id": "ask-1", "cancelled": true})
     );
     child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn extension_dialogs_become_forms() {
+    let (_temp, project, mut child, mut reader, session) = session(r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"extension_ui_request","id":"note-1","method":"notify","message":"Checking"}'
+emit '{"type":"extension_ui_request","id":"select-1","method":"select","title":"Choose","options":["Allow","Block"]}'
+next_command
+printf '%s\n' "$command" >> dialogs
+emit '{"type":"extension_ui_request","id":"confirm-1","method":"confirm","title":"Run?","message":"Delete build"}'
+next_command
+printf '%s\n' "$command" >> dialogs
+emit '{"type":"extension_ui_request","id":"input-1","method":"input","title":"Name"}'
+next_command
+printf '%s\n' "$command" >> dialogs
+emit '{"type":"extension_ui_request","id":"editor-1","method":"editor","title":"Edit","prefill":"first\nsecond"}'
+next_command
+printf '%s\n' "$command" >> dialogs
+settled
+"#).await;
+    send(&mut child, prompt_request(3, &session)).await;
+    let mut seen = Vec::new();
+    for content in [
+        json!({"answer":"Block"}),
+        json!({"answer":"no"}),
+        json!({}),
+        json!({"answer":"edited\nsecond"}),
+    ] {
+        let (request, more) = until_method(&mut reader, "elicitation/create").await;
+        seen.extend(more);
+        assert_eq!(request["params"]["mode"], "form", "{request}");
+        assert_eq!(request["params"]["sessionId"], session, "{request}");
+        answer_form(
+            &mut child,
+            &request,
+            json!({"action":"accept", "content":content}),
+        )
+        .await;
+    }
+    let (idle, seen) = finish(&mut reader, 3, seen).await;
+    assert_eq!(idle["stopReason"], "end_turn");
+    let states: Vec<_> = seen
+        .iter()
+        .filter(|v| kind(v) == "state_update")
+        .map(|v| update(v)["state"].as_str().unwrap())
+        .collect();
+    assert!(
+        states
+            .windows(3)
+            .any(|s| s == ["running", "requires_action", "running"]),
+        "{states:?}"
+    );
+    let dialogs: Vec<Value> = lines(&project, "dialogs", 4)
+        .await
+        .iter()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        dialogs,
+        vec![
+            json!({"type":"extension_ui_response","id":"select-1","value":"Block"}),
+            json!({"type":"extension_ui_response","id":"confirm-1","confirmed":false}),
+            json!({"type":"extension_ui_response","id":"input-1","value":""}),
+            json!({"type":"extension_ui_response","id":"editor-1","value":"edited\nsecond"}),
+        ]
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn declined_and_cancelled_dialogs_answer_cancelled() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+for id in ask-1 ask-2; do
+  emit "{\"type\":\"extension_ui_request\",\"id\":\"$id\",\"method\":\"input\",\"title\":\"Name\"}"
+  next_command
+  printf '%s\n' "$command" >> dialogs
+done
+settled
+"#,
+    )
+    .await;
+    send(&mut child, prompt_request(3, &session)).await;
+    let mut seen = Vec::new();
+    for action in ["decline", "cancel"] {
+        let (request, more) = until_method(&mut reader, "elicitation/create").await;
+        seen.extend(more);
+        answer_form(&mut child, &request, json!({"action":action})).await;
+    }
+    finish(&mut reader, 3, seen).await;
+    for (index, line) in lines(&project, "dialogs", 2).await.iter().enumerate() {
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            json!({"type":"extension_ui_response","id":format!("ask-{}", index + 1),"cancelled":true})
+        );
+    }
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancel_withdraws_open_dialogs() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"extension_ui_request","id":"ask-1","method":"confirm","title":"Run?"}'
+next_command
+printf '%s\n' "$command" > dialog
+aborted
+settled true
+"#,
+    )
+    .await;
+    send(&mut child, prompt_request(3, &session)).await;
+    let (request, mut seen) = until_method(&mut reader, "elicitation/create").await;
+    send(&mut child, cancel_notification(&session)).await;
+    let (cancel, more) = until_method(&mut reader, "$/cancel_request").await;
+    seen.extend(more);
+    assert_eq!(cancel["params"]["requestId"], request["id"]);
+    let (idle, _) = finish(&mut reader, 3, seen).await;
+    assert_eq!(idle["stopReason"], "cancelled");
+    assert_eq!(
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        json!({"type":"extension_ui_response","id":"ask-1","cancelled":true})
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_dialog_with_a_timeout_is_withdrawn() {
+    let (_temp, project, mut child, mut reader, session) = session(r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"extension_ui_request","id":"ask-1","method":"select","title":"Choose","options":["Allow","Block"],"timeout":50}'
+next_command
+printf '%s\n' "$command" > dialog
+settled
+"#).await;
+    send(&mut child, prompt_request(3, &session)).await;
+    let (request, mut seen) = until_method(&mut reader, "elicitation/create").await;
+    let (cancel, more) = until_method(&mut reader, "$/cancel_request").await;
+    seen.extend(more);
+    assert_eq!(cancel["params"]["requestId"], request["id"]);
+    finish(&mut reader, 3, seen).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        json!({"type":"extension_ui_response","id":"ask-1","cancelled":true})
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_zero_timeout_keeps_the_dialog_open() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"extension_ui_request","id":"ask-1","method":"input","title":"Name","timeout":0}'
+next_command
+printf '%s\n' "$command" > dialog
+settled
+"#,
+    )
+    .await;
+    send(&mut child, prompt_request(3, &session)).await;
+    let (request, seen) = until_method(&mut reader, "elicitation/create").await;
+    // Pi treats zero as no timeout. Keep the form open beyond an immediate
+    // timer before answering, so cancellation cannot race a fast answer.
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            until_method(&mut reader, "$/cancel_request"),
+        )
+        .await
+        .is_err(),
+        "a zero timeout withdrew the dialog"
+    );
+    answer_form(
+        &mut child,
+        &request,
+        json!({"action":"accept", "content":{"answer":"Ada"}}),
+    )
+    .await;
+    finish(&mut reader, 3, seen).await;
+    assert_eq!(
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        json!({"type":"extension_ui_response","id":"ask-1","value":"Ada"})
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_aborted_run_and_pi_exit_withdraw_dialogs() {
+    for ending in ["settled true", "exit 3"] {
+        let script = format!(
+            r#"
+next_prompt
+accept
+emit '{{"type":"agent_start"}}'
+emit '{{"type":"extension_ui_request","id":"ask-1","method":"input","title":"Name"}}'
+# Wait for the client to observe the form, then trigger the boundary.
+next_command
+expect set_thinking_level
+{ending}
+"#
+        );
+        let (_temp, _project, mut child, mut reader, session) = session(&script).await;
+        send(&mut child, prompt_request(3, &session)).await;
+        let (request, _) = until_method(&mut reader, "elicitation/create").await;
+        send(&mut child, config_request(4, &session, "thinking", "high")).await;
+        let (cancel, _) = until_method(&mut reader, "$/cancel_request").await;
+        assert_eq!(cancel["params"]["requestId"], request["id"], "{ending}");
+        child.kill().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -755,7 +1011,7 @@ settled
     prompt(&mut child, &mut reader, 3, &session).await;
     child.kill().await.unwrap();
     let (mut child, mut reader) = start(&temp.path().join("bin"));
-    initialize(&mut child, &mut reader).await;
+    initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
     send(&mut child, resume_request(2, &session, &project, None)).await;
     let (resumed, notifications) = response(&mut reader, 2).await;
     assert!(resumed["result"].is_object(), "{resumed}");

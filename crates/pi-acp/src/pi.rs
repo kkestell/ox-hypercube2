@@ -15,11 +15,12 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     sync::{mpsc, oneshot},
-    task::JoinHandle,
+    task::{AbortHandle, JoinHandle},
+    time::{Duration, sleep},
 };
 use uuid::Uuid;
 
-use crate::{tools, updates::Updates};
+use crate::{dialogs, tools, updates::Updates};
 
 /// A prompt waiting for Pi's answer to its `prompt` command.
 struct Prompt {
@@ -38,6 +39,8 @@ enum Pending {
 #[derive(Default)]
 struct State {
     counter: u64,
+    /// Client forms still waiting for an answer, by Pi request ID.
+    dialogs: HashMap<String, AbortHandle>,
     /// Commands Pi has not answered, by ID.
     pending: HashMap<String, Pending>,
     /// The client cancelled while a prompt waited for Pi's answer. Pi's abort
@@ -51,6 +54,16 @@ struct State {
 }
 
 impl State {
+    fn withdraw_dialogs(&mut self, input: Option<&mpsc::UnboundedSender<Value>>) {
+        for (id, task) in self.dialogs.drain() {
+            task.abort();
+            if let Some(input) = input {
+                let _ =
+                    input.send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}));
+            }
+        }
+    }
+
     /// Sends `command` to Pi under a new ID and records what waits for the
     /// response.
     fn send(&mut self, input: &mpsc::UnboundedSender<Value>, mut command: Value, pending: Pending) {
@@ -182,6 +195,7 @@ impl Pi {
         {
             state.abort_on_start = true;
         }
+        state.withdraw_dialogs(Some(&self.input));
         state.send(&self.input, json!({"type": "abort"}), Pending::Abort);
     }
 
@@ -279,6 +293,7 @@ impl Output {
         let (pending, closing) = {
             let mut state = self.state.lock().unwrap();
             state.exited = Some(error.clone());
+            state.withdraw_dialogs(None);
             (std::mem::take(&mut state.pending), state.closing)
         };
         for (_, pending) in pending {
@@ -344,21 +359,56 @@ impl Output {
                 }
             }
             Some("tool_execution_end") => self.tool_ended(&record),
-            Some("extension_ui_request") => {
-                // TODO(task 5): ask the client with a form elicitation.
+            Some("extension_ui_request")
                 if matches!(
                     record["method"].as_str(),
                     Some("select" | "confirm" | "input" | "editor")
-                ) {
-                    self.send(json!({
-                        "type": "extension_ui_response",
-                        "id": record["id"],
-                        "cancelled": true,
-                    }));
-                }
+                ) =>
+            {
+                self.dialog(record);
             }
             _ => {}
         }
+    }
+
+    fn dialog(&self, request: Value) {
+        let form = self
+            .updates
+            .forms()
+            .then(|| dialogs::form(&request))
+            .flatten();
+        let Some((message, schema)) = form else {
+            self.send(dialogs::response(&request, None));
+            return;
+        };
+        let Some(id) = request["id"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let updates = self.updates.clone();
+        let state = self.state.clone();
+        let input = self.input.clone();
+        let mut locked = self.state.lock().unwrap();
+        let task_id = id.clone();
+        let task = tokio::spawn(async move {
+            let ask = updates.ask(message, schema);
+            // Pi silently forgets timed-out dialogs; it sends no withdrawal record.
+            // An extension's private AbortSignal cannot be observed over RPC.
+            let action = if let Some(timeout) = request["timeout"].as_u64().filter(|ms| *ms > 0) {
+                tokio::select! {
+                    action = ask => action,
+                    () = sleep(Duration::from_millis(timeout)) => None,
+                }
+            } else {
+                ask.await
+            };
+            let mut state = state.lock().unwrap();
+            if state.dialogs.remove(&task_id).is_some()
+                && let Some(input) = input.upgrade()
+            {
+                let _ = input.send(dialogs::response(&request, action));
+            }
+        });
+        locked.dialogs.insert(id, task.abort_handle());
     }
 
     /// Resolves the command Pi answered.
@@ -421,6 +471,12 @@ impl Output {
 
     /// Ends the turn once Pi has no more automatic work.
     fn settled(&mut self, aborted: bool) {
+        if aborted {
+            self.state
+                .lock()
+                .unwrap()
+                .withdraw_dialogs(self.input.upgrade().as_ref());
+        }
         self.running = false;
         self.updates.fail_open_tools();
         self.tools.clear();

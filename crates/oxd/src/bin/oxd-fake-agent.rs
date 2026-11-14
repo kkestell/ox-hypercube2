@@ -21,7 +21,7 @@
 //!   message `Order` and the fields `color` (required, one of `red` "Red"
 //!   and `blue` "Blue"), `size` (one of `small` and `large`), `extras` (at
 //!   most two of `sprinkles`, `nuts` and `cherries`), `sauces` (at least two
-//!   of `ketchup`, `mustard` and `mayo`), `note` (text), `code` (text
+//!   of `ketchup`, `mustard` and `mayo`), `note` (text, by default `first\nsecond`), `code` (text
 //!   containing three digits), `email` (an email address), `when` (a date
 //!   and time, by default `2026-11-12T08:30:00Z`), `count` (an integer from
 //!   1 to 9), `weight` (a number from 0.5 to 10), and `rush` (a boolean). Then
@@ -1194,7 +1194,9 @@ fn order(session_id: acp::SessionId) -> acp::CreateElicitationRequest {
         )
         .property(
             "note",
-            acp::StringPropertySchema::new().title("Note"),
+            acp::StringPropertySchema::new()
+                .title("Note")
+                .default_value("first\nsecond"),
             false,
         )
         .property(

@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use agent_client_protocol::v2::schema::{self as acp, SessionUpdate};
@@ -37,17 +40,27 @@ struct Description {
 pub struct Bridge {
     sessions: Mutex<HashMap<String, Session>>,
     store: Store,
+    forms: AtomicBool,
 }
 
 impl Bridge {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
+            forms: AtomicBool::new(false),
             store: Store::new(Config::from_env().store_dir),
         })
     }
 
-    pub fn initialize(request: &acp::InitializeRequest) -> acp::InitializeResponse {
+    pub fn initialize(&self, request: &acp::InitializeRequest) -> acp::InitializeResponse {
+        self.forms.store(
+            request
+                .capabilities
+                .elicitation
+                .as_ref()
+                .is_some_and(acp::ElicitationCapabilities::supports_form),
+            Ordering::Relaxed,
+        );
         acp::InitializeResponse::new(
             request.protocol_version,
             acp::Implementation::new("pi-acp", env!("CARGO_PKG_VERSION")).title("Pi ACP Bridge"),
@@ -237,7 +250,11 @@ impl Bridge {
                 history::replay(
                     std::path::Path::new(path),
                     &cwd,
-                    &Updates::new(connection.clone(), &id),
+                    &Updates::new(
+                        connection.clone(),
+                        &id,
+                        bridge.forms.load(Ordering::Relaxed),
+                    ),
                 )
                 .map_err(|error| store_error(&error))?;
             }
@@ -373,7 +390,7 @@ impl Bridge {
         let pi = Pi::start(
             &session.metadata.cwd,
             &session.metadata.pi_session_id,
-            Updates::new(connection.clone(), id),
+            Updates::new(connection.clone(), id, self.forms.load(Ordering::Relaxed)),
         )
         .map_err(|error| Error::new(-32603, error))?;
         session.pi = Some(pi);

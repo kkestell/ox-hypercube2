@@ -122,7 +122,7 @@ export function Elicitation({
     for (const field of item.fields) {
       const group = form.current?.elements.namedItem(field.name);
       const first = group instanceof RadioNodeList ? group[0] : group;
-      if (first instanceof HTMLInputElement) {
+      if (first instanceof HTMLInputElement || first instanceof HTMLTextAreaElement) {
         first.setCustomValidity(customError(field, values[field.name]));
       }
     }
@@ -167,11 +167,25 @@ export function Elicitation({
             />
           ));
         }
+        if (!field.format) {
+          return (
+            <textarea
+              className="text-field"
+              name={field.name}
+              aria-label={label}
+              required={field.required}
+              minLength={field.minLength}
+              maxLength={field.maxLength}
+              value={value as string}
+              onChange={(event) => set(field.name, event.target.value)}
+            />
+          );
+        }
         return (
           <input
             className="text-field"
             name={field.name}
-            type={inputTypes[field.format ?? ""] ?? "text"}
+            type={inputTypes[field.format] ?? "text"}
             aria-label={label}
             required={field.required}
             minLength={field.minLength}

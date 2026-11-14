@@ -41,6 +41,13 @@
   box-shadow: var(--shadow-sm);
 }
 
+textarea.text-field {
+  height: auto;
+  min-height: var(--text-control-height);
+  padding-block: var(--spacing);
+  resize: vertical;
+}
+
 .text-button:hover:enabled {
   background: var(--accent);
 }
