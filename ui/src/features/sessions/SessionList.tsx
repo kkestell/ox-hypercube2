@@ -133,7 +133,7 @@ export function SessionList({
           contextMenu(event, [
             {
               text: session.archived ? "Unarchive Session" : "Archive Session",
-              enabled: !busy.has(session.id),
+              enabled: !busy.has(session.id) && session.state !== "starting",
               action: () =>
                 session.archived ? unarchiveSession(session.id) : archiveSession(session.id, false),
             },

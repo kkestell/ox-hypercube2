@@ -170,7 +170,8 @@ pub enum Method {
     /// Stops the session's agent, removes its worktree, and marks the
     /// session archived, keeping its branch. The conversation stays readable
     /// by subscribing; `session.load` refuses an archived session. The
-    /// worktree removal is refused with `UNSAVED_WORK`, as for
+    /// archive is refused while the agent is starting. Worktree removal
+    /// is refused with `UNSAVED_WORK`, as for
     /// `session.delete`, unless `discard` is set. Git runs with `env` over
     /// the daemon's environment. The result is the session's
     /// [`SessionInfo`].
@@ -195,10 +196,13 @@ pub enum Method {
     /// Sets local branch `branch` of the workspace's repository to commit
     /// `to`. Refused, changing nothing, when the branch is not at
     /// `expected`, or when `to` does not descend from `expected` unless
-    /// `force` is set. When a checkout has the branch, its files and index
+    /// `force` is set. When `source_branch` is supplied, that local branch
+    /// must still be at `to` when the destination ref moves.
+    /// When a checkout has the branch, its files and index
     /// move with it; the move is refused with `UNSAVED_WORK` while tracked
-    /// files there have uncommitted changes, and refused while a session's
-    /// agent there is starting, in a turn, or waiting for an answer. Git
+    /// files there have uncommitted changes or the move would overwrite
+    /// ignored files. A move is refused while a session's agent there is
+    /// starting, in a turn, or waiting for an answer. Git
     /// runs with `env` over the daemon's environment.
     #[serde(rename = "branch.move")]
     BranchMove {
@@ -206,6 +210,8 @@ pub enum Method {
         branch: String,
         to: String,
         expected: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_branch: Option<String>,
         #[serde(default)]
         force: bool,
         #[serde(default)]
@@ -730,6 +736,7 @@ mod tests {
             branch: "main".into(),
             to: "abc".into(),
             expected: "def".into(),
+            source_branch: Some("topic".into()),
             force: true,
             env: BTreeMap::from([("PATH".into(), "/bin".into())]),
         };
@@ -744,6 +751,7 @@ mod tests {
                     "branch": "main",
                     "to": "abc",
                     "expected": "def",
+                    "source_branch": "topic",
                     "force": true,
                     "env": {"PATH": "/bin"}
                 }
@@ -757,7 +765,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             request.method,
-            Method::BranchMove { ref branch, ref to, ref expected, force: false, ref env, .. }
+            Method::BranchMove { ref branch, ref to, ref expected, source_branch: None, force: false, ref env, .. }
                 if branch == "main" && to == "abc" && expected == "def" && env.is_empty()
         ));
         for compare in [Some("origin/main".to_owned()), None] {

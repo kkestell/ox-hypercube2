@@ -1,7 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
-import { useState } from "react";
 import { SelectPicker } from "../../components/SelectPicker";
 import type { ConfigOption, Item, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -9,17 +8,20 @@ import { CommandInput } from "./CommandInput";
 import { Elicitation } from "./Elicitation";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { Permission } from "./Permission";
+import type { Drafts } from "./useDrafts";
 
 export function Composer({
   session,
   request,
+  drafts,
 }: {
   session: SessionInfo;
   /** The session's oldest unanswered permission request or form. */
   request: Extract<Item, { type: "permission" | "elicitation" }> | undefined;
+  drafts: Drafts;
 }) {
-  const [text, setText] = useState("");
-  const [attachments, setAttachments] = useState<string[]>([]);
+  const draft = drafts.get(session.id);
+  const { text, attachments } = draft;
 
   const running =
     session.state === "running" ||
@@ -42,8 +44,7 @@ export function Composer({
   const send = () =>
     run(async () => {
       await invoke("prompt", { sessionId: session.id, text: text.trim(), attachments });
-      setText("");
-      setAttachments([]);
+      drafts.update(session.id, (current) => (current === draft ? undefined : current));
     });
 
   const stop = () => run(() => invoke("cancel", { sessionId: session.id }));
@@ -64,7 +65,12 @@ export function Composer({
 
   const attach = async () => {
     const paths = await open({ multiple: true, title: "Attach Files" });
-    if (paths !== null) setAttachments((current) => [...new Set([...current, ...paths])]);
+    if (paths !== null) {
+      drafts.update(session.id, (current) => ({
+        ...current,
+        attachments: [...new Set([...current.attachments, ...paths])],
+      }));
+    }
   };
 
   return (
@@ -93,7 +99,12 @@ export function Composer({
                     <button
                       type="button"
                       aria-label="Remove"
-                      onClick={() => setAttachments((current) => current.filter((p) => p !== path))}
+                      onClick={() =>
+                        drafts.update(session.id, (current) => ({
+                          ...current,
+                          attachments: current.attachments.filter((p) => p !== path),
+                        }))
+                      }
                     >
                       <X />
                     </button>
@@ -117,7 +128,7 @@ export function Composer({
                 commands={session.available_commands}
                 disabled={disabled}
                 canSend={canSend}
-                onChange={setText}
+                onChange={(text) => drafts.update(session.id, (current) => ({ ...current, text }))}
                 onSubmit={send}
               />
               <button

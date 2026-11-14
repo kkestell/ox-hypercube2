@@ -25,7 +25,7 @@ export function MergeButton({
   const blocker = mergeBlocker(compare, comparison);
 
   const merge = async () => {
-    if (comparison.type !== "compared") return;
+    if (comparison.type !== "compared" || session.worktree === null) return;
     setMoving(true);
     try {
       await invoke("move_branch", {
@@ -33,6 +33,7 @@ export function MergeButton({
         branch: compare,
         to: comparison.tip,
         expected: comparison.compare_tip,
+        sourceBranch: session.worktree.branch,
       });
       setMerged(true);
     } catch (e) {

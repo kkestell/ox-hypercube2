@@ -8,6 +8,7 @@ import {
   git,
   gitWorkspace,
   send,
+  startStuckSession,
   startWorktreeSession,
   workspaceGroup,
 } from "../helpers.ts";
@@ -29,8 +30,12 @@ function entry(cwd: string) {
  * event and deliver the choice through Tauri's menu channel instead of showing
  * the native popup. Menu creation and the session action still run normally.
  */
-async function sessionAction(cwd: string, text: "Archive Session" | "Unarchive Session") {
-  await browser.execute(
+async function sessionAction(
+  cwd: string,
+  text: "Archive Session" | "Unarchive Session" | "Delete Session",
+  archiveDisabled = false,
+) {
+  const archiveEnabled = await browser.execute(
     async (element, text) => {
       type MenuItem = { text: string; enabled: boolean; handler: string };
       const internals = (
@@ -42,8 +47,9 @@ async function sessionAction(cwd: string, text: "Archive Session" | "Unarchive S
       ).__TAURI_INTERNALS__;
       const fetch = window.fetch;
       try {
-        await new Promise<void>((resolve, reject) => {
+        return await new Promise<boolean>((resolve, reject) => {
           let item: MenuItem;
+          let archiveEnabled = false;
           // Tauri's invoke is read-only; intercept its IPC fetch instead.
           window.fetch = async (input, options) => {
             const command = decodeURIComponent(String(input));
@@ -51,6 +57,9 @@ async function sessionAction(cwd: string, text: "Archive Session" | "Unarchive S
               const { options: menu } = JSON.parse(String(options?.body)) as {
                 options: { items: MenuItem[] };
               };
+              archiveEnabled = menu.items.some(
+                (item) => item.text === "Archive Session" && item.enabled,
+              );
               const choice = menu.items.find((item) => item.text === text);
               if (!choice?.enabled) {
                 reject(new Error(`${text} is missing or disabled`));
@@ -64,7 +73,7 @@ async function sessionAction(cwd: string, text: "Archive Session" | "Unarchive S
               window.fetch = fetch;
               const channel = Number(item.handler.split(":")[1]);
               internals.runCallback(channel, { index: 0, message: "" });
-              resolve();
+              resolve(archiveEnabled);
               return new Response("null", {
                 headers: { "Content-Type": "application/json", "Tauri-Response": "ok" },
               });
@@ -80,6 +89,7 @@ async function sessionAction(cwd: string, text: "Archive Session" | "Unarchive S
     await entry(cwd),
     text,
   );
+  if (archiveDisabled) expect(archiveEnabled).toBe(false);
 }
 
 /** The Archived group's toggle in the workspace in `cwd`. */
@@ -120,6 +130,15 @@ async function archiveDiscarding(cwd: string) {
 // A test that fails with a dialog open leaves it to the next test.
 afterEach(async () => {
   while (await $("dialog[open]").isExisting()) await browser.keys("Escape");
+});
+
+describe("A session stuck starting", () => {
+  it("offers Delete and disables Archive", async () => {
+    const cwd = await startStuckSession();
+    await expect(entry(cwd).$('[aria-label="Starting"]')).toBeDisplayed();
+    await sessionAction(cwd, "Delete Session", true);
+    await expect(entry(cwd)).not.toBeExisting();
+  });
 });
 
 describe("Archiving a worktree session", () => {

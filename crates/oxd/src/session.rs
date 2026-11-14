@@ -352,18 +352,6 @@ impl Session {
         self.update(|_| *self.archived.lock().unwrap() = archived);
     }
 
-    /// Waits until the session is not `starting`.
-    pub async fn started(&self) {
-        loop {
-            let mut seq = self.last_seq.subscribe();
-            if self.state() != SessionState::Starting {
-                return;
-            }
-            // Leaving `starting` records an event.
-            let _ = seq.changed().await;
-        }
-    }
-
     /// The directory the session's agent runs in.
     pub fn cwd(&self) -> &Path {
         &self.cwd

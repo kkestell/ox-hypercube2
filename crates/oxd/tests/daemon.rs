@@ -1029,6 +1029,14 @@ async fn delete_while_starting() {
     );
 
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    let error = timeout(TIMEOUT, client.archive(&session.id, false, BTreeMap::new()))
+        .await
+        .expect("archive waited for the agent to start")
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::Remote(ref body) if body.code == code::INVALID_STATE
+    ));
     client
         .delete(&session.id, false, BTreeMap::new())
         .await

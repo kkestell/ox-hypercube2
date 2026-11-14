@@ -28,108 +28,28 @@ the clients.
 
 ### Branch moves can overwrite local files or run alongside an agent
 
-Both failures violate the [branch-move requirements](specs/git-workflows.md#primitives)
-and affect desktop Merge. Ignored local files can be overwritten, and an
-agent can begin work after the move's busy check.
-
-- [ ] Preserve ignored, untracked files that a branch move would overwrite.
-  In the workspace checkout, commit a `.gitignore` containing `local.env`
-  and save the new `main` tip as `main_tip`. Create `topic` from that tip,
-  force-add and commit `local.env` with the contents `from topic`, and save
-  the resulting commit as `topic_tip`. Switch back to `main`, write `keep me`
-  to `local.env`, and run
-  `oxctl move-branch --workspace "$workspace" --expected "$main_tip" main "$topic_tip"`.
-  The move succeeds and the file contains `from topic`. It should refuse the
-  move and preserve both the branch and the file. The existing test covers
-  an untracked file that Git does not ignore.
-  [Branch move](../crates/oxd/src/branches.rs) ·
-  [Worktree tests](../crates/oxd/tests/worktrees.rs)
-- [ ] Keep a checkout from starting agent work during a branch move. The
-  daemon checks whether the checkout is busy once, before invoking `git
-  status`, `update-index`, `update-ref`, and `read-tree`. The existing test
-  starts the prompt before the move. Reproduce the opposite order using a
-  temporary Git wrapper and FIFOs after the
-  [reproduction setup](#reproduction-setup).
-  [Busy check](../crates/oxd/src/daemon.rs) ·
-  [Branch move](../crates/oxd/src/branches.rs)
-
-  ```sh
-  git -C "$repo" switch -qc topic
-  printf 'new\n' > "$repo/new"
-  git -C "$repo" add new
-  git -C "$repo" commit -qm topic
-  target=$(git -C "$repo" rev-parse HEAD)
-  git -C "$repo" switch -q main
-  session=$("$bin/oxctl" new --workspace "$workspace" -- "$bin/oxd-fake-agent")
-
-  export OX_REPRO_REAL_GIT=$(command -v git)
-  export OX_REPRO_READY="$scratch/status-ready" OX_REPRO_RELEASE="$scratch/status-release"
-  mkfifo "$OX_REPRO_READY" "$OX_REPRO_RELEASE"
-  mkdir "$scratch/bin"
-  cat > "$scratch/bin/git" <<'EOF'
-  #!/bin/sh
-  if [ "$3" = --no-optional-locks ] && [ "$4" = status ]; then
-      printf 'ready\n' > "$OX_REPRO_READY"
-      IFS= read -r release < "$OX_REPRO_RELEASE"
-  fi
-  exec "$OX_REPRO_REAL_GIT" "$@"
-  EOF
-  chmod +x "$scratch/bin/git"
-
-  PATH="$scratch/bin:$PATH" "$bin/oxctl" move-branch \
-      --workspace "$workspace" --expected "$base" main "$target" &
-  move_pid=$!
-  read -r ready < "$OX_REPRO_READY"
-  "$bin/oxctl" prompt "$session" wait
-  "$bin/oxctl" ls
-  printf 'release\n' > "$OX_REPRO_RELEASE"
-  wait "$move_pid"
-  git -C "$repo" rev-parse HEAD
-  "$bin/oxctl" ls
-  ```
-
-  The first `ls` shows `running`. The move succeeds, `HEAD` reaches `target`,
-  and the second `ls` still shows `running`.
+- [x] Preserve ignored, untracked files that a branch move would overwrite.
+- [x] Keep a checkout from starting agent work during a branch move.
+  [Desktop merge regressions](../ui/e2e/specs/merge.e2e.ts)
 
 ### Local merge can land an obsolete task commit
 
-- [ ] Validate the source branch and its expected tip as part of the merge
-  request. The button sends the source commit from the last comparison.
-  The daemon checks the expected destination commit and accepts the supplied
-  source SHA even if the task branch has moved.
-  [Merge button](../ui/src/features/sessions/MergeButton.tsx) ·
-  [Branch move](../crates/oxd/src/branches.rs)
-
-  1. Create a task with `oxctl new --workspace "$workspace" --worktree
-     --compare main -- "$bin/oxd-fake-agent"` and save its ID as `session`.
-     Find its checkout with
-     `oxctl ls` and make one commit there. Save its SHA as `old_tip`.
-  2. Run `oxctl compare "$session"`. It reports the task one commit ahead of
-     `main` and publishes `old_tip`.
-  3. In the task checkout, reset to `base` and make a different commit.
-     Leave `main` at `base` and leave the published comparison as it is.
-  4. Send the same move as the button using `oxctl move-branch --workspace
-     "$workspace" --expected "$base" main "$old_tip"`. It succeeds and
-     `main` points to `old_tip` while the task branch points to the new
-     commit. The merge should refuse the stale source.
+- [x] Validate the source branch and its expected tip as part of the merge
+  request.
+  [Desktop merge regressions](../ui/e2e/specs/merge.e2e.ts)
 
 ## Desktop workflow bugs
 
-- [ ] Keep unsent prompt text and attachments when switching sessions. Store
+- [x] Keep unsent prompt text and attachments when switching sessions. Store
   drafts in memory by session, and clear them after a successful send or
-  session deletion. Cover switching away and back in the desktop tests.
-  [Composer](../ui/src/features/composer/Composer.tsx)
-- [ ] Allow the desktop to display tool output images. The renderer uses
-  `data:` URLs, which the bundled content policy blocks. Allow them in
-  `img-src` and check that the image decodes in the existing desktop test.
-  [Content policy](../crates/ox/tauri.conf.json) ·
-  [Desktop test](../ui/e2e/specs/session.e2e.ts)
-- [ ] Keep Delete available while an agent is stuck starting. Archive waits
-  for startup while holding the lifecycle lock Delete needs. Offer Archive
-  once the agent has opened, and have the daemon refuse earlier requests
-  without waiting for startup. Exercise this with the stuck-start fixture.
-  [Archive](../crates/oxd/src/daemon.rs) ·
-  [Daemon tests](../crates/oxd/tests/daemon.rs)
+  session deletion.
+  [Desktop draft regression](../ui/e2e/specs/session.e2e.ts)
+- [ ] The bundled content policy may block tool output images. The tool image
+  decoded in the macOS desktop test. Other platforms have not been checked.
+  [Image decoding check](../ui/e2e/specs/session.e2e.ts)
+- [x] Keep Delete available while an agent is stuck starting. Disable
+  Archive during startup and refuse requests to archive during startup.
+  [Desktop startup regression](../ui/e2e/specs/archive.e2e.ts)
 
 ## Persistence and recovery
 
@@ -158,7 +78,7 @@ agent can begin work after the move's busy check.
      END;
      ```
 
-  3. Follow events with `oxctl attach "$session" --json` and send
+  3. Follow events with `oxctl attach "$session"` and send
      `oxctl prompt "$session" 'say 1 0'`. After `turn_ended` arrives, send
      the daemon SIGTERM and wait for it to exit. Its stderr logs the failed
      write. Inspect the database with
@@ -169,7 +89,7 @@ agent can begin work after the move's busy check.
      write error in stderr, then run `oxctl cancel "$session"` to record a
      later event in a separate batch.
   4. Restart `oxd` on the same socket and run
-     `oxctl attach "$session" --json --after 6`, using one less than the
+     `oxctl attach "$session" --after 6`, using one less than the
      final stored sequence if it differs. The subscription waits even though
      event 7 is already in the database.
 
@@ -220,7 +140,7 @@ agent can begin work after the move's busy check.
 
 ## Reproduction setup
 
-For the Git and persistence reproductions, run `cargo build -p oxd -p oxctl`
+For the persistence reproductions, run `cargo build -p oxd -p oxctl`
 from the repository root. Use a fresh temporary directory and daemon for each
 reproduction. The CLI, daemon and fake agent are in `target/debug`.
 
@@ -241,7 +161,3 @@ workspace=$(oxctl workspace add "$repo")
 `workspace add` starts the daemon for this socket. For the replay case, start
 the daemon explicitly before that command so you have its PID. Use
 `"$bin/oxd" --socket "$OX_SOCKET"` and wait for it to print `ready`.
-
-The review reproduced these failures in temporary repositories. `make
-check-rust`, `make check-ui`, and all 48 desktop end-to-end tests passed.
-The reproduction used the fake agent. The live Claude smoke test was skipped.

@@ -31,15 +31,14 @@ its error in the tooltip.
 ## Moving a branch
 
 **Merge into** fast-forwards the comparison branch to the session's
-commit when the session is one commit ahead and none behind. The comparison
-branch must still be at the commit Ox used for the comparison.
+commit when the session is one commit ahead and none behind. Both branches
+must still be at the commits Ox used for the comparison.
 
 When the branch is checked out, its files and index move with it. Ox checks
-for uncommitted tracked changes and for an agent starting, working, or
-waiting for an answer before it moves the branch. An agent can still start
-work after that check. Git refuses to overwrite untracked files it does not
-ignore. An ignored file can be overwritten if the incoming commit tracks
-that path.
+for uncommitted tracked changes, untracked files the move would overwrite
+(including ignored files), and agents starting, working, or waiting for an
+answer. While the move runs, Ox refuses requests to start, load, or prompt a
+session in that checkout.
 
 ## Deleting and archiving
 

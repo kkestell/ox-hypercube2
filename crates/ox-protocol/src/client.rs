@@ -545,7 +545,31 @@ impl Client {
             branch: branch.into(),
             to: to.into(),
             expected: expected.into(),
+            source_branch: None,
             force,
+            env,
+        })
+        .await
+    }
+
+    /// Fast-forwards a local branch while both branches are at the supplied
+    /// commits. Git runs with `env` over the daemon's environment.
+    pub async fn fast_forward_branch(
+        &self,
+        workspace_id: &str,
+        branch: &str,
+        expected: &str,
+        source_branch: &str,
+        source_tip: &str,
+        env: BTreeMap<String, String>,
+    ) -> Result<(), Error> {
+        self.ack(Method::BranchMove {
+            workspace_id: workspace_id.into(),
+            branch: branch.into(),
+            to: source_tip.into(),
+            expected: expected.into(),
+            source_branch: Some(source_branch.into()),
+            force: false,
             env,
         })
         .await

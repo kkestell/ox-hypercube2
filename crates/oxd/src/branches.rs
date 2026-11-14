@@ -3,6 +3,7 @@
 //! comparing a session's branch with its comparison ref, and moving a branch
 //! along with the checkout that has it.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -177,33 +178,39 @@ pub async fn compare(git: &Git, worktree: &SavedWorktree) -> Option<Comparison> 
     })
 }
 
-/// Sets local branch `branch` of the repository whose common Git directory
-/// is `common_dir` to commit `to`, when it is at commit `expected` and,
-/// unless `force` is set, `to` descends from `expected`. When a checkout
-/// has the branch, `busy` is asked whether the checkout's agents allow the
-/// move, tracked files there must have no uncommitted changes, and the
-/// checkout's index and files move with the branch. A move git cannot make
-/// in the checkout, such as one that would overwrite an untracked file, puts
-/// the branch back.
-pub async fn move_branch(
+pub(crate) struct Move<'a> {
+    pub branch: &'a str,
+    pub to: &'a str,
+    pub expected: &'a str,
+    pub source_branch: Option<&'a str>,
+    pub force: bool,
+}
+
+/// Moves a branch and its checkout. The reservation keeps Ox from starting
+/// agent work in that checkout until Git finishes, including any rollback.
+pub(crate) async fn move_branch<Reservation>(
     git: &Git,
     common_dir: &Path,
-    branch: &str,
-    to: &str,
-    expected: &str,
-    force: bool,
-    busy: impl FnOnce(&Path) -> Result<(), ErrorBody>,
+    movement: Move<'_>,
+    reserve: impl FnOnce(&Path) -> Result<Reservation, ErrorBody>,
 ) -> Result<(), ErrorBody> {
+    let Move {
+        branch,
+        to,
+        expected,
+        source_branch,
+        force,
+    } = movement;
     let repository = Repository::new(git, common_dir);
-    let reference = format!("refs/heads/{branch}");
-    if repository
-        .run(&[&"check-ref-format", &reference])
-        .await
-        .is_err()
-    {
-        return Err(invalid_request(format!(
-            "{branch} is not a valid branch name"
-        )));
+    let reference = branch_ref(&repository, branch).await?;
+    let source = match source_branch {
+        Some(branch) => Some(branch_ref(&repository, branch).await?),
+        None => None,
+    };
+    if source.as_ref() == Some(&reference) {
+        return Err(invalid_request(
+            "source and destination are the same branch".into(),
+        ));
     }
     let not_a_commit = |rev: &str| invalid_request(format!("{rev} is not a commit"));
     let target = repository
@@ -237,39 +244,15 @@ pub async fn move_branch(
     let checkout = checked_out_at(&repository, branch)
         .await?
         .map(PathBuf::from);
+    let _reservation = checkout.as_deref().map(reserve).transpose()?;
     if let Some(checkout) = &checkout {
-        busy(checkout)?;
-        let status = git
-            .run(
-                checkout,
-                &[
-                    &"--no-optional-locks",
-                    &"status",
-                    &"--porcelain",
-                    &"--untracked-files=no",
-                    &"--ignore-submodules=none",
-                ],
-            )
-            .await?;
-        if !status.is_empty() {
-            return Err(ErrorBody {
-                code: code::UNSAVED_WORK,
-                message: format!("{} has uncommitted changes", checkout.display()),
-            });
-        }
-        git.run(checkout, &[&"update-index", &"-q", &"--refresh"])
-            .await?;
+        check_checkout(git, checkout, &expected, &target).await?;
     }
     let message = format!("ox: move {branch}");
+    let verify = source.map_or_else(String::new, |source| format!("verify {source} {target}\n"));
+    let update = format!("{verify}update {reference} {target} {expected}\n");
     repository
-        .run(&[
-            &"update-ref",
-            &"-m",
-            &message,
-            &reference,
-            &target,
-            &expected,
-        ])
+        .run_with_input(&[&"update-ref", &"-m", &message, &"--stdin"], Some(&update))
         .await?;
     if let Some(checkout) = &checkout
         && let Err(error) = git
@@ -296,4 +279,137 @@ pub async fn move_branch(
         return Err(error);
     }
     Ok(())
+}
+
+async fn branch_ref(repository: &Repository<'_>, branch: &str) -> Result<String, ErrorBody> {
+    let reference = format!("refs/heads/{branch}");
+    repository
+        .run(&[&"check-ref-format", &reference])
+        .await
+        .map_err(|_| invalid_request(format!("{branch} is not a valid branch name")))?;
+    Ok(reference)
+}
+
+async fn check_checkout(
+    git: &Git,
+    checkout: &Path,
+    expected: &str,
+    target: &str,
+) -> Result<(), ErrorBody> {
+    let status = git
+        .run(
+            checkout,
+            &[
+                &"--no-optional-locks",
+                &"status",
+                &"--porcelain",
+                &"--untracked-files=no",
+                &"--ignore-submodules=none",
+            ],
+        )
+        .await?;
+    if !status.is_empty() {
+        return Err(ErrorBody {
+            code: code::UNSAVED_WORK,
+            message: format!("{} has uncommitted changes", checkout.display()),
+        });
+    }
+    git.run(checkout, &[&"update-index", &"-q", &"--refresh"])
+        .await?;
+    refuse_ignored_collisions(git, checkout, expected, target).await
+}
+
+/// Git's read-tree protects ordinary untracked files and allows overwriting
+/// ignored files. Check new paths and changes in file type, which can replace
+/// a directory with a file. Ordinary modifications affect tracked files.
+async fn refuse_ignored_collisions(
+    git: &Git,
+    checkout: &Path,
+    expected: &str,
+    target: &str,
+) -> Result<(), ErrorBody> {
+    let added = git
+        .run(
+            checkout,
+            &[
+                &"diff",
+                &"--no-renames",
+                &"--name-only",
+                &"--diff-filter=AT",
+                &"-z",
+                &expected,
+                &target,
+                &"--",
+            ],
+        )
+        .await?;
+    if added.is_empty() {
+        return Ok(());
+    }
+    let ignored = git
+        .run(
+            checkout,
+            &[
+                &"ls-files",
+                &"--others",
+                &"--ignored",
+                &"--exclude-standard",
+                &"-z",
+            ],
+        )
+        .await?;
+    if ignored.is_empty() {
+        return Ok(());
+    }
+    let ignore_case = git
+        .run(
+            checkout,
+            &[&"config", &"--type=bool", &"--get", &"core.ignorecase"],
+        )
+        .await
+        .is_ok_and(|value| value.starts_with(b"true"));
+    let key = |path: &[u8]| {
+        if ignore_case {
+            path.to_ascii_lowercase()
+        } else {
+            path.to_vec()
+        }
+    };
+    let ignored: BTreeSet<_> = git_paths(&ignored)
+        .map(|path| key(path.strip_suffix(b"/").unwrap_or(path)))
+        .collect();
+    if let Some(path) = git_paths(&added).find(|path| collides(&ignored, key(path))) {
+        return Err(ErrorBody {
+            code: code::UNSAVED_WORK,
+            message: format!(
+                "moving the branch would overwrite ignored files at {}",
+                checkout.join(OsStr::from_bytes(path)).display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn git_paths(output: &[u8]) -> impl Iterator<Item = &[u8]> {
+    output
+        .split(|&byte| byte == 0)
+        .filter(|path| !path.is_empty())
+}
+
+fn collides(ignored: &BTreeSet<Vec<u8>>, mut path: Vec<u8>) -> bool {
+    // A file anywhere along the new path would be replaced.
+    if ignored.contains(&path)
+        || path
+            .iter()
+            .enumerate()
+            .any(|(i, &byte)| byte == b'/' && ignored.contains(&path[..i]))
+    {
+        return true;
+    }
+    // The new path can also replace a directory that holds ignored files.
+    path.push(b'/');
+    ignored
+        .range(path.clone()..)
+        .next()
+        .is_some_and(|entry| entry.starts_with(&path))
 }

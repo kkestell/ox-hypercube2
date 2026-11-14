@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use ox_protocol::{ErrorBody, WorktreeBranch, WorktreeInfo, code};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::daemon::invalid_request;
@@ -109,6 +110,15 @@ impl Git {
     /// Runs `git -C dir args` and returns its output. Callers put
     /// `--end-of-options` before names and revisions a user supplied.
     pub async fn run(&self, dir: &Path, args: &[Arg<'_>]) -> Result<Vec<u8>, GitError> {
+        self.run_with_input(dir, args, None).await
+    }
+
+    async fn run_with_input(
+        &self,
+        dir: &Path,
+        args: &[Arg<'_>],
+        input: Option<&str>,
+    ) -> Result<Vec<u8>, GitError> {
         let failed = |stderr: String| GitError {
             args: args
                 .iter()
@@ -116,11 +126,24 @@ impl Git {
                 .collect(),
             stderr,
         };
-        let output = self
-            .command(dir, args)
-            .output()
-            .await
-            .map_err(|error| failed(error.to_string()))?;
+        let mut command = self.command(dir, args);
+        let output = async {
+            if let Some(input) = input {
+                let mut child = command.stdin(Stdio::piped()).spawn()?;
+                let mut stdin = child.stdin.take().expect("git stdin is piped");
+                let write = stdin.write_all(input.as_bytes()).await;
+                drop(stdin);
+                let output = child.wait_with_output().await?;
+                if output.status.success() {
+                    write?;
+                }
+                Ok(output)
+            } else {
+                command.output().await
+            }
+        }
+        .await
+        .map_err(|error| failed(error.to_string()))?;
         if output.status.success() {
             Ok(output.stdout)
         } else {
@@ -176,9 +199,17 @@ impl<'a> Repository<'a> {
     }
 
     pub(crate) async fn run(&self, args: &[Arg<'_>]) -> Result<Vec<u8>, GitError> {
+        self.run_with_input(args, None).await
+    }
+
+    pub(crate) async fn run_with_input(
+        &self,
+        args: &[Arg<'_>],
+        input: Option<&str>,
+    ) -> Result<Vec<u8>, GitError> {
         let mut all: Vec<Arg<'_>> = vec![&self.git_dir];
         all.extend_from_slice(args);
-        self.git.run(self.common_dir, &all).await
+        self.git.run_with_input(self.common_dir, &all, input).await
     }
 
     pub(crate) async fn text(&self, args: &[Arg<'_>]) -> Result<String, GitError> {

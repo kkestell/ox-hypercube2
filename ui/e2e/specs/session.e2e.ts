@@ -1,5 +1,8 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import {
   agentText,
+  answerNativeDialog,
   choose,
   composer,
   deleteSessions,
@@ -50,6 +53,33 @@ describe("A session", () => {
     await expect(sendButton()).toBeEnabled();
     await browser.keys("Enter");
     await expect(agentText()[0]).toHaveText("chunk-1");
+  });
+
+  it("keeps text and attachments when switching sessions and clears them after sending", async () => {
+    const attachment = join(cwd, "notes.txt");
+    await writeFile(attachment, "notes");
+    await composer().setValue("say 1 0");
+    await answerNativeDialog("open", [attachment]);
+    await $('button[aria-label="Attach Files"]').click();
+    const attached = () => $('.composer .attachments li[title$="/notes.txt"]');
+    await expect(attached()).toBeDisplayed();
+
+    const other = await startSession();
+    await openSession(other);
+    await expect(composer()).toHaveValue("");
+    await expect(attached()).not.toBeExisting();
+    await composer().setValue("other draft");
+
+    await openSession(cwd);
+    await expect(composer()).toHaveValue("say 1 0");
+    await expect(attached()).toBeDisplayed();
+    await send();
+    await expect(agentText()[0]).toHaveText("chunk-1");
+    await openSession(other);
+    await expect(composer()).toHaveValue("other draft");
+    await openSession(cwd);
+    await expect(composer()).toHaveValue("");
+    await expect(attached()).not.toBeExisting();
   });
 
   it("asks for permission above the composer until it is answered", async () => {
@@ -162,7 +192,9 @@ describe("A session", () => {
     await tool.$("summary").click();
     await expect(tool.$("section:first-child pre")).toHaveText('{\n  "text": "listed `a.rs`"\n}');
     await expect(tool.$("section:last-child pre")).toHaveText("listed `a.rs`");
-    await expect(tool.$("section:last-child img")).toBeDisplayed();
+    const image = tool.$("section:last-child img");
+    await expect(image).toBeDisplayed();
+    await expect(image).toHaveProperty("naturalWidth", 1);
   });
 
   it("stops a turn the agent started", async () => {

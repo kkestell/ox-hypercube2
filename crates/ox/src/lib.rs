@@ -230,8 +230,8 @@ async fn workspace_branches(app: State<'_, App>, workspace_id: String) -> Result
         .map_err(message)
 }
 
-/// Fast-forwards the workspace's branch `branch` from commit `expected` to
-/// commit `to`, with the checkout that has it.
+/// Fast-forwards the workspace's branch when both branches are still at the
+/// commits used for the comparison.
 #[tauri::command]
 async fn move_branch(
     app: State<'_, App>,
@@ -239,10 +239,18 @@ async fn move_branch(
     branch: String,
     to: String,
     expected: String,
+    source_branch: String,
 ) -> Result<(), String> {
     app.client()
         .await?
-        .move_branch(&workspace_id, &branch, &to, &expected, false, utf8_env())
+        .fast_forward_branch(
+            &workspace_id,
+            &branch,
+            &expected,
+            &source_branch,
+            &to,
+            utf8_env(),
+        )
         .await
         .map_err(message)
 }

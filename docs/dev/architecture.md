@@ -254,15 +254,18 @@ behind the ref, from `git rev-list --left-right --count` in the recorded
 common Git directory with `oxd`'s own environment; a ref or branch that no
 longer names a commit makes it `failed`, with the reason. A task of each
 worktree session computes it when the session is created or restored, and
-again when the session's agent ends a turn, after a `branch.move`, a session
-delete or a fetch in the session's repository, whether or not the fetch
-succeeded. Triggers that arrive while it computes make one more computation,
+again when the session's agent ends a turn, after a successful `branch.move`,
+after a move with a source branch even if it fails, after a session delete,
+or after a fetch in the session's repository whether or not it succeeded.
+Triggers that arrive while it computes make one more computation,
 and a changed comparison goes to every watch. `session.set_compare` and
 `session.refresh` answer the session with the comparison computed for the
 request.
 
 `oxd` updates the ref and checkout in `branch.move`. The request supplies
 the expected commit, which `git update-ref` checks when it writes the ref.
+When the client also supplies a source branch, the same ref transaction
+checks that it still points at the target commit.
 If updating the checkout with `git read-tree` fails, `oxd` tries to restore
 the branch at its previous tip and reports the error. Submodule checkouts
 stay at their current commits. See
@@ -293,8 +296,8 @@ delay. A parked session keeps its conversation, worktree, and branch, records
 it, as it does any exited session. Parking holds the session's lifecycle lock,
 so a load, delete, or startup in progress finishes first.
 
-**Archiving.** `session.archive` waits for the session's startup to finish,
-refuses with `UNSAVED_WORK` as `session.delete` does unless `discard` is set,
+**Archiving.** `session.archive` refuses immediately while the agent is
+starting. It checks for unsaved work as `session.delete` does, then
 stops the agent (ending an open turn and pending requests with the
 error "the agent was stopped", and recording `agent_parked`), removes the
 worktree, and marks the session archived in the `archived` table. The branch is

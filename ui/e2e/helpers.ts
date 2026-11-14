@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
@@ -23,6 +24,45 @@ export async function startSession(...agentArgs: string[]): Promise<string> {
   return cwd;
 }
 
+/** Starts a fake agent that never finishes initializing. oxctl waits for startup. */
+export async function startStuckSession(): Promise<string> {
+  const cwd = await tempDir("session-");
+  const workspace = await addWorkspace(cwd);
+  const socket = createConnection(process.env.OX_SOCKET!);
+  try {
+    socket.write(
+      [
+        { id: 1, method: "hello", params: { protocol_version: 1 } },
+        {
+          id: 2,
+          method: "session.new",
+          params: {
+            workspace_id: workspace,
+            command: [binary("oxd-fake-agent"), "--hang-initialize"],
+          },
+        },
+      ]
+        .map((request) => `${JSON.stringify(request)}\n`)
+        .join(""),
+    );
+    socket.setTimeout(5000, () => socket.destroy(new Error("timed out starting the fake agent")));
+    let pending = "";
+    for await (const chunk of socket.setEncoding("utf8")) {
+      pending += chunk;
+      const lines = pending.split("\n");
+      pending = lines.pop()!;
+      for (const line of lines) {
+        const response = JSON.parse(line);
+        if (response.error) throw new Error(response.error.message);
+        if (response.id === 2) return cwd;
+      }
+    }
+    throw new Error("the daemon closed the socket during startup");
+  } finally {
+    socket.destroy();
+  }
+}
+
 /**
  * Adds a new Git repository, with `main` at one commit, as a workspace, and
  * returns its path and workspace ID.
@@ -37,6 +77,11 @@ export async function gitWorkspace(): Promise<{ cwd: string; workspace: string }
 /** Starts a session of the fake agent in a new worktree of `workspace`. */
 export async function startWorktreeSession(workspace: string) {
   await oxctl("new", "--workspace", workspace, "--worktree", "--", binary("oxd-fake-agent"));
+}
+
+/** Starts the fake agent in an existing workspace's checkout. */
+export async function startCheckoutSession(workspace: string) {
+  await oxctl("new", "--workspace", workspace, "--", binary("oxd-fake-agent"));
 }
 
 /** Runs git in `cwd` and returns its output. */
@@ -83,8 +128,11 @@ export async function deleteSessions(cwd: string) {
  * returns what it prints: the ref, the branch's commit, the ref's commit, and
  * the commits ahead and behind, separated by tabs.
  */
-export async function compareSession(workspace: string): Promise<string> {
-  const sessions = lines(await oxctl("ls")).filter((line) => line.split("\t")[1] === workspace);
+export async function compareSession(workspace: string, cwd?: string): Promise<string> {
+  const sessions = lines(await oxctl("ls")).filter((line) => {
+    const [, id, , path] = line.split("\t");
+    return id === workspace && (cwd === undefined || path?.replace(/\/$/, "") === cwd);
+  });
   if (sessions.length !== 1) throw new Error(`${workspace} has ${sessions.length} sessions`);
   return oxctl("compare", sessions[0]!.split("\t")[0]!);
 }
@@ -184,6 +232,29 @@ export async function send(text?: string) {
   if (text !== undefined) await composer().setValue(text);
   await expect(sendButton()).toBeEnabled();
   await sendButton().click();
+}
+
+/** Answers one native file picker or message box at the Tauri IPC boundary. */
+export async function answerNativeDialog(command: "open" | "message", answer: string[] | null) {
+  await browser.execute(
+    (command, answer) => {
+      const fetch = window.fetch;
+      window.fetch = async (input, options) => {
+        if (decodeURIComponent(String(input)).endsWith(`plugin:dialog|${command}`)) {
+          window.fetch = fetch;
+          const { message } = JSON.parse(String(options?.body)) as { message?: string };
+          document.body.dataset.nativeDialog = message ?? command;
+          return new Response(JSON.stringify(answer), {
+            headers: { "Content-Type": "application/json", "Tauri-Response": "ok" },
+          });
+        }
+        return fetch.call(window, input, options);
+      };
+      delete document.body.dataset.nativeDialog;
+    },
+    command,
+    answer,
+  );
 }
 
 /** The agent's text items in the viewed conversation. */

@@ -1,13 +1,18 @@
-import { access } from "node:fs/promises";
+import { access, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  answerNativeDialog,
   commit,
   compareSession,
+  composer,
   git,
   gitWorkspace,
   newTask,
   openMenu,
+  openSession,
+  send,
   sessionEntry,
+  startCheckoutSession,
   startWorktreeSession,
   worktreeEntry,
 } from "../helpers.ts";
@@ -38,6 +43,117 @@ afterEach(async () => {
 });
 
 describe("Local merge", () => {
+  it("preserves an ignored local file that the task would overwrite", async () => {
+    const { cwd, workspace } = await gitWorkspace();
+    await writeFile(join(cwd, ".gitignore"), "local.env\n");
+    await commit(cwd);
+    const base = await git(cwd, "rev-parse", "HEAD");
+    const path = await newTask(cwd);
+    await writeFile(join(path, "local.env"), "from task\n");
+    await git(path, "add", "-f", "local.env");
+    await commit(path);
+    await writeFile(join(cwd, "local.env"), "keep me\n");
+    await compareSession(workspace);
+    await expect(mergeButton()).toBeEnabled();
+    await answerNativeDialog("message", null);
+    await mergeButton().click();
+    await browser.waitUntil(
+      async () => (await mergeButton().isEnabled()) || (await $("dialog[open]").isExisting()),
+    );
+
+    expect(await readFile(join(cwd, "local.env"), "utf8")).toBe("keep me\n");
+    expect(await git(cwd, "rev-parse", "HEAD")).toBe(base);
+    await expect($("body")).toHaveAttribute(
+      "data-native-dialog",
+      expect.stringContaining("local.env"),
+    );
+  });
+
+  it("refuses to merge a task whose branch changed since comparison", async () => {
+    const { cwd, workspace } = await gitWorkspace();
+    const base = await git(cwd, "rev-parse", "HEAD");
+    const path = await newTask(cwd);
+    await commit(path);
+    await compareSession(workspace);
+    await expect(mergeButton()).toBeEnabled();
+    await git(path, "reset", "--hard", "main");
+    await commit(path);
+    await commit(path);
+    await answerNativeDialog("message", null);
+    await mergeButton().click();
+    await browser.waitUntil(
+      async () =>
+        (await $("body").getAttribute("data-native-dialog")) !== null ||
+        (await $("dialog[open]").isExisting()),
+    );
+
+    expect(await git(cwd, "rev-parse", "HEAD")).toBe(base);
+    await expect($("body")).toHaveAttribute(
+      "data-native-dialog",
+      expect.stringContaining("expected"),
+    );
+    await expect(mergeButton()).toHaveAttribute("title", "2 commits: ask the agent to squash");
+  });
+
+  it("blocks prompts in the destination checkout until the merge finishes", async () => {
+    const { cwd, workspace } = await gitWorkspace();
+    await startCheckoutSession(workspace);
+    const path = await newTask(cwd);
+    await commit(path);
+    const tip = await git(path, "rev-parse", "HEAD");
+    await compareSession(workspace, path);
+    await expect(mergeButton()).toBeEnabled();
+
+    // Pause Git after Ox has checked the destination, while it updates main.
+    const ready = join(cwd, ".git", "move-ready");
+    const release = join(cwd, ".git", "move-release");
+    await writeFile(
+      join(cwd, ".git", "hooks", "reference-transaction"),
+      `#!/bin/sh
+[ "$1" = prepared ] || exit 0
+grep -q ' refs/heads/main$' || exit 0
+dir="$(dirname "$0")/.."
+touch "$dir/move-ready"
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  [ ! -f "$dir/move-release" ] || exit 0
+  sleep 1
+done
+exit 1
+`,
+      { mode: 0o755 },
+    );
+    await git(cwd, "config", "core.hooksPath", join(cwd, ".git", "hooks"));
+    await mergeButton().click();
+    try {
+      await browser.waitUntil(() =>
+        access(ready).then(
+          () => true,
+          () => false,
+        ),
+      );
+      await openSession(cwd);
+      await answerNativeDialog("message", null);
+      await send("wait");
+      await browser.waitUntil(
+        async () =>
+          (await $("body").getAttribute("data-native-dialog")) !== null ||
+          (await sessionEntry(cwd).$('[aria-label="Running"]').isExisting()),
+      );
+      await expect(sessionEntry(cwd).$('[aria-label="Idle"]')).toBeDisplayed();
+      await expect($("body")).toHaveAttribute(
+        "data-native-dialog",
+        expect.stringContaining("branch move"),
+      );
+      await expect(composer()).toHaveValue("wait");
+    } finally {
+      await writeFile(release, "");
+    }
+    await expect(branchStatus()).not.toBeExisting();
+    expect(await git(cwd, "rev-parse", "HEAD")).toBe(tip);
+    await send();
+    await expect(sessionEntry(cwd).$('[aria-label="Running"]')).toBeDisplayed();
+  });
+
   it("can't merge a task with no commits", async () => {
     const { cwd } = await gitWorkspace();
     await newTask(cwd);
@@ -49,6 +165,9 @@ describe("Local merge", () => {
 
   it("merges a task one commit ahead into main and deletes it", async () => {
     const { cwd, workspace } = await gitWorkspace();
+    await writeFile(join(cwd, ".gitignore"), "local.env\n");
+    await commit(cwd);
+    await writeFile(join(cwd, "local.env"), "keep me\n");
     const path = await newTask(cwd);
     const file = await commit(path);
     await compareSession(workspace);
@@ -59,6 +178,7 @@ describe("Local merge", () => {
 
     const dialog = await merge();
     expect(await git(cwd, "rev-parse", "main")).toBe(tip);
+    expect(await readFile(join(cwd, "local.env"), "utf8")).toBe("keep me\n");
     await access(join(cwd, file));
     await expect(dialog.$("code")).toHaveText(branch);
     await dialog.$("button=Delete Session").click();

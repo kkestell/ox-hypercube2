@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -25,6 +25,7 @@ struct Registry {
     workspaces: Vec<SavedWorkspace>,
     sessions: HashMap<String, Arc<Session>>,
     clients: usize,
+    moving_checkouts: HashSet<PathBuf>,
     /// Whether the startup cleanup is still running.
     cleaning: bool,
 }
@@ -56,6 +57,36 @@ pub struct ClientGuard(Arc<Daemon>);
 impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.update(|registry| registry.clients -= 1);
+    }
+}
+
+struct CheckoutMove<'a> {
+    daemon: &'a Daemon,
+    checkout: PathBuf,
+}
+
+impl Drop for CheckoutMove<'_> {
+    fn drop(&mut self) {
+        self.daemon.lock().moving_checkouts.remove(&self.checkout);
+    }
+}
+
+impl Registry {
+    fn refuse_moving(&self, cwd: &Path) -> Result<(), ErrorBody> {
+        if self.moving_checkouts.is_empty() {
+            return Ok(());
+        }
+        let cwd = resolved(cwd);
+        if self
+            .moving_checkouts
+            .iter()
+            .any(|checkout| cwd.starts_with(checkout))
+        {
+            return Err(invalid_state(
+                "a branch move is in progress in this checkout",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -96,6 +127,7 @@ impl Daemon {
             workspaces: store.workspaces()?,
             sessions,
             clients: 0,
+            moving_checkouts: HashSet::new(),
             cleaning: !unstarted.is_empty(),
         };
         Ok(Self {
@@ -237,11 +269,19 @@ impl Daemon {
                 let session = self.session(&session_id)?;
                 let _lifecycle = self.lifecycle(&session).await?;
                 session.history().await?;
+                let registry = self.lock();
+                registry.refuse_moving(session.cwd())?;
                 session.load(env)?;
                 Ok(to_value(session.info()))
             }
             Method::SessionPrompt { session_id, prompt } => {
-                self.session(&session_id)?.prompt(prompt)?;
+                let registry = self.lock();
+                let session = registry
+                    .sessions
+                    .get(&session_id)
+                    .ok_or_else(|| not_found("session", &session_id))?;
+                registry.refuse_moving(session.cwd())?;
+                session.prompt(prompt)?;
                 Ok(Value::Null)
             }
             Method::SessionSetConfigOption {
@@ -295,11 +335,22 @@ impl Daemon {
                 branch,
                 to,
                 expected,
+                source_branch,
                 force,
                 env,
             } => {
-                self.move_branch(&workspace_id, &branch, &to, &expected, force, env)
-                    .await?;
+                self.move_branch(
+                    &workspace_id,
+                    branches::Move {
+                        branch: &branch,
+                        to: &to,
+                        expected: &expected,
+                        source_branch: source_branch.as_deref(),
+                        force,
+                    },
+                    env,
+                )
+                .await?;
                 Ok(Value::Null)
             }
             Method::SessionSetCompare {
@@ -461,6 +512,7 @@ impl Daemon {
                 Some((_, plan)) => (plan.cwd.clone(), Some(plan.saved())),
                 None => (workspace.path.clone(), None),
             };
+            registry.refuse_moving(&cwd)?;
             let number = self
                 .store
                 .add_session(&id, workspace_id, &command, &cwd, info.as_ref())
@@ -608,7 +660,7 @@ impl Daemon {
         Ok(Deleted { kept_branch })
     }
 
-    /// Archives a session once its startup has finished: its agent is
+    /// Archives a session that is not starting: its agent is
     /// stopped and its worktree removed, with git run with `env`, and the
     /// branch is kept. A worktree that would lose work refuses the archive
     /// unless `discard` is set, leaving the session as it was, or `exited`
@@ -620,7 +672,9 @@ impl Daemon {
         env: BTreeMap<String, String>,
     ) -> Result<SessionInfo, ErrorBody> {
         let session = self.session(id)?;
+        refuse_starting(&session)?;
         let _lifecycle = self.lifecycle(&session).await?;
+        refuse_starting(&session)?;
         if session.archived() {
             return Err(invalid_state("the session is already archived"));
         }
@@ -634,7 +688,6 @@ impl Daemon {
                 return Err(worktree::unsaved_work(&unsaved));
             }
         }
-        session.started().await;
         session.stop(Change::Parked).await;
         if let Some(worktree) = &worktree {
             worktree::remove_worktree(&git, worktree, discard).await?;
@@ -675,29 +728,31 @@ impl Daemon {
     async fn move_branch(
         &self,
         workspace_id: &str,
-        branch: &str,
-        to: &str,
-        expected: &str,
-        force: bool,
+        movement: branches::Move<'_>,
         env: BTreeMap<String, String>,
     ) -> Result<(), ErrorBody> {
         let workspace = self.workspace_path(workspace_id)?;
         let git = Git::for_client(env);
         let common_dir = branches::common_dir(&git, &workspace).await?;
-        branches::move_branch(&git, &common_dir, branch, to, expected, force, |checkout| {
-            self.refuse_busy(checkout)
+        let refresh_comparison = movement.source_branch.is_some();
+        let result = branches::move_branch(&git, &common_dir, movement, |checkout| {
+            self.reserve_checkout(checkout)
         })
-        .await?;
-        self.recompare(&common_dir);
-        Ok(())
+        .await;
+        if result.is_ok() || refresh_comparison {
+            self.recompare(&common_dir);
+        }
+        result
     }
 
-    /// Refuses when a session whose directory is in `checkout` has an agent
-    /// that is starting, in a turn, or waiting for an answer.
-    fn refuse_busy(&self, checkout: &Path) -> Result<(), ErrorBody> {
+    /// Keeps Ox from starting or prompting agents in the checkout during
+    /// a branch move. The registry lock makes the busy check and reservation
+    /// one operation with respect to those requests.
+    fn reserve_checkout(&self, checkout: &Path) -> Result<CheckoutMove<'_>, ErrorBody> {
         let checkout = resolved(checkout);
-        let sessions: Vec<Arc<Session>> = self.lock().sessions.values().cloned().collect();
-        for session in sessions {
+        let mut registry = self.lock();
+        registry.refuse_moving(&checkout)?;
+        for session in registry.sessions.values() {
             let state = session.state();
             if matches!(state, SessionState::Idle | SessionState::Exited) {
                 continue;
@@ -714,7 +769,11 @@ impl Daemon {
                 });
             }
         }
-        Ok(())
+        registry.moving_checkouts.insert(checkout.clone());
+        Ok(CheckoutMove {
+            daemon: self,
+            checkout,
+        })
     }
 
     /// Asks every session whose worktree is in the repository with common
@@ -781,6 +840,13 @@ async fn remove_unstarted(worktree: &SavedWorktree) -> Result<(), ErrorBody> {
 /// `path` with symbolic links resolved, or as it is when it cannot be.
 fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
+}
+
+fn refuse_starting(session: &Session) -> Result<(), ErrorBody> {
+    if session.state() == SessionState::Starting {
+        return Err(invalid_state("the session is still starting"));
+    }
+    Ok(())
 }
 
 /// The workspace as clients see it.
