@@ -8,175 +8,168 @@ v2 and what Ox supports of it. It is built from `agent-client-protocol-schema`
 `agent-client-protocol` updates these rows in the same change.
 
 The columns are the feature, `oxd` as the client, `claude-code-acp` and
-`pi-acp` as agents, and caveats. Each cell is *supported*, *partial*, or
-*unsupported*; a partial cell says in the caveats what works and what does not.
+`pi-acp` as agents, and caveats. Each cell is ✅ supported, ⚠️ partial, or ❌ unsupported;
+a partial cell says in the caveats what works and what does not.
 `oxd-fake-agent` is a test fixture and has no column.
 
 `oxd` records and relays live session updates unchanged and in order. During
 resume it keeps the existing conversation when it has one and discards the
-agent's replay. "Supported" in the `oxd` column means `oxd` records and
+agent's replay. ✅ in the `oxd` column means `oxd` records and
 relays the update or acts on it as the protocol requires.
 
 ## Methods the client sends
 
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `initialize` | supported | supported | supported | claude-code-acp: The agent answers with the protocol version the client sent, and notes whether the client advertises `elicitation.form`. pi-acp: Answers with the protocol version the client sent, and notes whether the client advertises `elicitation.form`. oxd: Sends protocol version 2 and the client capability `elicitation.form`. A session whose agent selects a lower version, or advertises no `session` capability, exits with an error. |
-| `auth/login` | unsupported | unsupported | unsupported | The agents advertise no auth methods. |
-| `auth/logout` | unsupported | unsupported | unsupported | |
-| `auth/status` (unstable) | unsupported | unsupported | unsupported | |
-| `providers/list` (unstable) | unsupported | unsupported | unsupported | |
-| `providers/set` (unstable) | unsupported | unsupported | unsupported | |
-| `providers/disable` (unstable) | unsupported | unsupported | unsupported | |
-| `session/new` | supported | supported | supported | claude-code-acp: Answers with the session's config options, reports the session idle, then starts its Claude process, whose native command catalog follows as `available_commands_update`. A Claude process that fails to start fails the next prompt with its error. MCP servers are stdio only; see `session.mcp`. pi-acp: Answers, reports the session idle, then starts `pi --mode rpc --approve` on a new Pi session ID. Config options and the command catalog follow as `config_option_update` and `available_commands_update`. A Pi that fails to start is started again by the next prompt. MCP servers are rejected with `-32602`. oxd: Sends the session's directory, and the [`ox` MCP server](architecture.md#ox-mcp) to an agent that advertises `session.mcp.stdio`. |
-| `session/list` | unsupported | supported | unsupported | claude-code-acp: Lists the bridge's sessions and Claude's native transcripts, 50 per page. oxd: `oxd` keeps its own sessions. |
-| `session/resume` | supported | supported | supported | claude-code-acp: Starts a Claude process if needed. A spawn failure fails the resume request. The bridge proceeds while native initialization runs. With `replayFrom: start` it replays Claude's transcript. It sends the session's state and replies with the command catalog available so far whether replay was requested or omitted. Later catalog updates arrive as `available_commands_update`. Any other cursor is rejected with `-32602`. pi-acp: Starts Pi if needed; a spawn failure fails the request. With `replayFrom: start`, replays the message entries of Pi's session file in file order: user messages, text and thinking as whole messages, and tool calls with their results and `edit`/`write` diffs. Sends the state and answers with config options and the command catalog. Any other cursor, a different `cwd`, or MCP servers are rejected with `-32602`. oxd: See [Resume and replay](#resume-and-replay) for history recovery. Sends the `ox` MCP server as `session/new` does. |
-| `session/close` | unsupported | supported | supported | claude-code-acp: Interrupts and stops the session's `claude`, answers once it has exited, and leaves the session resumable. Closing a session that is not open succeeds. pi-acp: Aborts the run, stops Pi, and answers once Pi has exited; the open turn ends `cancelled`. The session stays resumable. Closing a session that is not open succeeds. oxd: Deleting a session kills the agent's process group. |
-| `session/prompt` | supported | supported | supported | claude-code-acp: Answers with the `messageId` of the user message the prompt becomes, once `claude` takes the prompt into a turn. A prompt sent during a turn waits for it. A prompt dropped by `session/cancel` before that is answered with `-32800`. pi-acp: Answers with the user message's `messageId` once Pi accepts the prompt. A prompt sent during a run is queued by Pi as a follow-up and answered when queued. A prompt an extension command handles without starting a run ends its turn at once. Pi's refusal is the error. oxd: Checks the prompt against the agent's prompt capabilities first. The answer matters only when it is an error: the prompt was not inserted, and the turn ends with that error unless the agent already reported work for it. |
-| `session/set_config_option` | supported | supported | supported | claude-code-acp: Options `model`, `effort`, and `mode`, all selects. pi-acp: Options `model`, with values of the form `provider/id`, and `thinking`, offered when the model has more than one level. Both are selects. oxd: Selects and booleans. |
-| `session/delete` | unsupported | unsupported | unsupported | |
-| `session/fork` (unstable) | unsupported | unsupported | unsupported | |
-| `session/archive` (unstable) | unsupported | unsupported | unsupported | |
-| `session/unarchive` (unstable) | unsupported | unsupported | unsupported | |
-| `session/status` (unstable) | unsupported | unsupported | unsupported | |
-| `session/options` (unstable) | unsupported | unsupported | unsupported | |
-| `session/set_title` (unstable) | unsupported | unsupported | unsupported | Both bridges title a session from its first prompt. |
-| `tool_call/cancel` | unsupported | unsupported | unsupported | |
-| `terminal/cancel` | unsupported | unsupported | unsupported | |
-| `mcp/message` (unstable) | unsupported | unsupported | unsupported | |
-| Extension requests (`_`-prefixed) | unsupported | unsupported | unsupported | |
+| `initialize` | ✅ | ✅ | ✅ | Ox requires protocol v2 and the `session` capability. |
+| `auth/login` | ❌ | ❌ | ❌ | |
+| `auth/logout` | ❌ | ❌ | ❌ | |
+| `auth/status` (unstable) | ❌ | ❌ | ❌ | |
+| `providers/list` (unstable) | ❌ | ❌ | ❌ | |
+| `providers/set` (unstable) | ❌ | ❌ | ❌ | |
+| `providers/disable` (unstable) | ❌ | ❌ | ❌ | |
+| `session/new` | ✅ | ✅ | ✅ | Both bridges start their harness asynchronously; a successful response does not guarantee the harness has started. See `session.mcp.stdio` for MCP support. |
+| `session/list` | ❌ | ✅ | ❌ | Claude includes native transcripts. Ox uses its own session list. |
+| `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. Pi also rejects a changed `cwd` or MCP servers. See [Resume and replay](#resume-and-replay). |
+| `session/close` | ❌ | ✅ | ✅ | Both bridges leave the session resumable. Ox deletes sessions by stopping the agent process. |
+| `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude waits to accept the next prompt; Pi queues it as a follow-up. |
+| `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Ox supports select and boolean options. |
+| `session/delete` | ❌ | ❌ | ❌ | |
+| `session/fork` (unstable) | ❌ | ❌ | ❌ | |
+| `session/archive` (unstable) | ❌ | ❌ | ❌ | |
+| `session/unarchive` (unstable) | ❌ | ❌ | ❌ | |
+| `session/status` (unstable) | ❌ | ❌ | ❌ | |
+| `session/options` (unstable) | ❌ | ❌ | ❌ | |
+| `session/set_title` (unstable) | ❌ | ❌ | ❌ | Both bridges derive titles from the first prompt. |
+| `tool_call/cancel` | ❌ | ❌ | ❌ | |
+| `terminal/cancel` | ❌ | ❌ | ❌ | |
+| `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
+| Extension requests (`_`-prefixed) | ❌ | ❌ | ❌ | |
 
 ## Notifications the client sends
 
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `session/cancel` | supported | supported | supported | claude-code-acp: Interrupts the turn and drops prompts `claude` has not taken. Open permission requests and elicitations are withdrawn. pi-acp: Sends Pi's `abort`, and aborts again once Pi accepts a prompt that was still waiting. Open dialogs are answered cancelled and their elicitations withdrawn. oxd: Withdraws every open permission request as cancelled. Open elicitations stay open until the agent withdraws them with `$/cancel_request`. |
-| `$/cancel_request` | unsupported | unsupported | unsupported | |
-| `mcp/message` (unstable) | unsupported | unsupported | unsupported | |
-| Extension notifications (`_`-prefixed) | unsupported | unsupported | unsupported | |
+| `session/cancel` | ✅ | ✅ | ✅ | Claude also drops prompts it has not accepted. Ox closes permission requests, but elicitations remain open until the agent withdraws them. |
+| `$/cancel_request` | ❌ | ❌ | ❌ | |
+| `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
+| Extension notifications (`_`-prefixed) | ❌ | ❌ | ❌ | |
 
 ## Methods the agent sends
 
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `session/request_permission` | supported | supported | unsupported | claude-code-acp: Sent for each tool `claude` asks to use, except AskUserQuestion; see `elicitation/create`. The subject is the tool call. Options are allow once, allow always when `claude` supplies a rule, and reject once. pi-acp: Pi runs tools without asking. oxd: Recorded with its title, description, subject, and options, and answered when a client picks an option or the turn is cancelled. The session is awaiting permission meanwhile. |
-| `elicitation/create` | supported | supported | supported | claude-code-acp: Asks Claude's AskUserQuestion questions as a form, scoped to the session and the tool call. Question *i* becomes `q`*i*, a `oneOf` choice of its options or an `anyOf` multi-select when `multiSelect` is set, titled with its header and described by its text, and `q`*i*`-other`, a text field titled `Other`. No field is required. The message is `Claude has a question` or `Claude has questions`. Accepting allows the tool with the answers: a single-select question's `Other` text, or else its choice, and a multi-select question's choices in option order followed by its `Other` text, joined with `, `. Declining or cancelling denies the tool. A client without `elicitation.form` gets no elicitations: `claude` starts with AskUserQuestion disallowed and asks in plain text. pi-acp: Extension `select`, `confirm`, `input`, and `editor` dialogs become forms with the message `Pi has a question` and one field, `answer`, titled with the dialog's title. `select` is a required `oneOf` of its options; `confirm` is a required Yes/No choice described by its message; `input` is optional text described by its placeholder; `editor` is optional text defaulting to its prefill. Declining or cancelling answers Pi cancelled. A client without `elicitation.form` gets no elicitations; dialogs are answered cancelled. oxd: Form mode, scoped to the session. Recorded with its message, tool call, and schema, and answered when a client accepts, declines, or cancels it. Accepted content is checked against the schema, except `pattern` and `format`. The session is awaiting input meanwhile, or awaiting permission while a permission request is also open. The elicitation ends as `cancel` when the agent withdraws it, exits, or the session is parked or closed. URL mode, request scope, a required property of unknown type or with no schema, and a property with both `enum` and `oneOf` are refused with `-32602`. |
-| `mcp/message` (unstable) | unsupported | unsupported | unsupported | |
-| Extension requests (`_`-prefixed) | unsupported | unsupported | unsupported | |
+| `session/request_permission` | ✅ | ✅ | ❌ | Pi runs tools without asking. Claude's AskUserQuestion uses `elicitation/create` instead. |
+| `elicitation/create` | ✅ | ✅ | ✅ | Claude: AskUserQuestion forms. Pi: extension dialogs. Ox supports session-scoped forms only; URL mode and request scope are unsupported. Schema `pattern` and `format` are not validated; unknown required field types and fields combining `enum` with `oneOf` are rejected. |
+| `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
+| Extension requests (`_`-prefixed) | ❌ | ❌ | ❌ | |
 
 ## Notifications the agent sends
 
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `session/update` | supported | supported | supported | claude-code-acp: See the session updates below. pi-acp: See the session updates below. oxd: See the session updates below. |
-| `elicitation/complete` | unsupported | unsupported | unsupported | |
-| `auth/status_update` (unstable) | unsupported | unsupported | unsupported | |
-| `$/cancel_request` | partial | supported | supported | claude-code-acp: Withdraws an open permission request or elicitation when Claude withdraws it, the turn ends, or `claude` exits. pi-acp: Withdraws an elicitation when the dialog's `timeout` elapses, on cancel or close, when an aborted run settles, or when Pi exits. oxd: Withdraws an open elicitation, which ends as `cancel`. A withdrawn permission request stays pending until a client answers it or the turn is cancelled. |
-| Extension notifications (`_`-prefixed) | unsupported | unsupported | unsupported | |
+| `session/update` | ✅ | ✅ | ✅ | |
+| `elicitation/complete` | ❌ | ❌ | ❌ | |
+| `auth/status_update` (unstable) | ❌ | ❌ | ❌ | |
+| `$/cancel_request` | ⚠️ | ✅ | ✅ | Ox closes withdrawn elicitations. Withdrawn permission requests remain pending until answered or the turn is cancelled. |
+| Extension notifications (`_`-prefixed) | ❌ | ❌ | ❌ | |
 
 ## Session updates
 
 | `sessionUpdate` | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `user_message` | supported | supported | supported | claude-code-acp: Sent when a prompt enters the conversation, with the prompt's `messageId`, and on replay, one per transcript entry. pi-acp: Sent when Pi accepts a prompt, and on replay. oxd: Recorded and relayed. |
-| `user_message_chunk` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `agent_message` | supported | supported | supported | claude-code-acp: Sent for a message that streamed no text, and on replay. pi-acp: Sent for text Pi did not stream, and on replay. oxd: Recorded and relayed. |
-| `agent_message_chunk` | supported | supported | supported | claude-code-acp: Sent while `claude` streams text. The message is not repeated as a whole. pi-acp: Sent while Pi streams text. oxd: Recorded and relayed. |
-| `agent_thought` | supported | supported | supported | claude-code-acp: Same as `agent_message`. pi-acp: Sent for thinking Pi did not stream, and on replay. oxd: Recorded and relayed. |
-| `agent_thought_chunk` | supported | supported | supported | claude-code-acp: Same as `agent_message_chunk`. pi-acp: Sent while Pi streams thinking. oxd: Recorded and relayed. |
-| `state_update` | supported | supported | supported | claude-code-acp: See the state updates below. pi-acp: See the state updates below. oxd: Drives the turn; see the state updates below. The update is also recorded. |
-| `tool_call_update` | supported | supported | supported | claude-code-acp: The first update for a tool call ID carries its name, title, kind, `pending` status, and input. A result sets the whole `content` list: the result's text and images, preceded by the activity lines of a subagent the tool call started. Tool calls that end without a result are failed. pi-acp: The first update has the name, title, kind, `pending` status, input, and file location (with the line for `read`), followed by `in_progress` when Pi runs the tool. The result sets `content`: a diff for `edit` and `write`, then the result's text and images. Calls that end without a result are failed. oxd: Recorded and relayed. |
-| `tool_call_content_chunk` | supported | unsupported | unsupported | claude-code-acp: Tool call content is sent whole. oxd: Recorded and relayed. |
-| `terminal_update` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `terminal_output_chunk` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `plan_update` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `plan_removed` (unstable) | unsupported | unsupported | unsupported | |
-| `available_commands_update` | supported | supported | supported | claude-code-acp: Native command names, descriptions, and argument hints are sent once Claude initializes, included in resume responses, and replaced on Claude's `commands_changed` events. pi-acp: Extension commands, prompt templates, and skills (as `skill:name`) with descriptions, sent each time Pi starts and included in resume responses. oxd: Setup responses and notifications replace the current catalog, including an empty list, which is included in session listings and watches. |
-| `config_option_update` | supported | supported | supported | claude-code-acp: Sent after a config change is accepted. pi-acp: Sent when Pi starts and after a config change. oxd: Replaces the session's config options. |
-| `session_info_update` | supported | supported | supported | claude-code-acp: `title` from the first prompt, `updatedAt` after a turn finishes. pi-acp: `title` from the first prompt. oxd: A `title` sets or clears the session's title and is saved. `updatedAt` is only recorded. |
-| `usage_update` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `notice` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `compaction_update` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `compaction_summary_chunk` | supported | unsupported | unsupported | oxd: Recorded and relayed. |
-| `subagent_update` (unstable) | unsupported | unsupported | unsupported | claude-code-acp: A subagent shows as activity lines of its tool call. |
-| `session_message` (unstable) | unsupported | unsupported | unsupported | |
-| `session_message_chunk` (unstable) | unsupported | unsupported | unsupported | |
-| Extension updates (`_`-prefixed) | supported | unsupported | unsupported | oxd: Recorded and relayed. |
+| `user_message` | ✅ | ✅ | ✅ | |
+| `user_message_chunk` | ✅ | ❌ | ❌ | |
+| `agent_message` | ✅ | ✅ | ✅ | Both bridges use whole messages for replay and text that was not streamed. |
+| `agent_message_chunk` | ✅ | ✅ | ✅ | |
+| `agent_thought` | ✅ | ✅ | ✅ | Both bridges use whole messages for replay and thinking that was not streamed. |
+| `agent_thought_chunk` | ✅ | ✅ | ✅ | |
+| `state_update` | ✅ | ✅ | ✅ | |
+| `tool_call_update` | ✅ | ✅ | ✅ | Claude includes subagent activity as text. Pi includes diffs for `edit` and `write`. |
+| `tool_call_content_chunk` | ✅ | ❌ | ❌ | |
+| `terminal_update` | ✅ | ❌ | ❌ | |
+| `terminal_output_chunk` | ✅ | ❌ | ❌ | |
+| `plan_update` | ✅ | ❌ | ❌ | |
+| `plan_removed` (unstable) | ❌ | ❌ | ❌ | |
+| `available_commands_update` | ✅ | ✅ | ✅ | Claude: native commands, available after harness initialization. Pi: extension commands, prompt templates, and skills (`skill:name`). |
+| `config_option_update` | ✅ | ✅ | ✅ | |
+| `session_info_update` | ✅ | ✅ | ✅ | Both bridges supply titles. Only Claude supplies `updatedAt`; Ox only records it. |
+| `usage_update` | ✅ | ❌ | ❌ | |
+| `notice` | ✅ | ❌ | ❌ | |
+| `compaction_update` | ✅ | ❌ | ❌ | |
+| `compaction_summary_chunk` | ✅ | ❌ | ❌ | |
+| `subagent_update` (unstable) | ❌ | ❌ | ❌ | Claude reports subagent activity within tool calls instead. |
+| `session_message` (unstable) | ❌ | ❌ | ❌ | |
+| `session_message_chunk` (unstable) | ❌ | ❌ | ❌ | |
+| Extension updates (`_`-prefixed) | ✅ | ❌ | ❌ | |
 
-The app builds its conversation from the recorded updates. A prompt, an
-agent message, and an agent thought are items keyed by `messageId`: chunks
-append to the item, and `user_message`, `agent_message`, and `agent_thought`
-replace its content with their text. A `user_message` or `user_message_chunk`
-during a turn is skipped, because the turn's prompt is its item. The
-`tool_call_update` creates a tool call for a new ID and patches an existing one,
-and `tool_call_content_chunk` appends to its content. A tool call shows its
-text and images; diffs and terminals are not shown. A permission request whose
-subject is a tool call applies the subject as a `tool_call_update`. The app
-shows slash-command completion in the composer from the current catalog: typing `/` filters names by prefix; arrows select, Enter or Tab completes the draft, and a later submission runs it through `session/prompt`. Escape dismisses completion. Descriptions and text argument hints are shown. The app shows nothing for the other updates, which `oxd` still records.
+The app displays messages, thoughts, tool text and images, and command
+completion. It does not display tool diffs, terminals, or other update types;
+`oxd` still records them.
 
 ## State updates
 
 | `state` | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `running` | supported | supported | supported | claude-code-acp: Sent when `claude` takes a prompt or starts a turn of its own, including the turn a finished background task starts, and when a permission request is answered or withdrawn. pi-acp: Sent on Pi's `agent_start`, when Pi accepts a prompt, and when a form closes during a run. oxd: Starts a turn when none is running, recorded as `turn_started`. |
-| `idle` | supported | supported | supported | claude-code-acp: Sent when a turn ends, with its `stopReason`. A `claude` that exits during a turn ends it with `error`, or `cancelled` when the session is closing. pi-acp: Sent on `agent_settled` with its stop reason. A Pi that exits during a turn ends it with `error`, or with `cancelled` when the session is closing. oxd: Ends the running turn, recorded as `turn_ended` with the stop reason. After a prompt, an `idle` before the agent reports work for it is a repeated snapshot and ends nothing. In a resume snapshot it sets the session idle. |
-| `requires_action` | supported | supported | supported | claude-code-acp: Sent while a permission request is open. pi-acp: Sent while a dialog's form is open during a run. oxd: Counts as work, like `running`. |
-| `unknown` (unstable) | unsupported | unsupported | unsupported | |
-| `background` work lists | supported | supported | supported | claude-code-acp: Every state update carries the list, `[]` when nothing runs, including the `idle` it sends after `session/new` and in a resume snapshot. It holds `claude`'s live background tasks and the scheduled prompts it infers from `CronCreate`, `CronDelete` and `ScheduleWakeup`; each is a `tool_call` item when the client has the tool call, otherwise a custom `_claude_task` or `_claude_schedule` item. A listed tool call stays `in_progress`, or `pending` for a schedule, until its work ends. Schedules last until their fire time has passed and a turn that started after it has ended, until `CronDelete`, or after seven days for a recurring job; a call the bridge cannot read lasts until `claude` exits. Durable jobs saved by another session in the same folder are not listed. pi-acp: Always `[]`, so idle Pi sessions can park. oxd: Kept per session; a session whose agent last reported `[]`, with no turn and no pending request, can be parked. An agent that reports no list is never parked. |
-| Other states | supported | unsupported | unsupported | oxd: Count as work, never as idle. |
+| `running` | ✅ | ✅ | ✅ | |
+| `idle` | ✅ | ✅ | ✅ | |
+| `requires_action` | ✅ | ✅ | ✅ | Claude: permission requests. Pi: extension dialogs during a run. |
+| `unknown` (unstable) | ❌ | ❌ | ❌ | |
+| `background` work lists | ✅ | ✅ | ✅ | Claude reports live tasks and inferred schedules, excluding durable jobs from other sessions. Recurring schedules expire from the list after seven days. Pi always reports an empty list. See [parking rules](architecture.md#loading-and-stopping-agents). |
+| Other states | ✅ | ❌ | ❌ | Ox treats unrecognized states as active work. |
 
 ## Stop reasons
 
 | `stopReason` | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `end_turn` | supported | supported | supported | oxd: Recorded in `turn_ended`. |
-| `max_tokens` | supported | unsupported | supported | oxd: Recorded in `turn_ended`. pi-acp: From Pi's `length`. |
-| `max_turn_requests` | supported | supported | unsupported | claude-code-acp: From a `claude` result of `error_max_turns`. oxd: Recorded in `turn_ended`. |
-| `refusal` | supported | unsupported | unsupported | oxd: Recorded in `turn_ended`. |
-| `cancelled` | supported | supported | supported | oxd: Recorded in `turn_ended`. pi-acp: The run was aborted, or the session closed. |
-| `error` | supported | supported | supported | claude-code-acp: The error's message is the failure `claude` reported, or why `claude` exited, with its stderr. pi-acp: Pi's error message, or why Pi exited, with its stderr. oxd: Recorded in `turn_ended` with the failure's details. The app shows the message as a turn error. |
-| Other stop reasons | supported | unsupported | unsupported | oxd: Recorded in `turn_ended`. |
+| `end_turn` | ✅ | ✅ | ✅ | |
+| `max_tokens` | ✅ | ❌ | ✅ | |
+| `max_turn_requests` | ✅ | ✅ | ❌ | |
+| `refusal` | ✅ | ❌ | ❌ | |
+| `cancelled` | ✅ | ✅ | ✅ | |
+| `error` | ✅ | ✅ | ✅ | |
+| Other stop reasons | ✅ | ❌ | ❌ | |
 
 ## Content blocks in prompts
 
 | Block | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `text` | supported | supported | supported | |
-| `resource_link` | supported | supported | supported | Sent to the harness as a Markdown link, `[@name](uri)`. |
-| `image` | supported | supported | supported | claude-code-acp: PNG, JPEG, GIF, and WebP. pi-acp: Sent as a Pi image. oxd: Sent when the agent advertises `session.prompt.image`. |
-| `resource` | supported | supported | unsupported | claude-code-acp: Embedded text goes to `claude` in a `<context ref="uri">` block, and an embedded PDF or image as a document or image. Other blobs are rejected. pi-acp: Rejected with `-32602`. oxd: Sent when the agent advertises `session.prompt.embeddedContext`. |
-| `audio` | supported | unsupported | unsupported | claude-code-acp: Rejected with `-32602`. pi-acp: Rejected with `-32602`. oxd: Sent when the agent advertises `session.prompt.audio`. |
-| Other blocks | unsupported | unsupported | unsupported | Rejected with `-32602`. |
+| `text` | ✅ | ✅ | ✅ | |
+| `resource_link` | ✅ | ✅ | ✅ | Passed to the harness as a Markdown link. |
+| `image` | ✅ | ✅ | ✅ | Claude accepts PNG, JPEG, GIF, and WebP. |
+| `resource` | ✅ | ✅ | ❌ | Claude accepts embedded text, PDFs, and images; other blobs are rejected. |
+| `audio` | ✅ | ❌ | ❌ | |
+| Other blocks | ❌ | ❌ | ❌ | |
 
 ## Agent capabilities
 
 | Capability | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `session` | supported | supported | supported | claude-code-acp: Advertised, so the baseline session methods apply. pi-acp: Advertised, so the baseline session methods apply. oxd: Required. Without it the session exits with an error that the agent does not support sessions. |
-| `session.prompt.image` | supported | supported | supported | oxd: Gates image prompts. |
-| `session.prompt.embeddedContext` | supported | supported | unsupported | oxd: Gates resource prompts. |
-| `session.prompt.audio` | supported | unsupported | unsupported | oxd: Gates audio prompts. |
-| `session.mcp.stdio` | supported | supported | unsupported | oxd: The command is an absolute path. Gates the `ox` MCP server. claude-code-acp: Claude uses every tool of a server the client supplies without asking for permission. pi-acp: Not advertised; Pi sessions get no `ox` MCP server. |
-| `session.mcp.http` | unsupported | unsupported | unsupported | claude-code-acp: A request with an HTTP server is rejected with invalid params. pi-acp: All MCP servers are rejected. |
-| `session.mcp.acp` (unstable) | unsupported | unsupported | unsupported | |
-| `session.delete` | unsupported | unsupported | unsupported | |
-| `session.additionalDirectories` | unsupported | unsupported | unsupported | |
-| `session.systemPrompt` | unsupported | unsupported | unsupported | |
-| `session.fork` (unstable) | unsupported | unsupported | unsupported | |
-| `session.archive` (unstable) | unsupported | unsupported | unsupported | |
-| `session.status` (unstable) | unsupported | unsupported | unsupported | |
-| `session.options` (unstable) | unsupported | unsupported | unsupported | |
-| `session.title` (unstable) | unsupported | unsupported | unsupported | |
-| `auth` | unsupported | unsupported | unsupported | |
-| `providers` (unstable) | unsupported | unsupported | unsupported | |
+| `session` | ✅ | ✅ | ✅ | |
+| `session.prompt.image` | ✅ | ✅ | ✅ | |
+| `session.prompt.embeddedContext` | ✅ | ✅ | ❌ | |
+| `session.prompt.audio` | ✅ | ❌ | ❌ | |
+| `session.mcp.stdio` | ✅ | ✅ | ❌ | Ox supplies the [`ox` MCP server](architecture.md#ox-mcp) to Claude, which allows its tools without permission prompts. Pi sessions have no `ox` MCP server. |
+| `session.mcp.http` | ❌ | ❌ | ❌ | |
+| `session.mcp.acp` (unstable) | ❌ | ❌ | ❌ | |
+| `session.delete` | ❌ | ❌ | ❌ | |
+| `session.additionalDirectories` | ❌ | ❌ | ❌ | |
+| `session.systemPrompt` | ❌ | ❌ | ❌ | |
+| `session.fork` (unstable) | ❌ | ❌ | ❌ | |
+| `session.archive` (unstable) | ❌ | ❌ | ❌ | |
+| `session.status` (unstable) | ❌ | ❌ | ❌ | |
+| `session.options` (unstable) | ❌ | ❌ | ❌ | |
+| `session.title` (unstable) | ❌ | ❌ | ❌ | |
+| `auth` | ❌ | ❌ | ❌ | |
+| `providers` (unstable) | ❌ | ❌ | ❌ | |
 
 ## Client capabilities
 
 | Capability | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `auth.terminal` | unsupported | unsupported | unsupported | |
-| `elicitation.form` | supported | supported | supported | claude-code-acp: Decides whether Claude can call AskUserQuestion; see `elicitation/create`. pi-acp: Decides whether Pi's dialogs become forms; see `elicitation/create`. oxd: Advertised in `initialize`; see `elicitation/create`. |
-| `elicitation.url` | unsupported | unsupported | unsupported | |
+| `auth.terminal` | ❌ | ❌ | ❌ | |
+| `elicitation.form` | ✅ | ✅ | ✅ | Without this capability, Claude asks questions in plain text; Pi cancels extension dialogs. |
+| `elicitation.url` | ❌ | ❌ | ❌ | |
 
 ## Resume and replay
 
