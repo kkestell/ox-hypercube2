@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run opt-in smoke checks against Claude Code through oxd and oxctl."""
+"""Run opt-in smoke checks against an ACP bridge through oxd and oxctl."""
 
 import argparse
 import json
@@ -225,25 +225,15 @@ class SmokeRun:
         self.directory = directory
         self.project = directory / "project"
         self.project.mkdir()
-        skill = self.project / ".claude" / "skills" / "ox-command-probe"
-        skill.mkdir(parents=True)
-        (skill / "SKILL.md").write_text(
-            "---\nname: ox-command-probe\n"
-            "description: Return the smoke command marker\n"
-            "argument-hint: value\ndisable-model-invocation: true\n---\n"
-            "Reply with exactly OX_NATIVE_COMMAND_$ARGUMENTS and nothing else. "
-            "Do not use tools.\n"
-        )
+        self.write_project()
         self.socket = directory / "oxd.sock"
         self.cli = [str(binaries / "oxctl"), "--socket", str(self.socket)]
         self.binaries = binaries
         self.events = events
         self.stderr = stderr
         self.env = os.environ.copy()
-        self.agent = [str(binaries / "claude-code-acp")]
-        self.env.update(
-            CLAUDE_ACP_STORE_DIR=str(directory / "bridge-store"),
-        )
+        self.agent = [str(binaries / self.bridge)]
+        self.env[self.store_variable] = str(directory / "bridge-store")
         self.daemon = None
         self.workspace = None
         self.session = None
@@ -304,10 +294,6 @@ class SmokeRun:
         check("Error:" not in text(events), f"Agent reported an error: {text(events)}")
         return events
 
-    def permission(self):
-        events = self.until(lambda e: kind(e) == "permission_requested")
-        return events[-1]
-
     def remember_agents(self):
         # ACP agents own separate process groups; retain their PIDs for cleanup
         # if session startup or a later command fails.
@@ -355,28 +341,27 @@ class SmokeRun:
 
         watch = Watch(self.socket, self.session, self.args.timeout)
         try:
-            # The watch's first changes list every session.
-            current = next(watch.session_changes(time.monotonic() + self.args.timeout))
-            commands = current["available_commands"]
-            probe = next(c for c in commands if c["name"] == "ox-command-probe")
-            check(probe["input"] == {"type": "text", "hint": "value"}, probe)
-            check("smoke command marker" in probe["description"], probe)
-            self.report("native_commands_discovered_before_prompt", command=probe)
+            deadline = time.monotonic() + self.args.timeout
+            for current in watch.session_changes(deadline):
+                probe = next(
+                    (
+                        c
+                        for c in current["available_commands"]
+                        if c["name"] == self.probe
+                    ),
+                    None,
+                )
+                if probe is not None:
+                    self.check_probe(probe)
+                    self.report(
+                        "native_commands_discovered_before_prompt", command=probe
+                    )
+                    break
         finally:
             watch.close()
 
-        self.check_reconnect()
-        self.check_effort()
-        self.check_commands()
-        self.check_permission()
-        self.check_question()
-        self.check_background_wake()
-        self.check_cancellation()
-        self.verify_model()
-        self.check_title_tool()
-        self.check_load_after_restart()
-        self.check_parking()
-        self.check_archive()
+        for check_method in self.checks():
+            check_method()
         self.report("all_event_sequences_contiguous", event_count=self.seq)
 
         self.disconnect()
@@ -425,46 +410,11 @@ class SmokeRun:
         check(token in response, f"Conversation token was not retained: {response}")
         self.report("followup_retains_conversation", response=response)
 
-    def check_commands(self):
-        """Invokes a native skill through the same content blocks the app sends."""
-        self.ctl("prompt", self.session, "/ox-command-probe ARGUMENTS")
-        response = text(self.finish()).strip()
-        check(response == "OX_NATIVE_COMMAND_ARGUMENTS", response)
-        self.report("native_skill_invoked_with_arguments", response=response)
-        self.ctl("prompt", self.session, "/model")
-        response = text(self.finish()).strip()
-        check(
-            "Current model:" in response,
-            f"Local command did not return model: {response}",
-        )
-        self.report("native_local_command_completed", response=response)
-
-    def check_effort(self):
-        """Sets the effort of the session's running Claude."""
-        effort = self.ctl("config", self.session, "effort", "low")
-        check(effort == "low", f"Effort was not set: {effort}")
-        self.report("effort_set_on_running_claude", effort=effort)
-
     def session_row(self):
         """The fields of the session's row in `oxctl ls`: id, workspace id,
         state, directory, command, title, and agent session id."""
         row = next(r for r in self.ctl("ls").splitlines() if r.startswith(self.session))
         return row.split("\t")
-
-    def check_title_tool(self):
-        """Has Claude retitle the session with the `ox` MCP server's
-        `set_title` tool. A permission request would stall the turn."""
-        title = f"Smoke {self.directory.name}"
-        self.ctl(
-            "prompt",
-            self.session,
-            f"Call the set_title tool of the ox MCP server with the title {title} "
-            "and do nothing else.",
-        )
-        self.finish()
-        row = self.session_row()
-        check(row[5] == title, f"The title tool did not set the title: {row}")
-        self.report("agent_set_title_through_ox_mcp", title=title)
 
     def check_load_after_restart(self):
         token = self.directory.name
@@ -530,6 +480,187 @@ class SmokeRun:
         response = text(self.finish()).strip()
         check(token in response, f"Loaded session lost the conversation: {response}")
         self.report("loaded_session_retains_conversation", response=response)
+
+    def check_cancel_generation(self):
+        self.ctl(
+            "prompt",
+            self.session,
+            "Do not use tools. Write a numbered list of 200 short factual sentences "
+            "about geometry.",
+        )
+        self.until(message)
+        self.ctl("cancel", self.session)
+        self.finish("cancelled")
+        self.report("cancel_running_generation", stop_reason="cancelled")
+
+    def parking_run(self, delay):
+        directory = self.directory / "parking"
+        directory.mkdir()
+        run = type(self)(
+            self.args,
+            directory,
+            self.binaries,
+            self.events,
+            self.stderr,
+            ["--park-after-ms", str(delay * 1000)],
+        )
+        run.daemon_log = self.daemon_log
+        try:
+            run.start_daemon()
+            workspace = run.ctl("workspace", "add", str(run.project))
+            run.session = run.ctl("new", "--workspace", workspace, "--", *run.agent)
+            run.ctl("config", run.session, "model", self.args.model)
+            run.remember_agents()
+            run.attach(0)
+            return run
+        except BaseException:
+            run.cleanup()
+            raise
+
+    def check_archive(self):
+        """An archived session stops its agent and keeps its conversation
+        across a daemon restart; unarchiving it lets it resume."""
+        token = self.directory.name
+        self.disconnect()
+        self.remember_agents()
+        self.ctl("archive", self.session)
+        row = self.session_row()
+        check(row[2] == "archived", f"Archived session is not listed so: {row}")
+        check(
+            not running_after(self.agent_pids, 10), "Archiving left the agent running"
+        )
+        self.daemon.send_signal(signal.SIGTERM)
+        check(self.daemon.wait(timeout=15) == 0, "Daemon did not stop on SIGTERM")
+        self.start_daemon()
+        check(
+            self.session_row()[2] == "archived",
+            "The session is not archived after a restart",
+        )
+        self.seq = 0
+        self.attach(0)
+        history = []
+        deadline = time.monotonic() + self.args.timeout
+        while True:
+            event = self.attachment.read(deadline)
+            check(event["seq"] == self.seq + 1, f"Sequence gap or duplicate: {event}")
+            self.seq = event["seq"]
+            history.append(event)
+            if kind(event) == "agent_parked":
+                break
+        check(
+            token in text(history),
+            f"The archive lacks the conversation: {text(history)[:300]}",
+        )
+        self.report(
+            "archived_session_history_survives_daemon_restart", events=len(history)
+        )
+
+        self.ctl("unarchive", self.session)
+        check(self.session_row()[2] == "exited", "Unarchived session is not exited")
+        self.ctl("load", self.session)
+        self.remember_agents()
+        restarted = self.until(lambda e: kind(e) == "agent_started")
+        check(
+            len(restarted) == 1,
+            f"Load recorded the agent's replay again: {restarted[:3]}",
+        )
+        self.ctl(
+            "prompt",
+            self.session,
+            "What exact token did I ask you to remember at the start of this "
+            "conversation? Reply with only that token. Do not use tools.",
+        )
+        response = text(self.finish()).strip()
+        check(
+            token in response, f"Unarchived session lost the conversation: {response}"
+        )
+        self.report("unarchived_session_retains_conversation", response=response)
+
+    def cleanup(self):
+        try:
+            if self.attachment is not None:
+                self.disconnect()
+            if self.daemon is not None and self.daemon.poll() is None:
+                self.remember_agents()
+                if self.session is not None:
+                    self.ctl("delete", self.session)
+        finally:
+            try:
+                if self.daemon is not None:
+                    self.daemon.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                # A failed delete must not leave a live model request behind.
+                for pid in self.agent_pids:
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            finally:
+                if self.daemon is not None:
+                    stop(self.daemon)
+
+
+class ClaudeRun(SmokeRun):
+    harness = "claude"
+    bridge = "claude-code-acp"
+    store_variable = "CLAUDE_ACP_STORE_DIR"
+    probe = "ox-command-probe"
+
+    def write_project(self):
+        skill = self.project / ".claude" / "skills" / "ox-command-probe"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: ox-command-probe\n"
+            "description: Return the smoke command marker\n"
+            "argument-hint: value\ndisable-model-invocation: true\n---\n"
+            "Reply with exactly OX_NATIVE_COMMAND_$ARGUMENTS and nothing else. "
+            "Do not use tools.\n"
+        )
+
+    def check_probe(self, command):
+        check(command["input"] == {"type": "text", "hint": "value"}, command)
+        check("smoke command marker" in command["description"], command)
+
+    def checks(self):
+        return (
+            self.check_reconnect,
+            self.check_effort,
+            self.check_commands,
+            self.check_permission,
+            self.check_question,
+            self.check_background_wake,
+            self.check_cancel_permission,
+            self.check_cancel_generation,
+            self.verify_model,
+            self.check_title_tool,
+            self.check_load_after_restart,
+            self.check_parking,
+            self.check_archive,
+        )
+
+    def permission(self):
+        events = self.until(lambda e: kind(e) == "permission_requested")
+        return events[-1]
+
+    def check_effort(self):
+        """Sets the effort of the session's running Claude."""
+        effort = self.ctl("config", self.session, "effort", "low")
+        check(effort == "low", f"Effort was not set: {effort}")
+        self.report("effort_set_on_running_claude", effort=effort)
+
+    def check_commands(self):
+        """Invokes a native skill through the same content blocks the app sends."""
+        self.ctl("prompt", self.session, "/ox-command-probe ARGUMENTS")
+        response = text(self.finish()).strip()
+        check(response == "OX_NATIVE_COMMAND_ARGUMENTS", response)
+        self.report("native_skill_invoked_with_arguments", response=response)
+        self.ctl("prompt", self.session, "/model")
+        response = text(self.finish()).strip()
+        check(
+            "Current model:" in response,
+            f"Local command did not return model: {response}",
+        )
+        self.report("native_local_command_completed", response=response)
 
     def check_permission(self):
         self.ctl(
@@ -693,32 +824,77 @@ class SmokeRun:
             response=text(woke).strip(),
         )
 
+    def check_cancel_permission(self):
+        self.ctl(
+            "prompt",
+            self.session,
+            "Use your file write or patch tool to create cancelled.txt containing "
+            "cancelled. Do not use shell commands.",
+        )
+        self.permission()
+        self.ctl("cancel", self.session)
+        events = self.finish("cancelled")
+        check(
+            any(
+                kind(e) == "permission_resolved"
+                and e["kind"]["data"]["outcome"]["outcome"] == "cancelled"
+                for e in events
+            ),
+            "Pending permission was not cancelled",
+        )
+        check(
+            not (self.project / "cancelled.txt").exists(),
+            "Cancelled write created a file",
+        )
+        self.report("cancel_pending_permission", file_created=False)
+
+    def verify_model(self):
+        store = json.loads(
+            (self.directory / "bridge-store/acp-sessions.json").read_text()
+        )
+        session = next(iter(store.values()))
+        claude_dir = Path(
+            self.env.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+        )
+        transcript = next(
+            (claude_dir / "projects").glob(f"*/{session['claudeSessionId']}.jsonl")
+        )
+        models = set()
+        for line in transcript.read_text().splitlines():
+            model = json.loads(line).get("message", {}).get("model")
+            if model and model != "<synthetic>":
+                models.add(model)
+        check(
+            models == {self.args.model},
+            f"Unexpected transcript models: {sorted(models)}",
+        )
+        self.report("model_verified", models=sorted(models))
+
+    def check_title_tool(self):
+        """Has Claude retitle the session with the `ox` MCP server's
+        `set_title` tool. A permission request would stall the turn."""
+        title = f"Smoke {self.directory.name}"
+        self.ctl(
+            "prompt",
+            self.session,
+            f"Call the set_title tool of the ox MCP server with the title {title} "
+            "and do nothing else.",
+        )
+        self.finish()
+        row = self.session_row()
+        check(row[5] == title, f"The title tool did not set the title: {row}")
+        self.report("agent_set_title_through_ox_mcp", title=title)
+
     def check_parking(self):
         """A session with a background command is not parked while it runs,
         and is parked once Claude has handled it and the session has been idle
         and unviewed for the delay, in a daemon of its own with a short
         delay."""
         delay = 10
-        directory = self.directory / "parking"
-        directory.mkdir()
-        run = SmokeRun(
-            self.args,
-            directory,
-            self.binaries,
-            self.events,
-            self.stderr,
-            ["--park-after-ms", str(delay * 1000)],
-        )
-        run.daemon_log = self.daemon_log
+        run = self.parking_run(delay)
         watch = None
         try:
-            run.start_daemon()
-            workspace = run.ctl("workspace", "add", str(run.project))
-            run.session = run.ctl("new", "--workspace", workspace, "--", *run.agent)
-            run.ctl("config", run.session, "model", self.args.model)
-            run.remember_agents()
-            token = f"parked-{directory.parent.name}"
-            run.attach(0)
+            token = f"parked-{self.directory.name}"
             run.ctl(
                 "prompt",
                 run.session,
@@ -775,143 +951,148 @@ class SmokeRun:
                 watch.close()
             run.cleanup()
 
-    def check_archive(self):
-        """An archived session stops its agent and keeps its conversation
-        across a daemon restart; unarchiving it lets it resume."""
-        token = self.directory.name
-        self.disconnect()
-        self.remember_agents()
-        self.ctl("archive", self.session)
-        row = self.session_row()
-        check(row[2] == "archived", f"Archived session is not listed so: {row}")
-        check(
-            not running_after(self.agent_pids, 10), "Archiving left the agent running"
+
+class PiRun(SmokeRun):
+    harness = "pi"
+    bridge = "pi-acp"
+    store_variable = "PI_ACP_STORE_DIR"
+    probe = "skill:ox-command-probe"
+
+    def write_project(self):
+        skill = self.project / ".pi" / "skills" / "ox-command-probe"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: ox-command-probe\n"
+            "description: Return the smoke command marker\n"
+            "disable-model-invocation: true\n---\n"
+            "The entire text after the closing </skill> tag, ignoring surrounding "
+            "whitespace, is the argument value. Reply with OX_NATIVE_COMMAND_ "
+            "immediately followed by that value and nothing else. Do not use tools.\n"
         )
-        self.daemon.send_signal(signal.SIGTERM)
-        check(self.daemon.wait(timeout=15) == 0, "Daemon did not stop on SIGTERM")
-        self.start_daemon()
-        check(
-            self.session_row()[2] == "archived",
-            "The session is not archived after a restart",
-        )
-        self.seq = 0
-        self.attach(0)
-        history = []
-        deadline = time.monotonic() + self.args.timeout
-        while True:
-            event = self.attachment.read(deadline)
-            check(event["seq"] == self.seq + 1, f"Sequence gap or duplicate: {event}")
-            self.seq = event["seq"]
-            history.append(event)
-            if kind(event) == "agent_parked":
-                break
-        check(
-            token in text(history),
-            f"The archive lacks the conversation: {text(history)[:300]}",
-        )
-        self.report(
-            "archived_session_history_survives_daemon_restart", events=len(history)
+        extensions = self.project / ".pi" / "extensions"
+        extensions.mkdir()
+        (extensions / "ox-color.ts").write_text(
+            "export default function (pi) {\n"
+            '  pi.on("tool_call", async (event, ctx) => {\n'
+            '    if (event.toolName !== "bash" || !event.input.command.includes("ox-color")) return;\n'
+            '    const color = await ctx.ui.select("Which color?", ["Red", "Blue"]);\n'
+            "    event.input.command = `echo ox-color-${color}`;\n"
+            "  });\n"
+            "}\n"
         )
 
-        self.ctl("unarchive", self.session)
-        check(self.session_row()[2] == "exited", "Unarchived session is not exited")
-        self.ctl("load", self.session)
-        self.remember_agents()
-        restarted = self.until(lambda e: kind(e) == "agent_started")
-        check(
-            len(restarted) == 1,
-            f"Load recorded the agent's replay again: {restarted[:3]}",
+    def check_probe(self, command):
+        check("smoke command marker" in command["description"], command)
+
+    def checks(self):
+        return (
+            self.check_reconnect,
+            self.check_thinking,
+            self.check_commands,
+            self.check_dialog,
+            self.check_cancel_generation,
+            self.verify_model,
+            self.check_load_after_restart,
+            self.check_parking,
+            self.check_archive,
         )
-        self.ctl(
-            "prompt",
-            self.session,
-            "What exact token did I ask you to remember at the start of this "
-            "conversation? Reply with only that token. Do not use tools.",
-        )
+
+    def check_thinking(self):
+        thinking = self.ctl("config", self.session, "thinking", "low")
+        check(thinking == "low", f"Thinking was not set: {thinking}")
+        self.report("thinking_set_on_running_pi", thinking=thinking)
+
+    def check_commands(self):
+        self.ctl("prompt", self.session, "/skill:ox-command-probe ARGUMENTS")
         response = text(self.finish()).strip()
-        check(
-            token in response, f"Unarchived session lost the conversation: {response}"
-        )
-        self.report("unarchived_session_retains_conversation", response=response)
+        check(response == "OX_NATIVE_COMMAND_ARGUMENTS", response)
+        self.report("native_skill_invoked_with_arguments", response=response)
 
-    def check_cancellation(self):
+    def check_dialog(self):
         self.ctl(
             "prompt",
             self.session,
-            "Use your file write or patch tool to create cancelled.txt containing "
-            "cancelled. Do not use shell commands.",
+            "Run exactly `echo ox-color` with the bash tool, then reply with only "
+            "the command's output.",
         )
-        self.permission()
-        self.ctl("cancel", self.session)
-        events = self.finish("cancelled")
+        requested = self.until(lambda e: kind(e) == "elicitation_requested")[-1]
+        elicitation = requested["kind"]["data"]
         check(
-            any(
-                kind(e) == "permission_resolved"
-                and e["kind"]["data"]["outcome"]["outcome"] == "cancelled"
-                for e in events
-            ),
-            "Pending permission was not cancelled",
+            "\tawaiting_input\t" in self.ctl("ls"),
+            "The session is not awaiting input",
         )
-        check(
-            not (self.project / "cancelled.txt").exists(),
-            "Cancelled write created a file",
-        )
-        self.report("cancel_pending_permission", file_created=False)
+        self.disconnect()
+        self.attach(self.seq - 1)
+        replay = self.attachment.read(time.monotonic() + self.args.timeout)
+        check(replay == requested, "Replayed elicitation differs from the original")
+        choices = [
+            option["const"]
+            for option in elicitation["requested_schema"]["properties"]["answer"][
+                "oneOf"
+            ]
+        ]
+        check("Blue" in choices, f"The form does not offer Blue: {choices}")
         self.ctl(
-            "prompt",
-            self.session,
-            "Do not use tools. Write a numbered list of 200 short factual sentences "
-            "about geometry.",
+            "answer", self.session, elicitation["request_id"], '{"answer": "Blue"}'
         )
-        self.until(message)
-        self.ctl("cancel", self.session)
-        self.finish("cancelled")
-        self.report("cancel_running_generation", stop_reason="cancelled")
+        events = self.finish()
+        check(
+            any(kind(e) == "elicitation_resolved" for e in events),
+            "The answer was not recorded",
+        )
+        response = text(events).strip()
+        check("ox-color-Blue" in response, f"Pi did not get the answer: {response}")
+        self.report(
+            "extension_dialog_answered_as_a_form",
+            request_id=elicitation["request_id"],
+            response=response,
+        )
 
     def verify_model(self):
         store = json.loads(
             (self.directory / "bridge-store/acp-sessions.json").read_text()
         )
         session = next(iter(store.values()))
-        claude_dir = Path(
-            self.env.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
+        agent_dir = Path(
+            self.env.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent"))
         )
         transcript = next(
-            (claude_dir / "projects").glob(f"*/{session['claudeSessionId']}.jsonl")
+            (agent_dir / "sessions").glob(f"*/*_{session['piSessionId']}.jsonl")
         )
         models = set()
         for line in transcript.read_text().splitlines():
-            model = json.loads(line).get("message", {}).get("model")
-            if model and model != "<synthetic>":
-                models.add(model)
+            entry = json.loads(line)
+            message = entry.get("message", {})
+            if entry.get("type") == "message" and message.get("role") == "assistant":
+                models.add(f"{message['provider']}/{message['model']}")
         check(
             models == {self.args.model},
             f"Unexpected transcript models: {sorted(models)}",
         )
         self.report("model_verified", models=sorted(models))
 
-    def cleanup(self):
+    def check_parking(self):
+        delay = 10
+        run = self.parking_run(delay)
+        watch = None
         try:
-            if self.attachment is not None:
-                self.disconnect()
-            if self.daemon is not None and self.daemon.poll() is None:
-                self.remember_agents()
-                if self.session is not None:
-                    self.ctl("delete", self.session)
+            run.ctl("prompt", run.session, "Reply with only ready. Do not use tools.")
+            run.finish()
+            run.disconnect()
+            watch = Watch(run.socket, run.session, self.args.timeout)
+            watch.until("exited")
+            run.attach(0)
+            deadline = time.monotonic() + self.args.timeout
+            while kind(run.attachment.read(deadline)) != "agent_parked":
+                pass
+            self.report("idle_session_parks", park_after_seconds=delay)
         finally:
-            try:
-                if self.daemon is not None:
-                    self.daemon.wait(timeout=8)
-            except subprocess.TimeoutExpired:
-                # A failed delete must not leave a live model request behind.
-                for pid in self.agent_pids:
-                    try:
-                        os.killpg(pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-            finally:
-                if self.daemon is not None:
-                    stop(self.daemon)
+            if watch is not None:
+                watch.close()
+            run.cleanup()
+
+
+AGENTS = {"claude": ClaudeRun, "pi": PiRun}
 
 
 def positive_seconds(value):
@@ -923,6 +1104,7 @@ def positive_seconds(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--agent", choices=AGENTS, default="claude")
     parser.add_argument("--model", required=True, help="Model ID; no fallback")
     parser.add_argument(
         "--timeout",
@@ -931,8 +1113,12 @@ def main():
         help="Seconds per command or event phase (default: 120)",
     )
     args = parser.parse_args()
-    check(shutil.which("claude"), "claude is not installed or is not on PATH")
-    packages = ["oxd", "ox-mcp", "oxctl", "claude-code-acp"]
+    agent = AGENTS[args.agent]
+    check(
+        shutil.which(agent.harness),
+        f"{agent.harness} is not installed or is not on PATH",
+    )
+    packages = ["oxd", "ox-mcp", "oxctl", agent.bridge]
     subprocess.run(
         ["cargo", "build", *[flag for p in packages for flag in ("-p", p)]],
         cwd=REPO,
@@ -949,7 +1135,7 @@ def main():
         (directory / "attach.stderr.log").open("w") as stderr,
         (directory / "oxd.log").open("w") as daemon_log,
     ):
-        run = SmokeRun(args, directory, binaries, events, stderr)
+        run = agent(args, directory, binaries, events, stderr)
         try:
             try:
                 run.run(daemon_log)

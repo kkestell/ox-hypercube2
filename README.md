@@ -10,7 +10,7 @@ bridges for Claude Code and Pi.
 | `crates/pi-acp/`          | ACP bridge for the Pi CLI                                                         |
 | `crates/oxd/`             | Session daemon that owns ACP agent processes and serves Ox UIs over a Unix socket |
 | `crates/ox-protocol/`     | oxd wire types and client                                                         |
-| `crates/oxctl/`           | Daemon client for the desktop end-to-end and live Claude smoke tests               |
+| `crates/oxctl/`           | Daemon client for the desktop end-to-end and live smoke tests                      |
 | `ui/`                     | Ox frontend (TypeScript, Vite)                                                    |
 
 See [architecture](docs/dev/architecture.md), [where sessions run](docs/worktrees.md),
@@ -22,6 +22,8 @@ and [ACP v2 support](docs/dev/acp-v2.md). Historical harness research covers
 
 - **Claude Code bridge included.** A custom ACP wrapper brings Claude Code into
   Ox, including model and effort controls, tool permissions, and background tasks.
+- **Pi bridge included.** Use model and thinking controls, skills and extension
+  commands, and extension dialogs as forms.
 - **Multiple projects, parallel sessions.** Organize sessions by workspace and
   keep independent tasks running.
 - **Isolated Git worktrees.** New Task gives each task its own checkout
@@ -52,7 +54,8 @@ make install
 This builds a release `Ox.app` with the daemon, MCP server, and the Claude and
 Pi bridges, signs it with an ad hoc signature (no certificate required), and
 copies it to `~/Applications/Ox.app`, replacing any previous installation.
-Claude Code must be installed and authenticated to use the Claude bridge. The
+Claude Code must be installed and authenticated to use the Claude bridge. Pi
+must be installed with a model provider authenticated to use the Pi bridge. The
 macOS app reads `PATH` from your interactive login shell so it can find tools
 when opened from Finder or the Dock.
 
@@ -68,9 +71,9 @@ Run the app from the repository root:
 make dev
 ```
 
-`make dev` builds `oxd`, its `ox-mcp` server, and the Claude bridge and runs
-the app against its own `oxd` on `target/dev/oxd.sock`, which it stops before
-building and after the app exits.
+`make dev` builds `oxd`, its `ox-mcp` server, and the Claude and Pi bridges. It
+runs the app against its own `oxd` on `target/dev/oxd.sock`, which it stops
+before building and after the app exits.
 
 ### Daemon configuration and data
 

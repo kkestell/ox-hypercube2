@@ -13,12 +13,16 @@ flowchart TB
     oxctl["oxctl"]
     oxd["oxd"]
     bridge["claude-code-acp<br/>(one per session)"]
+    pibridge["pi-acp<br/>(one per session)"]
+    pi["pi<br/>(one per session)"]
     claude["claude<br/>(one per session)"]
     oxmcp["ox-mcp<br/>(one per session)"]
 
     ox -.-> oxd
     oxctl -.-> oxd
     oxd --> bridge
+    oxd --> pibridge
+    pibridge --> pi
     bridge --> claude
     claude --> oxmcp
     oxmcp -.-> oxd
@@ -45,11 +49,16 @@ passes to sessions, and checks again each time its window gains focus.
 over its standard input and output. Stopping the agent terminates that
 process group, including its children.
 
-The bundled agent is `claude-code-acp`, a bridge between draft ACP v2 and the
-Claude Code CLI. Each bridge keeps one Claude process running between
-prompts, exchanging stream-json messages and control requests with it.
+The bundled agents bridge draft ACP v2 to the Claude Code and Pi CLIs.
+`claude-code-acp` keeps one Claude process running between prompts, exchanging
+stream-json messages and control requests with it.
 Claude authenticates with the user's subscription. The bridge can restart
 an exited Claude process using its native session ID.
+
+`pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
+project's settings, skills, and extensions. The bridge exchanges JSONL commands
+and events with Pi, using the providers and credentials configured in Pi. It
+can restart an exited Pi on the same Pi session ID.
 
 [ACP v2 support](acp-v2.md) owns protocol details and integration caveats.
 
@@ -110,7 +119,8 @@ Ox's saved conversation and the agent's resumable conversation are separate.
 Continuing a Claude session requires its native transcript even when Ox still
 has the displayed history. Claude's transcript retention is controlled by
 its [`cleanupPeriodDays` setting](https://code.claude.com/docs/en/data-usage#data-retention).
-The bridge keeps its session records separately from the daemon's database.
+Continuing a Pi session requires its Pi session file. Each bridge keeps its
+session records separately from the daemon's database.
 
 ## Session lifecycle
 

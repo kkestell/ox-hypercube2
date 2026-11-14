@@ -139,16 +139,27 @@ harness stubs, which holds `claude` unless a test changes it with
 
 After changing `oxd`, `ox-protocol`, `oxctl`, `claude-code-acp`, or
 `scripts/smoke-acp.py`, also run `make smoke-claude` and report its result.
-This live check runs Haiku through `oxd` and `oxctl` using an installed,
-authenticated Claude Code CLI. It is separate from `cargo test` and invokes a
-real model. See [External systems and live checks](#external-systems-and-live-checks)
-for interpreting and reporting its results.
+After changing `oxd`, `ox-protocol`, `oxctl`, `pi-acp`, or
+`scripts/smoke-acp.py`, also run `make smoke-pi` and report its result.
+These live checks run real models through `oxd` and `oxctl`, separately from
+`cargo test`. Claude uses Haiku and requires an installed, authenticated
+Claude Code CLI. Pi uses `openrouter/deepseek/deepseek-v4.1-flash-1017` and
+requires an installed Pi CLI authenticated with OpenRouter. See
+[External systems and live checks](#external-systems-and-live-checks) for
+interpreting and reporting results.
 
-The smoke check covers streaming, reconnect and replay, conversation
-continuity, permissions, cancellation, and process cleanup. It prints the
-directory with its results, events, logs, and test project. Set `CLAUDE_MODEL`
-to override Make's default model. To override the per-phase timeout, run
-`python3 scripts/smoke-acp.py --model claude-haiku-5-5 --timeout 180`.
+Both runs cover streaming, reconnect and replay, conversation continuity,
+native skills with arguments, cancellation, model verification, history and
+resume after a daemon restart, idle parking, archive and unarchive, and process
+cleanup. Claude also covers effort changes, native local commands, permissions,
+AskUserQuestion forms, background work and wake, and the `ox` MCP title tool.
+Pi also covers thinking changes and extension dialogs answered as forms.
+
+Each run prints the directory with its results, events, logs, and test project.
+Set `CLAUDE_MODEL` or `PI_MODEL` to override Make's default model; Pi model values
+are provider-qualified (`provider/id`). The script defaults to the Claude agent.
+To choose the agent and override the per-phase timeout directly, run
+`python3 scripts/smoke-acp.py --agent claude --model claude-haiku-5-5 --timeout 180`.
 
 ## External systems and live checks
 
