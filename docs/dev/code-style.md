@@ -39,6 +39,27 @@ every last edge case.
 - Measure before optimizing. Fix demonstrated problems rather than inventing
   them.
 
+## UI
+
+- The UI is idiomatic React in `ui/src/`, with icons from `lucide-react`.
+- The user designs the app's look. UI changes add only the CSS a layout needs
+  to work, such as a scrolling region or `white-space: pre-wrap`, plus styling
+  the user asks for or styling that makes an element match its peers.
+- Stylesheets take every colour, size, spacing, radius, and duration from the
+  tokens in `ui/src/styles/tokens.css`. Rules space elements with multiples of
+  `--spacing`, such as `calc(var(--spacing) * 2)`. A component's own size,
+  and any value several elements share, is a named token in `tokens.css`,
+  derived from the base tokens.
+- Elements of the same kind look the same everywhere. A new element takes its
+  class and tokens from the existing elements of its kind, and the CSS states
+  each shared value once, in one rule for the kind. Elements in neighbouring
+  regions that nearly line up share an edge or a centre line exactly.
+- A change that would make one element differ from its peers, or that nudges a
+  value by a few pixels to line things up, points at a missing or wrong shared
+  abstraction: a class for the kind of element, a token, or a shared layout
+  component. Propose the abstraction and build it first, so the change lands
+  in the shared rule.
+
 ## Verification
 
 See [Testing](testing.md) for test design and verification procedures.

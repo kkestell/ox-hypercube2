@@ -31,7 +31,7 @@
 /* A text button and a text field share one box. */
 .text-button,
 .text-field {
-  height: calc(var(--spacing) * 8);
+  height: var(--text-control-height);
   padding: 0 calc(var(--spacing) * 3);
   border: var(--border-width) solid var(--border);
   border-radius: var(--radius-md);
@@ -285,5 +285,6 @@
 
 .tool-call .title code,
 .request-panel .title code {
+  margin-left: var(--tool-argument-gap);
   color: var(--muted-foreground);
 }

@@ -24,7 +24,7 @@
   flex: none;
   align-items: center;
   justify-content: flex-end;
-  height: calc(var(--spacing) * 7);
+  height: var(--pane-header-height);
   padding: calc(var(--spacing) * 2);
 }
 

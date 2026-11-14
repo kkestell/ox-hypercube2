@@ -176,19 +176,6 @@
   font-size: var(--text-xs);
 }
 
-.composer .attachments button {
-  display: inline-flex;
-  padding: var(--spacing);
-  border: none;
-  background: transparent;
-  color: var(--muted-foreground);
-}
-
-.composer .attachments svg {
-  width: calc(var(--spacing) * 3);
-  height: calc(var(--spacing) * 3);
-}
-
 .composer .settings {
   display: flex;
   flex-wrap: wrap;

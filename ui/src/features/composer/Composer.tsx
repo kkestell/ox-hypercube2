@@ -98,6 +98,7 @@ export function Composer({
                     {path.split("/").pop()}
                     <button
                       type="button"
+                      className="icon-button"
                       aria-label="Remove"
                       onClick={() =>
                         drafts.update(session.id, (current) => ({

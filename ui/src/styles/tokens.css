@@ -60,7 +60,9 @@
   --icon-size: calc(var(--spacing) * 4);
   --status-dot-size: calc(var(--spacing) * 2);
   --icon-button-size: calc(var(--spacing) * 6);
+  --text-control-height: calc(var(--spacing) * 8);
   --select-picker-height: calc(var(--spacing) * 5);
+  --pane-header-height: calc(var(--spacing) * 7);
   --pane-header-button-height: var(--icon-button-size);
   --sidebar-padding: calc(var(--spacing) * 2);
   --sidebar-row-height: calc(var(--spacing) * 8);
@@ -85,6 +87,7 @@
   --choice-gap: calc(var(--spacing) * 2);
   --prompt-max-width: 75%;
   --tool-call-gap: calc(var(--spacing) * 2);
+  --tool-argument-gap: var(--spacing);
   --scrollbar-size: calc(var(--spacing) * 2.5);
   --scrollbar-inset: calc(var(--spacing) * 0.5);
   /* The transcript's text lines up with the composer's text. */
