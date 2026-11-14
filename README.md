@@ -39,6 +39,22 @@ and [ACP v2 support](docs/dev/acp-v2.md). Historical harness research covers
 - **Safe cleanup.** Detect unsaved work before removing worktrees and preserve
   branches containing unique commits.
 
+## Installation
+
+On macOS, with Rust, Node.js, and the Xcode Command Line Tools installed:
+
+```sh
+(cd ui && npm install)
+make install
+```
+
+This builds a release `Ox.app` with the daemon, MCP server, and Claude bridge,
+signs it with an ad hoc signature (no certificate required), and copies it to
+`~/Applications/Ox.app`, replacing any previous installation. Claude Code must
+be installed and authenticated to use the Claude bridge. The macOS app reads
+`PATH` from your interactive login shell so it can find tools when opened from
+Finder or the Dock.
+
 ## Development
 
 See [agent guidance](AGENTS.md) and the [testing guide](docs/dev/testing.md)

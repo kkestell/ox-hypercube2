@@ -29,6 +29,9 @@ tokio = { version = "1", features = ["sync"] }
 # the app through.
 webdriver = ["dep:tauri-plugin-wdio-webdriver"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs" }
+
 
 [lints]
 workspace = true
