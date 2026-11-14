@@ -2,20 +2,19 @@
 
 ## Project scope
 
-- Ox is a hobby project with one user, Kyle. The desktop app is his normal
+- Ox is a hobby project with one user. The desktop app is the normal
   interface. Agents use `oxctl` to test the daemon and handle occasional tasks
-  on his behalf. Custom daemon sockets, including `--socket` and `OX_SOCKET`,
+  on the user's behalf. Custom daemon sockets, including `--socket` and `OX_SOCKET`,
   are development and test tools. A CLI option alone does not establish a
   user workflow or a compatibility promise.
-- Prioritize failures Kyle can encounter in the desktop and in the workflows
-  he asks agents to run. Rank findings by likelihood in those workflows and
+- Prioritize failures the user can encounter in the desktop and in the workflows
+  the user asks agents to run. Rank findings by likelihood in those workflows and
   the cost of failure. Protect work and preserve required guarantees with
   the simplest mechanism that covers the demonstrated problem.
 - Defer unusual inputs, unlikely combinations of failures, and recovery
   machinery until there is evidence of a practical need. A short, local
   TODO may record a credible concern and the condition that would make it
-  worth revisiting. Match tests to the consequence and the supported workflow.
-  One focused regression is usually enough.
+  worth revisiting.
 
 ## Writing code
 
@@ -26,13 +25,6 @@
   - `oxd` prints `ready` once it listens; `connect_or_start` reads that line.
   - Idle exit watches a `watch::Sender<()>` signalled whenever clients,
     sessions, or a session's state change, then starts its idle timer.
-- Tests drive the same application paths the desktop uses. Development
-  controls such as socket selection support isolated runs. Put test fixtures
-  with the tests and reuse existing operations when exercising behavior.
-  - A session stuck in startup is deleted with `session.delete`, the method a
-    UI uses, rather than through a test-only timeout flag.
-  - Tests build text prompts with a helper in the test file; `Client` has
-    one `prompt` method.
 - Change an interface by updating every caller in the repository.
 - Versions stay at 1 until the project is in production. The client–daemon
   `hello` handshake checks the protocol version, but no change bumps it, and
@@ -70,10 +62,7 @@
 - Elements of the same kind look the same everywhere. A new element takes its
   class and tokens from the existing elements of its kind, and the CSS states
   each shared value once, in one rule for the kind. Elements in neighbouring
-  regions that nearly line up share an edge or a centre line exactly. Before
-  finishing a UI change, compare the element with every peer on screen for
-  size, colour, spacing, and alignment, and fix any difference the user's
-  design does not call for.
+  regions that nearly line up share an edge or a centre line exactly.
 - UI changes go through the shared abstractions: a class per kind of element,
   tokens for sizes and colours, and shared layout components for regions that
   line up. A requested change that would make one element differ from its
@@ -93,20 +82,8 @@
 
 ## Testing
 
-- For a meaningful behavior fix, use an existing test or add a focused
-  regression that fails without the fix. Check that it exercises the actual
-  failure. Use direct inspection for documentation and simple cleanup.
-  - Making the stderr reader wait for end of file makes
-    `failed_exit_reports_claude_stderr` time out.
-  - Making idle ignore sessions makes `lifetime` fail.
-- A test that waits for something confirms it happened: that the process
-  started before checking it stopped, that the event arrived before checking
-  the state it sets.
-  - `delete_while_starting` waits for the agent to open its FIFO before
-    deleting the session, then waits for the FIFO to reach end of file.
-  - `cancellation_stops_a_pending_permission` waits for the prompt's
-    `cancelled` response, which follows Claude withdrawing the request,
-    before it answers the withdrawn request.
+Read [.agents/testing.md](.agents/testing.md) for test design, fixtures, and
+required verification commands before writing tests or running checks.
 
 ## Reporting
 
@@ -115,37 +92,3 @@
   - "`session/resume` ignores `replayFrom` although the bridge advertises the
     session methods."
   - "`prompt_text` exists only so tests can send one string."
-
-## Verifying changes
-
-Run checks once, when a task is finished, and report their results. While
-the user is reviewing a change and asking for adjustments, make the
-adjustments without running checks, and run them when the user says the work
-is done or asks for them.
-
-Run the targets for the parts that changed:
-
-- `make check-rust` checks Rust formatting and runs clippy with warnings as
-  errors and the workspace tests.
-- `make check-ui` runs Biome and `tsc` on the UI.
-- `make check-scripts` runs ruff on `scripts/`.
-- `make check` runs all three.
-
-`make fix` applies the formatters and safe lint fixes.
-
-After changing the behaviour of `crates/ox` or of the UI's TypeScript, also
-run `make e2e` and report its result. It builds the app with its embedded
-WebDriver server and drives it through the tests in `ui/e2e`, against sessions
-of `oxd-fake-agent` that the tests start with `oxctl`. A change to
-`ui/src/styles/` alone takes `make check-ui`.
-
-After changing `oxd`, `ox-protocol`, `oxctl`, `claude-code-acp`, or
-`scripts/smoke-acp.py`, also run this and report its result:
-
-```sh
-make smoke-claude     # Haiku
-```
-
-The smoke checks run real models through `oxd` and `oxctl` and are part of
-verifying every such change. Run them yourself; a failing smoke check is a
-failure of the change.
