@@ -37,8 +37,10 @@ connections only from its own user.
 
 The desktop app uses Tauri 2. Its React webview calls the Rust core through
 Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
-streams updates back over Tauri channels. `oxctl` uses the same daemon client
-and gives the integration tests access to the same operations.
+streams updates back over Tauri channels. The core keeps one conversation
+view per channel, so the run view follows every child session of a run at
+once. `oxctl` uses the same daemon client and gives the integration tests
+access to the same operations.
 
 The app offers an agent for each [harness](glossary.md) on the `PATH` it
 passes to sessions, and checks again each time its window gains focus.
@@ -179,8 +181,8 @@ each in its own process group, and records each command in the step's
 `commands`. When the daemon stops, it aborts the runners, which kills their
 running commands' process groups.
 
-Child sessions are ordinary sessions that refer to the run's worktree.
-Deleting or archiving one leaves the worktree; removing the run stops the
+Child sessions are ordinary sessions that refer to the run's worktree: a
+session is a child of the run that owns its worktree. Deleting or archiving one leaves the worktree; removing the run stops the
 child sessions' agents, removes the worktree, and deletes the child sessions.
 A running run keeps the daemon alive. A restart marks the runs and steps that
 were running `interrupted`, where they stay.

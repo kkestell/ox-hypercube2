@@ -32,6 +32,8 @@ pub struct SavedSession {
     pub last_seq: u64,
     /// Whether the session is archived.
     pub archived: bool,
+    /// When the session was created, in milliseconds since the Unix epoch.
+    pub created_at: u64,
 }
 
 /// A worktree as the database holds it.
@@ -68,6 +70,8 @@ pub struct SavedRun {
     pub error: Option<String>,
     /// The steps, in order.
     pub steps: Vec<StepInfo>,
+    /// When the run was started, in milliseconds since the Unix epoch.
+    pub created_at: u64,
 }
 
 /// The worktree a new session runs in.
@@ -135,7 +139,8 @@ impl Store {
                 cwd              TEXT NOT NULL,
                 title            TEXT,
                 agent_session_id TEXT,
-                worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL
+                worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL,
+                created_at       INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS runs (
                 number       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,7 +151,8 @@ impl Store {
                 name         TEXT NOT NULL,
                 input        TEXT NOT NULL,
                 state        TEXT NOT NULL,
-                error        TEXT
+                error        TEXT,
+                created_at   INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS run_steps (
                 run_id     TEXT    NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -287,7 +293,8 @@ impl Store {
         let mut query = connection.prepare(
             "SELECT number, id, workspace_id, command, cwd, title, agent_session_id, worktree_id,
                 (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
-                EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id)
+                EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
+                created_at
             FROM sessions
             ORDER BY number",
         )?;
@@ -311,14 +318,16 @@ impl Store {
                     worktree_id: row.get(7)?,
                     last_seq: u64::try_from(row.get::<_, i64>(8)?).expect("seqs are positive"),
                     archived: row.get(9)?,
+                    created_at: time_value(row, 10)?,
                 })
             })?
             .collect()
     }
 
-    /// Saves a session that has not started, with the worktree it runs in,
-    /// and returns its number, which is greater than the number of every
-    /// session saved before it. A step's session is recorded as its step's.
+    /// Saves a session that has not started, created at `created_at`, with
+    /// the worktree it runs in, and returns its number, which is greater than
+    /// the number of every session saved before it. A step's session is
+    /// recorded as its step's.
     pub fn add_session(
         &self,
         id: &str,
@@ -326,6 +335,7 @@ impl Store {
         command: &[String],
         cwd: &Path,
         worktree: SessionWorktree<'_>,
+        created_at: u64,
     ) -> rusqlite::Result<u64> {
         let command = serde_json::to_string(command).expect("a list of strings serializes");
         let mut connection = self.lock();
@@ -339,14 +349,15 @@ impl Store {
             SessionWorktree::Step { worktree_id, .. } => Some(worktree_id),
         };
         transaction.execute(
-            "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id)
-            VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
                 workspace_id,
                 command,
                 cwd.to_string_lossy(),
-                worktree_id
+                worktree_id,
+                time(created_at)
             ],
         )?;
         // `number` is the table's rowid.
@@ -371,8 +382,10 @@ impl Store {
         let transaction = connection.transaction()?;
         insert_worktree(&transaction, worktree)?;
         transaction.execute(
-            "INSERT INTO runs (id, workspace_id, worktree_id, workflow, name, input, state, error)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO runs (
+                id, workspace_id, worktree_id, workflow, name, input, state, error, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 run.id,
                 run.workspace_id,
@@ -381,7 +394,8 @@ impl Store {
                 run.name,
                 run.input,
                 state_name(run.state),
-                run.error
+                run.error,
+                time(run.created_at)
             ],
         )?;
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
@@ -407,7 +421,8 @@ impl Store {
     pub fn runs(&self) -> rusqlite::Result<Vec<SavedRun>> {
         let connection = self.lock();
         let mut query = connection.prepare(
-            "SELECT number, id, workspace_id, worktree_id, workflow, name, input, state, error
+            "SELECT number, id, workspace_id, worktree_id, workflow, name, input, state, error,
+                created_at
             FROM runs ORDER BY number",
         )?;
         let mut runs = query
@@ -423,6 +438,7 @@ impl Store {
                     state: parse_state(row, 7)?,
                     error: row.get(8)?,
                     steps: Vec::new(),
+                    created_at: time_value(row, 9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -660,6 +676,16 @@ fn position_value(position: usize) -> i64 {
     i64::try_from(position).expect("step positions fit an i64")
 }
 
+/// A time in milliseconds since the Unix epoch, as its column holds it.
+fn time(millis: u64) -> i64 {
+    i64::try_from(millis).expect("times fit an i64")
+}
+
+/// The time in column `index`.
+fn time_value(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    Ok(u64::try_from(row.get::<_, i64>(index)?).expect("times are positive"))
+}
+
 /// A run's, step's, or command's state, or a command's kind, as its column
 /// holds it: its name on the wire.
 fn state_name(state: impl serde::Serialize) -> String {
@@ -782,6 +808,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                1_700_000_000_000,
             )
             .unwrap();
         let second = store
@@ -791,6 +818,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                1_700_000_000_001,
             )
             .unwrap();
         assert!(first < second);
@@ -808,6 +836,7 @@ mod tests {
                     worktree_id: None,
                     last_seq: 0,
                     archived: false,
+                    created_at: 1_700_000_000_000,
                 },
                 SavedSession {
                     number: second,
@@ -820,6 +849,7 @@ mod tests {
                     worktree_id: None,
                     last_seq: 0,
                     archived: false,
+                    created_at: 1_700_000_000_001,
                 },
             ]
         );
@@ -836,6 +866,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         assert!(!store.sessions().unwrap()[0].archived);
@@ -859,6 +890,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         store.set_title("s", Some("Fix the build")).unwrap();
@@ -882,6 +914,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         store.remove_session("one").unwrap();
@@ -893,6 +926,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         assert!(second > first);
@@ -909,6 +943,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         assert!(store.remove_workspace("w").is_err());
@@ -936,6 +971,7 @@ mod tests {
                 &command(),
                 &worktree.path,
                 SessionWorktree::New(worktree),
+                0,
             )
             .unwrap();
     }
@@ -962,6 +998,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         let mut compared = worktree("01234567");
@@ -1028,6 +1065,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::New(&worktree("one")),
+                0,
             )
             .unwrap_err();
         assert_eq!(count(&store, "sessions"), 1);
@@ -1047,6 +1085,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         assert!(store.workspace_has_sessions("w").unwrap());
@@ -1090,6 +1129,7 @@ mod tests {
                 step("Plan", StepState::Pending),
                 step("Work", StepState::Pending),
             ],
+            created_at: 1_700_000_000_000,
         }
     }
 
@@ -1113,6 +1153,7 @@ mod tests {
                     position,
                     worktree_id: run_id,
                 },
+                0,
             )
             .unwrap();
     }
@@ -1319,6 +1360,7 @@ mod tests {
                 &command(),
                 Path::new("/work"),
                 SessionWorktree::None,
+                0,
             )
             .unwrap();
         store

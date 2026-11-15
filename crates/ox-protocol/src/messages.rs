@@ -272,6 +272,12 @@ pub enum Method {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
+    /// Lists the definitions in the daemon's workflows directory: every
+    /// `*.yaml` file whose name does not start with `.`, sorted by file
+    /// name. The result is a list of [`WorkflowInfo`], empty when the
+    /// directory does not exist.
+    #[serde(rename = "workflow.list")]
+    WorkflowList,
 }
 
 /// A coding-agent CLI that Ox drives through its ACP bridge.
@@ -517,6 +523,17 @@ pub enum ListingChange {
     },
 }
 
+/// A definition in the daemon's workflows directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowInfo {
+    /// The definition's file name without `.yaml`, which `run.start` takes.
+    pub workflow: String,
+    /// The definition's `name`, or `workflow` when the file does not parse.
+    pub name: String,
+    /// Why the file does not parse, or could not be read.
+    pub error: Option<String>,
+}
+
 /// A run of a workflow: its steps, run one after another in a worktree the
 /// run owns, each agent step in a child session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,6 +554,8 @@ pub struct RunInfo {
     pub error: Option<String>,
     /// Every step of the definition, in order.
     pub steps: Vec<StepInfo>,
+    /// When the run was started, in milliseconds since the Unix epoch.
+    pub created_at: u64,
 }
 
 /// A step of a run.
@@ -646,6 +665,8 @@ pub struct SessionInfo {
     /// Whether the session is archived: it is `exited`, its worktree is
     /// removed, and only its history can be read.
     pub archived: bool,
+    /// When the session was created, in milliseconds since the Unix epoch.
+    pub created_at: u64,
 }
 
 /// One entry in a session's history. `seq` starts at 1 and increases by one
@@ -1287,6 +1308,39 @@ mod tests {
         );
 
         let value = serde_json::to_value(Request {
+            id: 30,
+            method: Method::WorkflowList,
+        })
+        .unwrap();
+        assert_eq!(value, json!({"id": 30, "method": "workflow.list"}));
+        let request: Request = serde_json::from_value(value).unwrap();
+        assert!(matches!(request.method, Method::WorkflowList));
+        let workflows = vec![
+            WorkflowInfo {
+                workflow: "plan-work".into(),
+                name: "Plan and work".into(),
+                error: None,
+            },
+            WorkflowInfo {
+                workflow: "broken".into(),
+                name: "broken".into(),
+                error: Some("missing field `steps`".into()),
+            },
+        ];
+        let value = serde_json::to_value(&workflows).unwrap();
+        assert_eq!(
+            value,
+            json!([
+                {"workflow": "plan-work", "name": "Plan and work", "error": null},
+                {"workflow": "broken", "name": "broken", "error": "missing field `steps`"}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<WorkflowInfo>>(value).unwrap(),
+            workflows
+        );
+
+        let value = serde_json::to_value(Request {
             id: 1,
             method: Method::Hello {
                 protocol_version: 1,
@@ -1422,7 +1476,8 @@ mod tests {
                 "config_options": [],
                 "available_commands": [],
                 "worktree_id": "01234567-89ab",
-                "archived": false
+                "archived": false,
+                "created_at": 1_700_000_000_000_u64
                 }},
                 {"type": "session_removed", "session_id": "r"},
                 {"type": "run", "run": {
@@ -1450,7 +1505,8 @@ mod tests {
                          ]},
                         {"name": "Review", "state": "pending", "session_id": null, "output": null,
                          "commands": []}
-                    ]
+                    ],
+                    "created_at": 1_700_000_000_001_u64
                 }},
                 {"type": "run_removed", "run_id": "q"}
             ]
@@ -1539,6 +1595,7 @@ mod tests {
                         commands: Vec::new(),
                     },
                 ],
+                created_at: 1_700_000_000_001,
             }
         );
         let value = serde_json::to_value(run).unwrap();
@@ -1546,6 +1603,12 @@ mod tests {
         assert_eq!(session.workspace_id, "w");
         assert_eq!(session.title.as_deref(), Some("Fix the build"));
         assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));
+        assert_eq!(session.created_at, 1_700_000_000_000);
+        let value = serde_json::to_value(session).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SessionInfo>(value).unwrap(),
+            **session
+        );
         assert!(
             worktree.id == "01234567-89ab"
                 && worktree.branch == "ox/01234567"

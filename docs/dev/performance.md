@@ -15,7 +15,8 @@ session is added or removed or a client connects or disconnects.
 
 ## Desktop core
 
-The core sends the viewed session's conversation to the webview in batches:
+The core sends each viewed conversation, the viewed session's or each child
+of the viewed run, to the webview in batches on a channel of its own:
 each holds the items from the events received together, with an item merged
 into the earlier one with its key. Replaying a long session is a few large
 messages, and a message's streamed text chunks arrive joined.
@@ -30,6 +31,9 @@ messages, and a message's streamed text chunks arrive joined.
   when their own props change. The hooks that feed them return the same
   objects and callbacks until their data changes, so typing a draft or a
   change to another session renders nothing in the transcript.
+- The run view keeps each child's items apart. A change to one child's
+  conversation leaves the other children's items, and the other steps'
+  sections, unchanged.
 - A message's Markdown is parsed into top-level blocks, and each block renders
   on its own from that parse. Text appended to a message parses and renders
   only its last block again; the blocks before it keep their identity.

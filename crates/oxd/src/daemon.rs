@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ox_protocol::{
     Branches, Checkout, Deleted, ErrorBody, Harness, Listing, ListingChange, Method, RunInfo,
@@ -494,6 +494,7 @@ impl Daemon {
                 discard,
                 env,
             } => Ok(to_value(self.delete_run(&run_id, discard, env).await?)),
+            Method::WorkflowList => Ok(to_value(workflow::list(&self.workflows_dir))),
             Method::Hello { .. }
             | Method::SessionSubscribe { .. }
             | Method::Watch
@@ -766,6 +767,7 @@ impl Daemon {
                 None => (workspace.path.clone(), None),
             };
             registry.refuse_moving(&cwd)?;
+            let created_at = now();
             let number = self
                 .store
                 .add_session(
@@ -776,6 +778,7 @@ impl Daemon {
                     saved_worktree
                         .as_ref()
                         .map_or(SessionWorktree::None, SessionWorktree::New),
+                    created_at,
                 )
                 .map_err(|error| storage(&error))?;
             let saved = SavedSession {
@@ -789,6 +792,7 @@ impl Daemon {
                 worktree_id: saved_worktree.as_ref().map(|saved| saved.id.clone()),
                 last_seq: 0,
                 archived: false,
+                created_at,
             };
             let live_worktree =
                 saved_worktree.map(|saved| Worktree::new(saved, self.changed.clone()));
@@ -904,6 +908,7 @@ impl Daemon {
                     commands: Vec::new(),
                 })
                 .collect(),
+            created_at: now(),
         };
         let mut pending = Some((git, plan));
         let added = self.update(|registry| {
@@ -961,6 +966,7 @@ impl Daemon {
         let id = uuid::Uuid::new_v4().to_string();
         self.update(|registry| {
             registry.refuse_moving(cwd)?;
+            let created_at = now();
             let number = self
                 .store
                 .add_session(
@@ -973,6 +979,7 @@ impl Daemon {
                         position,
                         worktree_id: &run.worktree.id,
                     },
+                    created_at,
                 )
                 .map_err(|error| storage(&error))?;
             let saved = SavedSession {
@@ -986,6 +993,7 @@ impl Daemon {
                 worktree_id: Some(run.worktree.id.clone()),
                 last_seq: 0,
                 archived: false,
+                created_at,
             };
             let session = Session::create(
                 self.store.clone(),
@@ -1352,6 +1360,14 @@ impl Daemon {
 }
 
 /// `path` with symbolic links resolved, or as it is when it cannot be.
+/// The current time in milliseconds since the Unix epoch.
+fn now() -> u64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after the Unix epoch");
+    u64::try_from(since_epoch.as_millis()).expect("the time fits a u64")
+}
+
 fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
 }

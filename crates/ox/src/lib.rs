@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
     Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, Harness, ListingChange,
-    SessionInfo, WorkspaceInfo, code, content, default_socket_path,
+    RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code, content, default_socket_path,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -35,7 +35,8 @@ impl Drop for Task {
 struct App {
     client: tokio::sync::Mutex<Option<Arc<Client>>>,
     watch: Mutex<Option<Task>>,
-    view: Mutex<Option<Task>>,
+    /// The conversation views, by the ID of the channel each sends on.
+    views: Mutex<HashMap<u32, Task>>,
     /// The directory watches, by the ID of the channel each sends on.
     directories: Mutex<HashMap<u32, Task>>,
     files: Mutex<HashMap<u32, Task>>,
@@ -100,8 +101,9 @@ fn agents() -> Vec<Harness> {
 
 /// Sends the workspaces and sessions lists on `channel` each time either
 /// changes, replacing the previous watch. A new watch means the webview
-/// reloaded or reconnected, and in both it watches its files and directories
-/// again once the watch connects, so this ends their previous watches.
+/// reloaded or reconnected, and in both it views its conversations and
+/// watches its files and directories again once the watch connects, so this
+/// ends their previous views and watches.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
@@ -132,17 +134,17 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
         }
     });
     *app.watch.lock().unwrap() = Some(Task(task));
+    app.views.lock().unwrap().clear();
     app.directories.lock().unwrap().clear();
     app.files.lock().unwrap().clear();
 }
 
 /// Sends a session's conversation on `channel` from its first event, in
-/// batches of the items from the events received together, replacing the
-/// previous view; with no session, ends the previous view. The
-/// view ends when the session closes or the connection drops, and a view that
-/// cannot connect or subscribe sends nothing. The workspace watch reports the
-/// connection, and the webview views the session again once the watch
-/// reconnects.
+/// batches of the items from the events received together, until
+/// `unview_session` ends it. The view ends when the session closes or the
+/// connection drops, and a view that cannot connect or subscribe sends
+/// nothing. The workspace watch reports the connection, and the webview
+/// views the session again once the watch reconnects.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
@@ -151,28 +153,37 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
 fn view_session(
     handle: AppHandle,
     app: State<'_, App>,
-    session_id: Option<String>,
+    session_id: String,
     channel: Channel<Vec<Item>>,
 ) {
-    let task = session_id.map(|session_id| {
-        Task(tauri::async_runtime::spawn(async move {
-            let app = handle.state::<App>();
-            let Ok(client) = app.client().await else {
+    let id = channel.id();
+    let task = tauri::async_runtime::spawn(async move {
+        let app = handle.state::<App>();
+        let Ok(client) = app.client().await else {
+            return;
+        };
+        let Ok(mut events) = client.subscribe(&session_id, 0).await else {
+            return;
+        };
+        let mut conversation = Conversation::default();
+        while let Ok(events) = events.next_batch().await {
+            let items = coalesce(events.iter().flat_map(|event| conversation.apply(event)));
+            if !items.is_empty() && channel.send(items).is_err() {
                 return;
-            };
-            let Ok(mut events) = client.subscribe(&session_id, 0).await else {
-                return;
-            };
-            let mut conversation = Conversation::default();
-            while let Ok(events) = events.next_batch().await {
-                let items = coalesce(events.iter().flat_map(|event| conversation.apply(event)));
-                if !items.is_empty() && channel.send(items).is_err() {
-                    return;
-                }
             }
-        }))
+        }
     });
-    *app.view.lock().unwrap() = task;
+    app.views.lock().unwrap().insert(id, Task(task));
+}
+
+/// Ends the conversation view that sends on the channel `channel_id`.
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri passes managed state to commands as `State` by value"
+)]
+fn unview_session(app: State<'_, App>, channel_id: u32) {
+    app.views.lock().unwrap().remove(&channel_id);
 }
 
 /// Sends the entries of the directory at `path` on `channel` each time they
@@ -373,15 +384,14 @@ async fn set_config_option(
         .map_err(message)
 }
 
-/// The outcome of deleting a session.
+/// The outcome of deleting a session or a run.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Deletion {
     Deleted {
         kept_branch: Option<String>,
     },
-    /// The session's worktree has work the delete would lose; `message`
-    /// lists it.
+    /// The worktree has work the delete would lose; `message` lists it.
     UnsavedWork {
         message: String,
     },
@@ -398,6 +408,53 @@ async fn delete_session(
         app.client()
             .await?
             .delete(&session_id, discard, utf8_env())
+            .await,
+    )
+}
+
+/// The definitions in oxd's workflows directory.
+#[tauri::command]
+async fn workflows(app: State<'_, App>) -> Result<Vec<WorkflowInfo>, String> {
+    app.client().await?.list_workflows().await.map_err(message)
+}
+
+/// Starts a run of `workflow` in a new worktree of the workspace, with
+/// `input` for its first step.
+#[tauri::command]
+async fn start_run(
+    app: State<'_, App>,
+    workspace_id: String,
+    workflow: String,
+    input: String,
+) -> Result<RunInfo, String> {
+    app.client()
+        .await?
+        .start_run(&workspace_id, &workflow, &input, utf8_env())
+        .await
+        .map_err(message)
+}
+
+#[tauri::command]
+async fn cancel_run(app: State<'_, App>, run_id: String) -> Result<(), String> {
+    app.client()
+        .await?
+        .cancel_run(&run_id)
+        .await
+        .map_err(message)
+}
+
+/// Deletes a run with its child sessions and worktree, giving up the
+/// worktree's unsaved work if `discard`.
+#[tauri::command]
+async fn delete_run(
+    app: State<'_, App>,
+    run_id: String,
+    discard: bool,
+) -> Result<Deletion, String> {
+    deletion(
+        app.client()
+            .await?
+            .delete_run(&run_id, discard, utf8_env())
             .await,
     )
 }
@@ -453,8 +510,8 @@ fn archival<T>(answer: Result<T, Error>) -> Result<Archival, String> {
     }
 }
 
-/// The outcome of a `session.delete` answer. A session that is already gone
-/// counts as deleted.
+/// The outcome of a `session.delete` or `run.delete` answer. A session or run
+/// that is already gone counts as deleted.
 fn deletion(answer: Result<Deleted, Error>) -> Result<Deletion, String> {
     match answer {
         Ok(Deleted { kept_branch }) => Ok(Deletion::Deleted { kept_branch }),
@@ -494,6 +551,7 @@ pub fn run() {
             agents,
             watch,
             view_session,
+            unview_session,
             files::watch_file,
             files::unwatch_file,
             watch_directory,
@@ -512,6 +570,10 @@ pub fn run() {
             delete_session,
             archive_session,
             unarchive_session,
+            workflows,
+            start_run,
+            cancel_run,
+            delete_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

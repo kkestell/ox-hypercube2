@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef } from "react";
-import type { FileContent, SessionInfo } from "../../lib/protocol";
+import type { FileContent } from "../../lib/protocol";
 import {
   forgetDeletedViewers,
   openViewers,
@@ -9,13 +9,17 @@ import {
   viewerState,
 } from "./viewerState";
 
-/** Keep inactive viewers live too, so session selection can use their snapshots before paint. */
-export function useFileViewers(sessions: SessionInfo[], connection: number) {
-  const currentSessions = useRef(sessions);
-  currentSessions.current = sessions;
+/**
+ * Keeps the viewer of each session and each run live, each `id` with its
+ * files under `cwd`, so selection can use an inactive viewer's snapshot
+ * before paint.
+ */
+export function useFileViewers(views: readonly { id: string; cwd: string }[], connection: number) {
+  const currentViews = useRef(views);
+  currentViews.current = views;
   useEffect(() => {
-    if (connection > 0) forgetDeletedViewers(sessions);
-  }, [sessions, connection]);
+    if (connection > 0) forgetDeletedViewers(views);
+  }, [views, connection]);
 
   useEffect(() => {
     if (!connection) return;
@@ -32,8 +36,8 @@ export function useFileViewers(sessions: SessionInfo[], connection: number) {
       }
       for (const [id, state] of open) {
         if (subscriptions.has(id)) continue;
-        const session = currentSessions.current.find((session) => session.id === id);
-        if (!session || !state.path) continue;
+        const view = currentViews.current.find((view) => view.id === id);
+        if (!view || !state.path) continue;
         const path = state.path;
         const channel = new Channel<FileContent>();
         subscriptions.set(id, { path, channel });
@@ -42,7 +46,7 @@ export function useFileViewers(sessions: SessionInfo[], connection: number) {
             updateViewer(id, { content });
           }
         };
-        invoke("watch_file", { path: `${session.cwd}/${path}`, channel });
+        invoke("watch_file", { path: `${view.cwd}/${path}`, channel });
       }
     };
     const unsubscribe = subscribeOpenViewers(reconcile);

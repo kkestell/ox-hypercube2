@@ -22,7 +22,8 @@
   color: var(--muted-foreground);
 }
 
-.session:has(.status.exited) .select > * {
+/* An exited session dims its contents but not its tree line. */
+.sidebar-row.exited .select > :not(.tree-branch) {
   opacity: var(--dimmed-opacity);
 }
 

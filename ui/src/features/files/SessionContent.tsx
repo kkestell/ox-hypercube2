@@ -3,19 +3,19 @@ import { FileViewer } from "./FileViewer";
 import { subscribeViewer, updateViewer, viewerState } from "./viewerState";
 
 export function SessionContent({
-  sessionId,
+  viewId,
   header,
   children,
 }: {
-  sessionId: string;
+  viewId: string;
   header: ReactNode;
   children: ReactNode;
 }) {
   const subscribe = useCallback(
-    (listener: () => void) => subscribeViewer(sessionId, listener),
-    [sessionId],
+    (listener: () => void) => subscribeViewer(viewId, listener),
+    [viewId],
   );
-  const state = useSyncExternalStore(subscribe, () => viewerState(sessionId));
+  const state = useSyncExternalStore(subscribe, () => viewerState(viewId));
   const split = useRef<HTMLDivElement>(null);
   const dragging = useRef(false);
   return (
@@ -43,7 +43,7 @@ export function SessionContent({
               if (!dragging.current) return;
               const bounds = split.current!.getBoundingClientRect();
               const width = bounds.width - event.currentTarget.getBoundingClientRect().width;
-              updateViewer(sessionId, {
+              updateViewer(viewId, {
                 ratio: Math.max(0.25, Math.min(0.75, (event.clientX - bounds.left) / width)),
               });
             }}
@@ -53,7 +53,7 @@ export function SessionContent({
             }}
           />
           <div className="file-pane" style={{ flex: `${1 - state.ratio} 1 0` }}>
-            <FileViewer key={state.path} sessionId={sessionId} state={state} />
+            <FileViewer key={state.path} viewId={viewId} state={state} />
           </div>
         </>
       )}

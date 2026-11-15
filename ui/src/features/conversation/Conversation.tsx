@@ -1,8 +1,42 @@
 import { Check, X } from "lucide-react";
-import { memo, useLayoutEffect, useRef } from "react";
+import { memo, type ReactNode, useLayoutEffect, useRef } from "react";
 import { CodeSpans } from "../../components/CodeSpans";
 import type { Item, ToolCallStatus } from "../../lib/protocol";
 import { Markdown } from "./Markdown";
+
+/**
+ * A scrolling transcript that follows its end as it grows, from when `viewId`
+ * changes until the user scrolls away from the end.
+ */
+export function Transcript({ viewId, children }: { viewId: string; children: ReactNode }) {
+  const element = useRef<HTMLDivElement>(null);
+  // Whether the view follows the end of the transcript as it grows.
+  const following = useRef(true);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new view is followed from its end
+  useLayoutEffect(() => {
+    following.current = true;
+  }, [viewId]);
+
+  // Each render follows a change to the content, which scrolls a followed view.
+  useLayoutEffect(() => {
+    const node = element.current!;
+    if (following.current) node.scrollTop = node.scrollHeight;
+  });
+
+  return (
+    <div
+      className="conversation"
+      ref={element}
+      onScroll={(event) => {
+        const node = event.currentTarget;
+        following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 1;
+      }}
+    >
+      {children}
+    </div>
+  );
+}
 
 /**
  * A session's items. An item renders again only when it changes, so
@@ -15,38 +49,16 @@ export const Conversation = memo(function Conversation({
   sessionId: string;
   items: Item[];
 }) {
-  const element = useRef<HTMLDivElement>(null);
-  // Whether the view follows the end of the conversation as it grows.
-  const following = useRef(true);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new session is followed from its end
-  useLayoutEffect(() => {
-    following.current = true;
-  }, [sessionId]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: each change to the items scrolls a followed view
-  useLayoutEffect(() => {
-    const node = element.current!;
-    if (following.current) node.scrollTop = node.scrollHeight;
-  }, [items]);
-
   return (
-    <div
-      className="conversation"
-      ref={element}
-      onScroll={(event) => {
-        const node = event.currentTarget;
-        following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 1;
-      }}
-    >
+    <Transcript viewId={sessionId}>
       {items.map((item) => (
         <ItemView key={item.key} item={item} />
       ))}
-    </div>
+    </Transcript>
   );
 });
 
-const ItemView = memo(function ItemView({ item }: { item: Item }) {
+export const ItemView = memo(function ItemView({ item }: { item: Item }) {
   switch (item.type) {
     case "prompt":
       return (

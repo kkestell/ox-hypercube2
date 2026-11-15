@@ -1,7 +1,5 @@
-import type { SessionInfo } from "../../lib/protocol";
-
 /**
- * A session's file tree as the user left it: its open folders, by path
+ * A view's file tree as the user left it: its open folders, by path
  * relative to the tree's root, and how far its body was scrolled.
  */
 export interface TreeState {
@@ -11,18 +9,18 @@ export interface TreeState {
 
 const prefix = "fileTree:";
 
-export function loadTreeState(sessionId: string): TreeState {
-  const saved = localStorage.getItem(prefix + sessionId);
+export function loadTreeState(viewId: string): TreeState {
+  const saved = localStorage.getItem(prefix + viewId);
   return saved === null ? { open: [], scrollTop: 0 } : JSON.parse(saved);
 }
 
-export function saveTreeState(sessionId: string, state: TreeState) {
-  localStorage.setItem(prefix + sessionId, JSON.stringify(state));
+export function saveTreeState(viewId: string, state: TreeState) {
+  localStorage.setItem(prefix + viewId, JSON.stringify(state));
 }
 
-/** Removes the saved tree of every session not in `sessions`. */
-export function forgetDeletedTrees(sessions: SessionInfo[]) {
-  const ids = new Set(sessions.map((session) => session.id));
+/** Removes the saved tree of every session or run not in `views`. */
+export function forgetDeletedTrees(views: readonly { id: string }[]) {
+  const ids = new Set(views.map((view) => view.id));
   const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));
   for (const key of keys) {
     if (key?.startsWith(prefix) && !ids.has(key.slice(prefix.length))) {

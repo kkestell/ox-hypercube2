@@ -79,7 +79,7 @@ export interface Branches {
   head: string | null;
 }
 
-/** The outcome of deleting a session. */
+/** The outcome of deleting a session or a run. */
 export type Deletion =
   | { type: "deleted"; kept_branch: string | null }
   | { type: "unsaved_work"; message: string };
@@ -99,6 +99,18 @@ export interface SessionInfo {
   /** The ID of the worktree the session runs in. */
   worktree_id: string | null;
   archived: boolean;
+  /** When the session was created, in milliseconds since the Unix epoch. */
+  created_at: number;
+}
+
+/** A definition in oxd's workflows directory. */
+export interface WorkflowInfo {
+  /** The definition's file name, without `.yaml`. */
+  workflow: string;
+  /** The definition's name, or `workflow` when the file does not parse. */
+  name: string;
+  /** Why the file does not parse. */
+  error: string | null;
 }
 
 export type RunState = "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
@@ -125,6 +137,8 @@ export interface RunInfo {
   /** Why the run failed. */
   error: string | null;
   steps: StepInfo[];
+  /** When the run was started, in milliseconds since the Unix epoch. */
+  created_at: number;
 }
 
 export interface StepInfo {

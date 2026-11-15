@@ -47,6 +47,8 @@ pub struct Session {
     pub id: String,
     pub number: u64,
     workspace_id: String,
+    /// When the session was created, in milliseconds since the Unix epoch.
+    created_at: u64,
     command: Vec<String>,
     cwd: PathBuf,
     /// The worktree the session runs in. Unset when it could not be added.
@@ -117,6 +119,7 @@ impl Session {
             id: saved.id,
             number: saved.number,
             workspace_id: saved.workspace_id,
+            created_at: saved.created_at,
             command: saved.command,
             cwd: saved.cwd,
             worktree: Mutex::new(worktree),
@@ -362,6 +365,7 @@ impl Session {
                 .unwrap_or_default(),
             worktree_id,
             archived: *self.archived.lock().unwrap(),
+            created_at: self.created_at,
         }
     }
 

@@ -7,6 +7,7 @@ import {
   deleteSessions,
   git,
   gitWorkspace,
+  rowAction,
   send,
   startStuckSession,
   startWorktreeSession,
@@ -22,74 +23,7 @@ function exists(path: string) {
 
 /** The entry of the workspace's one session. */
 function entry(cwd: string) {
-  return workspaceGroup(cwd).$('./ul/li[@class="sidebar-row session"]');
-}
-
-/**
- * WebDriver cannot choose a native menu item. Dispatch the row's contextmenu
- * event and deliver the choice through Tauri's menu channel instead of showing
- * the native popup. Menu creation and the session action still run normally.
- */
-async function sessionAction(
-  cwd: string,
-  text: "Archive Session" | "Unarchive Session" | "Delete Session",
-  archiveDisabled = false,
-) {
-  const archiveEnabled = await browser.execute(
-    async (element, text) => {
-      type MenuItem = { text: string; enabled: boolean; handler: string };
-      const internals = (
-        window as unknown as {
-          __TAURI_INTERNALS__: {
-            runCallback: (id: number, data: { index: number; message: string }) => void;
-          };
-        }
-      ).__TAURI_INTERNALS__;
-      const fetch = window.fetch;
-      try {
-        return await new Promise<boolean>((resolve, reject) => {
-          let item: MenuItem;
-          let archiveEnabled = false;
-          // Tauri's invoke is read-only; intercept its IPC fetch instead.
-          window.fetch = async (input, options) => {
-            const command = decodeURIComponent(String(input));
-            if (command.includes("plugin:menu|new")) {
-              const { options: menu } = JSON.parse(String(options?.body)) as {
-                options: { items: MenuItem[] };
-              };
-              archiveEnabled = menu.items.some(
-                (item) => item.text === "Archive Session" && item.enabled,
-              );
-              const choice = menu.items.find((item) => item.text === text);
-              if (!choice?.enabled) {
-                reject(new Error(`${text} is missing or disabled`));
-                return new Response(JSON.stringify("menu choice unavailable"), {
-                  headers: { "Content-Type": "application/json", "Tauri-Response": "error" },
-                });
-              }
-              item = choice;
-            }
-            if (command.includes("plugin:menu|popup")) {
-              window.fetch = fetch;
-              const channel = Number(item.handler.split(":")[1]);
-              internals.runCallback(channel, { index: 0, message: "" });
-              resolve(archiveEnabled);
-              return new Response("null", {
-                headers: { "Content-Type": "application/json", "Tauri-Response": "ok" },
-              });
-            }
-            return fetch.call(window, input, options);
-          };
-          element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
-        });
-      } finally {
-        window.fetch = fetch;
-      }
-    },
-    await entry(cwd),
-    text,
-  );
-  if (archiveDisabled) expect(archiveEnabled).toBe(false);
+  return workspaceGroup(cwd).$('./ul/li[contains(@class, "session")]');
 }
 
 /** The Archived group's toggle in the workspace in `cwd`. */
@@ -122,7 +56,7 @@ async function conversedWorktree(workspaceCwd: string, workspace: string) {
  * session log, which counts as unsaved work.
  */
 async function archiveDiscarding(cwd: string) {
-  await sessionAction(cwd, "Archive Session");
+  await rowAction(entry(cwd), "Archive Session");
   await $("dialog[open]").$("button=Discard and Archive").click();
   await expect(entry(cwd)).not.toBeExisting();
 }
@@ -136,7 +70,8 @@ describe("A session stuck starting", () => {
   it("offers Delete and disables Archive", async () => {
     const cwd = await startStuckSession();
     await expect(entry(cwd).$('[aria-label="Starting"]')).toBeDisplayed();
-    await sessionAction(cwd, "Delete Session", true);
+    const enabled = await rowAction(entry(cwd), "Delete Session");
+    expect(enabled["Archive Session"]).toBe(false);
     await expect(entry(cwd)).not.toBeExisting();
   });
 });
@@ -157,7 +92,7 @@ describe("Archiving a worktree session", () => {
     const branch = (await git(path, "branch", "--show-current")).trim();
 
     await expect(entry(cwd).$(".row-actions")).not.toBeExisting();
-    await sessionAction(cwd, "Archive Session");
+    await rowAction(entry(cwd), "Archive Session");
     await expect(entry(cwd)).not.toBeExisting();
     await expect(archivedToggle(cwd)).toHaveAttribute("aria-expanded", "false");
     expect(await exists(path)).toBe(false);
@@ -181,7 +116,7 @@ describe("Archiving a worktree session", () => {
     await expect(entry(cwd)).toBeExisting();
     const path = (await entry(cwd).$("button.select").getAttribute("title"))!.replace(/\/$/, "");
     await writeFile(join(path, "unsaved.txt"), "unsaved\n");
-    await sessionAction(cwd, "Archive Session");
+    await rowAction(entry(cwd), "Archive Session");
     let dialog = $("dialog[open]");
     await expect(dialog.$(".message")).toHaveText(expect.stringContaining(path));
     await dialog.$("button=Cancel").click();
@@ -189,7 +124,7 @@ describe("Archiving a worktree session", () => {
     await expect(entry(cwd)).toBeExisting();
     expect(await exists(path)).toBe(true);
 
-    await sessionAction(cwd, "Archive Session");
+    await rowAction(entry(cwd), "Archive Session");
     dialog = $("dialog[open]");
     await dialog.$("button=Discard and Archive").click();
     await expect(entry(cwd)).not.toBeExisting();
@@ -206,10 +141,10 @@ describe("An archived session", () => {
     // The fake agent keeps its session log in the worktree; committing it
     // lets the unarchived worktree restore the session.
     await commit(path);
-    await sessionAction(cwd, "Archive Session");
+    await rowAction(entry(cwd), "Archive Session");
     await openArchived(cwd);
 
-    await sessionAction(cwd, "Unarchive Session");
+    await rowAction(entry(cwd), "Unarchive Session");
     await expect(archivedToggle(cwd)).not.toBeExisting();
     await expect(entry(cwd)).toBeExisting();
     expect((await git(path, "branch", "--show-current")).trim()).toBe(branch);
@@ -226,7 +161,7 @@ describe("An archived session", () => {
     const { cwd, workspace } = await gitWorkspace();
     await startWorktreeSession(workspace);
     await expect(entry(cwd)).toBeExisting();
-    await sessionAction(cwd, "Archive Session");
+    await rowAction(entry(cwd), "Archive Session");
     await openArchived(cwd);
 
     await expect(entry(cwd)).toBeExisting();

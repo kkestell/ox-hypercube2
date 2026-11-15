@@ -124,10 +124,21 @@ textarea.text-field {
 }
 
 .sidebar-row:hover,
-.menu button:hover,
+.menu button:hover:enabled,
 .menu button:focus-visible,
 .menu button.active {
   background: var(--hover);
+}
+
+.menu button:disabled {
+  opacity: var(--disabled-opacity);
+}
+
+.menu-separator {
+  height: var(--border-width);
+  border: none;
+  margin: var(--menu-separator-margin) calc(var(--menu-padding) * -1);
+  background: var(--border);
 }
 
 .sidebar-row:has(.select[aria-current="true"]),
@@ -269,11 +280,17 @@ textarea.text-field {
   color: var(--warning);
 }
 
+.status.succeeded {
+  color: var(--success);
+}
+
 .status.failed {
   color: var(--destructive);
 }
 
-.status.exited::before {
+/* A run's child shows a hollow dot. */
+.status.exited::before,
+.status.hollow::before {
   background: transparent;
 }
 
@@ -283,9 +300,11 @@ textarea.text-field {
   }
 }
 
+/* Without motion, a running dot stays faded, unlike a succeeded one. */
 @media (prefers-reduced-motion: reduce) {
   .status.running {
     animation: none;
+    opacity: var(--busy-dot-opacity);
   }
 }
 

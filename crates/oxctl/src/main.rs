@@ -123,6 +123,8 @@ enum RunCommand {
         /// The text the first step receives
         input: String,
     },
+    /// List runs as their id, state, and workflow name
+    Ls,
     /// Wait until a run ends, print it as JSON, and fail unless it succeeded
     Wait { run: String },
     /// Cancel a running run
@@ -312,6 +314,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     .start_run(&workspace, &workflow, &input, utf8_env())
                     .await?;
                 println!("{}", run.id);
+            }
+            RunCommand::Ls => {
+                let mut watch = client.watch().await?;
+                // The watch's first changes list every run.
+                let changes = watch.next().await.map_err(|_| ox_protocol::Error::Closed)?;
+                for change in changes {
+                    if let ListingChange::Run { run } = change {
+                        let state = serde_json::to_value(run.state)?;
+                        let state = state.as_str().unwrap_or_default();
+                        println!("{}\t{state}\t{}", run.id, run.name);
+                    }
+                }
             }
             RunCommand::Wait { run } => {
                 let run = ended(&client, &run).await?;

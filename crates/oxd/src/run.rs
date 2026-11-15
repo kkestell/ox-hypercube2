@@ -34,6 +34,8 @@ pub struct Run {
     workflow: String,
     name: String,
     input: String,
+    /// When the run was started, in milliseconds since the Unix epoch.
+    created_at: u64,
     pub worktree: Arc<Worktree>,
     record: Mutex<RunRecord>,
     store: Arc<Store>,
@@ -90,6 +92,7 @@ impl Run {
             workflow: saved.workflow,
             name: saved.name,
             input: saved.input,
+            created_at: saved.created_at,
             worktree,
             record: Mutex::new(RunRecord {
                 state: saved.state,
@@ -193,6 +196,7 @@ impl Run {
             state: record.state,
             error: record.error.clone(),
             steps: record.steps.clone(),
+            created_at: self.created_at,
         }
     }
 

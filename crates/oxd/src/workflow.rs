@@ -5,7 +5,7 @@
 use std::io;
 use std::path::Path;
 
-use ox_protocol::{ErrorBody, Harness, code};
+use ox_protocol::{ErrorBody, Harness, WorkflowInfo, code};
 use serde::Deserialize;
 
 use crate::daemon::invalid_request;
@@ -115,6 +115,41 @@ pub fn load(dir: &Path, workflow: &str) -> Result<Workflow, ErrorBody> {
         }
     };
     parse(&text).map_err(|error| invalid_request(format!("{}: {error}", path.display())))
+}
+
+/// The definitions in `dir`: every `*.yaml` file whose name does not start
+/// with `.`, sorted by file name, each with its `name`, or with the error
+/// `load` gives for it. A missing directory lists nothing.
+pub fn list(dir: &Path) -> Vec<WorkflowInfo> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut workflows: Vec<String> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "yaml" {
+                return None;
+            }
+            let workflow = path.file_stem()?.to_str()?;
+            (!workflow.starts_with('.')).then(|| workflow.to_owned())
+        })
+        .collect();
+    workflows.sort();
+    workflows
+        .into_iter()
+        .map(|workflow| match load(dir, &workflow) {
+            Ok(definition) => WorkflowInfo {
+                workflow,
+                name: definition.name,
+                error: None,
+            },
+            Err(error) => WorkflowInfo {
+                name: workflow.clone(),
+                workflow,
+                error: Some(error.message),
+            },
+        })
+        .collect()
 }
 
 /// A definition's text as a workflow.
@@ -309,5 +344,42 @@ steps:
             assert_eq!(error.code, code::INVALID_REQUEST, "{name:?}: {error:?}");
         }
         assert_eq!(load(dir.path(), "plan").unwrap_err().code, code::NOT_FOUND);
+    }
+
+    #[test]
+    fn list_gives_each_definition_by_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let steps = "steps:\n  - name: Build\n    shell: make\n";
+        std::fs::write(
+            dir.path().join("b-plan.yaml"),
+            format!("name: Plan\n{steps}"),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("a-broken.yaml"), "name: Broken\n").unwrap();
+        std::fs::write(
+            dir.path().join(".hidden.yaml"),
+            format!("name: Hidden\n{steps}"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("notes.yml"),
+            format!("name: Notes\n{steps}"),
+        )
+        .unwrap();
+        let workflows = list(dir.path());
+        assert_eq!(
+            workflows
+                .iter()
+                .map(|info| (info.workflow.as_str(), info.name.as_str()))
+                .collect::<Vec<_>>(),
+            [("a-broken", "a-broken"), ("b-plan", "Plan")]
+        );
+        let error = workflows[0].error.as_deref().unwrap();
+        assert!(
+            error.contains("a-broken.yaml") && error.contains("steps"),
+            "{error}"
+        );
+        assert_eq!(workflows[1].error, None);
+        assert!(list(&dir.path().join("missing")).is_empty());
     }
 }

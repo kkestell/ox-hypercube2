@@ -4,7 +4,7 @@ import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { memo } from "react";
 import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
-import type { ConfigOption, Item, SessionInfo } from "../../lib/protocol";
+import type { ConfigOption, Item, RunInfo, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
 import { Elicitation } from "./Elicitation";
@@ -12,12 +12,19 @@ import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { Permission } from "./Permission";
 import type { Drafts } from "./useDrafts";
 
+/**
+ * A session's composer. While the run a child session belongs to is running,
+ * the entry and attachments are disabled and Stop cancels the run.
+ */
 export const Composer = memo(function Composer({
   session,
+  run: parent,
   request,
   drafts,
 }: {
   session: SessionInfo;
+  /** The run the session is a child of. */
+  run: RunInfo | undefined;
   /** The session's oldest unanswered permission request or form. */
   request: Extract<Item, { type: "permission" | "elicitation" }> | undefined;
   drafts: Drafts;
@@ -29,8 +36,10 @@ export const Composer = memo(function Composer({
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
-  const canSend = session.state === "idle" && (text.trim() !== "" || attachments.length > 0);
-  const disabled = session.state === "exited";
+  const runRunning = parent?.state === "running";
+  const canSend =
+    session.state === "idle" && !runRunning && (text.trim() !== "" || attachments.length > 0);
+  const disabled = session.state === "exited" || runRunning;
 
   /** Runs `action`, shows its error if it fails, and resolves to whether it succeeded. */
   const run = async (action: () => Promise<unknown>) => {
@@ -49,7 +58,12 @@ export const Composer = memo(function Composer({
       drafts.update(session.id, (current) => (current === draft ? undefined : current));
     });
 
-  const stop = () => run(() => invoke("cancel", { sessionId: session.id }));
+  const stop = () =>
+    run(() =>
+      runRunning
+        ? invoke("cancel_run", { runId: parent.id })
+        : invoke("cancel", { sessionId: session.id }),
+    );
 
   const setOption = (option: ConfigOption, value: string | boolean) =>
     run(() =>

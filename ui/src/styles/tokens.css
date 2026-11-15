@@ -71,6 +71,7 @@
   --sidebar-padding: calc(var(--spacing) * 2);
   --sidebar-row-height: calc(var(--spacing) * 8);
   --sidebar-row-padding: calc(var(--spacing) * 2);
+  --sidebar-row-gap: calc(var(--spacing) * 1.5);
   --row-action-inset: var(--spacing);
   /* VS Code's explorer indent. */
   --tree-indent: calc(var(--spacing) * 2);
@@ -79,6 +80,7 @@
   --menu-padding: calc(var(--spacing) * 2);
   --menu-list-max-height: 40vh;
   --menu-item-padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 3);
+  --menu-separator-margin: var(--spacing);
   --model-menu-width: calc(var(--spacing) * 104);
   --dialog-width: calc(var(--spacing) * 96);
   --slider-track-height: calc(var(--spacing) * 1.5);

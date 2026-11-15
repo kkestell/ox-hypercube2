@@ -13,8 +13,8 @@ use std::sync::OnceLock;
 use ox_protocol::schema::{ContentBlock, SessionConfigKind, SessionUpdate, StopReason};
 use ox_protocol::{
     Client, CommandInfo, CommandKind, CommandState, Error, ErrorBody, EventKind, ListingChange,
-    MaybeUndefined, RunInfo, RunState, SessionInfo, SessionState, StepState, Watch, WorktreeInfo,
-    code,
+    MaybeUndefined, RunInfo, RunState, SessionInfo, SessionState, StepState, Watch, WorkflowInfo,
+    WorktreeInfo, code,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -632,6 +632,24 @@ steps:
         "{listed:?}"
     );
     assert_eq!(git(repo.path(), &["branch", "--list", "ox/*"]), "");
+}
+
+/// `workflow.list` lists the definitions in the daemon's workflows
+/// directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_lists_its_workflows() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    assert!(client.list_workflows().await.unwrap().is_empty());
+    daemon.define_two("plan-work", "text \"planned\"", "text \"worked\"");
+    assert_eq!(
+        client.list_workflows().await.unwrap(),
+        [WorkflowInfo {
+            workflow: "plan-work".into(),
+            name: "Two steps".into(),
+            error: None,
+        }]
+    );
 }
 
 /// A step whose turn fails, or whose config the agent refuses, fails the run

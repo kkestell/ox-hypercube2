@@ -2,7 +2,7 @@ import { FileTextIcon, X } from "lucide-react";
 import { useLayoutEffect, useRef } from "react";
 import { openFile, updateViewer, type ViewerState } from "./viewerState";
 
-export function FileViewer({ sessionId, state }: { sessionId: string; state: ViewerState }) {
+export function FileViewer({ viewId, state }: { viewId: string; state: ViewerState }) {
   const body = useRef<HTMLDivElement>(null);
   const path = state.path!;
   useLayoutEffect(() => {
@@ -21,7 +21,7 @@ export function FileViewer({ sessionId, state }: { sessionId: string; state: Vie
             className="icon-button"
             aria-label="Close file"
             title="Close file"
-            onClick={() => openFile(sessionId, null)}
+            onClick={() => openFile(viewId, null)}
           >
             <X />
           </button>
@@ -31,7 +31,7 @@ export function FileViewer({ sessionId, state }: { sessionId: string; state: Vie
         className="file-body"
         ref={body}
         onScroll={(event) =>
-          updateViewer(sessionId, {
+          updateViewer(viewId, {
             scrollTop: event.currentTarget.scrollTop,
             scrollLeft: event.currentTarget.scrollLeft,
           })

@@ -22,20 +22,20 @@ const userScrolls = ["wheel", "pointerdown", "keydown"] as const;
 
 /**
  * The file tree of the directory at `root`, with the open folders and scroll
- * position saved for `sessionId`.
+ * position saved for `viewId`.
  */
 export const FileTree = memo(function FileTree({
-  sessionId,
+  viewId,
   root,
   connection,
   onOpenFile,
 }: {
-  sessionId: string;
+  viewId: string;
   root: string;
   connection: number;
   onOpenFile: (relative: string) => void;
 }) {
-  const [saved] = useState(() => loadTreeState(sessionId));
+  const [saved] = useState(() => loadTreeState(viewId));
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set(saved.open));
   const scrollTop = useRef(saved.scrollTop);
   const restoring = useRef(saved.scrollTop > 0);
@@ -43,8 +43,8 @@ export const FileTree = memo(function FileTree({
   const content = useRef<HTMLUListElement>(null);
 
   useEffect(() => {
-    saveTreeState(sessionId, { open: [...open], scrollTop: scrollTop.current });
-  }, [sessionId, open]);
+    saveTreeState(viewId, { open: [...open], scrollTop: scrollTop.current });
+  }, [viewId, open]);
 
   // Folders open as their listings arrive, so the saved position is set
   // again each time the tree grows, until the body reaches it or the user
@@ -85,7 +85,7 @@ export const FileTree = memo(function FileTree({
       onScroll={(event) => {
         if (restoring.current) return;
         scrollTop.current = event.currentTarget.scrollTop;
-        saveTreeState(sessionId, { open: [...open], scrollTop: scrollTop.current });
+        saveTreeState(viewId, { open: [...open], scrollTop: scrollTop.current });
       }}
     >
       <ul ref={content}>

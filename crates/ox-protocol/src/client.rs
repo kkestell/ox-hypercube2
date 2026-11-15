@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use crate::messages::{
     Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
     HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo, ServerMessage,
-    SessionInfo, WorkspaceInfo, WorktreeInfo,
+    SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -711,6 +711,12 @@ impl Client {
             env,
         })
         .await
+    }
+
+    /// The definitions in the daemon's workflows directory, sorted by file
+    /// name.
+    pub async fn list_workflows(&self) -> Result<Vec<WorkflowInfo>, Error> {
+        self.call(Method::WorkflowList).await
     }
 
     async fn ack(&self, method: Method) -> Result<(), Error> {

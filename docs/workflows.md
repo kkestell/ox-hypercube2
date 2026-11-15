@@ -13,7 +13,9 @@ Each workflow is a YAML file in `$XDG_CONFIG_HOME/ox/workflows/`, by default
 `~/.config/ox/workflows/`. Every workspace and every daemon of the user shares
 these definitions. A run is started by the file name without `.yaml`, such as
 `plan-review` for `plan-review.yaml`. The file's `name` is the workflow's
-display name.
+display name. The desktop lists every definition, each time a New Task menu
+opens. A definition that does not parse is listed disabled, with its error as
+its tooltip.
 
 ```yaml
 name: Plan and review
@@ -199,6 +201,32 @@ steps:
 
 ## Running a workflow
 
+In the desktop, the New Task menu of a workspace in a Git working tree lists
+the workflows below New Task and Session in Checkout. Choosing one asks for
+the run's input. Run, or Command-Return, starts the run and opens it.
+
+The run's row is titled with its input, or with the workflow's name when the
+input is blank, and sits among the workspace's sessions in the order they
+were created. Each agent step's child session appears beneath the run's row
+as its step starts, titled with the step's name. The run's status dot is
+filled and each child's is hollow. Each dot is amber while a permission
+request or question awaits an answer, green and breathing while it runs,
+green once it succeeded, red once it failed, and grey once it was cancelled
+or interrupted.
+
+Selecting a run opens the run view: each step that has started, in order,
+with its preconditions, a shell step's command, its child's first turn, its
+postconditions, any repair turn and the postconditions it reran, and the
+child's later turns. A command's details hold the whole command, its exit
+status, and its output. The oldest permission request or question awaiting
+an answer among the children shows below the steps. Answering it there or in
+the child's own view resolves it in both. The right sidebar shows the run's
+worktree.
+
+Selecting a child opens its session view. While the run is running, the
+child's text entry and attachments are disabled, and Stop cancels the run.
+Once the run has ended, the child takes prompts like any other session.
+
 `oxctl run start --workspace <workspace id> <workflow> <input>` starts a run
 and prints its ID. The run's worktree is on a new branch
 `ox/<first 8 digits of the worktree's ID>` that starts at the workspace
@@ -206,6 +234,7 @@ checkout's `HEAD`, as for [New Task](worktrees.md#choosing-a-checkout).
 `oxctl run wait <run id>` prints the run as JSON once it ends, and unless
 the run succeeded fails with its state and error, such as
 `the run failed: a postcondition exited with status 1 after the repair turn`.
+`oxctl run ls` lists each run's ID, state and workflow name.
 
 The run continues when every client disconnects. Each child session is an
 ordinary session of the workspace: a client can follow it and answer its
@@ -223,6 +252,10 @@ the next step's input. A turn that ends any other way fails the run with its err
 stop reason, and the later steps stay pending.
 
 ## Cancelling, removing, and restarting
+
+In the desktop, Cancel Run, in a running run's context menu and in the run
+view's header, cancels the run. Delete Run, in the context menu of a run that
+has ended, removes it, and asks before discarding unsaved work.
 
 `oxctl run cancel <run id>` cancels the active step's turn, or stops its
 running command: the command's process group gets `SIGTERM`, and `SIGKILL`

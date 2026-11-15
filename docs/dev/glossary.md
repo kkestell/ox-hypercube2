@@ -34,3 +34,5 @@ ownership and lifecycle.
 - **Check**: A precondition or postcondition shell command of a step.
 - **Child session**: The session a run starts for one of its agent steps, in the
   run's worktree.
+- **Run view**: The desktop view of a run: the timeline of its started steps'
+  commands and child conversations.

@@ -1,14 +1,40 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createConnection } from "node:net";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
+import type { ChainablePromiseElement } from "webdriverio";
 
 const target = resolve(import.meta.dirname, "../../target/debug");
 
-/** The path of a binary the workspace builds. */
-export function binary(name: string): string {
+/** The path of a binary as the workspace builds it. */
+export function built(name: string): string {
   return join(target, name);
+}
+
+/** The directory the run's app, oxd, oxctl and agents run from. */
+export function binDir(): string {
+  return join(target, "e2e-bin");
+}
+
+/** The path of a binary the run uses, in `binDir()`. */
+export function binary(name: string): string {
+  return join(binDir(), name);
+}
+
+/**
+ * Saves `yaml` as the definition of workflow `name` in oxd's workflows
+ * directory. Agent steps on the `pi` harness run the fake agent, whose
+ * prompt, with the step's input after it, is its script.
+ */
+export async function defineWorkflow(name: string, yaml: string) {
+  await mkdir(workflowsDir(), { recursive: true });
+  await writeFile(join(workflowsDir(), `${name}.yaml`), yaml);
+}
+
+/** oxd's workflows directory, in the run's directory. */
+function workflowsDir(): string {
+  return join(process.env.XDG_CONFIG_HOME!, "ox/workflows");
 }
 
 /** The directory of harness stubs on the app's `PATH`. */
@@ -170,14 +196,28 @@ async function workspaceId(cwd: string): Promise<string> {
   throw new Error(`no workspace in ${cwd}`);
 }
 
-/** Deletes every session oxd has and removes every workspace. */
+/**
+ * Removes every run oxd has, cancelling a running one and waiting for it to
+ * end first, then deletes every session, removes every workspace, and
+ * removes the workflow definitions.
+ */
 export async function resetDaemon() {
+  for (const line of lines(await oxctl("run", "ls"))) {
+    const [id, state] = line.split("\t");
+    if (state === "running") {
+      await oxctl("run", "cancel", id!);
+      // `run wait` fails for a run that did not succeed.
+      await oxctl("run", "wait", id!).catch(() => {});
+    }
+    await oxctl("run", "rm", "--discard", id!);
+  }
   for (const line of lines(await oxctl("ls"))) {
     await oxctl("delete", "--discard", line.split("\t")[0]!);
   }
   for (const line of lines(await oxctl("workspace", "ls"))) {
     await oxctl("workspace", "rm", line.split("\t")[0]!);
   }
+  await rm(workflowsDir(), { recursive: true, force: true });
 }
 
 /**
@@ -205,14 +245,14 @@ export function workspaceGroup(cwd: string) {
 
 /** The session list's entry for the session in `cwd`. */
 export function sessionEntry(cwd: string) {
-  return $(`//li[@class="sidebar-row session"][button[@class="select"][@title="${cwd}"]]`);
+  return $(`//li[contains(@class, "session")][button[@class="select"][@title="${cwd}"]]`);
 }
 
 /** The session list's entry for the one session in a worktree. */
 export function worktreeEntry() {
   const worktrees = join(process.env.OX_E2E_DIR!, "worktrees/");
   return $(
-    `//li[@class="sidebar-row session"][button[@class="select"][starts-with(@title, "${worktrees}")]]`,
+    `//li[contains(@class, "session")][button[@class="select"][starts-with(@title, "${worktrees}")]]`,
   );
 }
 
@@ -320,5 +360,70 @@ export async function slide(selector: string, value: number) {
     },
     selector,
     value,
+  );
+}
+
+/**
+ * Chooses `text` from the native context menu of the sidebar row `row`, and
+ * returns whether each of the menu's items was enabled. WebDriver cannot
+ * choose a native menu item, so this dispatches the row's contextmenu event
+ * and delivers the choice through Tauri's menu channel instead of showing the
+ * native popup. Menu creation and the row's action still run normally.
+ */
+export async function rowAction(
+  row: ChainablePromiseElement,
+  text: string,
+): Promise<Record<string, boolean>> {
+  return browser.execute(
+    async (element, text) => {
+      type MenuItem = { text: string; enabled: boolean; handler: string };
+      const internals = (
+        window as unknown as {
+          __TAURI_INTERNALS__: {
+            runCallback: (id: number, data: { index: number; message: string }) => void;
+          };
+        }
+      ).__TAURI_INTERNALS__;
+      const fetch = window.fetch;
+      try {
+        return await new Promise<Record<string, boolean>>((resolve, reject) => {
+          let item: MenuItem;
+          let enabled: Record<string, boolean> = {};
+          // Tauri's invoke is read-only; intercept its IPC fetch instead.
+          window.fetch = async (input, options) => {
+            const command = decodeURIComponent(String(input));
+            if (command.includes("plugin:menu|new")) {
+              const { options: menu } = JSON.parse(String(options?.body)) as {
+                options: { items: MenuItem[] };
+              };
+              enabled = Object.fromEntries(menu.items.map((item) => [item.text, item.enabled]));
+              const choice = menu.items.find((item) => item.text === text);
+              if (!choice?.enabled) {
+                reject(new Error(`${text} is missing or disabled`));
+                return new Response(JSON.stringify("menu choice unavailable"), {
+                  headers: { "Content-Type": "application/json", "Tauri-Response": "error" },
+                });
+              }
+              item = choice;
+            }
+            if (command.includes("plugin:menu|popup")) {
+              window.fetch = fetch;
+              const channel = Number(item.handler.split(":")[1]);
+              internals.runCallback(channel, { index: 0, message: "" });
+              resolve(enabled);
+              return new Response("null", {
+                headers: { "Content-Type": "application/json", "Tauri-Response": "ok" },
+              });
+            }
+            return fetch.call(window, input, options);
+          };
+          element.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+        });
+      } finally {
+        window.fetch = fetch;
+      }
+    },
+    await row,
+    text,
   );
 }

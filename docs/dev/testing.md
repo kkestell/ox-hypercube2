@@ -135,14 +135,21 @@ that the tests start with `oxctl`. Tests that create sessions through the
 desktop start the Claude bridge without sending it prompts. The app runs with
 a stub login shell and a `PATH` of the system directories and a directory of
 harness stubs, which holds `claude` unless a test changes it with
-`setHarnesses`. A change only to `ui/src/styles/` requires `make check-ui`.
+`setHarnesses`. The app, its `oxd`, `oxctl` and the fake agent run from
+`target/debug/e2e-bin/`, which links the binaries just built and holds the
+fake agent as `pi-acp`, so test workflows run their `pi` steps with the fake
+agent. `defineWorkflow` writes a definition to the run's workflows directory,
+`config/ox/workflows/` in `OX_E2E_DIR`. A change only to `ui/src/styles/`
+requires `make check-ui`.
 
-After changing `oxd`, `ox-protocol`, `oxctl`, `claude-code-acp`, or
-`scripts/smoke-acp.py`, also run `make smoke-claude` and report its result.
-After changing `oxd`, `ox-protocol`, `oxctl`, `pi-acp`, or
-`scripts/smoke-acp.py`, also run `make smoke-pi` and report its result.
-These live checks run real models through `oxd` and `oxctl`, separately from
-`cargo test`. Claude uses Haiku and requires an installed, authenticated
+The live checks run real models through `oxd` and `oxctl`, separately from
+`cargo test`, and each run spends paid model requests. Run them only for
+changes whose correctness depends on a real agent: after changing
+`claude-code-acp`, run `make smoke-claude`; after changing `pi-acp`, run
+`make smoke-pi`; after changing how `oxd` launches agents or exchanges ACP
+messages with them, or changing `scripts/smoke-acp.py`, run both. Run each
+check once and report its result. For other changes to `oxd`, `ox-protocol`,
+and `oxctl`, the integration tests against `oxd-fake-agent` are the evidence. Claude uses Haiku and requires an installed, authenticated
 Claude Code CLI. Pi uses `openrouter/deepseek/deepseek-v4.1-flash-1017` and
 requires an installed Pi CLI authenticated with OpenRouter. See
 [External systems and live checks](#external-systems-and-live-checks) for
