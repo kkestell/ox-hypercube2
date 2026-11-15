@@ -2690,3 +2690,75 @@ async fn directory_watch_lists_a_directory_once_it_exists() {
     std::fs::write(path.join("a.txt"), "a").unwrap();
     entries_until(&mut watch, &[("a.txt", EntryKind::File)]).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn file_watch_follows_edits_replacement_and_recreation() {
+    use ox_protocol::FileContent;
+    async fn text(watch: &mut ox_protocol::FileWatch, expected: &str) {
+        timeout(TIMEOUT, async {
+            loop {
+                if watch.next().await.unwrap()
+                    == (FileContent::Text {
+                        text: expected.into(),
+                    })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let daemon = Daemon::start(1000).await;
+    let client = daemon.client().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "first").unwrap();
+    let mut watch = client.watch_file(&path).await.unwrap();
+    text(&mut watch, "first").await;
+    std::fs::write(&path, "edited").unwrap();
+    text(&mut watch, "edited").await;
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&replacement, "replacement").unwrap();
+    std::fs::rename(&replacement, &path).unwrap();
+    text(&mut watch, "replacement").await;
+    std::fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        timeout(TIMEOUT, watch.next()).await.unwrap().unwrap(),
+        FileContent::Error { .. }
+    ));
+    std::fs::write(&path, "recreated").unwrap();
+    text(&mut watch, "recreated").await;
+    for bytes in [vec![0xff], vec![0]] {
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            timeout(TIMEOUT, watch.next()).await.unwrap().unwrap(),
+            FileContent::Error { .. }
+        ));
+    }
+    let fifo = dir.path().join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .await
+            .unwrap()
+            .success()
+    );
+    let mut special = client.watch_file(&fifo).await.unwrap();
+    assert!(matches!(
+        timeout(TIMEOUT, special.next()).await.unwrap().unwrap(),
+        FileContent::Error { .. }
+    ));
+    let mut directory = client.watch_file(dir.path()).await.unwrap();
+    assert!(matches!(
+        timeout(TIMEOUT, directory.next()).await.unwrap().unwrap(),
+        FileContent::Error { .. }
+    ));
+    assert!(
+        client
+            .watch_file(std::path::Path::new("relative"))
+            .await
+            .is_err()
+    );
+}

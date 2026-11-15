@@ -1,0 +1,80 @@
+.session-content {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+
+.chat-pane,
+.file-pane {
+  min-width: 0;
+}
+
+.file-viewer {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--surface);
+}
+
+.file-header {
+  justify-content: flex-start;
+  border-bottom: var(--border-width) solid var(--border);
+}
+
+.file-pill {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  min-width: 0;
+  max-width: 100%;
+  padding-left: var(--file-pill-padding);
+  padding-right: var(--spacing);
+  height: var(--pane-header-button-height);
+  border-radius: var(--file-pill-radius);
+  background: var(--muted);
+  font-size: var(--text-sm);
+}
+
+.file-pill > svg,
+.file-pill > button {
+  flex: none;
+}
+
+.file-pill > svg {
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
+.file-pill > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-pill .icon-button {
+  color: var(--muted-foreground);
+}
+
+.file-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--file-content-padding);
+}
+
+.file-body pre {
+  margin: 0;
+  width: max-content;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--leading);
+  white-space: pre;
+  user-select: text;
+}
+
+.file-message {
+  margin: 0;
+  color: var(--muted-foreground);
+}

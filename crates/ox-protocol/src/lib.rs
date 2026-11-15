@@ -3,13 +3,14 @@
 //!
 //! Messages are newline-delimited JSON over a Unix socket. Clients send
 //! [`Request`]s; the daemon answers each with a [`ServerMessage`] carrying the
-//! same `id`. The daemon also pushes three kinds of stream, each named in
+//! same `id`. The daemon also pushes streams, each named in
 //! every message by the `id` of the request that started it: a subscription
 //! (`session.subscribe`) delivers one session's [`Event`]s, a watch (`watch`)
 //! delivers every workspace and session, then each one that is added,
 //! changes, or is removed, and a
 //! directory watch (`directory.watch`) delivers a directory's entries whenever
-//! they change. `unsubscribe` ends any of them.
+//! they change. A file watch (`file.watch`) delivers changed text or read errors.
+//! `unsubscribe` ends any of them.
 
 #[cfg(unix)]
 mod client;
@@ -17,7 +18,7 @@ mod messages;
 
 #[cfg(unix)]
 pub use client::{
-    Client, DirectoryWatch, End, Error, Subscription, Watch, daemon_binary, data_dir,
+    Client, DirectoryWatch, End, Error, FileWatch, Subscription, Watch, daemon_binary, data_dir,
     default_socket_path,
 };
 #[cfg(unix)]

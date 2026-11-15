@@ -1,4 +1,5 @@
 mod conversation;
+mod files;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
@@ -37,6 +38,7 @@ struct App {
     view: Mutex<Option<Task>>,
     /// The directory watches, by the ID of the channel each sends on.
     directories: Mutex<HashMap<u32, Task>>,
+    files: Mutex<HashMap<u32, Task>>,
 }
 
 impl App {
@@ -120,14 +122,14 @@ fn agents() -> Vec<Agent> {
         .collect()
 }
 
-// `watch`, `view_session`, `watch_directory`, and `unwatch_directory` are
+// `watch`, `view_session`, and the file and directory watch commands are
 // synchronous, so they run on the main thread in the order the webview calls
 // them, and the last call's task is the one that stays.
 
 /// Sends the workspaces and sessions lists on `channel` each time either
 /// changes, replacing the previous watch. A new watch means the webview
-/// reloaded or reconnected, and in both it watches its directories again once
-/// the watch connects, so this ends every directory watch.
+/// reloaded or reconnected, and in both it watches its files and directories
+/// again once the watch connects, so this ends their previous watches.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
@@ -159,6 +161,7 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
     });
     *app.watch.lock().unwrap() = Some(Task(task));
     app.directories.lock().unwrap().clear();
+    app.files.lock().unwrap().clear();
 }
 
 /// Sends a session's conversation on `channel` from its first event, in
@@ -519,6 +522,8 @@ pub fn run() {
             agents,
             watch,
             view_session,
+            files::watch_file,
+            files::unwatch_file,
             watch_directory,
             unwatch_directory,
             add_workspace,

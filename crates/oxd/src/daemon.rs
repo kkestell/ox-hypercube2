@@ -393,6 +393,7 @@ impl Daemon {
             | Method::SessionSubscribe { .. }
             | Method::Watch
             | Method::DirectoryWatch { .. }
+            | Method::FileWatch { .. }
             | Method::Unsubscribe { .. } => Err(ErrorBody {
                 code: code::INVALID_REQUEST,
                 message: "unexpected method".into(),

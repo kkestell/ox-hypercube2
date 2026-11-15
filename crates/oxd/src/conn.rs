@@ -39,7 +39,7 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
     let (read, write) = stream.into_split();
     let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
     let mut writer = Task(tokio::spawn(write_loop(write, outgoing_rx)));
-    // Event subscriptions, watches, and directory watches, by the id of the
+    // Event subscriptions and watches, by the id of the
     // request that started each.
     let mut subscriptions: HashMap<u64, Task> = HashMap::new();
     let mut lines = BufReader::new(read).lines();
@@ -124,10 +124,32 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                 subscriptions.insert(id, Task(task));
                 continue;
             }
-            Method::DirectoryWatch { path } if !path.is_absolute() => Err(ErrorBody {
-                code: code::INVALID_REQUEST,
-                message: format!("{} is not an absolute path", path.display()),
-            }),
+            Method::FileWatch { path } | Method::DirectoryWatch { path } if !path.is_absolute() => {
+                Err(ErrorBody {
+                    code: code::INVALID_REQUEST,
+                    message: format!("{} is not an absolute path", path.display()),
+                })
+            }
+            Method::FileWatch { path } => {
+                if outgoing
+                    .send(ServerMessage::Result {
+                        id,
+                        result: Value::Null,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                let task = tokio::spawn(crate::files::stream(
+                    daemon.directories().clone(),
+                    path,
+                    id,
+                    outgoing.clone(),
+                ));
+                subscriptions.insert(id, Task(task));
+                continue;
+            }
             Method::DirectoryWatch { path } => {
                 let ack = ServerMessage::Result {
                     id,

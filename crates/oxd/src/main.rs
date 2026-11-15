@@ -12,6 +12,7 @@ mod branches;
 mod conn;
 mod daemon;
 mod directories;
+mod files;
 mod mcp;
 mod session;
 mod state;

@@ -121,7 +121,10 @@ pub enum Method {
     /// The request's `id` names the watch in every listing.
     #[serde(rename = "directory.watch")]
     DirectoryWatch { path: PathBuf },
-    /// Ends the subscription, watch, or directory watch that request
+    /// Follows the UTF-8 text or read error of an absolute file path.
+    #[serde(rename = "file.watch")]
+    FileWatch { path: PathBuf },
+    /// Ends the subscription, listing watch, directory watch, or file watch that request
     /// `subscription` started. Messages the daemon was sending it may arrive
     /// after the answer.
     #[serde(rename = "unsubscribe")]
@@ -559,6 +562,14 @@ pub mod code {
     pub const GIT: i32 = 8;
 }
 
+/// The current text of a file, or a readable failure.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FileContent {
+    Text { text: String },
+    Error { message: String },
+}
+
 /// An entry of a directory a directory watch lists.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
@@ -574,7 +585,7 @@ pub enum EntryKind {
 }
 
 /// A daemon message: a response to request `id`, or an event or listing
-/// delivered to the subscription, watch, or directory watch that request
+/// delivered to the subscription or watch that request
 /// `subscription` started.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -600,6 +611,10 @@ pub enum ServerMessage {
     Directory {
         subscription: u64,
         entries: Vec<DirEntry>,
+    },
+    File {
+        subscription: u64,
+        content: FileContent,
     },
 }
 

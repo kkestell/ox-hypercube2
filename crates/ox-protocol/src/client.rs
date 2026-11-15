@@ -19,8 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, HelloResult,
-    ListingChange, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo, WorkspaceInfo,
+    Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
+    HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo,
+    WorkspaceInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -112,12 +113,13 @@ struct Routes {
 }
 
 /// A stream's messages: a subscription's events, a watch's changes, or a
-/// directory watch's entries.
+/// directory watch’s entries, or a file watch’s contents.
 #[derive(Debug)]
 enum Route {
     Events(mpsc::UnboundedSender<Event>),
     Changes(mpsc::UnboundedSender<Vec<ListingChange>>),
     Entries(mpsc::UnboundedSender<Vec<DirEntry>>),
+    File(mpsc::UnboundedSender<FileContent>),
 }
 
 impl Routes {
@@ -257,6 +259,20 @@ impl DirectoryWatch {
     /// with [`End::Disconnected`].
     pub async fn next(&mut self) -> Result<Vec<DirEntry>, End> {
         self.entries.recv().await.ok_or(End::Disconnected)
+    }
+}
+
+/// A file’s contents, each time they change. Dropping it unsubscribes.
+#[derive(Debug)]
+pub struct FileWatch {
+    content: mpsc::UnboundedReceiver<FileContent>,
+    _unsubscribe: Unsubscribe,
+}
+
+impl FileWatch {
+    /// Waits for the initial snapshot or a changed snapshot.
+    pub async fn next(&mut self) -> Result<FileContent, End> {
+        self.content.recv().await.ok_or(End::Disconnected)
     }
 }
 
@@ -459,6 +475,24 @@ impl Client {
         self.send::<Value>(
             id,
             Method::DirectoryWatch {
+                path: path.to_owned(),
+            },
+        )
+        .await?;
+        Ok(watch)
+    }
+
+    /// Follows the contents of an absolute file path.
+    pub async fn watch_file(&self, path: &Path) -> Result<FileWatch, Error> {
+        let id = self.connection.next_id();
+        let (sender, content) = mpsc::unbounded_channel();
+        let watch = FileWatch {
+            content,
+            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::File(sender)),
+        };
+        self.send::<Value>(
+            id,
+            Method::FileWatch {
                 path: path.to_owned(),
             },
         )
@@ -684,6 +718,14 @@ async fn read_loop(read: OwnedReadHalf, connection: Arc<Connection>) {
                     let _ = sender.send(changes);
                 }
             }
+            ServerMessage::File {
+                subscription,
+                content,
+            } => {
+                if let Some(Route::File(sender)) = routes.streams.get(&subscription) {
+                    let _ = sender.send(content);
+                }
+            }
             ServerMessage::Directory {
                 subscription,
                 entries,
@@ -879,6 +921,34 @@ mod tests {
             unsubscribe.method,
             Method::Unsubscribe { subscription } if subscription == request.id
         ));
+    }
+
+    #[tokio::test]
+    async fn file_snapshots_route_and_drop_unsubscribes() {
+        let (client, mut daemon) = connect().await;
+        let (watch, request) = tokio::join!(
+            client.watch_file(Path::new("/work/a.txt")),
+            daemon.answer(Value::Null)
+        );
+        let mut watch = watch.unwrap();
+        let content = FileContent::Text {
+            text: "hello".into(),
+        };
+        daemon
+            .send(ServerMessage::File {
+                subscription: request.id,
+                content: content.clone(),
+            })
+            .await;
+        assert_eq!(
+            timeout(TIMEOUT, watch.next()).await.unwrap().unwrap(),
+            content
+        );
+        drop(watch);
+        let unsubscribe = daemon.answer(Value::Null).await;
+        assert!(
+            matches!(unsubscribe.method, Method::Unsubscribe { subscription } if subscription == request.id)
+        );
     }
 
     #[tokio::test]

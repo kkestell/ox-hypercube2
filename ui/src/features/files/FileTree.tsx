@@ -28,10 +28,12 @@ export const FileTree = memo(function FileTree({
   sessionId,
   root,
   connection,
+  onOpenFile,
 }: {
   sessionId: string;
   root: string;
   connection: number;
+  onOpenFile: (relative: string) => void;
 }) {
   const [saved] = useState(() => loadTreeState(sessionId));
   const [open, setOpen] = useState<ReadonlySet<string>>(() => new Set(saved.open));
@@ -91,6 +93,7 @@ export const FileTree = memo(function FileTree({
           path={root}
           relative=""
           depth={0}
+          onOpenFile={onOpenFile}
           connection={connection}
           open={open}
           toggle={toggle}
@@ -106,6 +109,7 @@ function Folder({
   relative,
   depth,
   connection,
+  onOpenFile,
   open,
   toggle,
 }: {
@@ -114,6 +118,7 @@ function Folder({
   relative: string;
   depth: number;
   connection: number;
+  onOpenFile: (relative: string) => void;
   open: ReadonlySet<string>;
   toggle: (relative: string) => void;
 }) {
@@ -124,12 +129,16 @@ function Folder({
       return (
         <li key={entry.name}>
           <div className="sidebar-row tree-row" style={style}>
-            <div className="select">
+            <button
+              type="button"
+              className="select"
+              onClick={() => onOpenFile(relative ? `${relative}/${entry.name}` : entry.name)}
+            >
               <span className="status">
                 <FileIcon />
               </span>
               <span className="title">{entry.name}</span>
-            </div>
+            </button>
           </div>
         </li>
       );
@@ -155,6 +164,7 @@ function Folder({
               path={join(path, entry.name)}
               relative={childRelative}
               depth={depth + 1}
+              onOpenFile={onOpenFile}
               connection={connection}
               open={open}
               toggle={toggle}

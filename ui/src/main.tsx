@@ -5,6 +5,7 @@ import "./styles/tokens.css";
 import "./styles/base.css";
 import "./styles/controls.css";
 import "./styles/layout.css";
+import "./styles/files.css";
 import "./styles/sidebar.css";
 import "./styles/sessions.css";
 import "./styles/conversation.css";

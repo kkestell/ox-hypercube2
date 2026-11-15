@@ -33,6 +33,7 @@ export function Workbench({
   right,
   actions,
   children,
+  renderContent,
 }: {
   left: ReactNode;
   /** The right sidebar's content, rendered only while the sidebar shows. */
@@ -40,6 +41,7 @@ export function Workbench({
   /** Controls for the content, at the start of its header. */
   actions?: ReactNode;
   children: ReactNode;
+  renderContent?: (header: ReactNode) => ReactNode;
 }) {
   const workbench = useRef<HTMLDivElement>(null);
   const center = useRef<HTMLDivElement>(null);
@@ -118,6 +120,30 @@ export function Workbench({
     panels.map((panel) => [`--${panel}-size`, `${sizes[panel]}px`]),
   ) as CSSProperties;
 
+  const header = (
+    <header className="pane-header content-header">
+      {actions}
+      <div className="toggles">
+        {panels.map((panel) => {
+          const { icon: Icon, title } = toggles[panel];
+          return (
+            <button
+              key={panel}
+              type="button"
+              className="icon-button"
+              title={title}
+              aria-label={title}
+              aria-pressed={visible[panel]}
+              onClick={() => setVisible((shown) => ({ ...shown, [panel]: !shown[panel] }))}
+            >
+              <Icon />
+            </button>
+          );
+        })}
+      </div>
+    </header>
+  );
+
   return (
     <div className="workbench" ref={workbench} style={style}>
       <aside className="panel left" hidden={!visible.left}>
@@ -125,30 +151,14 @@ export function Workbench({
       </aside>
       {sash("left")}
       <div className="center" ref={center}>
-        <main className="content">
-          <header className="pane-header content-header">
-            {actions}
-            <div className="toggles">
-              {panels.map((panel) => {
-                const { icon: Icon, title } = toggles[panel];
-                return (
-                  <button
-                    key={panel}
-                    type="button"
-                    className="icon-button"
-                    title={title}
-                    aria-label={title}
-                    aria-pressed={visible[panel]}
-                    onClick={() => setVisible((shown) => ({ ...shown, [panel]: !shown[panel] }))}
-                  >
-                    <Icon />
-                  </button>
-                );
-              })}
-            </div>
-          </header>
-          <div className="content-body">{children}</div>
-        </main>
+        {renderContent ? (
+          renderContent(header)
+        ) : (
+          <main className="content">
+            {header}
+            <div className="content-body">{children}</div>
+          </main>
+        )}
         {sash("bottom")}
         <section className="panel bottom" hidden={!visible.bottom} />
       </div>

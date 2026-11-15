@@ -1,3 +1,5 @@
+export type FileContent = { type: "text"; text: string } | { type: "error"; message: string };
+
 // The messages the backend sends, and the fields of oxd's types the UI reads.
 
 export type SessionState =
