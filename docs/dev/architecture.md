@@ -170,10 +170,14 @@ runs; exited sessions do not keep it alive.
 A run of a [workflow](../workflows.md) owns a worktree and the child
 sessions its steps run in. The daemon reads the workflow's definition when the
 run starts and runs the run's steps itself, so a run continues without
-clients. Its runner adds the worktree, then for each step starts a child
+clients. Its runner adds the worktree, then for each agent step starts a child
 session with the step's harness bridge from beside `oxd`'s executable, sets
 the step's config options, sends the prompt, and advances when the turn
-ends. A step's output is the final reply of its turn.
+ends. A step's output is the final reply of its turn, or a shell step's
+standard output. The runner runs shell steps and checks through `shell::run`,
+each in its own process group, and records each command in the step's
+`commands`. When the daemon stops, it aborts the runners, which kills their
+running commands' process groups.
 
 Child sessions are ordinary sessions that refer to the run's worktree.
 Deleting or archiving one leaves the worktree; removing the run stops the

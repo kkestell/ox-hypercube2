@@ -111,7 +111,7 @@ export type StepState =
   | "cancelled"
   | "interrupted";
 
-/** A run of a workflow, whose steps run in child sessions in its worktree. */
+/** A run of a workflow, whose steps run in its worktree, agent steps in child sessions. */
 export interface RunInfo {
   id: string;
   workspace_id: string;
@@ -130,10 +130,29 @@ export interface RunInfo {
 export interface StepInfo {
   name: string;
   state: StepState;
-  /** The step's child session, once the step has started. */
+  /** The step's child session, once an agent step has started. */
   session_id: string | null;
-  /** The final reply the next step receives. */
+  /** The final reply of the step's last turn, or a shell step's standard output. */
   output: string | null;
+  /** The commands the step has started, in order. */
+  commands: CommandInfo[];
+}
+
+export type CommandKind = "precondition" | "shell" | "postcondition";
+
+export type CommandState = "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
+
+/** A check or a shell step's command. */
+export interface CommandInfo {
+  kind: CommandKind;
+  command: string;
+  state: CommandState;
+  /** Unset while running, and when killed by a signal or unable to start. */
+  exit_code: number | null;
+  /** The last 64 KiB of interleaved standard output and standard error, once it ends. */
+  output: string;
+  /** Whether earlier output was dropped. */
+  truncated: boolean;
 }
 
 /** An entry of a directory, as a directory watch lists it. */

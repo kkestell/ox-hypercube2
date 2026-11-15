@@ -317,7 +317,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 let run = ended(&client, &run).await?;
                 println!("{}", serde_json::to_string(&run)?);
                 if run.state != RunState::Succeeded {
-                    return Err("the run did not succeed".into());
+                    let state = serde_json::to_value(run.state)?;
+                    let state = state.as_str().unwrap_or_default();
+                    return Err(match &run.error {
+                        Some(error) => format!("the run {state}: {error}"),
+                        None => format!("the run {state}"),
+                    }
+                    .into());
                 }
             }
             RunCommand::Cancel { run } => client.cancel_run(&run).await?,

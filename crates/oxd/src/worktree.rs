@@ -25,7 +25,7 @@ use crate::store::SavedWorktree;
 /// The variables that point git at one repository, as `git rev-parse
 /// --local-env-vars` lists them. Git runs in the directory it is given, so
 /// none of them pass through.
-const LOCAL_ENV_VARS: &[&str] = &[
+pub(crate) const LOCAL_ENV_VARS: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_CONFIG",
     "GIT_CONFIG_PARAMETERS",

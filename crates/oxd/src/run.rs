@@ -1,7 +1,8 @@
-//! Workflow runs: a run's record, and the runner that advances its steps in
-//! child sessions.
+//! Workflow runs: a run's record, and the runner that advances its steps:
+//! agent steps in child sessions, shell steps and checks as commands.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -11,16 +12,17 @@ use agent_client_protocol::v2::schema::{
     StopReason, TextContent,
 };
 use ox_protocol::{
-    ConfigValue, ErrorBody, Event, EventKind, MaybeUndefined, RunInfo, RunState, StepInfo,
-    StepState, code,
+    CommandInfo, CommandKind, CommandState, ConfigValue, ErrorBody, Event, EventKind,
+    MaybeUndefined, RunInfo, RunState, StepInfo, StepState, code,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::daemon::Daemon;
 use crate::session::Session;
+use crate::shell::{self, Finished, Inputs};
 use crate::store::{SavedRun, Store};
-use crate::workflow::{AgentStep, Step, Workflow};
+use crate::workflow::{Action, AgentStep, Check, Step, Workflow};
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
 
 /// A workflow run: its saved record, the worktree it owns, and, while it is
@@ -55,8 +57,21 @@ struct RunRecord {
 
 /// Why a step stopped before it succeeded.
 enum Ended {
-    Failed(String),
+    /// The step failed with `error`. `output` is the reply of a repair turn
+    /// after which a postcondition still failed.
+    Failed {
+        error: String,
+        output: Option<String>,
+    },
     Cancelled,
+}
+
+/// A step that failed with `error` and no output.
+fn failed(error: impl Into<String>) -> Ended {
+    Ended::Failed {
+        error: error.into(),
+        output: None,
+    }
 }
 
 impl Run {
@@ -90,7 +105,8 @@ impl Run {
     }
 
     /// Starts the runner, which adds the worktree `plan` describes with
-    /// `git`, then runs `workflow`'s steps in it, their agents with `env`.
+    /// `git`, then runs `workflow`'s steps in it, their agents and commands
+    /// with `env`.
     pub fn spawn(
         self: &Arc<Self>,
         daemon: Arc<Daemon>,
@@ -210,10 +226,17 @@ impl Run {
     }
 
     /// Ends the run in `state` with `error`, and step `position`, if one was
-    /// running, in `step_state`.
-    fn end(&self, state: RunState, error: Option<String>, step: Option<(usize, StepState)>) {
-        if let Some((position, step_state)) = step
-            && let Err(error) = self.store.set_step(&self.id, position, step_state, None)
+    /// running, in `step_state` with `output`.
+    fn end(
+        &self,
+        state: RunState,
+        error: Option<String>,
+        step: Option<(usize, StepState, Option<String>)>,
+    ) {
+        if let Some((position, step_state, output)) = &step
+            && let Err(error) =
+                self.store
+                    .set_step(&self.id, *position, *step_state, output.as_deref())
         {
             eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
         }
@@ -221,12 +244,58 @@ impl Run {
             eprintln!("oxd: saving run {}: {error}", self.id);
         }
         self.update(|record| {
-            if let Some((position, step_state)) = step {
+            if let Some((position, step_state, output)) = step {
                 record.steps[position].state = step_state;
+                record.steps[position].output = output;
             }
             record.state = state;
             record.error = error;
         });
+    }
+
+    /// Records that step `step` started `command`, and returns the command's
+    /// index among the step's commands.
+    fn start_command(&self, step: usize, kind: CommandKind, command: &str) -> usize {
+        let info = CommandInfo {
+            kind,
+            command: command.into(),
+            state: CommandState::Running,
+            exit_code: None,
+            output: String::new(),
+            truncated: false,
+        };
+        let index = self.lock().steps[step].commands.len();
+        self.save_command(step, index, &info);
+        self.update(|record| record.steps[step].commands.push(info));
+        index
+    }
+
+    /// Records how command `index` of step `step` ended.
+    fn finish_command(
+        &self,
+        step: usize,
+        index: usize,
+        state: CommandState,
+        exit_code: Option<i32>,
+        output: String,
+        truncated: bool,
+    ) {
+        let mut info = self.lock().steps[step].commands[index].clone();
+        info.state = state;
+        info.exit_code = exit_code;
+        info.output = output;
+        info.truncated = truncated;
+        self.save_command(step, index, &info);
+        self.update(|record| record.steps[step].commands[index] = info);
+    }
+
+    fn save_command(&self, step: usize, index: usize, info: &CommandInfo) {
+        if let Err(error) = self.store.save_command(&self.id, step, index, info) {
+            eprintln!(
+                "oxd: saving command {index} of step {step} of run {}: {error}",
+                self.id
+            );
+        }
     }
 
     fn cancelled(&self) -> bool {
@@ -234,9 +303,9 @@ impl Run {
     }
 }
 
-/// Adds the run's worktree, then runs each step in a new child session in
-/// it, giving each the previous step's output, or the run's input, until a
-/// step fails, the run is cancelled, or every step has succeeded.
+/// Adds the run's worktree, then runs each step in it, giving each the
+/// previous step's output, or the run's input, until a step fails, the run
+/// is cancelled, or every step has succeeded.
 async fn advance(
     run: Arc<Run>,
     daemon: Arc<Daemon>,
@@ -272,11 +341,11 @@ async fn advance(
                 run.set_step(position, StepState::Succeeded, Some(output.clone()));
                 input = output;
             }
-            Err(Ended::Failed(error)) => {
+            Err(Ended::Failed { error, output }) => {
                 run.end(
                     RunState::Failed,
                     Some(error),
-                    Some((position, StepState::Failed)),
+                    Some((position, StepState::Failed, output)),
                 );
                 return;
             }
@@ -284,7 +353,7 @@ async fn advance(
                 run.end(
                     RunState::Cancelled,
                     None,
-                    Some((position, StepState::Cancelled)),
+                    Some((position, StepState::Cancelled, None)),
                 );
                 return;
             }
@@ -298,30 +367,179 @@ struct StepContext<'a> {
     run: &'a Arc<Run>,
     daemon: &'a Arc<Daemon>,
     position: usize,
-    /// The directory the step's agent runs in.
+    /// The directory the step's agent and commands run in.
     cwd: &'a Path,
     env: &'a BTreeMap<String, String>,
 }
 
 impl StepContext<'_> {
-    /// Starts the step's session, sets its config options, prompts it with
-    /// the step's prompt and `input`, and returns the turn's final reply.
+    /// Runs the step's preconditions, its action, and its postconditions,
+    /// with `input`, and returns the step's output. An agent step whose
+    /// postcondition fails gets one repair turn, after which the
+    /// postconditions run again.
     async fn run(
         &self,
         step: &Step,
         input: &str,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<String, Ended> {
+        if let Some((_, finished)) = self
+            .checks(
+                CommandKind::Precondition,
+                &step.preconditions,
+                input,
+                cancel,
+            )
+            .await?
+        {
+            return Err(failed(format!("a precondition {}", outcome(&finished))));
+        }
+        match &step.action {
+            Action::Shell { command } => {
+                let finished = self
+                    .command(CommandKind::Shell, command, input, cancel)
+                    .await?;
+                if !finished.succeeded() {
+                    return Err(failed(format!("the command {}", outcome(&finished))));
+                }
+                if let Some((_, failure)) = self
+                    .checks(
+                        CommandKind::Postcondition,
+                        &step.postconditions,
+                        input,
+                        cancel,
+                    )
+                    .await?
+                {
+                    return Err(failed(format!("a postcondition {}", outcome(&failure))));
+                }
+                Ok(finished.stdout)
+            }
+            Action::Agent { agent, prompt } => {
+                let session = self.start_agent(agent, cancel).await?;
+                let mut blocks = vec![ContentBlock::Text(TextContent::new(prompt.clone()))];
+                if !input.is_empty() {
+                    blocks.push(ContentBlock::Text(TextContent::new(input)));
+                }
+                let reply = turn(&session, blocks, cancel).await?;
+                let Some((check, failure)) = self
+                    .checks(
+                        CommandKind::Postcondition,
+                        &step.postconditions,
+                        input,
+                        cancel,
+                    )
+                    .await?
+                else {
+                    return Ok(reply);
+                };
+                let repair = ContentBlock::Text(TextContent::new(repair_prompt(check, &failure)));
+                let reply = turn(&session, vec![repair], cancel).await?;
+                match self
+                    .checks(
+                        CommandKind::Postcondition,
+                        &step.postconditions,
+                        input,
+                        cancel,
+                    )
+                    .await?
+                {
+                    None => Ok(reply),
+                    Some((_, failure)) => Err(Ended::Failed {
+                        error: format!(
+                            "a postcondition {} after the repair turn",
+                            outcome(&failure)
+                        ),
+                        output: Some(reply),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Runs `checks` in order until one fails, and returns that one with
+    /// how it ended.
+    async fn checks<'c>(
+        &self,
+        kind: CommandKind,
+        checks: &'c [Check],
+        input: &str,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Option<(&'c Check, Finished)>, Ended> {
+        for check in checks {
+            let finished = self.command(kind, &check.shell, input, cancel).await?;
+            if !finished.succeeded() {
+                return Ok(Some((check, finished)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Runs `command` as one of the step's commands, with `input` as the
+    /// step's input, and records it. Cancelling the run stops it.
+    async fn command(
+        &self,
+        kind: CommandKind,
+        command: &str,
+        input: &str,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Finished, Ended> {
+        let index = self.run.start_command(self.position, kind, command);
+        let inputs = Inputs {
+            run: &self.run.input,
+            step: input,
+        };
+        let stop = async {
+            let _ = cancel.wait_for(|cancelled| *cancelled).await;
+        };
+        match shell::run(command, self.cwd, self.env, inputs, stop).await {
+            Ok(finished) => {
+                let state = if finished.succeeded() {
+                    CommandState::Succeeded
+                } else {
+                    CommandState::Failed
+                };
+                self.run.finish_command(
+                    self.position,
+                    index,
+                    state,
+                    finished.exit_code(),
+                    finished.output.clone(),
+                    finished.truncated,
+                );
+                Ok(finished)
+            }
+            Err(stopped) => {
+                self.run.finish_command(
+                    self.position,
+                    index,
+                    CommandState::Cancelled,
+                    None,
+                    stopped.output,
+                    stopped.truncated,
+                );
+                Err(Ended::Cancelled)
+            }
+        }
+    }
+
+    /// Starts the step's session, waits for its agent, and sets its config
+    /// options.
+    async fn start_agent(
+        &self,
+        agent: &AgentStep,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<Arc<Session>, Ended> {
         let session = self
             .daemon
             .add_step_session(
                 self.run,
                 self.position,
-                step.agent.harness,
+                agent.harness,
                 self.cwd,
                 self.env.clone(),
             )
-            .map_err(|error| Ended::Failed(format!("starting the agent: {}", error.message)))?;
+            .map_err(|error| failed(format!("starting the agent: {}", error.message)))?;
         let mut cursor = 0;
         'starting: loop {
             for event in next_events(&session, &mut cursor, cancel).await? {
@@ -329,13 +547,12 @@ impl StepContext<'_> {
                     EventKind::AgentStarted { .. } => break 'starting,
                     EventKind::AgentExited { error } => {
                         let error = error.unwrap_or_else(|| "it exited".into());
-                        return Err(Ended::Failed(format!("the agent did not start: {error}")));
+                        return Err(failed(format!("the agent did not start: {error}")));
                     }
                     _ => {}
                 }
             }
         }
-        let agent = &step.agent;
         let sets_options = [&agent.model, &agent.effort, &agent.permission_mode]
             .iter()
             .any(|value| value.is_some());
@@ -353,20 +570,49 @@ impl StepContext<'_> {
             }
         }
         configure(&session, agent, cancel).await?;
-        let mut prompt = vec![ContentBlock::Text(TextContent::new(step.prompt.clone()))];
-        if !input.is_empty() {
-            prompt.push(ContentBlock::Text(TextContent::new(input)));
+        Ok(session)
+    }
+}
+
+/// How a command ended, as a run's error gives it.
+fn outcome(finished: &Finished) -> String {
+    match finished.exit {
+        None => format!("could not start: {}", finished.output),
+        Some(_) => finished.result(),
+    }
+}
+
+/// The prompt of the repair turn after postcondition `check` failed.
+fn repair_prompt(check: &Check, failure: &Finished) -> String {
+    let mut prompt = format!(
+        "A postcondition of this step failed after your turn. Fix what it checks so that it \
+        passes, or reply with the reason you cannot.\n\nCommand:\n{}\n\nResult: {}\n",
+        check.shell.trim_end(),
+        failure.result()
+    );
+    let output = failure.output.trim_end();
+    if !output.is_empty() {
+        let _ = write!(prompt, "\nOutput:\n{output}\n");
+    }
+    prompt
+}
+
+/// Prompts the session with `prompt` and returns the turn's final reply.
+/// Cancelling the run cancels the turn.
+async fn turn(
+    session: &Session,
+    prompt: Vec<ContentBlock>,
+    cancel: &mut watch::Receiver<bool>,
+) -> Result<String, Ended> {
+    let seq = session
+        .prompt(prompt)
+        .map_err(|error| failed(format!("prompting the agent: {}", error.message)))?;
+    match final_reply(session, seq, cancel).await {
+        Err(Ended::Cancelled) => {
+            session.cancel();
+            Err(Ended::Cancelled)
         }
-        let seq = session
-            .prompt(prompt)
-            .map_err(|error| Ended::Failed(format!("prompting the agent: {}", error.message)))?;
-        match final_reply(&session, seq, cancel).await {
-            Err(Ended::Cancelled) => {
-                session.cancel();
-                Err(Ended::Cancelled)
-            }
-            result => result,
-        }
+        result => result,
     }
 }
 
@@ -408,7 +654,7 @@ async fn configure(
                 )
             })
         }) else {
-            return Err(Ended::Failed(format!("the agent has no {label} option")));
+            return Err(failed(format!("the agent has no {label} option")));
         };
         if current == *value {
             continue;
@@ -416,7 +662,7 @@ async fn configure(
         tokio::select! {
             set = session.set_config_option(config_id, ConfigValue::Id(value.clone())) => {
                 set.map_err(|error| {
-                    Ended::Failed(format!("setting the {label} to {value}: {}", error.message))
+                    failed(format!("setting the {label} to {value}: {}", error.message))
                 })?;
             }
             _ = cancel.wait_for(|cancelled| *cancelled) => return Err(Ended::Cancelled),
@@ -455,17 +701,17 @@ async fn final_reply(
                 }
                 EventKind::TurnEnded { stop_reason, error } => {
                     return match (stop_reason, error) {
-                        (_, Some(error)) => Err(Ended::Failed(error)),
+                        (_, Some(error)) => Err(failed(error)),
                         (Some(StopReason::EndTurn), None) => {
                             Ok(messages.pop().map(|(_, text)| text).unwrap_or_default())
                         }
                         (Some(StopReason::Error(stopped)), None) => {
-                            Err(Ended::Failed(stopped.error.map_or_else(
+                            Err(failed(stopped.error.map_or_else(
                                 || "the turn ended with an error".into(),
                                 |error| error.message,
                             )))
                         }
-                        (stop_reason, None) => Err(Ended::Failed(format!(
+                        (stop_reason, None) => Err(failed(format!(
                             "the turn ended with stop reason {}",
                             stop_reason_name(stop_reason.as_ref())
                         ))),
@@ -524,7 +770,7 @@ async fn next_events(
         .iter()
         .any(|event| matches!(event.kind, EventKind::SessionClosed))
     {
-        return Err(Ended::Failed("the step's session was deleted".into()));
+        return Err(failed("the step's session was deleted"));
     }
     if let Some(last) = events.last() {
         *cursor = last.seq;

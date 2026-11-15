@@ -30,6 +30,7 @@ ownership and lifecycle.
 - **Run**: One execution of a workflow in a workspace, in a worktree the run
   owns.
 - **Step**: One entry of a workflow. An agent step sends a prompt to a new
-  child session.
-- **Child session**: The session a run starts for one of its steps, in the
+  child session. A shell step runs a command in the run's worktree.
+- **Check**: A precondition or postcondition shell command of a step.
+- **Child session**: The session a run starts for one of its agent steps, in the
   run's worktree.

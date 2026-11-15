@@ -244,8 +244,8 @@ pub enum Method {
     /// that starts at `HEAD`. `input` goes to the first step. The result is
     /// the run, `running`. Refused, changing nothing, for a workflow that is
     /// not found (`NOT_FOUND`) or does not parse (`INVALID_REQUEST`), or a
-    /// workspace outside a Git working tree. Git and the steps' agents run
-    /// with `env` over the daemon's environment.
+    /// workspace outside a Git working tree. Git, the steps' agents, and
+    /// their commands run with `env` over the daemon's environment.
     #[serde(rename = "run.start")]
     RunStart {
         workspace_id: String,
@@ -254,9 +254,9 @@ pub enum Method {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
-    /// Cancels a running run: the active step's turn is cancelled, and the
-    /// step and the run end `cancelled`. Later steps do not start. Refused
-    /// for a run that is not `running`. Answers `null`.
+    /// Cancels a running run: the active step's turn or command is
+    /// cancelled, and the step and the run end `cancelled`. Later steps do
+    /// not start. Refused for a run that is not `running`. Answers `null`.
     #[serde(rename = "run.cancel")]
     RunCancel { run_id: String },
     /// Removes a run that is not `running`: stops its child sessions'
@@ -517,8 +517,8 @@ pub enum ListingChange {
     },
 }
 
-/// A run of a workflow: its steps, run one after another in child sessions
-/// in a worktree the run owns.
+/// A run of a workflow: its steps, run one after another in a worktree the
+/// run owns, each agent step in a child session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub id: String,
@@ -544,12 +544,57 @@ pub struct RunInfo {
 pub struct StepInfo {
     pub name: String,
     pub state: StepState,
-    /// The child session the step runs in, once the step has started. Unset
-    /// again when the session is deleted.
+    /// The child session the step runs in, once an agent step has started.
+    /// Unset again when the session is deleted.
     pub session_id: Option<String>,
-    /// The final reply of the step's turn, which the next step receives, once
-    /// the step has succeeded.
+    /// The final reply of the step's last turn, or a shell step's standard
+    /// output. The next step receives it once the step has succeeded. A step
+    /// whose postcondition still fails after its repair turn keeps the repair
+    /// turn's reply.
     pub output: Option<String>,
+    /// The commands the step has started, in order.
+    pub commands: Vec<CommandInfo>,
+}
+
+/// A command a step ran: a check or a shell step's command.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandInfo {
+    pub kind: CommandKind,
+    pub command: String,
+    pub state: CommandState,
+    /// Unset while the command runs, and when it was killed by a signal or
+    /// could not start.
+    pub exit_code: Option<i32>,
+    /// The command's standard output and standard error, interleaved as they
+    /// arrived, or the error of a command that could not start. Empty while
+    /// the command runs. Once it ends, the last 64 KiB.
+    pub output: String,
+    /// Whether output before the last 64 KiB was dropped.
+    pub truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    Precondition,
+    /// A shell step's command.
+    Shell,
+    Postcondition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandState {
+    Running,
+    /// It exited with status 0.
+    Succeeded,
+    /// It exited with another status, was killed by a signal, or could not
+    /// start.
+    Failed,
+    /// The run was cancelled while it ran.
+    Cancelled,
+    /// The daemon stopped while it ran.
+    Interrupted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1390,9 +1435,21 @@ mod tests {
                     "state": "failed",
                     "error": "boom",
                     "steps": [
-                        {"name": "Plan", "state": "succeeded", "session_id": "s", "output": "planned"},
-                        {"name": "Work", "state": "failed", "session_id": null, "output": null},
-                        {"name": "Review", "state": "pending", "session_id": null, "output": null}
+                        {"name": "Plan", "state": "succeeded", "session_id": "s", "output": "planned",
+                         "commands": [
+                            {"kind": "precondition", "command": "test -z \"$(git status --porcelain)\"",
+                             "state": "succeeded", "exit_code": 0, "output": "", "truncated": false},
+                            {"kind": "postcondition", "command": "make check",
+                             "state": "failed", "exit_code": null, "output": "...killed",
+                             "truncated": true}
+                         ]},
+                        {"name": "Work", "state": "failed", "session_id": null, "output": null,
+                         "commands": [
+                            {"kind": "shell", "command": "make", "state": "running",
+                             "exit_code": null, "output": "", "truncated": false}
+                         ]},
+                        {"name": "Review", "state": "pending", "session_id": null, "output": null,
+                         "commands": []}
                     ]
                 }},
                 {"type": "run_removed", "run_id": "q"}
@@ -1441,22 +1498,51 @@ mod tests {
                         state: StepState::Succeeded,
                         session_id: Some("s".into()),
                         output: Some("planned".into()),
+                        commands: vec![
+                            CommandInfo {
+                                kind: CommandKind::Precondition,
+                                command: r#"test -z "$(git status --porcelain)""#.into(),
+                                state: CommandState::Succeeded,
+                                exit_code: Some(0),
+                                output: String::new(),
+                                truncated: false,
+                            },
+                            CommandInfo {
+                                kind: CommandKind::Postcondition,
+                                command: "make check".into(),
+                                state: CommandState::Failed,
+                                exit_code: None,
+                                output: "...killed".into(),
+                                truncated: true,
+                            },
+                        ],
                     },
                     StepInfo {
                         name: "Work".into(),
                         state: StepState::Failed,
                         session_id: None,
                         output: None,
+                        commands: vec![CommandInfo {
+                            kind: CommandKind::Shell,
+                            command: "make".into(),
+                            state: CommandState::Running,
+                            exit_code: None,
+                            output: String::new(),
+                            truncated: false,
+                        }],
                     },
                     StepInfo {
                         name: "Review".into(),
                         state: StepState::Pending,
                         session_id: None,
                         output: None,
+                        commands: Vec::new(),
                     },
                 ],
             }
         );
+        let value = serde_json::to_value(run).unwrap();
+        assert_eq!(serde_json::from_value::<RunInfo>(value).unwrap(), *run);
         assert_eq!(session.workspace_id, "w");
         assert_eq!(session.title.as_deref(), Some("Fix the build"));
         assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));

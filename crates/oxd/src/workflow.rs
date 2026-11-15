@@ -1,5 +1,6 @@
 //! Workflow definitions: YAML files in the daemon's workflows directory, each
-//! a named sequence of agent steps.
+//! a named sequence of agent and shell steps, each step with optional
+//! preconditions and postconditions.
 
 use std::io;
 use std::path::Path;
@@ -16,13 +17,65 @@ pub struct Workflow {
     pub steps: Vec<Step>,
 }
 
-/// An agent step: a prompt sent to a new child session.
+/// A step: its action, with the checks that run before and after it.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "StepFields")]
 pub struct Step {
     pub name: String,
-    pub agent: AgentStep,
-    pub prompt: String,
+    pub action: Action,
+    pub preconditions: Vec<Check>,
+    pub postconditions: Vec<Check>,
+}
+
+/// What a step runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// A prompt sent to a new child session.
+    Agent { agent: AgentStep, prompt: String },
+    /// A command run with `/bin/sh -c` in the run's checkout.
+    Shell { command: String },
+}
+
+/// A shell command that passes when it exits with status 0.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Check {
+    pub shell: String,
+}
+
+/// A step as the definition gives it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StepFields {
+    name: String,
+    agent: Option<AgentStep>,
+    prompt: Option<String>,
+    shell: Option<String>,
+    preconditions: Option<Vec<Check>>,
+    postconditions: Option<Vec<Check>>,
+}
+
+impl TryFrom<StepFields> for Step {
+    type Error = String;
+
+    fn try_from(fields: StepFields) -> Result<Self, String> {
+        let action = match (fields.agent, fields.prompt, fields.shell) {
+            (Some(agent), Some(prompt), None) => Action::Agent { agent, prompt },
+            (None, None, Some(command)) => Action::Shell { command },
+            _ => {
+                return Err(format!(
+                    "step {} needs either agent and prompt, or shell",
+                    fields.name
+                ));
+            }
+        };
+        Ok(Self {
+            name: fields.name,
+            action,
+            preconditions: fields.preconditions.unwrap_or_default(),
+            postconditions: fields.postconditions.unwrap_or_default(),
+        })
+    }
 }
 
 /// The harness a step runs, and the values of its config options. Each value
@@ -77,6 +130,12 @@ fn parse(text: &str) -> Result<Workflow, String> {
 mod tests {
     use super::*;
 
+    fn check(shell: &str) -> Check {
+        Check {
+            shell: shell.into(),
+        }
+    }
+
     #[test]
     fn steps_share_an_agent_through_an_alias() {
         let workflow = parse(
@@ -109,13 +168,21 @@ steps:
                 steps: vec![
                     Step {
                         name: "Plan".into(),
-                        agent: claude.clone(),
-                        prompt: "Write a plan.\n".into(),
+                        action: Action::Agent {
+                            agent: claude.clone(),
+                            prompt: "Write a plan.\n".into(),
+                        },
+                        preconditions: Vec::new(),
+                        postconditions: Vec::new(),
                     },
                     Step {
                         name: "Review".into(),
-                        agent: claude,
-                        prompt: "Review it.".into(),
+                        action: Action::Agent {
+                            agent: claude,
+                            prompt: "Review it.".into(),
+                        },
+                        preconditions: Vec::new(),
+                        postconditions: Vec::new(),
                     },
                 ],
             }
@@ -123,18 +190,110 @@ steps:
     }
 
     #[test]
+    fn shell_steps_and_checks_parse() {
+        let workflow = parse(
+            "name: Checked
+steps:
+  - name: Build
+    shell: make
+    postconditions:
+      - shell: test -f out
+  - name: Plan
+    agent: {harness: pi}
+    preconditions:
+      - shell: test -z \"$(git status --porcelain)\"
+      - shell: |
+          set -eu
+          true
+    prompt: Plan.
+    postconditions:
+      - shell: test -n plan
+",
+        )
+        .unwrap();
+        assert_eq!(
+            workflow.steps,
+            [
+                Step {
+                    name: "Build".into(),
+                    action: Action::Shell {
+                        command: "make".into()
+                    },
+                    preconditions: Vec::new(),
+                    postconditions: vec![check("test -f out")],
+                },
+                Step {
+                    name: "Plan".into(),
+                    action: Action::Agent {
+                        agent: AgentStep {
+                            harness: Harness::Pi,
+                            model: None,
+                            effort: None,
+                            permission_mode: None,
+                        },
+                        prompt: "Plan.".into(),
+                    },
+                    preconditions: vec![
+                        check(r#"test -z "$(git status --porcelain)""#),
+                        check("set -eu\ntrue\n"),
+                    ],
+                    postconditions: vec![check("test -n plan")],
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn a_definition_without_steps_or_with_an_unknown_field_is_refused() {
+        let either = "step Plan needs either agent and prompt, or shell";
         for (text, expected) in [
             ("name: Empty\nsteps: []\n", "no steps"),
             (
-                "name: Checked
+                "name: Retried
 steps:
   - name: Plan
     agent: {harness: pi}
     prompt: Plan.
+    retries: 2
+",
+                "retries",
+            ),
+            (
+                "name: Both
+steps:
+  - name: Plan
+    agent: {harness: pi}
+    prompt: Plan.
+    shell: make
+",
+                either,
+            ),
+            (
+                "name: Neither
+steps:
+  - name: Plan
     postconditions: []
 ",
-                "postconditions",
+                either,
+            ),
+            (
+                "name: Prompt only
+steps:
+  - name: Plan
+    prompt: Plan.
+",
+                either,
+            ),
+            (
+                "name: Timed check
+steps:
+  - name: Build
+    shell: make
+    postconditions:
+      - shell: test -f out
+        timeout: 5
+",
+                "timeout",
             ),
         ] {
             let error = parse(text).unwrap_err();

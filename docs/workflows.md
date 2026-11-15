@@ -1,8 +1,11 @@
 # Workflows
 
-A workflow is a named sequence of agent steps. A run of a workflow gets its
-own worktree, and each step runs in a new child session in that worktree.
-The final reply of each step becomes the input of the next.
+A workflow is a named sequence of agent steps and shell steps. A run of a
+workflow gets its own worktree, and every step runs in it: an agent step in a
+new child session, a shell step as a command. The output of each step, an
+agent's final reply or a command's standard output, becomes the input of the
+next. Any step can have checks: shell commands that must pass before and
+after it.
 
 ## Defining a workflow
 
@@ -35,9 +38,13 @@ YAML anchors and aliases let steps share an agent. The daemon reads a
 definition when a run starts, and refuses a definition that does not parse,
 has no steps, or has a field this page does not list.
 
+Each step has a `name`, and either `agent` and `prompt` for an agent step, or
+`shell` for a shell step. Either kind can have `preconditions` and
+`postconditions`.
+
 ## Agent steps
 
-Each step has a `name`, a `prompt`, and an `agent`:
+An agent step has a `prompt` and an `agent`:
 
 | Field | Value |
 | --- | --- |
@@ -52,14 +59,153 @@ for Pi. The step's session is set to each value it gives before the prompt is
 sent. A value the harness has no option for, or refuses, fails the run at
 that step with the reason.
 
+## Shell steps
+
+A shell step runs its `shell` command with `/bin/sh -c` in the run's
+checkout, with stdin closed:
+
+```yaml
+  - name: Stage
+    shell: git add -A && git diff --cached --name-only
+```
+
+Commands run with the environment of the client that started the run over
+the daemon's, as agents do. `OX_RUN_INPUT` holds the run's input, and
+`OX_STEP_INPUT` the step's input: the previous step's output, or the run's
+input for the first step. A command reads them as `"$OX_STEP_INPUT"`. The
+command's standard output is the step's output. A non-zero exit fails the run
+with the exit status.
+
+## Checks
+
+`preconditions` and `postconditions` are lists of checks, each a `shell`
+command that passes when it exits with status 0. Checks run in the run's
+checkout with the same environment and variables as shell steps.
+
+```yaml
+    preconditions:
+      - shell: test -z "$(git status --porcelain)"
+    postconditions:
+      - shell: test -f token.txt
+```
+
+The preconditions run in order before the step, and the first one that fails
+fails the run; an agent step's session is not started. The postconditions run
+in order after the step, stopping at the first that fails. A failed
+postcondition of a shell step fails the run.
+
+When a postcondition of an agent step fails, the same session gets one repair
+turn with this prompt:
+
+```text
+A postcondition of this step failed after your turn. Fix what it checks so that it passes, or reply with the reason you cannot.
+
+Command:
+<command>
+
+Result: <exited with status n | was killed by signal n | could not start>
+
+Output:
+<output>
+```
+
+The `Output:` section is left out when the command printed nothing. After the
+repair turn, every postcondition runs again from the first. If one still
+fails, the run fails, and the step keeps the repair turn's reply as its
+output, so the agent's reason appears beside the failed check. Otherwise the
+step succeeds, and the repair turn's reply is its output.
+
+Each step lists the commands it ran in `commands`, with their kind, result,
+exit code, and output: standard output and standard error interleaved as they
+arrived. A command's output is recorded when it ends, and only its last
+64 KiB is kept. A shell step hands its whole standard output to the next step.
+
+## A full workflow
+
+This workflow plans, implements, reviews, and commits a change. Plan, Work,
+and Review each stage a new file, and their postconditions check that it is
+staged. Plan's precondition requires a clean checkout and records the
+starting commit in Git's metadata, and Commit's postcondition checks that the
+run made one commit and left the checkout clean.
+
+```yaml
+name: Plan, Work, Review, Commit
+
+steps:
+  - name: Plan
+    agent: &claude
+      harness: claude
+      model: claude-opus-5-5
+      effort: high
+      permission_mode: manual
+    preconditions:
+      - shell: |
+          set -eu
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          start_head=$(git rev-parse HEAD)
+          start_head_file=$(git rev-parse --git-path ox-workflow-start-head)
+          printf '%s\n' "$start_head" > "$start_head_file"
+    prompt: |
+      Write an implementation plan for the task in your input.
+      Save it as a new file under .agents/plans/ and stage it.
+    postconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/plans/)"
+
+  - name: Work
+    agent:
+      harness: pi
+      model: openai-codex/gpt-6.1-terra
+      effort: high
+    prompt: |
+      Implement the newly staged plan under .agents/plans/.
+      Write a new work log under .agents/work/ describing the changes and verification.
+      Stage the implementation and work log for the final commit.
+    postconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/work/)"
+
+  - name: Review
+    agent: *claude
+    prompt: |
+      Review the staged implementation against the staged plan under .agents/plans/.
+      Read the staged work log under .agents/work/ for verification details.
+      Save your findings as a new file under .agents/reviews/ and stage it.
+    postconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/reviews/)"
+
+  - name: Commit
+    agent:
+      harness: claude
+      model: claude-haiku-5-5
+      effort: low
+      permission_mode: manual
+    prompt: |
+      Read the staged diff, work log, and review record.
+      Write a commit message that describes what changed and why.
+      Commit the staged implementation and all three records together.
+    postconditions:
+      - shell: |
+          set -eu
+          start_head_file=$(git rev-parse --git-path ox-workflow-start-head)
+          start_head=$(cat "$start_head_file")
+          test "$(git rev-parse HEAD^ 2>/dev/null)" = "$start_head"
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          rm "$start_head_file"
+```
+
 ## Running a workflow
 
 `oxctl run start --workspace <workspace id> <workflow> <input>` starts a run
 and prints its ID. The run's worktree is on a new branch
 `ox/<first 8 digits of the worktree's ID>` that starts at the workspace
 checkout's `HEAD`, as for [New Task](worktrees.md#choosing-a-checkout).
-`oxctl run wait <run id>` prints the run as JSON once it ends, and fails
-unless the run succeeded.
+`oxctl run wait <run id>` prints the run as JSON once it ends, and unless
+the run succeeded fails with its state and error, such as
+`the run failed: a postcondition exited with status 1 after the repair turn`.
 
 The run continues when every client disconnects. Each child session is an
 ordinary session of the workspace: a client can follow it and answer its
@@ -71,15 +217,17 @@ A step's prompt and its input go to the agent as two text blocks, prompt
 first. The first step's input is the text the run was started with; an
 empty input sends the prompt alone.
 
-A step succeeds when its turn ends with the `end_turn` stop reason. Its output
-is the text of the last agent message of that turn, which becomes the next
-step's input. A turn that ends any other way fails the run with its error or
+An agent step's turn succeeds when it ends with the `end_turn` stop reason.
+Its output is the text of the last agent message of that turn, which becomes
+the next step's input. A turn that ends any other way fails the run with its error or
 stop reason, and the later steps stay pending.
 
 ## Cancelling, removing, and restarting
 
-`oxctl run cancel <run id>` cancels the active step's turn. The step and the
-run end `cancelled`, and later steps stay pending. The child session's agent
+`oxctl run cancel <run id>` cancels the active step's turn, or stops its
+running command: the command's process group gets `SIGTERM`, and `SIGKILL`
+if the command has not exited 5 seconds later. The step and the run end
+`cancelled`, and later steps stay pending. The child session's agent
 stays running, so the session can be prompted, and the worktree keeps its
 changes.
 
@@ -92,5 +240,6 @@ Deleting or archiving a child session leaves the run's worktree and its
 other child sessions. The step keeps its state and output.
 
 A run that is running when the daemon stops ends `interrupted`, with its
-running step `interrupted`. It keeps its record and its child sessions'
+running step and command `interrupted`. The daemon kills a running command's
+process group as it stops. It keeps its record and its child sessions'
 history, and its child sessions can be loaded.

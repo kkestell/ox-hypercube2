@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ox_protocol::{Event, EventKind, RunState, StepInfo, StepState};
+use ox_protocol::{CommandInfo, CommandState, Event, EventKind, RunState, StepInfo, StepState};
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
@@ -156,6 +156,20 @@ impl Store {
                 session_id TEXT    REFERENCES sessions(id) ON DELETE SET NULL,
                 output     TEXT,
                 PRIMARY KEY (run_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS run_commands (
+                run_id    TEXT    NOT NULL,
+                step      INTEGER NOT NULL,
+                position  INTEGER NOT NULL,
+                kind      TEXT    NOT NULL,
+                command   TEXT    NOT NULL,
+                state     TEXT    NOT NULL,
+                exit_code INTEGER,
+                output    TEXT    NOT NULL,
+                truncated INTEGER NOT NULL,
+                PRIMARY KEY (run_id, step, position),
+                FOREIGN KEY (run_id, step) REFERENCES run_steps(run_id, position)
+                    ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -416,6 +430,10 @@ impl Store {
             "SELECT name, state, session_id, output FROM run_steps
             WHERE run_id = ?1 ORDER BY position",
         )?;
+        let mut commands = connection.prepare(
+            "SELECT kind, command, state, exit_code, output, truncated FROM run_commands
+            WHERE run_id = ?1 AND step = ?2 ORDER BY position",
+        )?;
         for run in &mut runs {
             run.steps = steps
                 .query_map([&run.id], |row| {
@@ -424,11 +442,54 @@ impl Store {
                         state: parse_state(row, 1)?,
                         session_id: row.get(2)?,
                         output: row.get(3)?,
+                        commands: Vec::new(),
                     })
                 })?
                 .collect::<rusqlite::Result<_>>()?;
+            for (position, step) in run.steps.iter_mut().enumerate() {
+                step.commands = commands
+                    .query_map(params![run.id, position_value(position)], |row| {
+                        Ok(CommandInfo {
+                            kind: parse_state(row, 0)?,
+                            command: row.get(1)?,
+                            state: parse_state(row, 2)?,
+                            exit_code: row.get(3)?,
+                            output: row.get(4)?,
+                            truncated: row.get(5)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+            }
         }
         Ok(runs)
+    }
+
+    /// Saves command `position` of step `step` of run `run_id`, replacing
+    /// what was saved for it.
+    pub fn save_command(
+        &self,
+        run_id: &str,
+        step: usize,
+        position: usize,
+        command: &CommandInfo,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "INSERT OR REPLACE INTO run_commands
+                (run_id, step, position, kind, command, state, exit_code, output, truncated)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                run_id,
+                position_value(step),
+                position_value(position),
+                state_name(command.kind),
+                command.command,
+                state_name(command.state),
+                command.exit_code,
+                command.output,
+                command.truncated
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn set_run_state(
@@ -458,7 +519,7 @@ impl Store {
         Ok(())
     }
 
-    /// Marks the runs and steps that were running `interrupted`.
+    /// Marks the runs, steps, and commands that were running `interrupted`.
     pub fn interrupt_runs(&self) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
@@ -476,11 +537,18 @@ impl Store {
                 state_name(StepState::Interrupted),
             ],
         )?;
+        transaction.execute(
+            "UPDATE run_commands SET state = ?2 WHERE state = ?1",
+            [
+                state_name(CommandState::Running),
+                state_name(CommandState::Interrupted),
+            ],
+        )?;
         transaction.commit()
     }
 
-    /// Deletes a run, with its steps, its child sessions and their events,
-    /// and its worktree.
+    /// Deletes a run, with its steps and their commands, its child sessions
+    /// and their events, and its worktree.
     pub fn remove_run(&self, id: &str) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
@@ -592,7 +660,8 @@ fn position_value(position: usize) -> i64 {
     i64::try_from(position).expect("step positions fit an i64")
 }
 
-/// A run's or step's state as its column holds it: its name on the wire.
+/// A run's, step's, or command's state, or a command's kind, as its column
+/// holds it: its name on the wire.
 fn state_name(state: impl serde::Serialize) -> String {
     match serde_json::to_value(state).expect("a state serializes") {
         serde_json::Value::String(name) => name,
@@ -600,7 +669,7 @@ fn state_name(state: impl serde::Serialize) -> String {
     }
 }
 
-/// The run or step state in column `index`.
+/// The state or kind in column `index`.
 fn parse_state<T: serde::de::DeserializeOwned>(
     row: &rusqlite::Row<'_>,
     index: usize,
@@ -660,6 +729,8 @@ fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
 
 #[cfg(test)]
 mod tests {
+    use ox_protocol::CommandKind;
+
     use super::*;
 
     fn store() -> Store {
@@ -988,6 +1059,18 @@ mod tests {
             state,
             session_id: None,
             output: None,
+            commands: Vec::new(),
+        }
+    }
+
+    fn command_info(kind: CommandKind, command: &str, state: CommandState) -> CommandInfo {
+        CommandInfo {
+            kind,
+            command: command.into(),
+            state,
+            exit_code: None,
+            output: String::new(),
+            truncated: false,
         }
     }
 
@@ -1058,6 +1141,7 @@ mod tests {
                 state: StepState::Succeeded,
                 session_id: Some("s".into()),
                 output: Some("planned".into()),
+                commands: Vec::new(),
             },
             step("Work", StepState::Failed),
         ];
@@ -1070,6 +1154,37 @@ mod tests {
             store.sessions().unwrap()[0].worktree_id.as_deref(),
             Some("two")
         );
+    }
+
+    #[test]
+    fn a_run_s_commands_round_trip_in_order() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        let mut run = add_run(&store, "r");
+        let precondition = command_info(CommandKind::Precondition, "true", CommandState::Running);
+        let failed = CommandInfo {
+            exit_code: Some(1),
+            output: "...dirty".into(),
+            truncated: true,
+            ..command_info(
+                CommandKind::Postcondition,
+                "test -z dirty",
+                CommandState::Failed,
+            )
+        };
+        let shell = command_info(CommandKind::Shell, "make", CommandState::Running);
+        store.save_command("r", 0, 0, &precondition).unwrap();
+        store.save_command("r", 0, 1, &failed).unwrap();
+        store.save_command("r", 1, 0, &shell).unwrap();
+        let precondition = CommandInfo {
+            state: CommandState::Succeeded,
+            exit_code: Some(0),
+            ..precondition
+        };
+        store.save_command("r", 0, 0, &precondition).unwrap();
+        run.steps[0].commands = vec![precondition, failed];
+        run.steps[1].commands = vec![shell];
+        assert_eq!(store.runs().unwrap(), [run]);
     }
 
     #[test]
@@ -1092,6 +1207,9 @@ mod tests {
         add_step_session(&store, "s", "r", 0);
         add_step_session(&store, "t", "r", 1);
         add_step_session(&store, "u", "q", 0);
+        let make = command_info(CommandKind::Shell, "make", CommandState::Succeeded);
+        store.save_command("r", 0, 0, &make).unwrap();
+        store.save_command("q", 0, 0, &make).unwrap();
         store.log(vec![exited("s", 1), exited("u", 1)]);
         store.flush().await;
         store.remove_run("r").unwrap();
@@ -1105,15 +1223,29 @@ mod tests {
         assert!(store.events("s").unwrap().is_empty());
         assert_eq!(store.worktrees().unwrap(), [worktree("q")]);
         assert_eq!(count(&store, "run_steps"), 2);
+        assert_eq!(count(&store, "run_commands"), 1);
         assert_eq!(store.runs().unwrap()[0].id, other.id);
     }
 
     #[test]
-    fn interrupting_runs_marks_only_running_runs_and_steps() {
+    fn interrupting_runs_marks_only_running_runs_steps_and_commands() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         add_run(&store, "running");
         add_run(&store, "done");
+        for (position, state) in [CommandState::Failed, CommandState::Running]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .save_command(
+                    "running",
+                    1,
+                    position,
+                    &command_info(CommandKind::Postcondition, "true", state),
+                )
+                .unwrap();
+        }
         store
             .set_step("running", 0, StepState::Succeeded, Some("planned"))
             .unwrap();
@@ -1149,6 +1281,12 @@ mod tests {
                 ),
             ]
         );
+        let commands: Vec<_> = store.runs().unwrap()[0].steps[1]
+            .commands
+            .iter()
+            .map(|command| command.state)
+            .collect();
+        assert_eq!(commands, [CommandState::Failed, CommandState::Interrupted]);
     }
 
     #[test]

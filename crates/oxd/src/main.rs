@@ -17,6 +17,7 @@ mod files;
 mod mcp;
 mod run;
 mod session;
+mod shell;
 mod state;
 mod store;
 mod workflow;

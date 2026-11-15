@@ -65,6 +65,13 @@
 //! - `mcp-title <text>`: start the session's stdio MCP server named `ox`,
 //!   call its `set_title` tool with the rest of the line, and send the tool
 //!   result's text, or the error, as one chunk
+//! - `shell <JSON string>`: run the decoded text with `sh -c` in the
+//!   session's cwd and append its standard output to the turn's message. A
+//!   non-zero exit ends the turn with the stop reason `error` and the
+//!   command's standard error as its message
+//! - `next <JSON string>`: run the decoded text as the script of the
+//!   session's next prompt, in place of that prompt's text. The prompt is
+//!   still echoed as a `user_message`
 //!
 //! The agent advertises `session.mcp.stdio` and keeps the MCP servers of
 //! `session/new` and `session/resume`. It accepts image and embedded
@@ -179,6 +186,9 @@ struct State {
     form_elicitation: AtomicBool,
     /// Each session's MCP servers, by session ID.
     mcp_servers: Mutex<HashMap<String, Vec<acp::McpServer>>>,
+    /// The script of each session's next prompt, set by `next`, by session
+    /// ID.
+    next: Mutex<HashMap<String, String>>,
 }
 
 impl State {
@@ -189,6 +199,15 @@ impl State {
             .unwrap()
             .insert(session_id.to_string(), path.clone());
         path
+    }
+
+    /// The session's cwd, which holds its log.
+    fn cwd(&self, session_id: &acp::SessionId) -> Option<PathBuf> {
+        self.logs
+            .lock()
+            .unwrap()
+            .get(&session_id.to_string())
+            .and_then(|log| log.parent().map(Path::to_path_buf))
     }
 
     fn record(&self, session_id: &acp::SessionId, role: &str, text: &str) {
@@ -382,6 +401,7 @@ async fn main() -> agent_client_protocol::Result<()> {
         deferred_rejection: Mutex::new(None),
         form_elicitation: AtomicBool::new(false),
         mcp_servers: Mutex::default(),
+        next: Mutex::default(),
     });
     agent_client_protocol::Agent
         .v2()
@@ -617,7 +637,13 @@ async fn main() -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     // A prompt the agent cannot run is answered with an
                     // error: it was not inserted.
-                    let script = script(&request.prompt);
+                    let text = script(&request.prompt);
+                    let script = state
+                        .next
+                        .lock()
+                        .unwrap()
+                        .remove(&request.session_id.to_string())
+                        .unwrap_or_else(|| text.clone());
                     if script == "deferred-reject" {
                         state_update(&connection, &request.session_id, running())?;
                         state_update(
@@ -639,7 +665,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         Err(error) => return responder.respond_with_error(error),
                     };
                     state.cancelled.send_replace(false);
-                    state.record(&request.session_id, "user", &script);
+                    state.record(&request.session_id, "user", &text);
                     let id = message_id();
                     notify(
                         &connection,
@@ -696,6 +722,8 @@ enum Directive {
     Touch,
     Tool(String),
     McpTitle(String),
+    Shell(String),
+    Next(String),
     BackgroundStart(String),
     BackgroundEnd(String),
     Exit(i32),
@@ -752,6 +780,8 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["touch"] => Directive::Touch,
             ["tool", ..] => Directive::Tool(rest("tool")),
             ["mcp-title", ..] => Directive::McpTitle(rest("mcp-title")),
+            ["shell", ..] => Directive::Shell(json_after(line, 1)?),
+            ["next", ..] => Directive::Next(json_after(line, 1)?),
             ["background-start", name] => Directive::BackgroundStart((*name).to_owned()),
             ["background-end", name] => Directive::BackgroundEnd((*name).to_owned()),
             ["exit", code] => Directive::Exit(parse_number(code)?),
@@ -982,6 +1012,34 @@ async fn run(
                     None => "no ox MCP server".to_owned(),
                 };
                 say(text)?;
+            }
+            Directive::Shell(command) => {
+                let mut shell = tokio::process::Command::new("sh");
+                shell.arg("-c").arg(&command);
+                if let Some(cwd) = state.cwd(&session_id) {
+                    shell.current_dir(cwd);
+                }
+                let output = shell
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .map_err(|error| Error::internal_error().data(error.to_string()))?;
+                if !output.status.success() {
+                    return Ok(acp::StopReason::Error(acp::ErrorStopReason::new().error(
+                        acp::Error::new(-32603, String::from_utf8_lossy(&output.stderr)),
+                    )));
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+                if !stdout.is_empty() {
+                    say(stdout)?;
+                }
+            }
+            Directive::Next(script) => {
+                state
+                    .next
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_string(), script);
             }
             Directive::BackgroundStart(name) => {
                 let tool = format!("bg-{name}");

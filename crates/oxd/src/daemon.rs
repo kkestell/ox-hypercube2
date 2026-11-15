@@ -901,6 +901,7 @@ impl Daemon {
                     state: StepState::Pending,
                     session_id: None,
                     output: None,
+                    commands: Vec::new(),
                 })
                 .collect(),
         };
