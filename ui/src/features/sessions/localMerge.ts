@@ -1,7 +1,7 @@
 // The wording of a local merge session's git status, shared by its row and
 // its Merge button.
 
-import type { Comparison, SessionInfo } from "../../lib/protocol";
+import type { Comparison, SessionInfo, WorktreeInfo } from "../../lib/protocol";
 
 function commits(count: number) {
   return count === 1 ? "1 commit" : `${count} commits`;
@@ -32,12 +32,14 @@ export function mergeBlocker(compare: string, comparison: Comparison): string | 
 
 /**
  * The comparison ref and comparison of a session that follows local merge:
- * one not archived, with a comparison ref. Null for other sessions.
+ * one not archived, in a worktree with a comparison ref. Null for other
+ * sessions.
  */
 export function localMerge(
   session: SessionInfo,
+  worktree: WorktreeInfo | undefined,
 ): { compare: string; comparison: Comparison } | null {
-  const compare = session.worktree?.compare;
-  if (session.archived || compare == null || session.comparison === null) return null;
-  return { compare, comparison: session.comparison };
+  const compare = worktree?.compare;
+  if (session.archived || compare == null || worktree?.comparison == null) return null;
+  return { compare, comparison: worktree.comparison };
 }

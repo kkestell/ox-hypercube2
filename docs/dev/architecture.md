@@ -107,7 +107,7 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 ## Persistence and recovery
 
 `oxd` is the only writer of the SQLite database beside its socket. The
-database holds workspace and session metadata, worktree ownership,
+database holds workspace and session metadata, worktrees with their
 comparison refs, archive state, and conversation events.
 The database schema has no migrations.
 
@@ -170,12 +170,18 @@ worktree owned by Ox. The daemon uses the Git CLI for repository operations.
 [Where sessions run](../worktrees.md) owns checkout choices, branch
 comparisons, merge behavior, and cleanup rules.
 
-Worktree creation separates reserving and saving the session from adding
-the worktree and launching the agent. The daemon records the worktree and
-branch ownership before returning a starting session. Failure to add the
-worktree triggers cleanup of the partial worktree and of a newly created
-branch still at its starting commit. Restart cleanup revisits sessions that
-never started, preserving worktrees whose removal would lose work.
+The daemon saves each worktree as its own record and lists it to clients as
+its own entry, which a session refers to by ID. A worktree computes one
+branch comparison and publishes it with its entry.
+
+Worktree creation separates reserving and saving the worktree and its
+session from adding the worktree. The daemon records the worktree and branch
+ownership before returning a starting session, and launches the session's
+agent once the worktree is added. Failure to add the worktree triggers
+cleanup of the partial worktree and of a newly created branch still at its
+starting commit, and the worktree's record is removed. Restart cleanup
+removes worktrees in which no agent ever started, together with their
+sessions, and keeps worktrees whose removal would lose work.
 
 Each worktree records the repository's common Git directory, so cleanup and
 branch operations do not depend on the workspace directory still existing.

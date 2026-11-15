@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use crate::messages::{
     Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
     HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo,
-    WorkspaceInfo,
+    WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -622,24 +622,24 @@ impl Client {
         .await
     }
 
-    /// Sets or clears the session's comparison ref and returns the session
+    /// Sets or clears the worktree's comparison ref and returns the worktree
     /// with its comparison recomputed.
     pub async fn set_compare(
         &self,
-        session_id: &str,
+        worktree_id: &str,
         compare: Option<String>,
-    ) -> Result<SessionInfo, Error> {
-        self.call(Method::SessionSetCompare {
-            session_id: session_id.into(),
+    ) -> Result<WorktreeInfo, Error> {
+        self.call(Method::WorktreeSetCompare {
+            worktree_id: worktree_id.into(),
             compare,
         })
         .await
     }
 
-    /// Recomputes the session's comparison and returns the session.
-    pub async fn refresh(&self, session_id: &str) -> Result<SessionInfo, Error> {
-        self.call(Method::SessionRefresh {
-            session_id: session_id.into(),
+    /// Recomputes the worktree's comparison and returns the worktree.
+    pub async fn refresh(&self, worktree_id: &str) -> Result<WorktreeInfo, Error> {
+        self.call(Method::WorktreeRefresh {
+            worktree_id: worktree_id.into(),
         })
         .await
     }

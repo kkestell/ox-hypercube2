@@ -1,6 +1,8 @@
-//! Worktrees that sessions run in: resolving and creating a session's
-//! branch, adding its worktree, undoing both when the worktree cannot be
-//! added, and removing the worktree and the branch when the session goes.
+//! Worktrees that sessions run in: resolving and creating a worktree's
+//! branch, adding the worktree, undoing both when it cannot be added, and
+//! removing the worktree and the branch when its session goes. A
+//! [`Worktree`] is the daemon's live record of one, which publishes how its
+//! branch compares with its comparison ref.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -8,10 +10,14 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use ox_protocol::{ErrorBody, WorktreeBranch, WorktreeInfo, code};
+use ox_protocol::{Comparison, ErrorBody, WorktreeBranch, WorktreeInfo, code};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::{Notify, watch};
+use tokio::task::JoinHandle;
 
 use crate::daemon::invalid_request;
 use crate::store::SavedWorktree;
@@ -238,10 +244,10 @@ impl<'a> Repository<'a> {
     }
 }
 
-/// How a session's branch comes to exist.
+/// How a worktree's branch comes to exist.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Kind {
-    /// A branch created from `base`, with no upstream: the session's
+    /// A branch created from `base`, with no upstream: the worktree's
     /// `ox/<id8>` branch, or a new branch the client named.
     New,
     /// A local branch that already exists.
@@ -254,6 +260,7 @@ enum Kind {
 /// A worktree to add for a new session, resolved and checked.
 #[derive(Debug)]
 pub struct WorktreePlan {
+    id: String,
     /// The top level of the workspace's checkout, where git runs.
     top: PathBuf,
     /// The repository's absolute common Git directory.
@@ -272,24 +279,22 @@ pub struct WorktreePlan {
 }
 
 impl WorktreePlan {
-    /// The worktree as the session saves it.
+    /// The worktree as the daemon saves it.
     pub fn saved(&self) -> SavedWorktree {
         SavedWorktree {
-            info: WorktreeInfo {
-                path: self.path.clone(),
-                branch: self.branch.clone(),
-                base: self.base.clone(),
-                created_branch: self.kind != Kind::Existing,
-                compare: self.compare.clone(),
-            },
+            id: self.id.clone(),
+            path: self.path.clone(),
+            branch: self.branch.clone(),
+            base: self.base.clone(),
+            created_branch: self.kind != Kind::Existing,
+            compare: self.compare.clone(),
             common_dir: self.common_dir.clone(),
         }
     }
 }
 
-/// Resolves the worktree for session `session_id` in `workspace`, on
-/// `branch`, or on a new branch named for the session that starts at `HEAD`
-/// when there is none, compared with `compare`. Refuses, having changed
+/// Resolves worktree `worktree_id` of `workspace`, on `branch`, or on a new
+/// branch named for the worktree that starts at `HEAD` when there is none, compared with `compare`. Refuses, having changed
 /// nothing, a workspace outside a Git working tree, an existing branch that
 /// is not there or is checked out, a new branch whose name is taken, a start
 /// point or comparison ref that is not a commit, or a worktree directory in
@@ -300,7 +305,7 @@ pub async fn plan(
     branch: Option<WorktreeBranch>,
     compare: Option<String>,
     worktrees_dir: &Path,
-    session_id: &str,
+    worktree_id: &str,
 ) -> Result<WorktreePlan, ErrorBody> {
     let output = git
         .run(
@@ -326,7 +331,7 @@ pub async fn plan(
         .file_name()
         .ok_or_else(|| not_a_working_tree(workspace, ""))?;
 
-    let id8 = &session_id[..8];
+    let id8 = &worktree_id[..8];
     let mut directory = OsString::from(name);
     directory.push(format!("-{id8}"));
     let path = worktrees_dir.join(directory);
@@ -378,6 +383,7 @@ pub async fn plan(
         }
     }
     Ok(WorktreePlan {
+        id: worktree_id.to_owned(),
         cwd: path.join(&prefix),
         top,
         common_dir,
@@ -624,8 +630,8 @@ pub async fn add(git: &Git, plan: &WorktreePlan) -> Result<(), String> {
 }
 
 /// Adds the worktree again at its saved path, on its saved branch.
-pub async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
-    let path = worktree.info.path.as_path();
+async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
+    let path = worktree.path.as_path();
     if let Some(dir) = path.parent() {
         tokio::fs::create_dir_all(dir)
             .await
@@ -640,7 +646,7 @@ pub async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBod
             &"add",
             &"--end-of-options",
             &path,
-            &worktree.info.branch,
+            &worktree.branch,
         ])
         .await?;
     Ok(())
@@ -661,7 +667,7 @@ pub async fn roll_back(git: &Git, plan: &WorktreePlan, added: bool) -> Result<()
         failures.push(error.to_string());
     }
     if plan.kind != Kind::Existing {
-        // Another session's worktree may have checked the branch out
+        // Another worktree may have checked the branch out
         // meanwhile, which is what made `add` fail.
         match checked_out_at(&Repository::new(git, &plan.common_dir), &plan.branch).await {
             Ok(Some(_)) => {}
@@ -695,8 +701,8 @@ async fn delete_branch(git: &Git, plan: &WorktreePlan) -> Result<(), String> {
 /// worktree git can no longer use, because its repository is gone or no
 /// longer knows it, cannot be checked, which is listed too. A worktree
 /// directory that no longer exists has nothing to lose.
-pub async fn unsaved(git: &Git, worktree: &SavedWorktree) -> Result<Vec<String>, GitError> {
-    let path = worktree.info.path.as_path();
+async fn unsaved(git: &Git, worktree: &SavedWorktree) -> Result<Vec<String>, GitError> {
+    let path = worktree.path.as_path();
     if path.symlink_metadata().is_err() {
         return Ok(Vec::new());
     }
@@ -733,7 +739,7 @@ pub async fn unsaved(git: &Git, worktree: &SavedWorktree) -> Result<Vec<String>,
     if !status.is_empty() {
         unsaved.push(format!("uncommitted changes in {}", path.display()));
     }
-    let base = worktree.info.base.as_str();
+    let base = worktree.base.as_str();
     let detached = git
         .text(
             path,
@@ -795,7 +801,7 @@ pub async fn unsaved(git: &Git, worktree: &SavedWorktree) -> Result<Vec<String>,
 }
 
 /// The refusal to remove a worktree that would lose `unsaved`.
-pub fn unsaved_work(unsaved: &[String]) -> ErrorBody {
+fn unsaved_work(unsaved: &[String]) -> ErrorBody {
     ErrorBody {
         code: code::UNSAVED_WORK,
         message: format!("deleting the worktree would lose {}", unsaved.join("; ")),
@@ -812,12 +818,12 @@ async fn usable(git: &Git, path: &Path) -> Result<(), GitError> {
 /// left as it is. A worktree git can no longer use is deleted as a
 /// directory. A worktree that is gone from disk is unregistered, if its
 /// repository still lists it.
-pub async fn remove_worktree(
+async fn remove_worktree(
     git: &Git,
     worktree: &SavedWorktree,
     discard: bool,
 ) -> Result<(), ErrorBody> {
-    let path = worktree.info.path.as_path();
+    let path = worktree.path.as_path();
     let repository = Repository::new(git, &worktree.common_dir);
     if path.symlink_metadata().is_ok() {
         if !discard {
@@ -877,18 +883,18 @@ async fn registered(repository: &Repository<'_>, path: &Path) -> Result<bool, Gi
 /// deleted if every commit on it since the worktree's base is on another
 /// branch, a remote branch or a tag, and no worktree has it checked out, and
 /// kept otherwise. A branch the daemon cannot check, because its repository
-/// is gone, is reported as kept. A branch that existed before the session,
+/// is gone, is reported as kept. A branch that existed before the worktree,
 /// and a branch that is gone, leave nothing to do.
-pub async fn apply_branch_rule(
+async fn apply_branch_rule(
     git: &Git,
     worktree: &SavedWorktree,
 ) -> Result<Option<String>, GitError> {
-    let WorktreeInfo {
+    let SavedWorktree {
         branch,
         base,
         created_branch,
         ..
-    } = &worktree.info;
+    } = worktree;
     if !created_branch {
         return Ok(None);
     }
@@ -922,4 +928,203 @@ pub async fn apply_branch_rule(
         .run(&[&"update-ref", &"-d", &reference, &tip])
         .await?;
     Ok(None)
+}
+
+/// How the worktree's branch compares with its comparison ref, in its
+/// repository: the commits on each, and how many commits each has that the
+/// other lacks. Unset when the worktree has no comparison ref.
+async fn compare(git: &Git, worktree: &SavedWorktree) -> Option<Comparison> {
+    let compare = worktree.compare.as_deref()?;
+    let branch = &worktree.branch;
+    let repository = Repository::new(git, &worktree.common_dir);
+    let failed = |error: String| Some(Comparison::Failed { error });
+    let Some(tip) = repository.commit(&format!("refs/heads/{branch}")).await else {
+        return failed(format!("branch {branch} is not a commit"));
+    };
+    let Some(compare_tip) = repository.commit(compare).await else {
+        return failed(format!("{compare} is not a commit"));
+    };
+    let range = format!("{compare_tip}...{tip}");
+    let counts = match repository
+        .text(&[&"rev-list", &"--left-right", &"--count", &range])
+        .await
+    {
+        Ok(counts) => counts,
+        Err(error) => return failed(error.to_string()),
+    };
+    let mut counts = counts.split_whitespace().map(str::parse::<u64>);
+    let (Some(Ok(behind)), Some(Ok(ahead))) = (counts.next(), counts.next()) else {
+        return failed(format!("git rev-list printed no counts for {range}"));
+    };
+    Some(Comparison::Compared {
+        tip,
+        compare_tip,
+        ahead,
+        behind,
+    })
+}
+
+/// A worktree the daemon added for a session: its saved record, and how its
+/// branch compares with its comparison ref, which it computes when it is
+/// created and again each time it is asked.
+pub struct Worktree {
+    pub id: String,
+    saved: Mutex<SavedWorktree>,
+    /// The comparison as last computed. Locked after `saved`.
+    comparison: Mutex<Option<Comparison>>,
+    /// Held while a comparison is computed and published, so that one that
+    /// read git later is published later.
+    comparing: tokio::sync::Mutex<()>,
+    /// Asks the comparing task to compute the comparison again.
+    recompare: Notify,
+    comparer: Mutex<Option<JoinHandle<()>>>,
+    /// Counts the changes to the worktree's `WorktreeInfo`. Changed under the
+    /// `saved` lock.
+    version: AtomicU64,
+    /// The daemon's signal that the lists changed, sent when this worktree's
+    /// `WorktreeInfo` changes.
+    changed: watch::Sender<()>,
+}
+
+impl Worktree {
+    /// The live worktree for `saved`, which starts computing its comparison.
+    pub fn new(saved: SavedWorktree, changed: watch::Sender<()>) -> Arc<Self> {
+        let worktree = Arc::new(Self {
+            id: saved.id.clone(),
+            saved: Mutex::new(saved),
+            comparison: Mutex::new(None),
+            comparing: tokio::sync::Mutex::new(()),
+            recompare: Notify::new(),
+            comparer: Mutex::new(None),
+            version: AtomicU64::new(0),
+            changed,
+        });
+        *worktree.comparer.lock().unwrap() =
+            Some(tokio::spawn(worktree.clone().compare_when_asked()));
+        worktree
+    }
+
+    /// Computes the comparison, then again each time `recompare` is
+    /// notified. Notifications that arrive while it computes make one more
+    /// computation.
+    async fn compare_when_asked(self: Arc<Self>) {
+        loop {
+            self.compare().await;
+            self.recompare.notified().await;
+        }
+    }
+
+    pub fn info(&self) -> WorktreeInfo {
+        self.info_of(&self.saved.lock().unwrap())
+    }
+
+    /// The worktree's `WorktreeInfo` and its version, which grows with each
+    /// change.
+    pub fn versioned_info(&self) -> (WorktreeInfo, u64) {
+        let saved = self.saved.lock().unwrap();
+        (self.info_of(&saved), self.version())
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    fn info_of(&self, saved: &SavedWorktree) -> WorktreeInfo {
+        // A cleared ref has no comparison, whatever a comparison under way
+        // stores.
+        let comparison = saved
+            .compare
+            .as_ref()
+            .and_then(|_| self.comparison.lock().unwrap().clone());
+        WorktreeInfo {
+            id: saved.id.clone(),
+            path: saved.path.clone(),
+            branch: saved.branch.clone(),
+            base: saved.base.clone(),
+            created_branch: saved.created_branch,
+            compare: saved.compare.clone(),
+            comparison,
+        }
+    }
+
+    pub fn saved(&self) -> SavedWorktree {
+        self.saved.lock().unwrap().clone()
+    }
+
+    /// Changes the worktree and, if its `WorktreeInfo` changed, signals it.
+    fn update(&self, change: impl FnOnce(&mut SavedWorktree, &mut Option<Comparison>)) {
+        let mut saved = self.saved.lock().unwrap();
+        let before = self.info_of(&saved);
+        change(&mut saved, &mut self.comparison.lock().unwrap());
+        if self.info_of(&saved) != before {
+            self.version.fetch_add(1, Ordering::Release);
+            self.changed.send_replace(());
+        }
+    }
+
+    /// Computes how the branch compares with the comparison ref and
+    /// publishes it.
+    pub async fn compare(&self) {
+        let _comparing = self.comparing.lock().await;
+        let comparison = compare(&Git::own(), &self.saved()).await;
+        self.update(|_, current| *current = comparison);
+    }
+
+    /// Asks the comparing task to compute the comparison again.
+    pub fn recompare(&self) {
+        self.recompare.notify_one();
+    }
+
+    /// Sets or clears the comparison ref, which the caller has saved, and
+    /// publishes it with the comparison computed for it.
+    pub async fn set_compare(&self, compare_ref: Option<String>) {
+        let _comparing = self.comparing.lock().await;
+        let mut saved = self.saved();
+        saved.compare = compare_ref;
+        let comparison = compare(&Git::own(), &saved).await;
+        self.update(|current, current_comparison| {
+            current.compare = saved.compare;
+            *current_comparison = comparison;
+        });
+    }
+
+    /// Removes the worktree once `stop` has stopped the agent running in it.
+    /// Unless `discard` is set, a worktree with unsaved work is refused with
+    /// `UNSAVED_WORK` before `stop` runs, and again if work appeared before
+    /// the agent stopped.
+    pub async fn remove(
+        &self,
+        git: &Git,
+        discard: bool,
+        stop: impl Future<Output = ()>,
+    ) -> Result<(), ErrorBody> {
+        let saved = self.saved();
+        if !discard {
+            let unsaved = unsaved(git, &saved).await?;
+            if !unsaved.is_empty() {
+                return Err(unsaved_work(&unsaved));
+            }
+        }
+        stop.await;
+        remove_worktree(git, &saved, discard).await
+    }
+
+    /// Adds the removed worktree again at its path, on its branch.
+    pub async fn restore(&self, git: &Git) -> Result<(), ErrorBody> {
+        restore(git, &self.saved()).await
+    }
+
+    /// Applies the branch rule to the worktree's branch, as
+    /// [`apply_branch_rule`] describes, and returns the branch if it is kept.
+    pub async fn apply_branch_rule(&self, git: &Git) -> Result<Option<String>, GitError> {
+        apply_branch_rule(git, &self.saved()).await
+    }
+
+    /// Stops computing the comparison.
+    pub fn close(&self) {
+        let comparer = self.comparer.lock().unwrap().take();
+        if let Some(comparer) = comparer {
+            comparer.abort();
+        }
+    }
 }

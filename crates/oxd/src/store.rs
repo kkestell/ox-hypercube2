@@ -1,10 +1,11 @@
-//! The daemon's saved workspaces and sessions, in one `SQLite` database.
+//! The daemon's saved workspaces, worktrees and sessions, in one `SQLite`
+//! database.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ox_protocol::{Event, EventKind, WorktreeInfo};
+use ox_protocol::{Event, EventKind};
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
@@ -25,18 +26,27 @@ pub struct SavedSession {
     pub cwd: PathBuf,
     pub title: Option<String>,
     pub agent_session_id: Option<String>,
-    pub worktree: Option<SavedWorktree>,
+    /// The ID of the worktree the session runs in.
+    pub worktree_id: Option<String>,
     /// The seq of the session's last stored event, 0 if it has none.
     pub last_seq: u64,
     /// Whether the session is archived.
     pub archived: bool,
 }
 
-/// A session's worktree as the database holds it: what clients see, and the
-/// repository it belongs to.
+/// A worktree as the database holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedWorktree {
-    pub info: WorktreeInfo,
+    pub id: String,
+    /// The worktree's top level.
+    pub path: PathBuf,
+    pub branch: String,
+    /// The commit the worktree started at.
+    pub base: String,
+    /// Whether the daemon created the branch for the worktree.
+    pub created_branch: bool,
+    /// The ref the branch is compared with, as the client gave it.
+    pub compare: Option<String>,
     /// The repository's absolute common Git directory.
     pub common_dir: PathBuf,
 }
@@ -74,6 +84,15 @@ impl Store {
                 id   TEXT PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS worktrees (
+                id             TEXT PRIMARY KEY,
+                path           TEXT NOT NULL,
+                branch         TEXT NOT NULL,
+                base           TEXT NOT NULL,
+                created_branch INTEGER NOT NULL,
+                common_dir     TEXT NOT NULL,
+                compare        TEXT
+            );
             CREATE TABLE IF NOT EXISTS sessions (
                 number           INTEGER PRIMARY KEY AUTOINCREMENT,
                 id               TEXT NOT NULL UNIQUE,
@@ -81,15 +100,8 @@ impl Store {
                 command          TEXT NOT NULL,  -- JSON array
                 cwd              TEXT NOT NULL,
                 title            TEXT,
-                agent_session_id TEXT
-            );
-            CREATE TABLE IF NOT EXISTS worktrees (
-                session_id     TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                path           TEXT NOT NULL,
-                branch         TEXT NOT NULL,
-                base           TEXT NOT NULL,
-                created_branch INTEGER NOT NULL,
-                common_dir     TEXT NOT NULL
+                agent_session_id TEXT,
+                worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL
             );
             CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -99,10 +111,6 @@ impl Store {
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS archived (
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS compare_refs (
-                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                ref        TEXT NOT NULL
             );",
         )?;
         let connection = Arc::new(Mutex::new(connection));
@@ -183,18 +191,36 @@ impl Store {
         Ok(())
     }
 
+    /// Every worktree, in the order they were added.
+    pub fn worktrees(&self) -> rusqlite::Result<Vec<SavedWorktree>> {
+        let connection = self.lock();
+        let mut query = connection.prepare(
+            "SELECT id, path, branch, base, created_branch, common_dir, compare
+            FROM worktrees ORDER BY rowid",
+        )?;
+        query
+            .query_map([], |row| {
+                Ok(SavedWorktree {
+                    id: row.get(0)?,
+                    path: PathBuf::from(row.get::<_, String>(1)?),
+                    branch: row.get(2)?,
+                    base: row.get(3)?,
+                    created_branch: row.get(4)?,
+                    common_dir: PathBuf::from(row.get::<_, String>(5)?),
+                    compare: row.get(6)?,
+                })
+            })?
+            .collect()
+    }
+
     /// Every session, in the order they were created.
     pub fn sessions(&self) -> rusqlite::Result<Vec<SavedSession>> {
         let connection = self.lock();
         let mut query = connection.prepare(
-            "SELECT number, id, workspace_id, command, cwd, title, agent_session_id,
-                worktrees.path, branch, base, created_branch, common_dir,
+            "SELECT number, id, workspace_id, command, cwd, title, agent_session_id, worktree_id,
                 (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
-                EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
-                compare_refs.ref
+                EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id)
             FROM sessions
-                LEFT JOIN worktrees ON worktrees.session_id = sessions.id
-                LEFT JOIN compare_refs ON compare_refs.session_id = sessions.id
             ORDER BY number",
         )?;
         query
@@ -214,21 +240,9 @@ impl Store {
                     cwd: PathBuf::from(row.get::<_, String>(4)?),
                     title: row.get(5)?,
                     agent_session_id: row.get(6)?,
-                    worktree: match row.get::<_, Option<String>>(7)? {
-                        Some(path) => Some(SavedWorktree {
-                            info: WorktreeInfo {
-                                path: PathBuf::from(path),
-                                branch: row.get(8)?,
-                                base: row.get(9)?,
-                                created_branch: row.get(10)?,
-                                compare: row.get(14)?,
-                            },
-                            common_dir: PathBuf::from(row.get::<_, String>(11)?),
-                        }),
-                        None => None,
-                    },
-                    last_seq: u64::try_from(row.get::<_, i64>(12)?).expect("seqs are positive"),
-                    archived: row.get(13)?,
+                    worktree_id: row.get(7)?,
+                    last_seq: u64::try_from(row.get::<_, i64>(8)?).expect("seqs are positive"),
+                    archived: row.get(9)?,
                 })
             })?
             .collect()
@@ -248,56 +262,52 @@ impl Store {
         let command = serde_json::to_string(command).expect("a list of strings serializes");
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
+        if let Some(worktree) = worktree {
+            transaction.execute(
+                "INSERT INTO worktrees (id, path, branch, base, created_branch, common_dir, compare)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    worktree.id,
+                    worktree.path.to_string_lossy(),
+                    worktree.branch,
+                    worktree.base,
+                    worktree.created_branch,
+                    worktree.common_dir.to_string_lossy(),
+                    worktree.compare
+                ],
+            )?;
+        }
         transaction.execute(
-            "INSERT INTO sessions (id, workspace_id, command, cwd) VALUES (?1, ?2, ?3, ?4)",
-            params![id, workspace_id, command, cwd.to_string_lossy()],
+            "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id)
+            VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                id,
+                workspace_id,
+                command,
+                cwd.to_string_lossy(),
+                worktree.map(|worktree| &worktree.id)
+            ],
         )?;
         // `number` is the table's rowid.
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
-        if let Some(SavedWorktree { info, common_dir }) = worktree {
-            transaction.execute(
-                "INSERT INTO worktrees (session_id, path, branch, base, created_branch, common_dir)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id,
-                    info.path.to_string_lossy(),
-                    info.branch,
-                    info.base,
-                    info.created_branch,
-                    common_dir.to_string_lossy()
-                ],
-            )?;
-            if let Some(compare) = &info.compare {
-                transaction.execute(
-                    "INSERT INTO compare_refs (session_id, ref) VALUES (?1, ?2)",
-                    params![id, compare],
-                )?;
-            }
-        }
         transaction.commit()?;
         Ok(number)
     }
 
-    /// Sets or clears a session's comparison ref.
-    pub fn set_compare(&self, session_id: &str, compare: Option<&str>) -> rusqlite::Result<()> {
-        let connection = self.lock();
-        match compare {
-            Some(compare) => connection.execute(
-                "INSERT OR REPLACE INTO compare_refs (session_id, ref) VALUES (?1, ?2)",
-                params![session_id, compare],
-            )?,
-            None => connection.execute(
-                "DELETE FROM compare_refs WHERE session_id = ?1",
-                [session_id],
-            )?,
-        };
+    /// Sets or clears a worktree's comparison ref.
+    pub fn set_compare(&self, worktree_id: &str, compare: Option<&str>) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE worktrees SET compare = ?2 WHERE id = ?1",
+            params![worktree_id, compare],
+        )?;
         Ok(())
     }
 
-    /// Forgets a session's worktree, keeping the session.
-    pub fn remove_worktree(&self, session_id: &str) -> rusqlite::Result<()> {
+    /// Forgets a worktree. The session that ran in it is kept, with no
+    /// worktree.
+    pub fn remove_worktree(&self, worktree_id: &str) -> rusqlite::Result<()> {
         self.lock()
-            .execute("DELETE FROM worktrees WHERE session_id = ?1", [session_id])?;
+            .execute("DELETE FROM worktrees WHERE id = ?1", [worktree_id])?;
         Ok(())
     }
 
@@ -336,10 +346,16 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes a session, with its events and the worktree it runs in.
     pub fn remove_session(&self, id: &str) -> rusqlite::Result<()> {
-        self.lock()
-            .execute("DELETE FROM sessions WHERE id = ?1", [id])?;
-        Ok(())
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM worktrees WHERE id = (SELECT worktree_id FROM sessions WHERE id = ?1)",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+        transaction.commit()
     }
 }
 
@@ -450,7 +466,7 @@ mod tests {
                     cwd: "/work".into(),
                     title: None,
                     agent_session_id: None,
-                    worktree: None,
+                    worktree_id: None,
                     last_seq: 0,
                     archived: false,
                 },
@@ -462,7 +478,7 @@ mod tests {
                     cwd: "/work".into(),
                     title: None,
                     agent_session_id: None,
-                    worktree: None,
+                    worktree_id: None,
                     last_seq: 0,
                     archived: false,
                 },
@@ -484,11 +500,7 @@ mod tests {
         assert!(!store.sessions().unwrap()[0].archived);
         store.set_archived("one", true).unwrap();
         store.remove_session("one").unwrap();
-        let rows: i64 = store
-            .lock()
-            .query_row("SELECT COUNT(*) FROM archived", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(count(&store, "archived"), 0);
     }
 
     #[test]
@@ -535,57 +547,35 @@ mod tests {
         store.remove_workspace("w").unwrap();
     }
 
-    fn worktree() -> SavedWorktree {
+    fn worktree(id: &str) -> SavedWorktree {
         SavedWorktree {
-            info: WorktreeInfo {
-                path: "/worktrees/work-01234567".into(),
-                branch: "ox/01234567".into(),
-                base: "abc".into(),
-                created_branch: true,
-                compare: None,
-            },
+            id: id.into(),
+            path: format!("/worktrees/work-{id}").into(),
+            branch: format!("ox/{id}"),
+            base: "abc".into(),
+            created_branch: true,
+            compare: None,
             common_dir: "/repos/work/.git".into(),
         }
     }
 
-    /// A worktree session's comparison ref is saved with it, replaced and
-    /// cleared, and deleted with the session.
-    #[test]
-    fn a_comparison_ref_round_trips_and_goes_with_its_session() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        let mut compared = worktree();
-        compared.info.compare = Some("main".into());
+    fn add_worktree_session(store: &Store, id: &str, worktree: &SavedWorktree) {
         store
-            .add_session(
-                "s",
-                "w",
-                &command(),
-                Path::new("/worktrees/work-01234567"),
-                Some(&compared),
-            )
+            .add_session(id, "w", &command(), &worktree.path, Some(worktree))
             .unwrap();
-        assert_eq!(
-            store.sessions().unwrap()[0].worktree,
-            Some(compared.clone())
-        );
-
-        store.set_compare("s", Some("origin/main")).unwrap();
-        compared.info.compare = Some("origin/main".into());
-        assert_eq!(store.sessions().unwrap()[0].worktree, Some(compared));
-        store.set_compare("s", None).unwrap();
-        assert_eq!(store.sessions().unwrap()[0].worktree, Some(worktree()));
-
-        store.set_compare("s", Some("main")).unwrap();
-        store.remove_session("s").unwrap();
-        let rows: i64 = store
-            .lock()
-            .query_row("SELECT COUNT(*) FROM compare_refs", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
     }
 
-    /// The worktree, with its repository's location, comes back as saved.
+    fn count(store: &Store, table: &str) -> i64 {
+        store
+            .lock()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// The worktree, with its comparison ref and repository, comes back as
+    /// saved, and the session names it.
     #[test]
     fn a_session_round_trips_with_its_worktree() {
         let store = store();
@@ -593,56 +583,74 @@ mod tests {
         store
             .add_session("plain", "w", &command(), Path::new("/work"), None)
             .unwrap();
-        store
-            .add_session(
-                "worktree",
-                "w",
-                &command(),
-                Path::new("/worktrees/work-01234567/sub"),
-                Some(&worktree()),
-            )
-            .unwrap();
+        let mut compared = worktree("01234567");
+        compared.compare = Some("main".into());
+        add_worktree_session(&store, "s", &compared);
+        assert_eq!(store.worktrees().unwrap(), [compared]);
         let sessions = store.sessions().unwrap();
-        assert_eq!(sessions[0].worktree, None);
-        assert_eq!(sessions[1].worktree, Some(worktree()));
-        assert_eq!(sessions[1].cwd, Path::new("/worktrees/work-01234567/sub"));
+        assert_eq!(sessions[0].worktree_id, None);
+        assert_eq!(sessions[1].worktree_id.as_deref(), Some("01234567"));
+        assert_eq!(sessions[1].cwd, Path::new("/worktrees/work-01234567"));
+    }
+
+    #[test]
+    fn a_comparison_ref_is_replaced_and_cleared_by_worktree() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_worktree_session(&store, "s", &worktree("one"));
+        add_worktree_session(&store, "t", &worktree("two"));
+        store.set_compare("one", Some("origin/main")).unwrap();
+        let mut compared = worktree("one");
+        compared.compare = Some("origin/main".into());
+        assert_eq!(store.worktrees().unwrap(), [compared, worktree("two")]);
+        store.set_compare("one", None).unwrap();
+        assert_eq!(
+            store.worktrees().unwrap(),
+            [worktree("one"), worktree("two")]
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_leaves_its_session_without_one() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_worktree_session(&store, "s", &worktree("one"));
+        store.remove_worktree("one").unwrap();
+        assert!(store.worktrees().unwrap().is_empty());
+        assert_eq!(store.sessions().unwrap()[0].worktree_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_session_takes_its_worktree_and_events() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_worktree_session(&store, "s", &worktree("one"));
+        add_worktree_session(&store, "t", &worktree("two"));
+        store.log(vec![exited("s", 1), exited("t", 1)]);
+        store.flush().await;
+        store.remove_session("s").unwrap();
+        assert_eq!(store.worktrees().unwrap(), [worktree("two")]);
+        assert!(store.events("s").unwrap().is_empty());
+        assert_eq!(store.events("t").unwrap().len(), 1);
     }
 
     #[test]
     fn a_session_whose_worktree_row_fails_is_not_saved() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
-        store.lock().execute("DROP TABLE worktrees", []).unwrap();
+        add_worktree_session(&store, "s", &worktree("one"));
+        // The second worktree row conflicts with the first.
         store
-            .add_session("s", "w", &command(), Path::new("/work"), Some(&worktree()))
+            .add_session(
+                "t",
+                "w",
+                &command(),
+                Path::new("/work"),
+                Some(&worktree("one")),
+            )
             .unwrap_err();
-        let sessions: i64 = store
-            .lock()
-            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(sessions, 0);
-    }
-
-    #[test]
-    fn a_worktree_row_goes_with_its_session_or_alone() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        for id in ["one", "two"] {
-            store
-                .add_session(id, "w", &command(), Path::new("/work"), Some(&worktree()))
-                .unwrap();
-        }
-        store.remove_worktree("one").unwrap();
-        let sessions = store.sessions().unwrap();
-        assert_eq!(sessions[0].worktree, None);
-        assert_eq!(sessions[1].worktree, Some(worktree()));
-
-        store.remove_session("two").unwrap();
-        let rows: i64 = store
-            .lock()
-            .query_row("SELECT COUNT(*) FROM worktrees", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(rows, 0);
+        assert_eq!(count(&store, "sessions"), 1);
+        assert_eq!(count(&store, "worktrees"), 1);
     }
 
     #[test]
@@ -703,18 +711,5 @@ mod tests {
         store.log(vec![exited("s", 1)]);
         store.flush().await;
         assert!(store.events("s").unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn deleting_a_session_removes_its_events() {
-        let store = store_with_session();
-        store
-            .add_session("t", "w", &command(), Path::new("/work"), None)
-            .unwrap();
-        store.log(vec![exited("s", 1), exited("t", 1)]);
-        store.flush().await;
-        store.remove_session("s").unwrap();
-        assert!(store.events("s").unwrap().is_empty());
-        assert_eq!(store.events("t").unwrap().len(), 1);
     }
 }

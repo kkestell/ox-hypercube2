@@ -677,11 +677,30 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, Error>) -> ErrorBody {
     }
 }
 
-fn session_worktree(session: &SessionInfo) -> &WorktreeInfo {
-    session
-        .worktree
-        .as_ref()
-        .expect("the session has a worktree")
+/// The worktrees a new watch lists first.
+async fn listed_worktrees(client: &Client) -> Vec<WorktreeInfo> {
+    let mut watch = client.watch().await.unwrap();
+    next_changes(&mut watch)
+        .await
+        .into_iter()
+        .filter_map(|change| match change {
+            ListingChange::Worktree { worktree } => Some(worktree),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The session's worktree, as a new watch lists it.
+async fn worktree_of(client: &Client, session: &SessionInfo) -> WorktreeInfo {
+    let id = session
+        .worktree_id
+        .as_deref()
+        .expect("the session has a worktree");
+    listed_worktrees(client)
+        .await
+        .into_iter()
+        .find(|worktree| worktree.id == id)
+        .expect("the session's worktree is listed")
 }
 
 /// The paths `git worktree list` shows for the repository at `dir`.
@@ -708,25 +727,28 @@ async fn a_session_runs_in_a_new_worktree_on_a_new_branch() {
     let session = new_session(&client, repo.path(), on_ox_branch())
         .await
         .unwrap();
-    let answered = session_worktree(&session).clone();
+    let answered = session.worktree_id.clone();
     let session = started(&client, &session).await;
+    assert_eq!(session.worktree_id, answered);
 
-    let id8 = &session.id[..8];
+    let id = session.worktree_id.clone().unwrap();
+    let id8 = &id[..8];
     let name = canonical(repo.path());
     let name = name.file_name().unwrap().to_str().unwrap();
     let path = daemon.worktrees().join(format!("{name}-{id8}"));
     assert_eq!(session.cwd, path);
     assert_eq!(
-        session.worktree,
-        Some(WorktreeInfo {
+        worktree_of(&client, &session).await,
+        WorktreeInfo {
+            id: id.clone(),
             path: path.clone(),
             branch: format!("ox/{id8}"),
             base: head.clone(),
             created_branch: true,
             compare: None,
-        })
+            comparison: None,
+        }
     );
-    assert_eq!(answered, *session_worktree(&session));
     assert_eq!(git(repo.path(), &["rev-parse", &format!("ox/{id8}")]), head);
     assert_eq!(
         git(&path, &["branch", "--show-current"]),
@@ -737,6 +759,49 @@ async fn a_session_runs_in_a_new_worktree_on_a_new_branch() {
         git(repo.path(), &["status", "--porcelain", "--ignored"]),
         status
     );
+}
+
+/// A watch lists a session's worktree as its own entry, before the session
+/// that names it, and reports it removed with the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_is_listed_before_its_session_and_removed_with_it() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let session = new_session(&client, repo.path(), on_ox_branch())
+        .await
+        .unwrap();
+    let session = started(&client, &session).await;
+    let id = session
+        .worktree_id
+        .clone()
+        .expect("the session has a worktree");
+
+    let mut watch = client.watch().await.unwrap();
+    let changes = next_changes(&mut watch).await;
+    let position = |found: &dyn Fn(&ListingChange) -> bool| {
+        changes
+            .iter()
+            .position(found)
+            .unwrap_or_else(|| panic!("not listed: {changes:?}"))
+    };
+    let worktree = position(
+        &|change| matches!(change, ListingChange::Worktree { worktree } if worktree.id == id),
+    );
+    let listed = position(
+        &|change| matches!(change, ListingChange::Session { session: listed } if listed.id == session.id),
+    );
+    assert!(worktree < listed, "{changes:?}");
+
+    delete(&client, &session.id, false).await.unwrap();
+    loop {
+        let changes = next_changes(&mut watch).await;
+        if changes.iter().any(|change| {
+            matches!(change, ListingChange::WorktreeRemoved { worktree_id } if *worktree_id == id)
+        }) {
+            break;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -751,7 +816,7 @@ async fn a_named_new_branch_starts_where_asked_without_an_upstream() {
         .unwrap();
     let session = started(&client, &session).await;
     let feature = git(&clone, &["rev-parse", "origin/feature"]);
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(worktree.branch, "topic");
     assert_eq!(worktree.base, feature);
     assert!(worktree.created_branch);
@@ -773,7 +838,7 @@ async fn an_existing_branch_is_checked_out_unless_a_worktree_has_it() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(worktree.branch, "other");
     assert!(!worktree.created_branch);
     assert_eq!(worktree.base, git(repo.path(), &["rev-parse", "other"]));
@@ -800,7 +865,7 @@ async fn a_branch_only_on_a_remote_is_tracked() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(worktree.branch, "feature");
     assert!(worktree.created_branch);
     assert_eq!(worktree.base, git(&clone, &["rev-parse", "origin/feature"]));
@@ -820,7 +885,7 @@ async fn a_branch_only_on_a_remote_is_tracked() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    assert_eq!(session_worktree(&session).branch, "feature");
+    assert_eq!(worktree_of(&client, &session).await.branch, "feature");
     assert_eq!(
         git(&clone, &["config", "--get", "branch.feature.remote"]),
         "origin"
@@ -907,7 +972,7 @@ async fn a_subdirectory_workspace_runs_in_the_same_subdirectory() {
 
     let session = new_session(&client, &sub, on_ox_branch()).await.unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(session.cwd, worktree.path.join("sub"));
     assert!(session.cwd.join("file").is_file());
 
@@ -987,7 +1052,7 @@ async fn of_two_creations_of_one_branch_one_wins() {
     assert_eq!(refusal(loser).code, code::INVALID_REQUEST);
     let winner = started(&client, &winner).await;
     assert_eq!(git(repo.path(), &["rev-parse", "same"]), head);
-    assert!(session_worktree(&winner).path.is_dir());
+    assert!(worktree_of(&client, &winner).await.path.is_dir());
     assert_eq!(client.list().await.unwrap().len(), 1);
 }
 
@@ -1003,12 +1068,13 @@ async fn a_worktree_that_cannot_be_added_is_undone() {
         .await
         .unwrap();
     assert_eq!(session.state, SessionState::Starting);
-    let branch = session_worktree(&session).branch.clone();
+    let branch = format!("ox/{}", &session.worktree_id.as_ref().unwrap()[..8]);
     let error = exited(&client, &session).await;
     assert!(error.contains("worktree add"), "{error}");
     let after = info(&client, &session.id).await.unwrap();
     assert_eq!(after.state, SessionState::Exited);
-    assert_eq!(after.worktree, None);
+    assert_eq!(after.worktree_id, None);
+    assert!(listed_worktrees(&client).await.is_empty());
     assert_eq!(git(repo.path(), &["branch", "--list", &branch]), "");
     std::fs::set_permissions(daemon.worktrees(), PermissionsExt::from_mode(0o755)).unwrap();
 
@@ -1039,10 +1105,10 @@ async fn a_linked_worktree_workspace_names_the_worktree_after_itself() {
 
     let session = new_session(&client, &linked, on_ox_branch()).await.unwrap();
     let session = started(&client, &session).await;
-    let name = session_worktree(&session).path.file_name().unwrap();
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(
-        name.to_str().unwrap(),
-        format!("linked-{}", &session.id[..8])
+        worktree.path.file_name().unwrap().to_str().unwrap(),
+        format!("linked-{}", &worktree.id[..8])
     );
 }
 
@@ -1076,7 +1142,7 @@ async fn git_ignores_the_clients_repository_variables() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    assert!(session_worktree(&session).path.is_dir());
+    assert!(worktree_of(&client, &session).await.path.is_dir());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1088,13 +1154,15 @@ async fn a_worktree_session_survives_a_restart_and_loads_only_while_its_director
         .await
         .unwrap();
     let session = started(&client, &session).await;
+    let worktree = worktree_of(&client, &session).await;
     drop(client);
 
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
     let restored = info(&client, &session.id).await.unwrap();
     assert_eq!(restored.state, SessionState::Exited);
-    assert_eq!(restored.worktree, session.worktree);
+    assert_eq!(restored.worktree_id, session.worktree_id);
+    assert_eq!(worktree_of(&client, &restored).await, worktree);
     assert_eq!(restored.cwd, session.cwd);
 
     std::fs::remove_dir_all(&session.cwd).unwrap();
@@ -1141,7 +1209,7 @@ async fn a_failed_worktree_leaves_a_branch_another_worktree_checked_out() {
 
     let error = exited(&client, &session).await;
     assert!(error.contains("worktree add"), "{error}");
-    assert_eq!(info(&client, &session.id).await.unwrap().worktree, None);
+    assert_eq!(info(&client, &session.id).await.unwrap().worktree_id, None);
     assert!(git_succeeds(
         repo.path(),
         &["rev-parse", "--verify", "--quiet", "refs/heads/topic"]
@@ -1173,7 +1241,7 @@ async fn a_tracking_branch_starts_at_the_commit_it_records() {
     let (session, ()) = tokio::join!(creating, moving);
     let session = started(&client, &session.unwrap()).await;
 
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(&client, &session).await;
     assert_eq!(worktree.base, base);
     assert_eq!(git(&clone, &["rev-parse", "feature"]), base);
     assert_eq!(
@@ -1327,7 +1395,7 @@ async fn branches_name_the_worktree_that_has_them_checked_out() {
         .expect("other is listed");
     assert_eq!(
         other.worktree,
-        Some(canonical(&session_worktree(&session).path))
+        Some(canonical(&worktree_of(&client, &session).await.path))
     );
     // The session's worktree being on `other` leaves the workspace's head.
     assert_eq!(listed.head.as_deref(), Some("main"));
@@ -1536,7 +1604,7 @@ async fn a_clean_delete_removes_the_worktree_and_the_branch() {
     let client = daemon.client().await;
     let mut agent = ExitWatch::new(daemon.dir.path());
     let session = started_holding(&client, repo.path(), &mut agent).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     // Ignored files go with the worktree.
     std::fs::write(worktree.path.join("ignored"), "build output\n").unwrap();
     let status = git(repo.path(), &["status", "--porcelain", "--ignored"]);
@@ -1567,7 +1635,7 @@ async fn a_branch_merged_elsewhere_is_deleted_and_one_with_its_own_commits_is_ke
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     commit_file(&worktree.path, "merged");
     git(
         repo.path(),
@@ -1584,7 +1652,7 @@ async fn a_branch_merged_elsewhere_is_deleted_and_one_with_its_own_commits_is_ke
             .await
             .unwrap();
         let session = started(&client, &session).await;
-        let worktree = session_worktree(&session).clone();
+        let worktree = worktree_of(&client, &session).await;
         commit_file(&worktree.path, if discard { "discarded" } else { "kept" });
         let tip = git(&worktree.path, &["rev-parse", "HEAD"]);
         let deleted = delete(&client, &session.id, discard).await.unwrap();
@@ -1607,7 +1675,7 @@ async fn a_branch_that_existed_before_the_session_is_never_deleted() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     commit_file(&worktree.path, "new");
     let tip = git(&worktree.path, &["rev-parse", "HEAD"]);
 
@@ -1629,7 +1697,7 @@ async fn a_tracking_branch_is_kept_until_its_commits_are_pushed() {
             .await
             .unwrap();
         let session = started(&client, &session).await;
-        let worktree = session_worktree(&session).clone();
+        let worktree = worktree_of(&client, &session).await;
         assert!(worktree.created_branch);
         commit_file(&worktree.path, if push { "pushed" } else { "unpushed" });
         if push {
@@ -1654,7 +1722,7 @@ async fn uncommitted_changes_refuse_the_delete_until_it_discards_them() {
     let client = daemon.client().await;
     let mut agent = ExitWatch::new(daemon.dir.path());
     let session = started_holding(&client, repo.path(), &mut agent).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     std::fs::write(worktree.path.join("untracked"), "work\n").unwrap();
 
     let refused = refusal(delete(&client, &session.id, false).await);
@@ -1686,7 +1754,7 @@ async fn commits_on_no_branch_refuse_the_delete() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     git(&worktree.path, &["switch", "--quiet", "--detach"]);
     commit_file(&worktree.path, "detached");
 
@@ -1723,7 +1791,7 @@ async fn submodule_commits_on_no_remote_branch_refuse_the_delete() {
             .await
             .unwrap();
         let session = started(&client, &session).await;
-        let worktree = session_worktree(&session).clone();
+        let worktree = worktree_of(&client, &session).await;
         git(
             &worktree.path,
             &[
@@ -1768,7 +1836,7 @@ async fn a_worktree_deleted_outside_ox_is_unregistered() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     std::fs::remove_dir_all(&worktree.path).unwrap();
     assert!(
         worktree_paths(repo.path())
@@ -1792,7 +1860,7 @@ async fn a_worktree_whose_repository_moved_is_removed_only_with_discard() {
     let client = daemon.client().await;
     let session = new_session(&client, &path, on_ox_branch()).await.unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     std::fs::rename(&path, parent.path().join("moved")).unwrap();
 
     let refused = refusal(delete(&client, &session.id, false).await);
@@ -1824,7 +1892,7 @@ async fn a_locked_worktree_fails_the_delete_and_the_session_loads_again() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     // The fake agent resumes a session from the log a prompt writes in the
     // worktree, which the delete has to discard.
     answers(&client, &session.id).await;
@@ -1859,7 +1927,7 @@ async fn a_branch_another_worktree_has_checked_out_is_kept() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     git(&worktree.path, &["switch", "--quiet", "--detach"]);
     let other = tempfile::tempdir().unwrap();
     let other = other.path().join("other");
@@ -1893,7 +1961,7 @@ async fn a_delete_during_startup_waits_for_the_worktree() {
     let session = new_session_with(&client, repo.path(), on_existing("other"), blocked.env())
         .await
         .unwrap();
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     blocked.blocked().await;
 
     let releasing = async { blocked.release().await };
@@ -1932,8 +2000,8 @@ async fn startup_removes_the_worktrees_of_sessions_that_never_started() {
         exited(&client, &session).await;
         sessions.push(info(&client, &session.id).await.unwrap());
     }
-    let clean = session_worktree(&sessions[0]).clone();
-    let dirty = session_worktree(&sessions[1]).clone();
+    let clean = worktree_of(&client, &sessions[0]).await;
+    let dirty = worktree_of(&client, &sessions[1]).await;
     std::fs::write(dirty.path.join("untracked"), "work\n").unwrap();
     drop(client);
 
@@ -1945,7 +2013,7 @@ async fn startup_removes_the_worktrees_of_sessions_that_never_started() {
 
     let kept = info(&client, &sessions[1].id).await.unwrap();
     assert_eq!(kept.state, SessionState::Exited);
-    assert_eq!(kept.worktree.as_ref(), Some(&dirty));
+    assert_eq!(worktree_of(&client, &kept).await, dirty);
     let refused = refusal(client.load_session(&kept.id, BTreeMap::new()).await);
     assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
     delete(&client, &kept.id, true).await.unwrap();
@@ -1993,8 +2061,8 @@ async fn a_session_whose_workspace_subdirectory_is_gone_is_deleted() {
         let session = new_session(&client, &sub, on_ox_branch()).await.unwrap();
         sessions.push(started(&client, &session).await);
     }
-    let untouched = session_worktree(&sessions[0]).clone();
-    let committed = session_worktree(&sessions[1]).clone();
+    let untouched = worktree_of(&client, &sessions[0]).await;
+    let committed = worktree_of(&client, &sessions[1]).await;
     commit_file(&committed.path, "work");
     std::fs::remove_dir_all(&sub).unwrap();
 
@@ -2021,7 +2089,7 @@ async fn a_worktree_whose_registration_was_removed_is_removed_only_with_discard(
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     let admin = git(&worktree.path, &["rev-parse", "--absolute-git-dir"]);
     std::fs::remove_dir_all(admin).unwrap();
 
@@ -2061,7 +2129,7 @@ async fn startup_cleanup_runs_after_ready_and_holds_the_session() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let session = unstarted(&daemon, &client, repo.path()).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     drop(client);
 
     let blocked = BlockedGit::new(" worktree remove ");
@@ -2168,7 +2236,7 @@ async fn session_with_a_turn(
             break;
         }
     }
-    let worktree = session_worktree(&session);
+    let worktree = worktree_of(client, &session).await;
     git(&worktree.path, &["add", "."]);
     git(&worktree.path, &["commit", "--quiet", "-m", "transcript"]);
     (session, seen)
@@ -2180,7 +2248,7 @@ async fn archiving_removes_the_worktree_and_keeps_the_branch_and_the_conversatio
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, turn) = session_with_a_turn(&client, repo.path()).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
 
     let archived = archive(&client, &session.id, false).await.unwrap();
     assert!(archived.archived);
@@ -2262,7 +2330,7 @@ async fn archiving_refuses_unsaved_work_unless_it_is_discarded() {
     let client = daemon.client().await;
     let mut agent = ExitWatch::new(daemon.dir.path());
     let session = started_holding(&client, repo.path(), &mut agent).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     std::fs::write(worktree.path.join("unsaved"), "work\n").unwrap();
 
     let refused = refusal(archive(&client, &session.id, false).await);
@@ -2316,7 +2384,7 @@ async fn unarchiving_needs_a_branch_git_can_check_out() {
             .await
             .unwrap();
         let session = started(&client, &session).await;
-        let worktree = session_worktree(&session).clone();
+        let worktree = worktree_of(&client, &session).await;
         archive(&client, &session.id, true).await.unwrap();
         if deleted {
             git(repo.path(), &["branch", "-D", &worktree.branch]);
@@ -2341,7 +2409,7 @@ async fn deleting_an_archived_session_removes_it_and_applies_the_branch_rule() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     archive(&client, &session.id, true).await.unwrap();
 
     let deleted = delete(&client, &session.id, false).await.unwrap();
@@ -2422,18 +2490,28 @@ fn commit_beside(dir: &Path, parent: &str, name: &str) -> String {
     git(dir, &["commit-tree", &tree, "-p", parent, "-m", name])
 }
 
-/// Waits until a watch delivers the session with a comparison `done`
-/// accepts, and returns the session.
+/// Waits until a watch delivers the session's worktree with a comparison
+/// `done` accepts, and returns the worktree.
 async fn until_compared(
     client: &Client,
-    session_id: &str,
+    session: &SessionInfo,
     done: impl Fn(&Comparison) -> bool,
-) -> SessionInfo {
-    until_session(client, session_id, |session| {
-        session.comparison.as_ref().is_some_and(&done)
-    })
-    .await
-    .expect("the session is listed")
+) -> WorktreeInfo {
+    let id = session
+        .worktree_id
+        .as_deref()
+        .expect("the session has a worktree");
+    let mut watch = client.watch().await.unwrap();
+    loop {
+        for change in next_changes(&mut watch).await {
+            if let ListingChange::Worktree { worktree } = change
+                && worktree.id == id
+                && worktree.comparison.as_ref().is_some_and(&done)
+            {
+                return worktree;
+            }
+        }
+    }
 }
 
 /// Whether the comparison counts `ahead` and `behind`.
@@ -2581,7 +2659,7 @@ async fn a_forced_move_of_a_sessions_branch_moves_its_worktree() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    let worktree = session_worktree(&session).clone();
+    let worktree = worktree_of(&client, &session).await;
     commit_file(&worktree.path, "mine");
     let mine = commit_of(&worktree.path, "HEAD");
 
@@ -2612,10 +2690,10 @@ async fn a_new_session_publishes_its_comparison() {
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
-    assert_eq!(session_worktree(&session).compare.as_deref(), Some("main"));
-    let session = until_compared(&client, &session.id, counts(0, 0)).await;
+    let worktree = until_compared(&client, &session, counts(0, 0)).await;
+    assert_eq!(worktree.compare.as_deref(), Some("main"));
     assert_eq!(
-        session.comparison,
+        worktree.comparison,
         Some(Comparison::Compared {
             tip: head.clone(),
             compare_tip: head,
@@ -2634,15 +2712,15 @@ async fn a_turn_end_compares_again() {
         .await
         .unwrap();
     let session = started(&client, &session).await;
-    until_compared(&client, &session.id, counts(0, 0)).await;
-    commit_file(&session_worktree(&session).path, "work");
+    let worktree = until_compared(&client, &session, counts(0, 0)).await;
+    commit_file(&worktree.path, "work");
 
     answers(&client, &session.id).await;
-    let session = until_compared(&client, &session.id, counts(1, 0)).await;
-    let Some(Comparison::Compared { tip, .. }) = &session.comparison else {
-        unreachable!("until_compared returns a compared session");
+    let worktree = until_compared(&client, &session, counts(1, 0)).await;
+    let Some(Comparison::Compared { tip, .. }) = &worktree.comparison else {
+        unreachable!("until_compared returns a compared worktree");
     };
-    assert_eq!(*tip, commit_of(&session_worktree(&session).path, "HEAD"));
+    assert_eq!(*tip, commit_of(&worktree.path, "HEAD"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2655,12 +2733,12 @@ async fn a_move_compares_the_repositorys_sessions_again() {
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
-    until_compared(&client, &session.id, counts(0, 0)).await;
+    until_compared(&client, &session, counts(0, 0)).await;
 
     move_branch(&client, repo.path(), "main", &topic, &first, false)
         .await
         .unwrap();
-    until_compared(&client, &session.id, counts(0, 1)).await;
+    until_compared(&client, &session, counts(0, 1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2672,7 +2750,7 @@ async fn a_fetch_compares_the_repositorys_sessions_again() {
     let session = new_session(&client, &clone, compared_with("origin/main"))
         .await
         .unwrap();
-    until_compared(&client, &session.id, counts(0, 0)).await;
+    until_compared(&client, &session, counts(0, 0)).await;
 
     let pusher = dir.path().join("pusher");
     git(
@@ -2692,7 +2770,7 @@ async fn a_fetch_compares_the_repositorys_sessions_again() {
         .await
         .unwrap();
     assert_eq!(listed.fetch_error, None);
-    until_compared(&client, &session.id, counts(0, 1)).await;
+    until_compared(&client, &session, counts(0, 1)).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2704,15 +2782,15 @@ async fn a_delete_compares_the_repositorys_sessions_again() {
         .await
         .unwrap();
     let first = started(&client, &first).await;
-    let branch = session_worktree(&first).branch.clone();
+    let branch = worktree_of(&client, &first).await.branch.clone();
     let second = new_session(&client, repo.path(), compared_with(&branch))
         .await
         .unwrap();
-    until_compared(&client, &second.id, counts(0, 0)).await;
+    until_compared(&client, &second, counts(0, 0)).await;
 
     let deleted = delete(&client, &first.id, false).await.unwrap();
     assert_eq!(deleted, Deleted { kept_branch: None });
-    let second = until_compared(&client, &second.id, |comparison| {
+    let second = until_compared(&client, &second, |comparison| {
         matches!(comparison, Comparison::Failed { .. })
     })
     .await;
@@ -2733,10 +2811,10 @@ async fn a_comparison_is_refreshed_set_and_cleared_on_request() {
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
-    until_compared(&client, &session.id, counts(0, 0)).await;
+    let worktree_id = until_compared(&client, &session, counts(0, 0)).await.id;
 
     commit_file(repo.path(), "outside");
-    let refreshed = client.refresh(&session.id).await.unwrap();
+    let refreshed = client.refresh(&worktree_id).await.unwrap();
     assert!(
         refreshed.comparison.as_ref().is_some_and(counts(0, 1)),
         "{:?}",
@@ -2744,13 +2822,10 @@ async fn a_comparison_is_refreshed_set_and_cleared_on_request() {
     );
 
     let set = client
-        .set_compare(&session.id, Some(first.clone()))
+        .set_compare(&worktree_id, Some(first.clone()))
         .await
         .unwrap();
-    assert_eq!(
-        session_worktree(&set).compare.as_deref(),
-        Some(first.as_str())
-    );
+    assert_eq!(set.compare.as_deref(), Some(first.as_str()));
     assert!(
         set.comparison.as_ref().is_some_and(counts(0, 0)),
         "{:?}",
@@ -2758,26 +2833,21 @@ async fn a_comparison_is_refreshed_set_and_cleared_on_request() {
     );
     let refused = refusal(
         client
-            .set_compare(&session.id, Some("nothing".into()))
+            .set_compare(&worktree_id, Some("nothing".into()))
             .await,
     );
     assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
     assert_eq!(
-        session_worktree(&info(&client, &session.id).await.unwrap())
-            .compare
-            .as_deref(),
+        worktree_of(&client, &session).await.compare.as_deref(),
         Some(first.as_str())
     );
 
-    let cleared = client.set_compare(&session.id, None).await.unwrap();
-    assert_eq!(session_worktree(&cleared).compare, None);
+    let cleared = client.set_compare(&worktree_id, None).await.unwrap();
+    assert_eq!(cleared.compare, None);
     assert_eq!(cleared.comparison, None);
 
-    let plain = new_session(&client, repo.path(), Checkout::Workspace)
-        .await
-        .unwrap();
-    let refused = refusal(client.set_compare(&plain.id, Some("main".into())).await);
-    assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
+    let refused = refusal(client.set_compare("nothing", Some("main".into())).await);
+    assert_eq!(refused.code, code::NOT_FOUND, "{refused:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2789,12 +2859,12 @@ async fn a_comparison_ref_survives_a_restart_and_is_compared_unasked() {
         .await
         .unwrap();
     started(&client, &session).await;
-    until_compared(&client, &session.id, counts(0, 0)).await;
+    until_compared(&client, &session, counts(0, 0)).await;
     drop(client);
     commit_file(repo.path(), "meanwhile");
 
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
-    let restored = until_compared(&client, &session.id, counts(0, 1)).await;
-    assert_eq!(session_worktree(&restored).compare.as_deref(), Some("main"));
+    let restored = until_compared(&client, &session, counts(0, 1)).await;
+    assert_eq!(restored.compare.as_deref(), Some("main"));
 }

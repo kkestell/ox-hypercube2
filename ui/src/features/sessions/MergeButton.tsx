@@ -1,21 +1,23 @@
 import { invoke } from "@tauri-apps/api/core";
 import { memo, useState } from "react";
 import { Dialog } from "../../components/Dialog";
-import type { Comparison, SessionInfo } from "../../lib/protocol";
+import type { Comparison, SessionInfo, WorktreeInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { mergeBlocker } from "./localMerge";
 
 /**
- * Merge into `compare`: fast-forwards the ref's branch to the session's
- * branch, then offers to delete the session.
+ * Merge into `compare`: fast-forwards the ref's branch to the branch of the
+ * session's worktree, then offers to delete the session.
  */
 export const MergeButton = memo(function MergeButton({
   session,
+  worktree,
   compare,
   comparison,
   deleteSession,
 }: {
   session: SessionInfo;
+  worktree: WorktreeInfo;
   compare: string;
   comparison: Comparison;
   deleteSession: (sessionId: string, discard: boolean) => Promise<void>;
@@ -25,7 +27,7 @@ export const MergeButton = memo(function MergeButton({
   const blocker = mergeBlocker(compare, comparison);
 
   const merge = async () => {
-    if (comparison.type !== "compared" || session.worktree === null) return;
+    if (comparison.type !== "compared") return;
     setMoving(true);
     try {
       await invoke("move_branch", {
@@ -33,7 +35,7 @@ export const MergeButton = memo(function MergeButton({
         branch: compare,
         to: comparison.tip,
         expected: comparison.compare_tip,
-        sourceBranch: session.worktree.branch,
+        sourceBranch: worktree.branch,
       });
       setMerged(true);
     } catch (e) {
@@ -78,7 +80,7 @@ export const MergeButton = memo(function MergeButton({
         >
           <p className="message">
             Delete the session? Ox removes its worktree and its branch{" "}
-            <code>{session.worktree?.branch}</code>.
+            <code>{worktree.branch}</code>.
           </p>
         </Dialog>
       )}

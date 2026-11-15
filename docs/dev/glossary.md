@@ -19,7 +19,7 @@ ownership and lifecycle.
   a worktree created for a session.
 - **Worktree**: In session checkout choices, an additional Git working tree
   created by Ox for that session.
-- **Comparison ref**: The Git ref against which a worktree session's branch is
+- **Comparison ref**: The Git ref against which a worktree's branch is
   compared for commits ahead and behind.
 - **Parking**: Stopping an idle session's agent while retaining its conversation
   and checkout.

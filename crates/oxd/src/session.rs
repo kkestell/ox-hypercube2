@@ -15,17 +15,14 @@ use agent_client_protocol::v2::schema::{
 };
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
-use ox_protocol::{
-    Comparison, ConfigValue, ErrorBody, Event, EventKind, SessionInfo, SessionState, code,
-};
-use tokio::sync::{Notify, OwnedMutexGuard, mpsc, oneshot, watch};
+use ox_protocol::{ConfigValue, ErrorBody, Event, EventKind, SessionInfo, SessionState, code};
+use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::branches;
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
-use crate::store::{SavedSession, SavedWorktree, Store};
-use crate::worktree::{self, Git, WorktreePlan};
+use crate::store::{SavedSession, Store};
+use crate::worktree::Worktree;
 
 type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
 
@@ -45,7 +42,7 @@ enum Command {
 
 /// One ACP agent process and its event history. The database keeps the
 /// session's workspace, command, directory, title, agent session ID, and
-/// worktree.
+/// the ID of its worktree.
 pub struct Session {
     pub id: String,
     pub number: u64,
@@ -53,7 +50,7 @@ pub struct Session {
     command: Vec<String>,
     cwd: PathBuf,
     /// The worktree the session runs in. Unset when it could not be added.
-    worktree: Mutex<Option<SavedWorktree>>,
+    worktree: Mutex<Option<Arc<Worktree>>>,
     /// Whether the session is archived.
     archived: Mutex<bool>,
     /// Held while the session adds its worktree and launches its agent,
@@ -83,17 +80,6 @@ pub struct Session {
     parkable: watch::Sender<Parkable>,
     /// Stops the agent of a session that stays parkable for the park delay.
     parker: Mutex<Option<JoinHandle<()>>>,
-    /// How the worktree's branch compares with its comparison ref, as last
-    /// computed.
-    comparison: Mutex<Option<Comparison>>,
-    /// Held while a comparison is computed and published, so that one that
-    /// read git later is published later.
-    comparing: tokio::sync::Mutex<()>,
-    /// Asks the comparing task to compute the comparison again.
-    recompare: Notify,
-    /// Computes the comparison of a session with a worktree when it is
-    /// created or restored, and again each time `recompare` is notified.
-    comparer: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Whether a session is quiet and unviewed. `lapses` counts the times it
@@ -120,6 +106,7 @@ impl Session {
         changed: watch::Sender<()>,
         ox_server: Arc<OxServer>,
         saved: SavedSession,
+        worktree: Option<Arc<Worktree>>,
         state: State,
         park_after: Duration,
     ) -> Arc<Self> {
@@ -132,7 +119,7 @@ impl Session {
             workspace_id: saved.workspace_id,
             command: saved.command,
             cwd: saved.cwd,
-            worktree: Mutex::new(saved.worktree),
+            worktree: Mutex::new(worktree),
             archived: Mutex::new(saved.archived),
             lifecycle: Arc::default(),
             store,
@@ -147,59 +134,10 @@ impl Session {
                 lapses: 0,
             }),
             parker: Mutex::new(None),
-            comparison: Mutex::new(None),
-            comparing: tokio::sync::Mutex::new(()),
-            recompare: Notify::new(),
-            comparer: Mutex::new(None),
         });
         *session.parker.lock().unwrap() =
             Some(tokio::spawn(session.clone().park_when_idle(park_after)));
-        if session.worktree.lock().unwrap().is_some() {
-            *session.comparer.lock().unwrap() =
-                Some(tokio::spawn(session.clone().compare_when_asked()));
-        }
         session
-    }
-
-    /// Computes the comparison, then again each time `recompare` is
-    /// notified. Notifications that arrive while it computes make one more
-    /// computation.
-    async fn compare_when_asked(self: Arc<Self>) {
-        loop {
-            self.compare().await;
-            self.recompare.notified().await;
-        }
-    }
-
-    /// Computes how the worktree's branch compares with its comparison ref
-    /// and publishes it.
-    pub async fn compare(&self) {
-        let _comparing = self.comparing.lock().await;
-        let comparison = match self.worktree() {
-            Some(worktree) => branches::compare(&Git::own(), &worktree).await,
-            None => None,
-        };
-        self.update(|_| *self.comparison.lock().unwrap() = comparison);
-    }
-
-    /// Asks the comparing task to compute the comparison again.
-    pub fn recompare(&self) {
-        self.recompare.notify_one();
-    }
-
-    /// Sets or clears the worktree's comparison ref, which the caller has
-    /// saved, and publishes it with the comparison computed for it.
-    pub async fn set_compare(&self, compare: Option<String>) {
-        let _comparing = self.comparing.lock().await;
-        let Some(mut worktree) = self.worktree() else {
-            return;
-        };
-        worktree.info.compare = compare;
-        let comparison = branches::compare(&Git::own(), &worktree).await;
-        self.update(|_| {
-            *self.worktree.lock().unwrap() = Some(worktree);
-            *self.comparison.lock().unwrap() = comparison;
-        });
     }
 
     /// Parks the session each time it stays parkable for `park_after`. Any
@@ -228,66 +166,42 @@ impl Session {
         }
     }
 
-    /// Starts a session just saved: adds its worktree, if it has one to
-    /// add, then spawns its agent. The session records `AgentStarted` once
-    /// the ACP session is open, or `AgentExited` if the worktree cannot be
-    /// added or the session cannot be opened.
-    pub fn spawn(
+    /// A session just saved, `starting`, in `worktree` if it runs in one.
+    /// `start` launches its agent.
+    pub fn create(
         store: Arc<Store>,
         changed: watch::Sender<()>,
         park_after: Duration,
         ox_server: Arc<OxServer>,
         saved: SavedSession,
-        env: BTreeMap<String, String>,
-        worktree: Option<(Git, WorktreePlan)>,
+        worktree: Option<Arc<Worktree>>,
     ) -> Arc<Self> {
         let state = State::new(saved.id.clone());
-        let session = Self::new(store, changed, ox_server, saved, state, park_after);
-        match worktree {
-            None => session.launch(&mut session.task.lock().unwrap(), env, None),
-            Some((git, plan)) => {
-                let lifecycle = session.hold_lifecycle();
-                tokio::spawn(session.clone().start_in_worktree(lifecycle, git, plan, env));
-            }
-        }
-        session
+        Self::new(
+            store, changed, ox_server, saved, worktree, state, park_after,
+        )
     }
 
-    /// Adds the session's worktree, then launches its agent in it. If the
-    /// worktree cannot be added, undoes the branch and the worktree, and the
-    /// session exits with git's error and no worktree.
-    async fn start_in_worktree(
-        self: Arc<Self>,
-        _lifecycle: OwnedMutexGuard<()>,
-        git: Git,
-        plan: WorktreePlan,
-        env: BTreeMap<String, String>,
-    ) {
-        if let Err(mut message) = worktree::add(&git, &plan).await {
-            if let Err(error) = worktree::roll_back(&git, &plan, true).await {
-                eprintln!("oxd: undoing the worktree of session {}: {error}", self.id);
-                message = format!("{message}; undoing it failed: {error}");
-            }
-            if let Err(error) = self.store.remove_worktree(&self.id) {
-                eprintln!(
-                    "oxd: forgetting the worktree of session {}: {error}",
-                    self.id
-                );
-                message = format!("{message}; forgetting the worktree failed: {error}");
-            }
-            self.update(|state| {
-                *self.worktree.lock().unwrap() = None;
-                state.record(Change::Exited(Some(message)));
-            });
-            return;
-        }
+    /// Launches the agent of a session that is still `starting`. The session
+    /// records `AgentStarted` once the ACP session is open, or `AgentExited`
+    /// if it cannot be opened. A session closed before it started stays
+    /// closed.
+    pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>) {
         // Holding the task slot keeps a concurrent `close` from missing the
-        // agent's task. A session closed while its worktree was added stays
-        // closed.
+        // agent's task.
         let mut task = self.task.lock().unwrap();
         if self.state() == SessionState::Starting {
             self.launch(&mut task, env, None);
         }
+    }
+
+    /// Records that the session's worktree could not be added: the session
+    /// has no worktree and exits with `message`.
+    pub fn fail_start(&self, message: String) {
+        self.update(|state| {
+            *self.worktree.lock().unwrap() = None;
+            state.record(Change::Exited(Some(message)));
+        });
     }
 
     /// A saved session whose agent is not running: it is `exited`, and its
@@ -299,6 +213,7 @@ impl Session {
         park_after: Duration,
         ox_server: Arc<OxServer>,
         saved: SavedSession,
+        worktree: Option<Arc<Worktree>>,
     ) -> Arc<Self> {
         let state = match saved.agent_session_id.clone() {
             Some(agent_session_id) => State::restored(
@@ -309,7 +224,9 @@ impl Session {
             ),
             None => State::unstarted(saved.id.clone(), saved.title.clone()),
         };
-        Self::new(store, changed, ox_server, saved, state, park_after)
+        Self::new(
+            store, changed, ox_server, saved, worktree, state, park_after,
+        )
     }
 
     /// Starts the agent task in `task`, which opens or resumes an ACP session.
@@ -395,7 +312,7 @@ impl Session {
         &self.cwd
     }
 
-    pub fn worktree(&self) -> Option<SavedWorktree> {
+    pub fn worktree(&self) -> Option<Arc<Worktree>> {
         self.worktree.lock().unwrap().clone()
     }
 
@@ -420,18 +337,12 @@ impl Session {
 
     fn info_of(&self, state: &State) -> SessionInfo {
         let agent = state.agent();
-        let worktree = self
+        let worktree_id = self
             .worktree
             .lock()
             .unwrap()
             .as_ref()
-            .map(|worktree| worktree.info.clone());
-        // A worktree that could not be added, or a cleared ref, has no
-        // comparison, whatever a comparison under way stores.
-        let comparison = worktree
-            .as_ref()
-            .and_then(|worktree| worktree.compare.as_ref())
-            .and_then(|_| self.comparison.lock().unwrap().clone());
+            .map(|worktree| worktree.id.clone());
         SessionInfo {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -449,9 +360,8 @@ impl Session {
             available_commands: agent
                 .map(|agent| agent.available_commands.clone())
                 .unwrap_or_default(),
-            worktree,
+            worktree_id,
             archived: *self.archived.lock().unwrap(),
-            comparison,
         }
     }
 
@@ -612,10 +522,6 @@ impl Session {
         if let Some(parker) = parker {
             parker.abort();
         }
-        let comparer = self.comparer.lock().unwrap().take();
-        if let Some(comparer) = comparer {
-            comparer.abort();
-        }
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -631,8 +537,8 @@ impl Session {
     /// Changes the state, publishes the seq of its last event, queues its new
     /// events for the database, saves a
     /// changed title or agent session ID, signals the daemon if the
-    /// session's `SessionInfo` changed, and asks for the comparison again
-    /// when a turn ended.
+    /// session's `SessionInfo` changed, and asks the worktree for its
+    /// comparison again when a turn ended.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.lock();
         let before = self.info_of(&state);
@@ -642,8 +548,9 @@ impl Session {
         if events
             .iter()
             .any(|event| matches!(event.kind, EventKind::TurnEnded { .. }))
+            && let Some(worktree) = self.worktree()
         {
-            self.recompare();
+            worktree.recompare();
         }
         if !events.is_empty() {
             self.store.log(events);

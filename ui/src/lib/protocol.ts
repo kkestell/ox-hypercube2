@@ -49,21 +49,24 @@ export interface WorkspaceInfo {
 
 /**
  * Where a new session runs: the workspace's directory, or a new worktree on
- * an `ox/<id8>` branch from `HEAD`, compared with the ref `compare`.
+ * an `ox/<id8>` branch, named for the worktree's ID, from `HEAD`, compared
+ * with the ref `compare`.
  */
 export type Checkout = { type: "workspace" } | { type: "worktree"; compare: string };
 
 export interface WorktreeInfo {
+  id: string;
   path: string;
   branch: string;
   base: string;
   created_branch: boolean;
   /** The ref the branch is compared with. */
   compare: string | null;
+  comparison: Comparison | null;
 }
 
 /**
- * How a session's branch compares with its comparison ref: the two tips and
+ * How a worktree's branch compares with its comparison ref: the two tips and
  * the commits each has that the other lacks, or git's error.
  */
 export type Comparison =
@@ -93,8 +96,8 @@ export interface SessionInfo {
   agent_session_id: string | null;
   config_options: ConfigOption[];
   available_commands: Command[];
-  worktree: WorktreeInfo | null;
-  comparison: Comparison | null;
+  /** The ID of the worktree the session runs in. */
+  worktree_id: string | null;
   archived: boolean;
 }
 
@@ -185,17 +188,20 @@ export type Item =
 export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
 
 /**
- * A change to the listing: a workspace or session added or changed, or one
- * removed. One that is new comes last; one that changed keeps its place.
+ * A change to the listing: a workspace, worktree or session added or changed,
+ * or one removed. A workspace or session that is new comes last; one that
+ * changed keeps its place. A session's worktree comes before the session.
  */
 export type ListingChange =
   | { type: "workspace"; workspace: WorkspaceInfo }
   | { type: "workspace_removed"; workspace_id: string }
+  | { type: "worktree"; worktree: WorktreeInfo }
+  | { type: "worktree_removed"; worktree_id: string }
   | { type: "session"; session: SessionInfo }
   | { type: "session_removed"; session_id: string };
 
 export type WatchMessage =
-  /** A watch's first changes list every workspace and session. */
+  /** A watch's first changes list every workspace, worktree and session. */
   | { type: "changes"; changes: ListingChange[] }
   | { type: "error"; message: string }
   | { type: "disconnected" };

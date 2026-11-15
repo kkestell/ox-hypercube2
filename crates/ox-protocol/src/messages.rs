@@ -222,17 +222,17 @@ pub enum Method {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
-    /// Sets or clears a worktree session's comparison ref and answers the
-    /// session with its comparison recomputed. Refused for a session with
-    /// no worktree and for a ref that names no commit.
-    #[serde(rename = "session.set_compare")]
-    SessionSetCompare {
-        session_id: String,
+    /// Sets or clears a worktree's comparison ref and answers the worktree
+    /// with its comparison recomputed. Refused for a ref that names no
+    /// commit.
+    #[serde(rename = "worktree.set_compare")]
+    WorktreeSetCompare {
+        worktree_id: String,
         compare: Option<String>,
     },
-    /// Recomputes the session's comparison and answers the session.
-    #[serde(rename = "session.refresh")]
-    SessionRefresh { session_id: String },
+    /// Recomputes the worktree's comparison and answers the worktree.
+    #[serde(rename = "worktree.refresh")]
+    WorktreeRefresh { worktree_id: String },
     /// Sets the session's title, shown in the session list and saved with
     /// the session. Runs of whitespace become one space, and a title left
     /// empty is refused with `invalid_request`. Answers `null`.
@@ -250,8 +250,8 @@ pub enum Checkout {
     /// A new worktree of the workspace's repository, in the same
     /// subdirectory the workspace is of its checkout, on `branch`. With no
     /// `branch`, the worktree is on a new branch `ox/<first 8 digits of the
-    /// session ID>` that starts at `HEAD`. With `compare`, a ref such as
-    /// `main` that must name a commit, the session publishes how its branch
+    /// worktree ID>` that starts at `HEAD`. With `compare`, a ref such as
+    /// `main` that must name a commit, the worktree publishes how its branch
     /// compares with the ref.
     Worktree {
         #[serde(default)]
@@ -279,9 +279,10 @@ pub enum WorktreeBranch {
     },
 }
 
-/// A session's worktree.
+/// A worktree the daemon added for a session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeInfo {
+    pub id: String,
     /// The worktree's top level. The session's `cwd` is this directory or a
     /// subdirectory of it.
     pub path: PathBuf,
@@ -292,9 +293,14 @@ pub struct WorktreeInfo {
     pub created_branch: bool,
     /// The ref the branch is compared with, as the client gave it.
     pub compare: Option<String>,
+    /// How the branch compares with `compare`. Unset when there is no
+    /// comparison ref. The daemon recomputes it when the session's agent
+    /// ends a turn, after a branch move, a session delete or a fetch in the
+    /// repository, and on `worktree.refresh`.
+    pub comparison: Option<Comparison>,
 }
 
-/// How a session's branch compares with its comparison ref.
+/// How a worktree's branch compares with its comparison ref.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Comparison {
@@ -398,16 +404,19 @@ pub struct LocalBranch {
     pub worktree: Option<PathBuf>,
 }
 
-/// The daemon's workspaces, in the order they were added, and its sessions,
-/// in the order they were created.
+/// The daemon's workspaces, in the order they were added, its worktrees, and
+/// its sessions, in the order they were created.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listing {
     pub workspaces: Vec<WorkspaceInfo>,
+    pub worktrees: Vec<WorktreeInfo>,
     pub sessions: Vec<SessionInfo>,
 }
 
-/// One change a watch delivers. A workspace or session that is new comes
-/// after every one listed before it; one that changed keeps its place.
+/// One change a watch delivers. A workspace, worktree or session that is new
+/// comes after every one listed before it; one that changed keeps its place.
+/// Each batch lists removals first, then workspaces, worktrees and sessions,
+/// so a session's worktree arrives before the session.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ListingChange {
@@ -417,6 +426,13 @@ pub enum ListingChange {
     },
     WorkspaceRemoved {
         workspace_id: String,
+    },
+    /// A worktree that was added, or whose info changed.
+    Worktree {
+        worktree: WorktreeInfo,
+    },
+    WorktreeRemoved {
+        worktree_id: String,
     },
     /// A session that was added, or whose info changed.
     Session {
@@ -446,18 +462,12 @@ pub struct SessionInfo {
     pub config_options: Vec<SessionConfigOption>,
     /// The agent's complete current slash-command catalog.
     pub available_commands: Vec<AvailableCommand>,
-    /// The worktree the session runs in, if it has one. Unset again when
-    /// the worktree could not be added.
-    pub worktree: Option<WorktreeInfo>,
+    /// The ID of the worktree the session runs in, if it has one. Unset
+    /// again when the worktree could not be added.
+    pub worktree_id: Option<String>,
     /// Whether the session is archived: it is `exited`, its worktree is
     /// removed, and only its history can be read.
     pub archived: bool,
-    /// How the worktree's branch compares with its comparison ref. Unset
-    /// when the session has no worktree or no comparison ref. The daemon
-    /// recomputes it when the session's agent ends a turn, after a branch
-    /// move, a session delete or a fetch in the repository, and on
-    /// `session.refresh`.
-    pub comparison: Option<Comparison>,
 }
 
 /// One entry in a session's history. `seq` starts at 1 and increases by one
@@ -813,8 +823,8 @@ mod tests {
                 if branch == "main" && to == "abc" && expected == "def" && env.is_empty()
         ));
         for compare in [Some("origin/main".to_owned()), None] {
-            let method = Method::SessionSetCompare {
-                session_id: "s".into(),
+            let method = Method::WorktreeSetCompare {
+                worktree_id: "t".into(),
                 compare: compare.clone(),
             };
             let value = serde_json::to_value(Request { id: 23, method }).unwrap();
@@ -822,32 +832,32 @@ mod tests {
                 value,
                 json!({
                     "id": 23,
-                    "method": "session.set_compare",
-                    "params": {"session_id": "s", "compare": compare}
+                    "method": "worktree.set_compare",
+                    "params": {"worktree_id": "t", "compare": compare}
                 })
             );
             let request: Request = serde_json::from_value(value).unwrap();
             assert!(matches!(
                 request.method,
-                Method::SessionSetCompare { ref session_id, compare: ref decoded }
-                    if session_id == "s" && *decoded == compare
+                Method::WorktreeSetCompare { ref worktree_id, compare: ref decoded }
+                    if worktree_id == "t" && *decoded == compare
             ));
         }
         let value = serde_json::to_value(Request {
             id: 24,
-            method: Method::SessionRefresh {
-                session_id: "s".into(),
+            method: Method::WorktreeRefresh {
+                worktree_id: "t".into(),
             },
         })
         .unwrap();
         assert_eq!(
             value,
-            json!({"id": 24, "method": "session.refresh", "params": {"session_id": "s"}})
+            json!({"id": 24, "method": "worktree.refresh", "params": {"worktree_id": "t"}})
         );
         let request: Request = serde_json::from_value(value).unwrap();
         assert!(matches!(
             request.method,
-            Method::SessionRefresh { ref session_id } if session_id == "s"
+            Method::WorktreeRefresh { ref worktree_id } if worktree_id == "t"
         ));
         let request: Request = serde_json::from_value(json!({
             "id": 16,
@@ -1135,6 +1145,22 @@ mod tests {
                     "workspace": {"id": "w", "path": "/tmp", "git_working_tree": true}
                 },
                 {"type": "workspace_removed", "workspace_id": "v"},
+                {"type": "worktree", "worktree": {
+                    "id": "01234567-89ab",
+                    "path": "/worktrees/tmp-01234567",
+                    "branch": "ox/01234567",
+                    "base": "abc",
+                    "created_branch": true,
+                    "compare": "main",
+                    "comparison": {
+                        "type": "compared",
+                        "tip": "abc",
+                        "compare_tip": "def",
+                        "ahead": 1,
+                        "behind": 2
+                    }
+                }},
+                {"type": "worktree_removed", "worktree_id": "u"},
                 {"type": "session", "session": {
                 "id": "s",
                 "workspace_id": "w",
@@ -1146,21 +1172,8 @@ mod tests {
                 "prompt_capabilities": {},
                 "config_options": [],
                 "available_commands": [],
-                "worktree": {
-                    "path": "/worktrees/tmp-01234567",
-                    "branch": "ox/01234567",
-                    "base": "abc",
-                    "created_branch": true,
-                    "compare": "main"
-                },
-                "archived": false,
-                "comparison": {
-                    "type": "compared",
-                    "tip": "abc",
-                    "compare_tip": "def",
-                    "ahead": 1,
-                    "behind": 2
-                }
+                "worktree_id": "01234567-89ab",
+                "archived": false
                 }},
                 {"type": "session_removed", "session_id": "r"}
             ]
@@ -1176,6 +1189,8 @@ mod tests {
         let [
             ListingChange::Workspace { workspace },
             ListingChange::WorkspaceRemoved { workspace_id },
+            ListingChange::Worktree { worktree },
+            ListingChange::WorktreeRemoved { worktree_id },
             ListingChange::Session { session },
             ListingChange::SessionRemoved { session_id },
         ] = &changes[..]
@@ -1184,16 +1199,19 @@ mod tests {
         };
         assert!(workspace.id == "w" && workspace.git_working_tree);
         assert_eq!(workspace_id, "v");
+        assert_eq!(worktree_id, "u");
         assert_eq!(session_id, "r");
         assert_eq!(session.workspace_id, "w");
         assert_eq!(session.title.as_deref(), Some("Fix the build"));
-        assert!(session.worktree.as_ref().is_some_and(|worktree| {
-            worktree.branch == "ox/01234567"
+        assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));
+        assert!(
+            worktree.id == "01234567-89ab"
+                && worktree.branch == "ox/01234567"
                 && worktree.created_branch
                 && worktree.compare.as_deref() == Some("main")
-        }));
+        );
         assert_eq!(
-            session.comparison,
+            worktree.comparison,
             Some(Comparison::Compared {
                 tip: "abc".into(),
                 compare_tip: "def".into(),

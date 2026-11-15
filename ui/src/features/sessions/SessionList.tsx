@@ -11,6 +11,7 @@ import type {
   SessionInfo,
   SessionState,
   WorkspaceInfo,
+  WorktreeInfo,
 } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { branchStatus, localMerge } from "./localMerge";
@@ -51,12 +52,14 @@ async function run(action: () => Promise<unknown>) {
 
 export const SessionList = memo(function SessionList({
   workspaces,
+  worktrees,
   sessions,
   selected,
   onSelect,
   actions: { busy, deleteSession, archiveSession, unarchiveSession },
 }: {
   workspaces: WorkspaceInfo[];
+  worktrees: Map<string, WorktreeInfo>;
   sessions: SessionInfo[];
   selected: string | null;
   onSelect: (sessionId: string) => void;
@@ -85,8 +88,9 @@ export const SessionList = memo(function SessionList({
       onSelect(session.id);
     });
 
-  // A worktree session on a new `ox/<id8>` branch from `HEAD`, compared with
-  // the branch the workspace's checkout is on.
+  // A session in a new worktree, on a new `ox/<id8>` branch named for the
+  // worktree's ID, from `HEAD`, compared with the branch the workspace's
+  // checkout is on.
   const newTask = (workspace: WorkspaceInfo, agent: AgentId) =>
     run(async () => {
       const { head } = await invoke<Branches>("workspace_branches", {
@@ -128,6 +132,7 @@ export const SessionList = memo(function SessionList({
     <SessionRow
       key={session.id}
       session={session}
+      worktree={session.worktree_id === null ? undefined : worktrees.get(session.worktree_id)}
       selected={session.id === selected}
       busy={busy.has(session.id)}
       onSelect={select}
@@ -261,6 +266,7 @@ export const SessionList = memo(function SessionList({
 /** A session's row, which renders again only when its props change. */
 const SessionRow = memo(function SessionRow({
   session,
+  worktree,
   selected,
   busy,
   onSelect,
@@ -269,13 +275,14 @@ const SessionRow = memo(function SessionRow({
   unarchiveSession,
 }: {
   session: SessionInfo;
+  worktree: WorktreeInfo | undefined;
   selected: boolean;
   /** Whether an action on the session is in flight. */
   busy: boolean;
   onSelect: (session: SessionInfo) => void;
 } & Omit<SessionActions, "busy">) {
   const state = stateLabels[session.state];
-  const merge = localMerge(session);
+  const merge = localMerge(session, worktree);
   const status = merge && branchStatus(merge.compare, merge.comparison);
   return (
     <li

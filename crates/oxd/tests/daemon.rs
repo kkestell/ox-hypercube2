@@ -451,6 +451,15 @@ fn apply(listing: &mut Listing, change: ListingChange) {
         ListingChange::WorkspaceRemoved { workspace_id } => {
             listing.workspaces.retain(|w| w.id != workspace_id);
         }
+        ListingChange::Worktree { worktree } => {
+            match listing.worktrees.iter_mut().find(|w| w.id == worktree.id) {
+                Some(listed) => *listed = worktree,
+                None => listing.worktrees.push(worktree),
+            }
+        }
+        ListingChange::WorktreeRemoved { worktree_id } => {
+            listing.worktrees.retain(|w| w.id != worktree_id);
+        }
         ListingChange::Session { session } => {
             match listing.sessions.iter_mut().find(|s| s.id == session.id) {
                 Some(listed) => *listed = *session,

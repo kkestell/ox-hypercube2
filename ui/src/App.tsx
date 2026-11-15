@@ -17,7 +17,7 @@ import { useWorkspaces } from "./features/sessions/useWorkspaces";
 import type { Item } from "./lib/protocol";
 
 export function App() {
-  const { workspaces, sessions, connection } = useWorkspaces();
+  const { workspaces, worktrees, sessions, connection } = useWorkspaces();
   useFileViewers(sessions, connection);
   const drafts = useDrafts(sessions, connection > 0);
   // The viewed session survives a webview reload.
@@ -38,7 +38,8 @@ export function App() {
     },
     [viewed],
   );
-  const merge = session && localMerge(session);
+  const worktree = session?.worktree_id == null ? undefined : worktrees.get(session.worktree_id);
+  const merge = session && localMerge(session, worktree);
   const { actions, dialogs } = useSessionActions();
   const items = useConversation(session?.id ?? null, connection);
   const request = useMemo(
@@ -56,6 +57,7 @@ export function App() {
         left={
           <SessionList
             workspaces={workspaces}
+            worktrees={worktrees}
             sessions={sessions}
             selected={viewed}
             onSelect={setViewed}
@@ -85,10 +87,12 @@ export function App() {
         }
         actions={
           session &&
+          worktree &&
           merge && (
             <MergeButton
               key={session.id}
               session={session}
+              worktree={worktree}
               compare={merge.compare}
               comparison={merge.comparison}
               deleteSession={actions.deleteSession}

@@ -1,21 +1,29 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
-import type { ListingChange, SessionInfo, WatchMessage, WorkspaceInfo } from "../../lib/protocol";
+import type {
+  ListingChange,
+  SessionInfo,
+  WatchMessage,
+  WorkspaceInfo,
+  WorktreeInfo,
+} from "../../lib/protocol";
 
 interface Listing {
   workspaces: WorkspaceInfo[];
+  /** The worktrees by ID. */
+  worktrees: Map<string, WorktreeInfo>;
   sessions: SessionInfo[];
 }
 
-const emptyListing: Listing = { workspaces: [], sessions: [] };
+const emptyListing: Listing = { workspaces: [], worktrees: new Map(), sessions: [] };
 
 /**
  * `listing` with `changes` applied. Each list is copied once at most, and
  * the entries that did not change keep their identity.
  */
 function apply(listing: Listing, changes: ListingChange[]): Listing {
-  let { workspaces, sessions } = listing;
+  let { workspaces, worktrees, sessions } = listing;
   // Where each session is in `sessions`, once a change needs it.
   let positions: Map<string, number> | null = null;
   for (const change of changes) {
@@ -29,6 +37,14 @@ function apply(listing: Listing, changes: ListingChange[]): Listing {
       }
       case "workspace_removed":
         workspaces = workspaces.filter((workspace) => workspace.id !== change.workspace_id);
+        break;
+      case "worktree":
+        if (worktrees === listing.worktrees) worktrees = new Map(worktrees);
+        worktrees.set(change.worktree.id, change.worktree);
+        break;
+      case "worktree_removed":
+        if (worktrees === listing.worktrees) worktrees = new Map(worktrees);
+        worktrees.delete(change.worktree_id);
         break;
       case "session": {
         if (sessions === listing.sessions) sessions = [...sessions];
@@ -48,13 +64,15 @@ function apply(listing: Listing, changes: ListingChange[]): Listing {
         break;
     }
   }
-  return workspaces === listing.workspaces && sessions === listing.sessions
+  return workspaces === listing.workspaces &&
+    worktrees === listing.worktrees &&
+    sessions === listing.sessions
     ? listing
-    : { workspaces, sessions };
+    : { workspaces, worktrees, sessions };
 }
 
 /**
- * The daemon's workspaces and sessions, from a watch that restarts,
+ * The daemon's workspaces, worktrees and sessions, from a watch that restarts,
  * reconnecting, when the connection drops. `connection` changes each time a
  * watch connects.
  */
@@ -98,5 +116,10 @@ export function useWorkspaces() {
     };
   }, [attempt]);
 
-  return { workspaces: listing.workspaces, sessions: listing.sessions, connection };
+  return {
+    workspaces: listing.workspaces,
+    worktrees: listing.worktrees,
+    sessions: listing.sessions,
+    connection,
+  };
 }

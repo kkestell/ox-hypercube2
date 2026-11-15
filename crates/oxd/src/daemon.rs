@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ox_protocol::{
     Branches, Checkout, Deleted, ErrorBody, Listing, ListingChange, Method, SessionInfo,
-    SessionState, WorkspaceInfo, code,
+    SessionState, WorkspaceInfo, WorktreeInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -16,14 +16,15 @@ use crate::directories::Directories;
 use crate::mcp::OxServer;
 use crate::session::Session;
 use crate::state::Change;
-use crate::store::{SavedSession, SavedWorkspace, SavedWorktree, Store};
-use crate::worktree::{self, Git, WorktreePlan};
+use crate::store::{SavedSession, SavedWorkspace, Store};
+use crate::worktree::{self, Git, Worktree, WorktreePlan};
 
 /// The outcome of a fetch, once it has one.
 type FetchOutcome = Option<Result<(), String>>;
 
 struct Registry {
     workspaces: Vec<SavedWorkspace>,
+    worktrees: HashMap<String, Arc<Worktree>>,
     sessions: HashMap<String, Arc<Session>>,
     clients: usize,
     moving_checkouts: HashSet<PathBuf>,
@@ -41,27 +42,33 @@ pub struct Daemon {
     /// How long a session stays idle, with no background work, and unviewed
     /// before its agent is parked.
     park_after: Duration,
-    /// Sent when a workspace or session is added or removed, a client
-    /// connects or disconnects, or a session's `SessionInfo` changes.
+    /// Sent when a workspace, worktree or session is added or removed, a
+    /// client connects or disconnects, or a session's `SessionInfo` or a
+    /// worktree's `WorktreeInfo` changes.
     changed: watch::Sender<()>,
     /// The fetches running, by the common Git directory of the repository
     /// each fetches, so that requests for one repository share one fetch.
     fetches: Arc<Mutex<HashMap<PathBuf, watch::Receiver<FetchOutcome>>>>,
-    /// The sessions that never started and have a worktree to remove, each
-    /// with its lifecycle guard, until `clean_up` takes them.
-    unstarted: Mutex<Vec<(Arc<Session>, OwnedMutexGuard<()>)>>,
+    /// The worktrees in which no session ever started, each with its session
+    /// and the session's lifecycle guard, until `clean_up` takes them.
+    unstarted: Mutex<Vec<Unstarted>>,
     /// The directories that directory watches follow.
     directories: Arc<Directories>,
     /// The `ox` MCP server each session's agent is given.
     ox_server: Arc<OxServer>,
 }
 
+/// A worktree in which no session ever started, with its session and the
+/// session's lifecycle guard.
+type Unstarted = (Arc<Worktree>, Arc<Session>, OwnedMutexGuard<()>);
+
 /// What a watch has sent: the workspaces, as of a version of the registry,
-/// and the version of each session's info.
+/// and the version of each worktree's and each session's info.
 #[derive(Default)]
 pub struct Sent {
     registry_version: Option<u64>,
     workspaces: Vec<WorkspaceInfo>,
+    worktrees: HashMap<String, u64>,
     sessions: HashMap<String, u64>,
 }
 
@@ -105,14 +112,15 @@ impl Registry {
 }
 
 impl Daemon {
-    /// A daemon with the workspaces and sessions `store` holds, which adds
-    /// sessions' worktrees in `worktrees_dir`, and parks the agent of a session
-    /// that has been idle, with no background work, and unviewed for
-    /// `park_after`, whose directory watches follow `directories`, and whose
-    /// sessions' agents are given `ox_server`. Each saved session is
-    /// `exited`, with no agent, until it loads. A saved session that never
-    /// started has nothing to load. One without a worktree is deleted; one
-    /// with a worktree waits, `exited`, for `clean_up`.
+    /// A daemon with the workspaces, worktrees and sessions `store` holds,
+    /// which adds sessions' worktrees in `worktrees_dir`, and parks the agent
+    /// of a session that has been idle, with no background work, and
+    /// unviewed for `park_after`, whose directory watches follow
+    /// `directories`, and whose sessions' agents are given `ox_server`. Each
+    /// saved session is `exited`, with no agent, until it loads. A saved
+    /// session that never started has nothing to load. One without a
+    /// worktree is deleted; one with a worktree waits, `exited`, for
+    /// `clean_up`.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
@@ -122,12 +130,23 @@ impl Daemon {
     ) -> rusqlite::Result<Self> {
         let store = Arc::new(store);
         let changed = watch::Sender::new(());
+        let worktrees: HashMap<String, Arc<Worktree>> = store
+            .worktrees()?
+            .into_iter()
+            .map(|saved| (saved.id.clone(), Worktree::new(saved, changed.clone())))
+            .collect();
         let mut sessions = HashMap::new();
         let mut unstarted = Vec::new();
         let saved_sessions = store.sessions()?;
         for saved in saved_sessions {
             let started = saved.agent_session_id.is_some();
-            if !started && saved.worktree.is_none() {
+            let worktree = saved.worktree_id.as_ref().map(|id| {
+                worktrees
+                    .get(id)
+                    .expect("a session's worktree is saved")
+                    .clone()
+            });
+            if !started && worktree.is_none() {
                 store.remove_session(&saved.id)?;
                 continue;
             }
@@ -137,15 +156,17 @@ impl Daemon {
                 park_after,
                 ox_server.clone(),
                 saved,
+                worktree.clone(),
             );
-            if !started {
+            if let Some(worktree) = worktree.filter(|_| !started) {
                 let guard = session.hold_lifecycle();
-                unstarted.push((session.clone(), guard));
+                unstarted.push((worktree, session.clone(), guard));
             }
             sessions.insert(session.id.clone(), session);
         }
         let registry = Registry {
             workspaces: store.workspaces()?,
+            worktrees,
             sessions,
             clients: 0,
             moving_checkouts: HashSet::new(),
@@ -165,20 +186,23 @@ impl Daemon {
         })
     }
 
-    /// Removes the worktrees and branches of the sessions that never
-    /// started, one at a time, with the daemon's own environment, as a delete
-    /// without `discard` does, and deletes those sessions. A session whose
-    /// worktree would lose work, or cannot be removed, stays to be deleted by
-    /// the user. The daemon is not idle until this ends.
+    /// Removes the worktrees in which no session ever started, and their
+    /// branches, one at a time, with the daemon's own environment, as a
+    /// delete without `discard` does, and deletes their sessions. A worktree
+    /// that would lose work, or cannot be removed, stays with its session to
+    /// be deleted by the user. The daemon is not idle until this ends.
     pub async fn clean_up(&self) {
         let unstarted = std::mem::take(&mut *self.unstarted.lock().unwrap());
-        for (session, _lifecycle) in unstarted {
-            let worktree = session
-                .worktree()
-                .expect("an unstarted session waiting for cleanup has a worktree");
-            match remove_unstarted(&worktree).await {
+        for (worktree, session, _lifecycle) in unstarted {
+            let git = Git::own();
+            let removed = async {
+                worktree.remove(&git, false, async {}).await?;
+                worktree.apply_branch_rule(&git).await?;
+                Ok::<_, ErrorBody>(())
+            };
+            match removed.await {
                 Ok(()) => {
-                    self.recompare(&worktree.common_dir);
+                    self.recompare(&worktree.saved().common_dir);
                     if let Err(error) = self.forget(&session.id) {
                         eprintln!(
                             "oxd: deleting session {}, which never started: {}",
@@ -232,12 +256,19 @@ impl Daemon {
                 .all(|session| session.state() == SessionState::Exited)
     }
 
-    /// Stops every agent. The sessions stay saved.
+    /// Stops every agent and every comparison. The sessions stay saved.
     pub fn close_all(&self) {
         let mut sessions = Vec::new();
-        self.update(|registry| sessions.extend(registry.sessions.drain().map(|(_, s)| s)));
+        let mut worktrees = Vec::new();
+        self.update(|registry| {
+            sessions.extend(registry.sessions.drain().map(|(_, s)| s));
+            worktrees.extend(registry.worktrees.drain().map(|(_, w)| w));
+        });
         for session in sessions {
             session.close();
+        }
+        for worktree in worktrees {
+            worktree.close();
         }
     }
 
@@ -263,9 +294,17 @@ impl Daemon {
             .ok_or_else(|| not_found("session", id))
     }
 
+    fn worktree(&self, id: &str) -> Result<Arc<Worktree>, ErrorBody> {
+        self.lock()
+            .worktrees
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("worktree", id))
+    }
+
     /// Handles every method except `hello`, `session.subscribe`, `watch`, and
     /// `unsubscribe`, which belong to the connection.
-    pub async fn handle(&self, method: Method) -> Result<Value, ErrorBody> {
+    pub async fn handle(self: &Arc<Self>, method: Method) -> Result<Value, ErrorBody> {
         match method {
             Method::SessionList => Ok(to_value(self.list().sessions)),
             Method::WorkspaceAdd { path } => Ok(to_value(self.add_workspace(path)?)),
@@ -376,14 +415,14 @@ impl Daemon {
                 .await?;
                 Ok(Value::Null)
             }
-            Method::SessionSetCompare {
-                session_id,
+            Method::WorktreeSetCompare {
+                worktree_id,
                 compare,
-            } => Ok(to_value(self.set_compare(&session_id, compare).await?)),
-            Method::SessionRefresh { session_id } => {
-                let session = self.session(&session_id)?;
-                session.compare().await;
-                Ok(to_value(session.info()))
+            } => Ok(to_value(self.set_compare(&worktree_id, compare).await?)),
+            Method::WorktreeRefresh { worktree_id } => {
+                let worktree = self.worktree(&worktree_id)?;
+                worktree.compare().await;
+                Ok(to_value(worktree.info()))
             }
             Method::SessionSetTitle { session_id, title } => {
                 self.session(&session_id)?.set_title(&title)?;
@@ -414,31 +453,46 @@ impl Daemon {
         result
     }
 
-    /// The workspaces in the order they were added and the sessions in the
-    /// order they were created. Whether each workspace is in a Git working
-    /// tree is worked out now.
+    /// The workspaces in the order they were added, the worktrees, and the
+    /// sessions in the order they were created. Whether each workspace is in
+    /// a Git working tree is worked out now.
     pub fn list(&self) -> Listing {
         let registry = self.lock();
         let workspaces = registry.workspaces.clone();
+        let worktrees: Vec<Arc<Worktree>> = registry.worktrees.values().cloned().collect();
         let mut sessions: Vec<Arc<Session>> = registry.sessions.values().cloned().collect();
         drop(registry);
         sessions.sort_by_key(|session| session.number);
         Listing {
             workspaces: workspaces.into_iter().map(workspace_info).collect(),
+            worktrees: worktrees.iter().map(|worktree| worktree.info()).collect(),
             sessions: sessions.iter().map(|session| session.info()).collect(),
         }
     }
 
-    /// The changes to the workspaces and sessions since `sent`, which then
-    /// records them: removals first, then additions and changes, in the order
-    /// the listing has them. Only sessions whose info changed are read, and
-    /// the workspaces only when the registry changed, such as when a client
-    /// connects.
+    /// The changes to the workspaces, worktrees and sessions since `sent`,
+    /// which then records them: removals first, then additions and changes
+    /// of workspaces, worktrees and sessions, in that order, so that a
+    /// session's worktree comes before the session. Only worktrees and
+    /// sessions whose info changed are read, and the workspaces only when
+    /// the registry changed, such as when a client connects.
     pub fn listing_changes(&self, sent: &mut Sent) -> Vec<ListingChange> {
         let registry = self.lock();
         let workspaces =
             (sent.registry_version != Some(registry.version)).then(|| registry.workspaces.clone());
         sent.registry_version = Some(registry.version);
+        let outdated_worktrees: Vec<Arc<Worktree>> = registry
+            .worktrees
+            .values()
+            .filter(|worktree| sent.worktrees.get(&worktree.id) != Some(&worktree.version()))
+            .cloned()
+            .collect();
+        let removed_worktrees: Vec<String> = sent
+            .worktrees
+            .keys()
+            .filter(|id| !registry.worktrees.contains_key(*id))
+            .cloned()
+            .collect();
         let mut outdated: Vec<Arc<Session>> = registry
             .sessions
             .values()
@@ -458,6 +512,10 @@ impl Daemon {
             sent.sessions.remove(&id);
             changes.push(ListingChange::SessionRemoved { session_id: id });
         }
+        for id in removed_worktrees {
+            sent.worktrees.remove(&id);
+            changes.push(ListingChange::WorktreeRemoved { worktree_id: id });
+        }
         if let Some(workspaces) = workspaces {
             let workspaces: Vec<WorkspaceInfo> =
                 workspaces.into_iter().map(workspace_info).collect();
@@ -476,6 +534,11 @@ impl Daemon {
                 }
             }
             sent.workspaces = workspaces;
+        }
+        for worktree in outdated_worktrees {
+            let (info, version) = worktree.versioned_info();
+            sent.worktrees.insert(worktree.id.clone(), version);
+            changes.push(ListingChange::Worktree { worktree: info });
         }
         outdated.sort_by_key(|session| session.number);
         for session in outdated {
@@ -549,9 +612,9 @@ impl Daemon {
 
     /// Creates a session in the workspace's directory or in a new worktree.
     /// For a worktree, the branch is resolved and created here, and the
-    /// session's startup adds the worktree.
+    /// worktree is added before the session's agent starts.
     async fn new_session(
-        &self,
+        self: &Arc<Self>,
         workspace_id: &str,
         command: Vec<String>,
         env: BTreeMap<String, String>,
@@ -566,8 +629,16 @@ impl Daemon {
         };
         let workspace = self.workspace_path(workspace_id)?;
         let git = Git::for_client(env.clone());
-        let plan =
-            worktree::plan(&git, &workspace, branch, compare, &self.worktrees_dir, &id).await?;
+        let worktree_id = uuid::Uuid::new_v4().to_string();
+        let plan = worktree::plan(
+            &git,
+            &workspace,
+            branch,
+            compare,
+            &self.worktrees_dir,
+            &worktree_id,
+        )
+        .await?;
         worktree::create_branch(&git, &plan).await?;
         let mut worktree = Some((git, plan));
         let added = self.add_session(id, workspace_id, command, env, &mut worktree);
@@ -579,11 +650,11 @@ impl Daemon {
         added
     }
 
-    /// Saves a session, with its worktree if it has one, and spawns it,
-    /// taking the worktree to add. A session that cannot be saved leaves the
-    /// worktree where it is.
+    /// Saves and registers a session, with its worktree if it has one, and
+    /// starts it, taking the worktree to add. A session that cannot be saved
+    /// leaves the worktree where it is.
     fn add_session(
-        &self,
+        self: &Arc<Self>,
         id: String,
         workspace_id: &str,
         command: Vec<String>,
@@ -596,14 +667,14 @@ impl Daemon {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .ok_or_else(|| not_found("workspace", workspace_id))?;
-            let (cwd, info) = match worktree {
+            let (cwd, saved_worktree) = match worktree {
                 Some((_, plan)) => (plan.cwd.clone(), Some(plan.saved())),
                 None => (workspace.path.clone(), None),
             };
             registry.refuse_moving(&cwd)?;
             let number = self
                 .store
-                .add_session(&id, workspace_id, &command, &cwd, info.as_ref())
+                .add_session(&id, workspace_id, &command, &cwd, saved_worktree.as_ref())
                 .map_err(|error| storage(&error))?;
             let saved = SavedSession {
                 number,
@@ -613,23 +684,76 @@ impl Daemon {
                 cwd,
                 title: None,
                 agent_session_id: None,
-                worktree: info,
+                worktree_id: saved_worktree.as_ref().map(|saved| saved.id.clone()),
                 last_seq: 0,
                 archived: false,
             };
-            let session = Session::spawn(
+            let live_worktree =
+                saved_worktree.map(|saved| Worktree::new(saved, self.changed.clone()));
+            let session = Session::create(
                 self.store.clone(),
                 self.changed.clone(),
                 self.park_after,
                 self.ox_server.clone(),
                 saved,
-                env,
-                worktree.take(),
+                live_worktree.clone(),
             );
+            match (live_worktree, worktree.take()) {
+                (Some(live_worktree), Some((git, plan))) => {
+                    registry
+                        .worktrees
+                        .insert(live_worktree.id.clone(), live_worktree.clone());
+                    let lifecycle = session.hold_lifecycle();
+                    tokio::spawn(self.clone().start_in_worktree(
+                        session.clone(),
+                        live_worktree,
+                        lifecycle,
+                        git,
+                        plan,
+                        env,
+                    ));
+                }
+                _ => session.start(env),
+            }
             let info = session.info();
             registry.sessions.insert(session.id.clone(), session);
             Ok(info)
         })
+    }
+
+    /// Adds the session's worktree, then launches its agent in it. If the
+    /// worktree cannot be added, undoes the branch and the worktree, forgets
+    /// the worktree, and the session exits with git's error and no worktree.
+    async fn start_in_worktree(
+        self: Arc<Self>,
+        session: Arc<Session>,
+        live_worktree: Arc<Worktree>,
+        _lifecycle: OwnedMutexGuard<()>,
+        git: Git,
+        plan: WorktreePlan,
+        env: BTreeMap<String, String>,
+    ) {
+        let Err(mut message) = worktree::add(&git, &plan).await else {
+            session.start(env);
+            return;
+        };
+        if let Err(error) = worktree::roll_back(&git, &plan, true).await {
+            eprintln!(
+                "oxd: undoing the worktree of session {}: {error}",
+                session.id
+            );
+            message = format!("{message}; undoing it failed: {error}");
+        }
+        if let Err(error) = self.store.remove_worktree(&live_worktree.id) {
+            eprintln!(
+                "oxd: forgetting the worktree of session {}: {error}",
+                session.id
+            );
+            message = format!("{message}; forgetting the worktree failed: {error}");
+        }
+        self.update(|registry| registry.worktrees.remove(&live_worktree.id));
+        live_worktree.close();
+        session.fail_start(message);
     }
 
     fn workspace_path(&self, id: &str) -> Result<PathBuf, ErrorBody> {
@@ -665,7 +789,7 @@ impl Daemon {
 
     /// Fetches the repository whose common Git directory is `common_dir`,
     /// from `workspace` with `git`, or waits for the fetch of it already
-    /// running, then asks the sessions in the repository to compare again.
+    /// running, then asks the worktrees of the repository to compare again.
     /// The fetch runs in its own task, so it finishes even when every request
     /// waiting for it is dropped.
     async fn fetch(&self, git: &Git, common_dir: PathBuf, workspace: &Path) -> Result<(), String> {
@@ -733,16 +857,11 @@ impl Daemon {
         let mut kept_branch = None;
         if let Some(worktree) = session.worktree() {
             let git = Git::for_client(env);
-            if !discard {
-                let unsaved = worktree::unsaved(&git, &worktree).await?;
-                if !unsaved.is_empty() {
-                    return Err(worktree::unsaved_work(&unsaved));
-                }
-            }
-            session.stop(Change::Exited(None)).await;
-            worktree::remove_worktree(&git, &worktree, discard).await?;
-            kept_branch = worktree::apply_branch_rule(&git, &worktree).await?;
-            self.recompare(&worktree.common_dir);
+            worktree
+                .remove(&git, discard, session.stop(Change::Exited(None)))
+                .await?;
+            kept_branch = worktree.apply_branch_rule(&git).await?;
+            self.recompare(&worktree.saved().common_dir);
         }
         self.forget(id)?;
         session.close();
@@ -767,19 +886,14 @@ impl Daemon {
         if session.archived() {
             return Err(invalid_state("the session is already archived"));
         }
-        let git = Git::for_client(env);
-        let worktree = session.worktree();
-        if let Some(worktree) = &worktree
-            && !discard
-        {
-            let unsaved = worktree::unsaved(&git, worktree).await?;
-            if !unsaved.is_empty() {
-                return Err(worktree::unsaved_work(&unsaved));
+        match session.worktree() {
+            Some(worktree) => {
+                let git = Git::for_client(env);
+                worktree
+                    .remove(&git, discard, session.stop(Change::Parked))
+                    .await?;
             }
-        }
-        session.stop(Change::Parked).await;
-        if let Some(worktree) = &worktree {
-            worktree::remove_worktree(&git, worktree, discard).await?;
+            None => session.stop(Change::Parked).await,
         }
         self.store
             .set_archived(id, true)
@@ -801,7 +915,7 @@ impl Daemon {
             return Err(invalid_state("the session is not archived"));
         }
         if let Some(worktree) = session.worktree() {
-            worktree::restore(&Git::for_client(env), &worktree).await?;
+            worktree.restore(&Git::for_client(env)).await?;
         }
         self.store
             .set_archived(id, false)
@@ -812,7 +926,7 @@ impl Daemon {
 
     /// Moves local branch `branch` of the workspace's repository from
     /// `expected` to `to`, with git run with `env`, unless a session's agent
-    /// in the checkout that has the branch is busy, and asks the sessions in
+    /// in the checkout that has the branch is busy, and asks the worktrees of
     /// the repository to compare again.
     async fn move_branch(
         &self,
@@ -865,33 +979,26 @@ impl Daemon {
         })
     }
 
-    /// Asks every session whose worktree is in the repository with common
-    /// Git directory `common_dir` to compare its branch again.
+    /// Asks every worktree of the repository with common Git directory
+    /// `common_dir` to compare its branch again.
     fn recompare(&self, common_dir: &Path) {
-        for session in self.lock().sessions.values() {
-            if session
-                .worktree()
-                .is_some_and(|worktree| worktree.common_dir == common_dir)
-            {
-                session.recompare();
+        for worktree in self.lock().worktrees.values() {
+            if worktree.saved().common_dir == common_dir {
+                worktree.recompare();
             }
         }
     }
 
-    /// Sets or clears the session's comparison ref, which must name a
-    /// commit, and returns the session with its comparison recomputed.
+    /// Sets or clears the worktree's comparison ref, which must name a
+    /// commit, and returns the worktree with its comparison recomputed.
     async fn set_compare(
         &self,
         id: &str,
         compare: Option<String>,
-    ) -> Result<SessionInfo, ErrorBody> {
-        let session = self.session(id)?;
-        let _lifecycle = self.lifecycle(&session).await?;
-        let worktree = session
-            .worktree()
-            .ok_or_else(|| invalid_request("the session has no worktree".into()))?;
+    ) -> Result<WorktreeInfo, ErrorBody> {
+        let worktree = self.worktree(id)?;
         if let Some(compare) = &compare
-            && worktree::Repository::new(&Git::own(), &worktree.common_dir)
+            && worktree::Repository::new(&Git::own(), &worktree.saved().common_dir)
                 .commit(compare)
                 .await
                 .is_none()
@@ -901,29 +1008,28 @@ impl Daemon {
         self.store
             .set_compare(id, compare.as_deref())
             .map_err(|error| storage(&error))?;
-        session.set_compare(compare).await;
-        Ok(session.info())
+        worktree.set_compare(compare).await;
+        Ok(worktree.info())
     }
 
-    /// Deletes the session's rows and removes it from the registry.
+    /// Deletes the session's rows, with its worktree's, and removes both from
+    /// the registry.
     fn forget(&self, id: &str) -> Result<(), ErrorBody> {
-        self.update(|registry| {
+        let session = self.update(|registry| {
             self.store
                 .remove_session(id)
                 .map_err(|error| storage(&error))?;
-            registry.sessions.remove(id);
-            Ok(())
-        })
+            let session = registry.sessions.remove(id);
+            if let Some(worktree) = session.as_ref().and_then(|session| session.worktree()) {
+                registry.worktrees.remove(&worktree.id);
+            }
+            Ok::<_, ErrorBody>(session)
+        })?;
+        if let Some(worktree) = session.and_then(|session| session.worktree()) {
+            worktree.close();
+        }
+        Ok(())
     }
-}
-
-/// Removes the worktree and branch of a session that never started, with
-/// the daemon's own environment, as a delete without `discard` would.
-async fn remove_unstarted(worktree: &SavedWorktree) -> Result<(), ErrorBody> {
-    let git = Git::own();
-    worktree::remove_worktree(&git, worktree, false).await?;
-    worktree::apply_branch_rule(&git, worktree).await?;
-    Ok(())
 }
 
 /// `path` with symbolic links resolved, or as it is when it cannot be.

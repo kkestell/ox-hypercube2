@@ -1,7 +1,6 @@
 //! A workspace's branches: listing them for a client naming the branch of a
-//! new worktree, the fetch that brings its remote branches up to date,
-//! comparing a session's branch with its comparison ref, and moving a branch
-//! along with the checkout that has it.
+//! new worktree, the fetch that brings its remote branches up to date, and
+//! moving a branch along with the checkout that has it.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
@@ -10,11 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use ox_protocol::{Branches, Comparison, ErrorBody, LocalBranch, code};
+use ox_protocol::{Branches, ErrorBody, LocalBranch, code};
 use tokio::io::AsyncReadExt;
 
 use crate::daemon::invalid_request;
-use crate::store::SavedWorktree;
 use crate::worktree::{Git, Repository, checked_out_at, not_a_working_tree};
 
 /// How long a fetch may run before it is stopped.
@@ -142,40 +140,6 @@ pub async fn fetch(git: &Git, workspace: &Path) -> Result<(), String> {
             ))
         }
     }
-}
-
-/// How the worktree's branch compares with its comparison ref, in its
-/// repository: the commits on each, and how many commits each has that the
-/// other lacks. Unset when the worktree has no comparison ref.
-pub async fn compare(git: &Git, worktree: &SavedWorktree) -> Option<Comparison> {
-    let compare = worktree.info.compare.as_deref()?;
-    let branch = &worktree.info.branch;
-    let repository = Repository::new(git, &worktree.common_dir);
-    let failed = |error: String| Some(Comparison::Failed { error });
-    let Some(tip) = repository.commit(&format!("refs/heads/{branch}")).await else {
-        return failed(format!("branch {branch} is not a commit"));
-    };
-    let Some(compare_tip) = repository.commit(compare).await else {
-        return failed(format!("{compare} is not a commit"));
-    };
-    let range = format!("{compare_tip}...{tip}");
-    let counts = match repository
-        .text(&[&"rev-list", &"--left-right", &"--count", &range])
-        .await
-    {
-        Ok(counts) => counts,
-        Err(error) => return failed(error.to_string()),
-    };
-    let mut counts = counts.split_whitespace().map(str::parse::<u64>);
-    let (Some(Ok(behind)), Some(Ok(ahead))) = (counts.next(), counts.next()) else {
-        return failed(format!("git rev-list printed no counts for {range}"));
-    };
-    Some(Comparison::Compared {
-        tip,
-        compare_tip,
-        ahead,
-        behind,
-    })
 }
 
 pub(crate) struct Move<'a> {

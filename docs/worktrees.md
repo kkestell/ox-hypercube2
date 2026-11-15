@@ -6,15 +6,16 @@ of the workspace's repository.
 ## Choosing a checkout
 
 In the workspace's **+** menu, **Session in Checkout** runs in the workspace's
-directory. **New Task** creates a worktree on a new branch named for the
-session, starting at the workspace checkout's `HEAD`. New Task is offered for
+directory. **New Task** creates a worktree on a new branch
+`ox/<first 8 digits of the worktree's ID>`, starting at the workspace
+checkout's `HEAD`. New Task is offered for
 workspaces in a Git working tree and requires a checked-out branch with a
 commit.
 
 ## Worktrees
 
 Each worktree is the directory `worktrees/<checkout name>-<first 8 digits of
-the session ID>` beside the daemon socket. By default that is in Ox's data
+the worktree's ID>` beside the daemon socket. By default that is in Ox's data
 directory. When the workspace is a subdirectory of its checkout, the session
 runs in the same subdirectory of the worktree.
 

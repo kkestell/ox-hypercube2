@@ -38,7 +38,7 @@ enum Command {
         #[arg(long)]
         workspace: String,
         /// Run in a new worktree of the workspace's repository, on a new
-        /// branch named for the session
+        /// branch named for the worktree
         #[arg(long)]
         worktree: bool,
         /// Agent command
@@ -238,9 +238,18 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             client.unarchive(&session, utf8_env()).await?;
         }
         Command::Compare { session } => {
-            let info = client.refresh(&session).await?;
-            let reference = info.worktree.and_then(|worktree| worktree.compare);
-            match (reference, info.comparison) {
+            let worktree_id = client
+                .list()
+                .await?
+                .into_iter()
+                .find(|info| info.id == session)
+                .ok_or_else(|| format!("no session {session}"))?
+                .worktree_id;
+            let Some(worktree_id) = worktree_id else {
+                return Ok(());
+            };
+            let info = client.refresh(&worktree_id).await?;
+            match (info.compare, info.comparison) {
                 (
                     Some(reference),
                     Some(Comparison::Compared {
