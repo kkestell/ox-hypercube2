@@ -305,6 +305,8 @@ class SmokeRun:
         )
 
     def start_daemon(self):
+        # oxd reads workflow definitions from its configuration directory.
+        env = {**os.environ, "XDG_CONFIG_HOME": str(self.directory / "config")}
         self.daemon = subprocess.Popen(
             [
                 str(self.binaries / "oxd"),
@@ -314,6 +316,7 @@ class SmokeRun:
             ],
             stdout=subprocess.PIPE,
             stderr=self.daemon_log,
+            env=env,
         )
         # oxd prints `ready` once it is listening and nothing else on stdout.
         with self.daemon.stdout:
@@ -576,6 +579,89 @@ class SmokeRun:
         )
         self.report("unarchived_session_retains_conversation", response=response)
 
+    def check_workflow(self):
+        """Runs a two-step workflow on this agent in its own repository, and
+        checks that the launch input reached the second step through the
+        first step's reply."""
+        project = self.directory / "workflow-project"
+        project.mkdir()
+        command(["git", "init", "--quiet", "-b", "main"], cwd=project)
+        (project / "README").write_text("Workflow smoke project\n")
+        command(["git", "add", "README"], cwd=project)
+        command(
+            [
+                "git",
+                "-c",
+                "user.name=Ox",
+                "-c",
+                "user.email=ox@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "first",
+            ],
+            cwd=project,
+        )
+        workflows = self.directory / "config" / "ox" / "workflows"
+        workflows.mkdir(parents=True)
+        # JSON is YAML, so each step's agent is a flow mapping.
+        agent = json.dumps(self.workflow_agent())
+        (workflows / "smoke.yaml").write_text(
+            "name: Smoke handoff\n"
+            "steps:\n"
+            "  - name: Extract\n"
+            f"    agent: {agent}\n"
+            "    prompt: Your input contains a token. Reply with only that token. "
+            "Do not use tools.\n"
+            "  - name: Repeat\n"
+            f"    agent: {agent}\n"
+            "    prompt: Your input is a token. Reply with only that token. "
+            "Do not use tools.\n"
+        )
+        workspace = self.ctl("workspace", "add", str(project))
+        token = f"{self.directory.name}-workflow"
+        run = self.ctl(
+            "run", "start", "--workspace", workspace, "smoke", f"The token is {token}."
+        )
+        waited = None
+        try:
+            waited = subprocess.run(
+                self.cli + ["run", "wait", run],
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=self.args.timeout * 2,
+                check=False,
+            )
+            check(
+                waited.returncode == 0,
+                f"The workflow did not succeed: {waited.stdout.strip()} "
+                f"{waited.stderr.strip()}",
+            )
+            info = json.loads(waited.stdout)
+            output = info["steps"][1]["output"]
+            check(token in output, f"The token did not reach step 2: {info}")
+            self.report(
+                "workflow_hands_off_between_steps",
+                run_id=run,
+                outputs=[step["output"] for step in info["steps"]],
+            )
+        finally:
+            self.remember_agents()
+            if self.daemon.poll() is None:
+                if waited is None:
+                    # A run still going is cancelled, and removed once it ends.
+                    for args in (["run", "cancel", run], ["run", "wait", run]):
+                        subprocess.run(
+                            self.cli + args,
+                            env=self.env,
+                            capture_output=True,
+                            timeout=self.args.timeout,
+                            check=False,
+                        )
+                self.ctl("run", "rm", run, "--discard")
+                self.ctl("workspace", "rm", workspace)
+
     def cleanup(self):
         try:
             if self.attachment is not None:
@@ -636,7 +722,16 @@ class ClaudeRun(SmokeRun):
             self.check_load_after_restart,
             self.check_parking,
             self.check_archive,
+            self.check_workflow,
         )
+
+    def workflow_agent(self):
+        return {
+            "harness": "claude",
+            "model": self.args.model,
+            "effort": "low",
+            "permission_mode": "acceptEdits",
+        }
 
     def permission(self):
         events = self.until(lambda e: kind(e) == "permission_requested")
@@ -995,7 +1090,11 @@ class PiRun(SmokeRun):
             self.check_load_after_restart,
             self.check_parking,
             self.check_archive,
+            self.check_workflow,
         )
+
+    def workflow_agent(self):
+        return {"harness": "pi", "model": self.args.model, "effort": "low"}
 
     def check_thinking(self):
         thinking = self.ctl("config", self.session, "thinking", "low")
@@ -1003,9 +1102,9 @@ class PiRun(SmokeRun):
         self.report("thinking_set_on_running_pi", thinking=thinking)
 
     def check_commands(self):
-        self.ctl("prompt", self.session, "/skill:ox-command-probe ARGUMENTS")
+        self.ctl("prompt", self.session, "/skill:ox-command-probe copper-lantern")
         response = text(self.finish()).strip()
-        check(response == "OX_NATIVE_COMMAND_ARGUMENTS", response)
+        check(response == "OX_NATIVE_COMMAND_copper-lantern", response)
         self.report("native_skill_invoked_with_arguments", response=response)
 
     def check_dialog(self):

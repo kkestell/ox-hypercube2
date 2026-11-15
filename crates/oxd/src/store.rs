@@ -1,11 +1,11 @@
-//! The daemon's saved workspaces, worktrees and sessions, in one `SQLite`
-//! database.
+//! The daemon's saved workspaces, worktrees, sessions and workflow runs, in
+//! one `SQLite` database.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ox_protocol::{Event, EventKind};
+use ox_protocol::{Event, EventKind, RunState, StepInfo, StepState};
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
@@ -49,6 +49,40 @@ pub struct SavedWorktree {
     pub compare: Option<String>,
     /// The repository's absolute common Git directory.
     pub common_dir: PathBuf,
+}
+
+/// A workflow run as the database holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedRun {
+    pub number: u64,
+    pub id: String,
+    pub workspace_id: String,
+    /// The worktree the run owns.
+    pub worktree_id: String,
+    /// The file name the run was started with.
+    pub workflow: String,
+    /// The definition's name.
+    pub name: String,
+    pub input: String,
+    pub state: RunState,
+    pub error: Option<String>,
+    /// The steps, in order.
+    pub steps: Vec<StepInfo>,
+}
+
+/// The worktree a new session runs in.
+#[derive(Clone, Copy)]
+pub enum SessionWorktree<'a> {
+    /// The workspace's directory.
+    None,
+    /// A worktree the session owns, saved with it.
+    New(&'a SavedWorktree),
+    /// The worktree of run `run_id`, whose step `position` the session runs.
+    Step {
+        run_id: &'a str,
+        position: usize,
+        worktree_id: &'a str,
+    },
 }
 
 /// What the event writer thread is sent.
@@ -102,6 +136,26 @@ impl Store {
                 title            TEXT,
                 agent_session_id TEXT,
                 worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS runs (
+                number       INTEGER PRIMARY KEY AUTOINCREMENT,
+                id           TEXT NOT NULL UNIQUE,
+                workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+                worktree_id  TEXT NOT NULL REFERENCES worktrees(id),
+                workflow     TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                input        TEXT NOT NULL,
+                state        TEXT NOT NULL,
+                error        TEXT
+            );
+            CREATE TABLE IF NOT EXISTS run_steps (
+                run_id     TEXT    NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                position   INTEGER NOT NULL,
+                name       TEXT    NOT NULL,
+                state      TEXT    NOT NULL,
+                session_id TEXT    REFERENCES sessions(id) ON DELETE SET NULL,
+                output     TEXT,
+                PRIMARY KEY (run_id, position)
             );
             CREATE TABLE IF NOT EXISTS events (
                 session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -248,35 +302,28 @@ impl Store {
             .collect()
     }
 
-    /// Saves a session that has not started, with its worktree if it has
-    /// one, and returns its number, which is greater than the number of
-    /// every session saved before it.
+    /// Saves a session that has not started, with the worktree it runs in,
+    /// and returns its number, which is greater than the number of every
+    /// session saved before it. A step's session is recorded as its step's.
     pub fn add_session(
         &self,
         id: &str,
         workspace_id: &str,
         command: &[String],
         cwd: &Path,
-        worktree: Option<&SavedWorktree>,
+        worktree: SessionWorktree<'_>,
     ) -> rusqlite::Result<u64> {
         let command = serde_json::to_string(command).expect("a list of strings serializes");
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
-        if let Some(worktree) = worktree {
-            transaction.execute(
-                "INSERT INTO worktrees (id, path, branch, base, created_branch, common_dir, compare)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    worktree.id,
-                    worktree.path.to_string_lossy(),
-                    worktree.branch,
-                    worktree.base,
-                    worktree.created_branch,
-                    worktree.common_dir.to_string_lossy(),
-                    worktree.compare
-                ],
-            )?;
-        }
+        let worktree_id = match worktree {
+            SessionWorktree::None => None,
+            SessionWorktree::New(worktree) => {
+                insert_worktree(&transaction, worktree)?;
+                Some(worktree.id.as_str())
+            }
+            SessionWorktree::Step { worktree_id, .. } => Some(worktree_id),
+        };
         transaction.execute(
             "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id)
             VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -285,13 +332,170 @@ impl Store {
                 workspace_id,
                 command,
                 cwd.to_string_lossy(),
-                worktree.map(|worktree| &worktree.id)
+                worktree_id
             ],
         )?;
         // `number` is the table's rowid.
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
+        if let SessionWorktree::Step {
+            run_id, position, ..
+        } = worktree
+        {
+            transaction.execute(
+                "UPDATE run_steps SET session_id = ?3 WHERE run_id = ?1 AND position = ?2",
+                params![run_id, position_value(position), id],
+            )?;
+        }
         transaction.commit()?;
         Ok(number)
+    }
+
+    /// Saves a run with its worktree and its steps, and returns its number,
+    /// which is greater than the number of every run saved before it.
+    pub fn add_run(&self, run: &SavedRun, worktree: &SavedWorktree) -> rusqlite::Result<u64> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        insert_worktree(&transaction, worktree)?;
+        transaction.execute(
+            "INSERT INTO runs (id, workspace_id, worktree_id, workflow, name, input, state, error)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run.id,
+                run.workspace_id,
+                run.worktree_id,
+                run.workflow,
+                run.name,
+                run.input,
+                state_name(run.state),
+                run.error
+            ],
+        )?;
+        let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
+        for (position, step) in run.steps.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO run_steps (run_id, position, name, state, session_id, output)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    run.id,
+                    position_value(position),
+                    step.name,
+                    state_name(step.state),
+                    step.session_id,
+                    step.output
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(number)
+    }
+
+    /// Every run with its steps, in the order they were started.
+    pub fn runs(&self) -> rusqlite::Result<Vec<SavedRun>> {
+        let connection = self.lock();
+        let mut query = connection.prepare(
+            "SELECT number, id, workspace_id, worktree_id, workflow, name, input, state, error
+            FROM runs ORDER BY number",
+        )?;
+        let mut runs = query
+            .query_map([], |row| {
+                Ok(SavedRun {
+                    number: u64::try_from(row.get::<_, i64>(0)?).expect("rowids are positive"),
+                    id: row.get(1)?,
+                    workspace_id: row.get(2)?,
+                    worktree_id: row.get(3)?,
+                    workflow: row.get(4)?,
+                    name: row.get(5)?,
+                    input: row.get(6)?,
+                    state: parse_state(row, 7)?,
+                    error: row.get(8)?,
+                    steps: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut steps = connection.prepare(
+            "SELECT name, state, session_id, output FROM run_steps
+            WHERE run_id = ?1 ORDER BY position",
+        )?;
+        for run in &mut runs {
+            run.steps = steps
+                .query_map([&run.id], |row| {
+                    Ok(StepInfo {
+                        name: row.get(0)?,
+                        state: parse_state(row, 1)?,
+                        session_id: row.get(2)?,
+                        output: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+        }
+        Ok(runs)
+    }
+
+    pub fn set_run_state(
+        &self,
+        id: &str,
+        state: RunState,
+        error: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE runs SET state = ?2, error = ?3 WHERE id = ?1",
+            params![id, state_name(state), error],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_step(
+        &self,
+        run_id: &str,
+        position: usize,
+        state: StepState,
+        output: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE run_steps SET state = ?3, output = ?4 WHERE run_id = ?1 AND position = ?2",
+            params![run_id, position_value(position), state_name(state), output],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the runs and steps that were running `interrupted`.
+    pub fn interrupt_runs(&self) -> rusqlite::Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE runs SET state = ?2 WHERE state = ?1",
+            [
+                state_name(RunState::Running),
+                state_name(RunState::Interrupted),
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE run_steps SET state = ?2 WHERE state = ?1",
+            [
+                state_name(StepState::Running),
+                state_name(StepState::Interrupted),
+            ],
+        )?;
+        transaction.commit()
+    }
+
+    /// Deletes a run, with its steps, its child sessions and their events,
+    /// and its worktree.
+    pub fn remove_run(&self, id: &str) -> rusqlite::Result<()> {
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM sessions
+            WHERE id IN (SELECT session_id FROM run_steps WHERE run_id = ?1)",
+            [id],
+        )?;
+        let worktree_id: String =
+            transaction.query_row("SELECT worktree_id FROM runs WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })?;
+        transaction.execute("DELETE FROM runs WHERE id = ?1", [id])?;
+        transaction.execute("DELETE FROM worktrees WHERE id = ?1", [worktree_id])?;
+        transaction.commit()
     }
 
     /// Sets or clears a worktree's comparison ref.
@@ -311,9 +515,11 @@ impl Store {
         Ok(())
     }
 
+    /// Whether any session or run belongs to the workspace.
     pub fn workspace_has_sessions(&self, workspace_id: &str) -> rusqlite::Result<bool> {
         self.lock().query_row(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = ?1)
+                OR EXISTS (SELECT 1 FROM runs WHERE workspace_id = ?1)",
             [workspace_id],
             |row| row.get(0),
         )
@@ -346,17 +552,67 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes a session, with its events and the worktree it runs in.
+    /// Deletes a session, with its events and the worktree it runs in unless
+    /// a run owns the worktree.
     pub fn remove_session(&self, id: &str) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
-            "DELETE FROM worktrees WHERE id = (SELECT worktree_id FROM sessions WHERE id = ?1)",
+            "DELETE FROM worktrees
+            WHERE id = (SELECT worktree_id FROM sessions WHERE id = ?1)
+                AND NOT EXISTS (SELECT 1 FROM runs WHERE worktree_id = worktrees.id)",
             [id],
         )?;
         transaction.execute("DELETE FROM sessions WHERE id = ?1", [id])?;
         transaction.commit()
     }
+}
+
+fn insert_worktree(
+    transaction: &rusqlite::Transaction<'_>,
+    worktree: &SavedWorktree,
+) -> rusqlite::Result<()> {
+    transaction.execute(
+        "INSERT INTO worktrees (id, path, branch, base, created_branch, common_dir, compare)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            worktree.id,
+            worktree.path.to_string_lossy(),
+            worktree.branch,
+            worktree.base,
+            worktree.created_branch,
+            worktree.common_dir.to_string_lossy(),
+            worktree.compare
+        ],
+    )?;
+    Ok(())
+}
+
+fn position_value(position: usize) -> i64 {
+    i64::try_from(position).expect("step positions fit an i64")
+}
+
+/// A run's or step's state as its column holds it: its name on the wire.
+fn state_name(state: impl serde::Serialize) -> String {
+    match serde_json::to_value(state).expect("a state serializes") {
+        serde_json::Value::String(name) => name,
+        value => unreachable!("a state serializes as a string, not {value}"),
+    }
+}
+
+/// The run or step state in column `index`.
+fn parse_state<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let name: String = row.get(index)?;
+    serde_json::from_value(serde_json::Value::String(name)).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 /// Writes each batch the queue holds in one transaction, until every sender
@@ -449,10 +705,22 @@ mod tests {
         store.add_workspace(&workspace("w", "/work")).unwrap();
         assert!(store.sessions().unwrap().is_empty());
         let first = store
-            .add_session("one", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "one",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         let second = store
-            .add_session("two", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "two",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         assert!(first < second);
         assert_eq!(
@@ -491,7 +759,13 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("one", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "one",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         assert!(!store.sessions().unwrap()[0].archived);
         store.set_archived("one", true).unwrap();
@@ -508,7 +782,13 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "s",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         store.set_title("s", Some("Fix the build")).unwrap();
         store.set_agent_session_id("s", "agent").unwrap();
@@ -525,12 +805,24 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         let first = store
-            .add_session("one", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "one",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         store.remove_session("one").unwrap();
         assert!(store.sessions().unwrap().is_empty());
         let second = store
-            .add_session("two", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "two",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         assert!(second > first);
     }
@@ -540,7 +832,13 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "s",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         assert!(store.remove_workspace("w").is_err());
         store.remove_session("s").unwrap();
@@ -561,7 +859,13 @@ mod tests {
 
     fn add_worktree_session(store: &Store, id: &str, worktree: &SavedWorktree) {
         store
-            .add_session(id, "w", &command(), &worktree.path, Some(worktree))
+            .add_session(
+                id,
+                "w",
+                &command(),
+                &worktree.path,
+                SessionWorktree::New(worktree),
+            )
             .unwrap();
     }
 
@@ -581,7 +885,13 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("plain", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "plain",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         let mut compared = worktree("01234567");
         compared.compare = Some("main".into());
@@ -646,7 +956,7 @@ mod tests {
                 "w",
                 &command(),
                 Path::new("/work"),
-                Some(&worktree("one")),
+                SessionWorktree::New(&worktree("one")),
             )
             .unwrap_err();
         assert_eq!(count(&store, "sessions"), 1);
@@ -660,10 +970,193 @@ mod tests {
         store.add_workspace(&workspace("v", "/other")).unwrap();
         assert!(!store.workspace_has_sessions("w").unwrap());
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "s",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         assert!(store.workspace_has_sessions("w").unwrap());
         assert!(!store.workspace_has_sessions("v").unwrap());
+    }
+
+    fn step(name: &str, state: StepState) -> StepInfo {
+        StepInfo {
+            name: name.into(),
+            state,
+            session_id: None,
+            output: None,
+        }
+    }
+
+    /// A running run `id` of two pending steps in worktree `id`.
+    fn run(id: &str) -> SavedRun {
+        SavedRun {
+            number: 0,
+            id: id.into(),
+            workspace_id: "w".into(),
+            worktree_id: id.into(),
+            workflow: "plan-work".into(),
+            name: "Plan and work".into(),
+            input: "Fix the build".into(),
+            state: RunState::Running,
+            error: None,
+            steps: vec![
+                step("Plan", StepState::Pending),
+                step("Work", StepState::Pending),
+            ],
+        }
+    }
+
+    /// Saves run `id` and returns it as saved.
+    fn add_run(store: &Store, id: &str) -> SavedRun {
+        let mut run = run(id);
+        run.number = store.add_run(&run, &worktree(id)).unwrap();
+        run
+    }
+
+    /// Saves the session of step `position` of run `run_id`.
+    fn add_step_session(store: &Store, id: &str, run_id: &str, position: usize) {
+        store
+            .add_session(
+                id,
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::Step {
+                    run_id,
+                    position,
+                    worktree_id: run_id,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_run_round_trips_with_its_steps() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        assert!(store.runs().unwrap().is_empty());
+        let first = add_run(&store, "one");
+        let mut second = add_run(&store, "two");
+        assert!(first.number < second.number);
+        add_step_session(&store, "s", "two", 0);
+        store
+            .set_step("two", 0, StepState::Succeeded, Some("planned"))
+            .unwrap();
+        store.set_step("two", 1, StepState::Failed, None).unwrap();
+        store
+            .set_run_state("two", RunState::Failed, Some("boom"))
+            .unwrap();
+        second.state = RunState::Failed;
+        second.error = Some("boom".into());
+        second.steps = vec![
+            StepInfo {
+                name: "Plan".into(),
+                state: StepState::Succeeded,
+                session_id: Some("s".into()),
+                output: Some("planned".into()),
+            },
+            step("Work", StepState::Failed),
+        ];
+        assert_eq!(store.runs().unwrap(), [first, second]);
+        assert_eq!(
+            store.worktrees().unwrap(),
+            [worktree("one"), worktree("two")]
+        );
+        assert_eq!(
+            store.sessions().unwrap()[0].worktree_id.as_deref(),
+            Some("two")
+        );
+    }
+
+    #[test]
+    fn removing_a_child_session_keeps_the_run_worktree() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_run(&store, "r");
+        add_step_session(&store, "s", "r", 0);
+        store.remove_session("s").unwrap();
+        assert_eq!(store.worktrees().unwrap(), [worktree("r")]);
+        assert_eq!(store.runs().unwrap()[0].steps[0].session_id, None);
+    }
+
+    #[tokio::test]
+    async fn removing_a_run_takes_its_sessions_steps_and_worktree() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_run(&store, "r");
+        let other = add_run(&store, "q");
+        add_step_session(&store, "s", "r", 0);
+        add_step_session(&store, "t", "r", 1);
+        add_step_session(&store, "u", "q", 0);
+        store.log(vec![exited("s", 1), exited("u", 1)]);
+        store.flush().await;
+        store.remove_run("r").unwrap();
+        let sessions: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(sessions, ["u"]);
+        assert!(store.events("s").unwrap().is_empty());
+        assert_eq!(store.worktrees().unwrap(), [worktree("q")]);
+        assert_eq!(count(&store, "run_steps"), 2);
+        assert_eq!(store.runs().unwrap()[0].id, other.id);
+    }
+
+    #[test]
+    fn interrupting_runs_marks_only_running_runs_and_steps() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_run(&store, "running");
+        add_run(&store, "done");
+        store
+            .set_step("running", 0, StepState::Succeeded, Some("planned"))
+            .unwrap();
+        store
+            .set_step("running", 1, StepState::Running, None)
+            .unwrap();
+        store
+            .set_step("done", 0, StepState::Cancelled, None)
+            .unwrap();
+        store
+            .set_run_state("done", RunState::Cancelled, None)
+            .unwrap();
+        store.interrupt_runs().unwrap();
+        let states: Vec<_> = store
+            .runs()
+            .unwrap()
+            .into_iter()
+            .map(|run| {
+                let steps: Vec<_> = run.steps.iter().map(|step| step.state).collect();
+                (run.state, steps)
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                (
+                    RunState::Interrupted,
+                    vec![StepState::Succeeded, StepState::Interrupted]
+                ),
+                (
+                    RunState::Cancelled,
+                    vec![StepState::Cancelled, StepState::Pending]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_workspace_with_a_run_has_sessions() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        add_run(&store, "r");
+        assert!(store.workspace_has_sessions("w").unwrap());
     }
 
     fn event(session: &str, seq: u64, kind: EventKind) -> Event {
@@ -682,7 +1175,13 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None)
+            .add_session(
+                "s",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+            )
             .unwrap();
         store
     }

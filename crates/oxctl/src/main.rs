@@ -1,4 +1,5 @@
-//! Daemon client for the desktop end-to-end and live Claude smoke tests.
+//! Daemon client for the desktop end-to-end and live smoke tests, and for
+//! running workflows.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -10,11 +11,15 @@ use ox_protocol::schema::{
     ContentBlock, ElicitationAcceptAction, ElicitationAction, SessionConfigKind, TextContent,
 };
 use ox_protocol::{
-    Checkout, Client, Comparison, ConfigValue, End, EventKind, ListingChange, SessionState,
+    Checkout, Client, Comparison, ConfigValue, End, EventKind, ListingChange, RunInfo, RunState,
+    SessionState,
 };
 
 #[derive(Parser)]
-#[command(name = "oxctl", about = "Daemon client for Ox integration tests")]
+#[command(
+    name = "oxctl",
+    about = "Daemon client for Ox integration tests and workflow runs"
+)]
 struct Cli {
     /// oxd socket [default: $`OX_SOCKET`, else oxd.sock in $`XDG_DATA_HOME`/ox, else ~/.local/share/ox]
     #[arg(long, global = true)]
@@ -98,6 +103,40 @@ enum Command {
     Unarchive { session: String },
     /// Refresh and print a worktree session's branch comparison
     Compare { session: String },
+    /// Start, follow, cancel, and remove workflow runs
+    Run {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RunCommand {
+    /// Run a workflow in a new worktree of a workspace and print the run's id
+    Start {
+        /// The workspace's id, as `workspace ls` shows it
+        #[arg(long)]
+        workspace: String,
+        /// The workflow's file name in the workflows directory, without
+        /// `.yaml`
+        workflow: String,
+        /// The text the first step receives
+        input: String,
+    },
+    /// Wait until a run ends, print it as JSON, and fail unless it succeeded
+    Wait { run: String },
+    /// Cancel a running run
+    Cancel { run: String },
+    /// Remove a run that has ended, with its child sessions, its worktree,
+    /// and the branch Ox created for it, unless the branch has commits on no
+    /// other branch
+    Rm {
+        run: String,
+        /// Remove the worktree even if that loses uncommitted changes or
+        /// commits
+        #[arg(long)]
+        discard: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -263,8 +302,58 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 _ => {}
             }
         }
+        Command::Run { command } => match command {
+            RunCommand::Start {
+                workspace,
+                workflow,
+                input,
+            } => {
+                let run = client
+                    .start_run(&workspace, &workflow, &input, utf8_env())
+                    .await?;
+                println!("{}", run.id);
+            }
+            RunCommand::Wait { run } => {
+                let run = ended(&client, &run).await?;
+                println!("{}", serde_json::to_string(&run)?);
+                if run.state != RunState::Succeeded {
+                    return Err("the run did not succeed".into());
+                }
+            }
+            RunCommand::Cancel { run } => client.cancel_run(&run).await?,
+            RunCommand::Rm { run, discard } => {
+                client.delete_run(&run, discard, utf8_env()).await?;
+            }
+        },
     }
     Ok(())
+}
+
+/// Waits until a run is not running and returns it.
+async fn ended(client: &Client, run_id: &str) -> Result<RunInfo, Box<dyn Error>> {
+    let mut watch = client.watch().await?;
+    // The watch's first changes list every run.
+    let mut listed = false;
+    loop {
+        let changes = watch.next().await.map_err(|_| ox_protocol::Error::Closed)?;
+        let mut current = None;
+        for change in changes {
+            match change {
+                ListingChange::Run { run } if run.id == run_id => current = Some(run),
+                ListingChange::RunRemoved { run_id: id } if id == run_id => {
+                    return Err(format!("the run {run_id} was removed").into());
+                }
+                _ => {}
+            }
+        }
+        if !listed && current.is_none() {
+            return Err(format!("no run {run_id}").into());
+        }
+        listed = true;
+        if let Some(run) = current.filter(|run| run.state != RunState::Running) {
+            return Ok(run);
+        }
+    }
 }
 
 /// Waits for a session's agent to start and returns the session's id. A

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ox_protocol::{
-    Branches, Checkout, Deleted, ErrorBody, Listing, ListingChange, Method, SessionInfo,
-    SessionState, WorkspaceInfo, WorktreeInfo, code,
+    Branches, Checkout, Deleted, ErrorBody, Harness, Listing, ListingChange, Method, RunInfo,
+    RunState, SessionInfo, SessionState, StepInfo, StepState, WorkspaceInfo, WorktreeInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -14,9 +14,11 @@ use tokio::sync::{OwnedMutexGuard, watch};
 use crate::branches;
 use crate::directories::Directories;
 use crate::mcp::OxServer;
+use crate::run::Run;
 use crate::session::Session;
 use crate::state::Change;
-use crate::store::{SavedSession, SavedWorkspace, Store};
+use crate::store::{SavedRun, SavedSession, SavedWorkspace, SessionWorktree, Store};
+use crate::workflow;
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
 
 /// The outcome of a fetch, once it has one.
@@ -26,6 +28,7 @@ struct Registry {
     workspaces: Vec<SavedWorkspace>,
     worktrees: HashMap<String, Arc<Worktree>>,
     sessions: HashMap<String, Arc<Session>>,
+    runs: HashMap<String, Arc<Run>>,
     clients: usize,
     moving_checkouts: HashSet<PathBuf>,
     /// Whether the startup cleanup is still running.
@@ -37,14 +40,16 @@ struct Registry {
 pub struct Daemon {
     registry: Mutex<Registry>,
     store: Arc<Store>,
-    /// The directory that holds sessions' worktrees.
+    /// The directory that holds sessions' and runs' worktrees.
     worktrees_dir: PathBuf,
+    /// The directory that holds workflow definitions.
+    workflows_dir: PathBuf,
     /// How long a session stays idle, with no background work, and unviewed
     /// before its agent is parked.
     park_after: Duration,
-    /// Sent when a workspace, worktree or session is added or removed, a
-    /// client connects or disconnects, or a session's `SessionInfo` or a
-    /// worktree's `WorktreeInfo` changes.
+    /// Sent when a workspace, worktree, session or run is added or removed, a
+    /// client connects or disconnects, or a session's `SessionInfo`, a
+    /// worktree's `WorktreeInfo` or a run's `RunInfo` changes.
     changed: watch::Sender<()>,
     /// The fetches running, by the common Git directory of the repository
     /// each fetches, so that requests for one repository share one fetch.
@@ -63,13 +68,14 @@ pub struct Daemon {
 type Unstarted = (Arc<Worktree>, Arc<Session>, OwnedMutexGuard<()>);
 
 /// What a watch has sent: the workspaces, as of a version of the registry,
-/// and the version of each worktree's and each session's info.
+/// and the version of each worktree's, session's and run's info.
 #[derive(Default)]
 pub struct Sent {
     registry_version: Option<u64>,
     workspaces: Vec<WorkspaceInfo>,
     worktrees: HashMap<String, u64>,
     sessions: HashMap<String, u64>,
+    runs: HashMap<String, u64>,
 }
 
 /// Counts one connected client for as long as it lives.
@@ -109,21 +115,31 @@ impl Registry {
         }
         Ok(())
     }
+
+    /// The session's worktree, unless a run owns it.
+    fn owned_worktree(&self, session: &Session) -> Option<Arc<Worktree>> {
+        session
+            .worktree()
+            .filter(|worktree| !self.runs.values().any(|run| run.worktree.id == worktree.id))
+    }
 }
 
 impl Daemon {
-    /// A daemon with the workspaces, worktrees and sessions `store` holds,
-    /// which adds sessions' worktrees in `worktrees_dir`, and parks the agent
-    /// of a session that has been idle, with no background work, and
-    /// unviewed for `park_after`, whose directory watches follow
-    /// `directories`, and whose sessions' agents are given `ox_server`. Each
-    /// saved session is `exited`, with no agent, until it loads. A saved
-    /// session that never started has nothing to load. One without a
-    /// worktree is deleted; one with a worktree waits, `exited`, for
-    /// `clean_up`.
+    /// A daemon with the workspaces, worktrees, sessions and runs `store`
+    /// holds, which adds worktrees in `worktrees_dir`, reads workflow
+    /// definitions from `workflows_dir`, and parks the agent of a session
+    /// that has been idle, with no background work, and unviewed for
+    /// `park_after`, whose directory watches follow `directories`, and whose
+    /// sessions' agents are given `ox_server`. Each saved session is
+    /// `exited`, with no agent, until it loads. A saved session that never
+    /// started has nothing to load. One without a worktree is deleted; one
+    /// with a worktree of its own waits, `exited`, for `clean_up`; a run's
+    /// child session stays with its run. A run that was running is
+    /// `interrupted`, and stays so.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
+        workflows_dir: PathBuf,
         park_after: Duration,
         directories: Arc<Directories>,
         ox_server: Arc<OxServer>,
@@ -134,6 +150,19 @@ impl Daemon {
             .worktrees()?
             .into_iter()
             .map(|saved| (saved.id.clone(), Worktree::new(saved, changed.clone())))
+            .collect();
+        store.interrupt_runs()?;
+        let runs: HashMap<String, Arc<Run>> = store
+            .runs()?
+            .into_iter()
+            .map(|saved| {
+                let worktree = worktrees
+                    .get(&saved.worktree_id)
+                    .expect("a run's worktree is saved")
+                    .clone();
+                let run = Run::new(saved, worktree, store.clone(), changed.clone());
+                (run.id.clone(), run)
+            })
             .collect();
         let mut sessions = HashMap::new();
         let mut unstarted = Vec::new();
@@ -158,7 +187,9 @@ impl Daemon {
                 saved,
                 worktree.clone(),
             );
-            if let Some(worktree) = worktree.filter(|_| !started) {
+            let owned = worktree
+                .filter(|worktree| !runs.values().any(|run| run.worktree.id == worktree.id));
+            if let Some(worktree) = owned.filter(|_| !started) {
                 let guard = session.hold_lifecycle();
                 unstarted.push((worktree, session.clone(), guard));
             }
@@ -168,6 +199,7 @@ impl Daemon {
             workspaces: store.workspaces()?,
             worktrees,
             sessions,
+            runs,
             clients: 0,
             moving_checkouts: HashSet::new(),
             cleaning: !unstarted.is_empty(),
@@ -177,6 +209,7 @@ impl Daemon {
             registry: Mutex::new(registry),
             store,
             worktrees_dir,
+            workflows_dir,
             park_after,
             changed,
             fetches: Arc::default(),
@@ -226,9 +259,9 @@ impl Daemon {
         ClientGuard(self.clone())
     }
 
-    /// Resolves once the daemon has had no clients and no running agents for
-    /// `idle_exit`. A session whose agent is not running, `exited`, is saved
-    /// and does not keep the daemon alive.
+    /// Resolves once the daemon has had no clients, no running agents and no
+    /// running runs for `idle_exit`. A session whose agent is not running,
+    /// `exited`, is saved and does not keep the daemon alive.
     pub async fn idle(&self, idle_exit: Duration) {
         let mut changed = self.changed.subscribe();
         loop {
@@ -254,16 +287,24 @@ impl Daemon {
                 .sessions
                 .values()
                 .all(|session| session.state() == SessionState::Exited)
+            && !registry.runs.values().any(|run| run.running())
     }
 
-    /// Stops every agent and every comparison. The sessions stay saved.
+    /// Stops every runner, every agent and every comparison. The runs and
+    /// sessions stay saved. Runners stop first, so that none sees its step's
+    /// session close.
     pub fn close_all(&self) {
+        let mut runs = Vec::new();
         let mut sessions = Vec::new();
         let mut worktrees = Vec::new();
         self.update(|registry| {
+            runs.extend(registry.runs.drain().map(|(_, r)| r));
             sessions.extend(registry.sessions.drain().map(|(_, s)| s));
             worktrees.extend(registry.worktrees.drain().map(|(_, w)| w));
         });
+        for run in runs {
+            run.close();
+        }
         for session in sessions {
             session.close();
         }
@@ -292,6 +333,14 @@ impl Daemon {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("session", id))
+    }
+
+    fn run(&self, id: &str) -> Result<Arc<Run>, ErrorBody> {
+        self.lock()
+            .runs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| not_found("run", id))
     }
 
     fn worktree(&self, id: &str) -> Result<Arc<Worktree>, ErrorBody> {
@@ -428,6 +477,23 @@ impl Daemon {
                 self.session(&session_id)?.set_title(&title)?;
                 Ok(Value::Null)
             }
+            Method::RunStart {
+                workspace_id,
+                workflow,
+                input,
+                env,
+            } => Ok(to_value(
+                self.start_run(&workspace_id, &workflow, input, env).await?,
+            )),
+            Method::RunCancel { run_id } => {
+                self.run(&run_id)?.cancel()?;
+                Ok(Value::Null)
+            }
+            Method::RunDelete {
+                run_id,
+                discard,
+                env,
+            } => Ok(to_value(self.delete_run(&run_id, discard, env).await?)),
             Method::Hello { .. }
             | Method::SessionSubscribe { .. }
             | Method::Watch
@@ -453,29 +519,35 @@ impl Daemon {
         result
     }
 
-    /// The workspaces in the order they were added, the worktrees, and the
-    /// sessions in the order they were created. Whether each workspace is in
-    /// a Git working tree is worked out now.
+    /// The workspaces in the order they were added, the worktrees, the
+    /// sessions in the order they were created, and the runs in the order
+    /// they were started. Whether each workspace is in a Git working tree is
+    /// worked out now.
     pub fn list(&self) -> Listing {
         let registry = self.lock();
         let workspaces = registry.workspaces.clone();
         let worktrees: Vec<Arc<Worktree>> = registry.worktrees.values().cloned().collect();
         let mut sessions: Vec<Arc<Session>> = registry.sessions.values().cloned().collect();
+        let mut runs: Vec<Arc<Run>> = registry.runs.values().cloned().collect();
         drop(registry);
         sessions.sort_by_key(|session| session.number);
+        runs.sort_by_key(|run| run.number);
         Listing {
             workspaces: workspaces.into_iter().map(workspace_info).collect(),
             worktrees: worktrees.iter().map(|worktree| worktree.info()).collect(),
             sessions: sessions.iter().map(|session| session.info()).collect(),
+            runs: runs.iter().map(|run| run.info()).collect(),
         }
     }
 
-    /// The changes to the workspaces, worktrees and sessions since `sent`,
-    /// which then records them: removals first, then additions and changes
-    /// of workspaces, worktrees and sessions, in that order, so that a
-    /// session's worktree comes before the session. Only worktrees and
-    /// sessions whose info changed are read, and the workspaces only when
-    /// the registry changed, such as when a client connects.
+    /// The changes to the workspaces, worktrees, sessions and runs since
+    /// `sent`, which then records them: removals of runs, sessions and
+    /// worktrees, then additions and changes of workspaces, worktrees,
+    /// sessions and runs, in that order, so that a session's worktree comes
+    /// before the session, and a run's worktree and child sessions before the
+    /// run. Only worktrees, sessions and runs whose info changed are read,
+    /// and the workspaces only when the registry changed, such as when a
+    /// client connects.
     pub fn listing_changes(&self, sent: &mut Sent) -> Vec<ListingChange> {
         let registry = self.lock();
         let workspaces =
@@ -505,9 +577,25 @@ impl Daemon {
             .filter(|id| !registry.sessions.contains_key(*id))
             .cloned()
             .collect();
+        let mut outdated_runs: Vec<Arc<Run>> = registry
+            .runs
+            .values()
+            .filter(|run| sent.runs.get(&run.id) != Some(&run.version()))
+            .cloned()
+            .collect();
+        let removed_runs: Vec<String> = sent
+            .runs
+            .keys()
+            .filter(|id| !registry.runs.contains_key(*id))
+            .cloned()
+            .collect();
         drop(registry);
 
         let mut changes = Vec::new();
+        for id in removed_runs {
+            sent.runs.remove(&id);
+            changes.push(ListingChange::RunRemoved { run_id: id });
+        }
         for id in removed {
             sent.sessions.remove(&id);
             changes.push(ListingChange::SessionRemoved { session_id: id });
@@ -547,6 +635,12 @@ impl Daemon {
             changes.push(ListingChange::Session {
                 session: Box::new(info),
             });
+        }
+        outdated_runs.sort_by_key(|run| run.number);
+        for run in outdated_runs {
+            let (info, version) = run.versioned_info();
+            sent.runs.insert(run.id.clone(), version);
+            changes.push(ListingChange::Run { run: info });
         }
         changes
     }
@@ -599,7 +693,7 @@ impl Daemon {
             {
                 return Err(ErrorBody {
                     code: code::INVALID_STATE,
-                    message: "the workspace has sessions".into(),
+                    message: "the workspace has sessions or runs".into(),
                 });
             }
             self.store
@@ -674,7 +768,15 @@ impl Daemon {
             registry.refuse_moving(&cwd)?;
             let number = self
                 .store
-                .add_session(&id, workspace_id, &command, &cwd, saved_worktree.as_ref())
+                .add_session(
+                    &id,
+                    workspace_id,
+                    &command,
+                    &cwd,
+                    saved_worktree
+                        .as_ref()
+                        .map_or(SessionWorktree::None, SessionWorktree::New),
+                )
                 .map_err(|error| storage(&error))?;
             let saved = SavedSession {
                 number,
@@ -754,6 +856,212 @@ impl Daemon {
         self.update(|registry| registry.worktrees.remove(&live_worktree.id));
         live_worktree.close();
         session.fail_start(message);
+    }
+
+    /// Starts a run of workflow `workflow` in a new worktree of the
+    /// workspace's repository, on a new branch at `HEAD`. The definition is
+    /// read, and the branch created, before the answer; the runner adds the
+    /// worktree and runs the steps.
+    async fn start_run(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        workflow: &str,
+        input: String,
+        env: BTreeMap<String, String>,
+    ) -> Result<RunInfo, ErrorBody> {
+        let definition = workflow::load(&self.workflows_dir, workflow)?;
+        let workspace = self.workspace_path(workspace_id)?;
+        let git = Git::for_client(env.clone());
+        let worktree_id = uuid::Uuid::new_v4().to_string();
+        let plan = worktree::plan(
+            &git,
+            &workspace,
+            None,
+            None,
+            &self.worktrees_dir,
+            &worktree_id,
+        )
+        .await?;
+        worktree::create_branch(&git, &plan).await?;
+        let mut saved = SavedRun {
+            number: 0,
+            id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: workspace_id.into(),
+            worktree_id,
+            workflow: workflow.into(),
+            name: definition.name.clone(),
+            input,
+            state: RunState::Running,
+            error: None,
+            steps: definition
+                .steps
+                .iter()
+                .map(|step| StepInfo {
+                    name: step.name.clone(),
+                    state: StepState::Pending,
+                    session_id: None,
+                    output: None,
+                })
+                .collect(),
+        };
+        let mut pending = Some((git, plan));
+        let added = self.update(|registry| {
+            if !registry
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.id == workspace_id)
+            {
+                return Err(not_found("workspace", workspace_id));
+            }
+            let (_, plan) = pending.as_ref().expect("the worktree is not added yet");
+            registry.refuse_moving(&plan.cwd)?;
+            let saved_worktree = plan.saved();
+            saved.number = self
+                .store
+                .add_run(&saved, &saved_worktree)
+                .map_err(|error| storage(&error))?;
+            let worktree = Worktree::new(saved_worktree, self.changed.clone());
+            registry
+                .worktrees
+                .insert(worktree.id.clone(), worktree.clone());
+            let run = Run::new(saved, worktree, self.store.clone(), self.changed.clone());
+            let (git, plan) = pending.take().expect("the worktree is not added yet");
+            run.spawn(self.clone(), definition, git, plan, env);
+            let info = run.info();
+            registry.runs.insert(run.id.clone(), run);
+            Ok(info)
+        });
+        if let Some((git, plan)) = pending
+            && let Err(error) = worktree::roll_back(&git, &plan, false).await
+        {
+            eprintln!("oxd: undoing a run that was not saved: {error}");
+        }
+        added
+    }
+
+    /// Saves, registers and starts the child session of step `position` of
+    /// `run`: the bridge of `harness` beside the daemon's executable, in
+    /// `cwd` in the run's worktree, with `env` over the daemon's environment.
+    pub fn add_step_session(
+        self: &Arc<Self>,
+        run: &Run,
+        position: usize,
+        harness: Harness,
+        cwd: &Path,
+        env: BTreeMap<String, String>,
+    ) -> Result<Arc<Session>, ErrorBody> {
+        let bridge = std::env::current_exe()
+            .map_err(|error| ErrorBody {
+                code: code::INVALID_STATE,
+                message: format!("finding the daemon's executable: {error}"),
+            })?
+            .with_file_name(harness.bridge());
+        let command = vec![bridge.to_string_lossy().into_owned()];
+        let id = uuid::Uuid::new_v4().to_string();
+        self.update(|registry| {
+            registry.refuse_moving(cwd)?;
+            let number = self
+                .store
+                .add_session(
+                    &id,
+                    &run.workspace_id,
+                    &command,
+                    cwd,
+                    SessionWorktree::Step {
+                        run_id: &run.id,
+                        position,
+                        worktree_id: &run.worktree.id,
+                    },
+                )
+                .map_err(|error| storage(&error))?;
+            let saved = SavedSession {
+                number,
+                id,
+                workspace_id: run.workspace_id.clone(),
+                command,
+                cwd: cwd.to_owned(),
+                title: None,
+                agent_session_id: None,
+                worktree_id: Some(run.worktree.id.clone()),
+                last_seq: 0,
+                archived: false,
+            };
+            let session = Session::create(
+                self.store.clone(),
+                self.changed.clone(),
+                self.park_after,
+                self.ox_server.clone(),
+                saved,
+                Some(run.worktree.clone()),
+            );
+            session.start(env);
+            run.set_step_session(position, &session.id);
+            registry
+                .sessions
+                .insert(session.id.clone(), session.clone());
+            Ok(session)
+        })
+    }
+
+    /// Removes a run that is not running: its child sessions' agents are
+    /// stopped, its worktree removed and the branch rule applied, with git
+    /// run with `env`, and the run and its child sessions deleted. A
+    /// worktree that would lose work refuses the removal unless `discard` is
+    /// set, leaving the run as it was.
+    async fn delete_run(
+        &self,
+        id: &str,
+        discard: bool,
+        env: BTreeMap<String, String>,
+    ) -> Result<Deleted, ErrorBody> {
+        let run = self.run(id)?;
+        if run.running() {
+            return Err(invalid_state("the run is running"));
+        }
+        let sessions: Vec<Arc<Session>> = {
+            let registry = self.lock();
+            run.session_ids()
+                .iter()
+                .filter_map(|id| registry.sessions.get(id).cloned())
+                .collect()
+        };
+        let mut lifecycles = Vec::new();
+        for session in &sessions {
+            lifecycles.push(session.lifecycle().await);
+        }
+        if !self.lock().runs.contains_key(id) {
+            return Err(not_found("run", id));
+        }
+        let git = Git::for_client(env);
+        let stop = async {
+            for session in &sessions {
+                session.stop(Change::Exited(None)).await;
+            }
+        };
+        run.worktree.remove(&git, discard, stop).await?;
+        let kept_branch = run.worktree.apply_branch_rule(&git).await?;
+        self.recompare(&run.worktree.saved().common_dir);
+        self.update(|registry| {
+            self.store.remove_run(id).map_err(|error| storage(&error))?;
+            registry.runs.remove(id);
+            registry.worktrees.remove(&run.worktree.id);
+            for session in &sessions {
+                registry.sessions.remove(&session.id);
+            }
+            Ok::<_, ErrorBody>(())
+        })?;
+        drop(lifecycles);
+        run.close();
+        for session in &sessions {
+            session.close();
+        }
+        run.worktree.close();
+        Ok(Deleted { kept_branch })
+    }
+
+    /// The session's worktree, unless a run owns it.
+    fn owned_worktree(&self, session: &Session) -> Option<Arc<Worktree>> {
+        self.lock().owned_worktree(session)
     }
 
     fn workspace_path(&self, id: &str) -> Result<PathBuf, ErrorBody> {
@@ -841,8 +1149,9 @@ impl Daemon {
     }
 
     /// Deletes a session once its startup has finished. A session in a
-    /// worktree has its agent stopped, then its worktree removed and the
-    /// branch rule applied, with git run with `env`. A worktree that would
+    /// worktree of its own has its agent stopped, then its worktree removed
+    /// and the branch rule applied, with git run with `env`; a run's child
+    /// session leaves the run's worktree. A worktree that would
     /// lose work refuses the delete unless `discard` is set, leaving the
     /// session as it was, or `exited` when the work appeared after its agent
     /// stopped.
@@ -855,7 +1164,7 @@ impl Daemon {
         let session = self.session(id)?;
         let _lifecycle = self.lifecycle(&session).await?;
         let mut kept_branch = None;
-        if let Some(worktree) = session.worktree() {
+        if let Some(worktree) = self.owned_worktree(&session) {
             let git = Git::for_client(env);
             worktree
                 .remove(&git, discard, session.stop(Change::Exited(None)))
@@ -869,8 +1178,8 @@ impl Daemon {
     }
 
     /// Archives a session that is not starting: its agent is
-    /// stopped and its worktree removed, with git run with `env`, and the
-    /// branch is kept. A worktree that would lose work refuses the archive
+    /// stopped and its own worktree removed, with git run with `env`, and the
+    /// branch is kept. A run's child session leaves the run's worktree. A worktree that would lose work refuses the archive
     /// unless `discard` is set, leaving the session as it was, or `exited`
     /// when the work appeared after its agent stopped.
     async fn archive_session(
@@ -886,7 +1195,7 @@ impl Daemon {
         if session.archived() {
             return Err(invalid_state("the session is already archived"));
         }
-        match session.worktree() {
+        match self.owned_worktree(&session) {
             Some(worktree) => {
                 let git = Git::for_client(env);
                 worktree
@@ -902,8 +1211,8 @@ impl Daemon {
         Ok(session.info())
     }
 
-    /// Adds an archived session's worktree again, with git run with `env`,
-    /// and unarchives it.
+    /// Adds an archived session's own worktree again, with git run with
+    /// `env`, and unarchives it.
     async fn unarchive_session(
         &self,
         id: &str,
@@ -914,7 +1223,7 @@ impl Daemon {
         if !session.archived() {
             return Err(invalid_state("the session is not archived"));
         }
-        if let Some(worktree) = session.worktree() {
+        if let Some(worktree) = self.owned_worktree(&session) {
             worktree.restore(&Git::for_client(env)).await?;
         }
         self.store
@@ -1012,20 +1321,29 @@ impl Daemon {
         Ok(worktree.info())
     }
 
-    /// Deletes the session's rows, with its worktree's, and removes both from
-    /// the registry.
+    /// Deletes the session's rows, with its own worktree's, and removes both
+    /// from the registry. A run's child session leaves the run's worktree,
+    /// and its step no longer names it.
     fn forget(&self, id: &str) -> Result<(), ErrorBody> {
-        let session = self.update(|registry| {
+        let worktree = self.update(|registry| {
             self.store
                 .remove_session(id)
                 .map_err(|error| storage(&error))?;
             let session = registry.sessions.remove(id);
-            if let Some(worktree) = session.as_ref().and_then(|session| session.worktree()) {
+            let worktree = session
+                .as_ref()
+                .and_then(|session| registry.owned_worktree(session));
+            if let Some(worktree) = &worktree {
                 registry.worktrees.remove(&worktree.id);
             }
-            Ok::<_, ErrorBody>(session)
+            for run in registry.runs.values() {
+                if run.session_ids().iter().any(|session_id| session_id == id) {
+                    run.forget_session(id);
+                }
+            }
+            Ok::<_, ErrorBody>(worktree)
         })?;
-        if let Some(worktree) = session.and_then(|session| session.worktree()) {
+        if let Some(worktree) = worktree {
             worktree.close();
         }
         Ok(())

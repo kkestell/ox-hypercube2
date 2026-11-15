@@ -101,6 +101,41 @@ export interface SessionInfo {
   archived: boolean;
 }
 
+export type RunState = "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
+
+export type StepState =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted";
+
+/** A run of a workflow, whose steps run in child sessions in its worktree. */
+export interface RunInfo {
+  id: string;
+  workspace_id: string;
+  /** The definition's file name, without `.yaml`. */
+  workflow: string;
+  /** The definition's name. */
+  name: string;
+  input: string;
+  worktree_id: string;
+  state: RunState;
+  /** Why the run failed. */
+  error: string | null;
+  steps: StepInfo[];
+}
+
+export interface StepInfo {
+  name: string;
+  state: StepState;
+  /** The step's child session, once the step has started. */
+  session_id: string | null;
+  /** The final reply the next step receives. */
+  output: string | null;
+}
+
 /** An entry of a directory, as a directory watch lists it. */
 export interface DirEntry {
   name: string;
@@ -188,9 +223,10 @@ export type Item =
 export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
 
 /**
- * A change to the listing: a workspace, worktree or session added or changed,
- * or one removed. A workspace or session that is new comes last; one that
- * changed keeps its place. A session's worktree comes before the session.
+ * A change to the listing: a workspace, worktree, session or run added or
+ * changed, or one removed. One that is new comes last; one that changed keeps
+ * its place. A session's worktree comes before the session, and a run's
+ * worktree and child sessions before the run.
  */
 export type ListingChange =
   | { type: "workspace"; workspace: WorkspaceInfo }
@@ -198,10 +234,12 @@ export type ListingChange =
   | { type: "worktree"; worktree: WorktreeInfo }
   | { type: "worktree_removed"; worktree_id: string }
   | { type: "session"; session: SessionInfo }
-  | { type: "session_removed"; session_id: string };
+  | { type: "session_removed"; session_id: string }
+  | { type: "run"; run: RunInfo }
+  | { type: "run_removed"; run_id: string };
 
 export type WatchMessage =
-  /** A watch's first changes list every workspace, worktree and session. */
+  /** A watch's first changes list every workspace, worktree, session and run. */
   | { type: "changes"; changes: ListingChange[] }
   | { type: "error"; message: string }
   | { type: "disconnected" };

@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 
 use crate::messages::{
     Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
-    HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, ServerMessage, SessionInfo,
-    WorkspaceInfo, WorktreeInfo,
+    HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo, ServerMessage,
+    SessionInfo, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -77,6 +77,22 @@ fn data_dir_from(xdg: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
     let base = match (xdg.map(PathBuf::from), home) {
         (Some(xdg), _) if xdg.is_absolute() => xdg,
         (_, Some(home)) => home.join(".local/share"),
+        (_, None) => std::env::temp_dir(),
+    };
+    base.join("ox")
+}
+
+/// Ox's configuration directory: `$XDG_CONFIG_HOME/ox` when
+/// `XDG_CONFIG_HOME` is an absolute path, else `~/.config/ox`, else
+/// `<temp dir>/ox` when there is no home directory.
+pub fn config_dir() -> PathBuf {
+    config_dir_from(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir())
+}
+
+fn config_dir_from(xdg: Option<OsString>, home: Option<PathBuf>) -> PathBuf {
+    let base = match (xdg.map(PathBuf::from), home) {
+        (Some(xdg), _) if xdg.is_absolute() => xdg,
+        (_, Some(home)) => home.join(".config"),
         (_, None) => std::env::temp_dir(),
     };
     base.join("ox")
@@ -653,6 +669,50 @@ impl Client {
         .await
     }
 
+    /// Starts a run of the workflow defined in `<workflow>.yaml` in the
+    /// workspace, with `input` for its first step. Git and the steps' agents
+    /// run with `env` over the daemon's environment.
+    pub async fn start_run(
+        &self,
+        workspace_id: &str,
+        workflow: &str,
+        input: &str,
+        env: BTreeMap<String, String>,
+    ) -> Result<RunInfo, Error> {
+        self.call(Method::RunStart {
+            workspace_id: workspace_id.into(),
+            workflow: workflow.into(),
+            input: input.into(),
+            env,
+        })
+        .await
+    }
+
+    /// Cancels a running run.
+    pub async fn cancel_run(&self, run_id: &str) -> Result<(), Error> {
+        self.ack(Method::RunCancel {
+            run_id: run_id.into(),
+        })
+        .await
+    }
+
+    /// Removes a run that is not running, with its child sessions and its
+    /// worktree, unless that loses work `discard` does not give up. Git runs
+    /// with `env` over the daemon's environment.
+    pub async fn delete_run(
+        &self,
+        run_id: &str,
+        discard: bool,
+        env: BTreeMap<String, String>,
+    ) -> Result<Deleted, Error> {
+        self.call(Method::RunDelete {
+            run_id: run_id.into(),
+            discard,
+            env,
+        })
+        .await
+    }
+
     async fn ack(&self, method: Method) -> Result<(), Error> {
         self.call::<Value>(method).await.map(drop)
     }
@@ -1025,5 +1085,30 @@ mod tests {
     #[test]
     fn data_dir_without_a_home_is_in_the_temp_dir() {
         assert_eq!(data_dir_from(None, None), std::env::temp_dir().join("ox"));
+    }
+
+    #[test]
+    fn config_dir_follows_an_absolute_xdg_config_home_or_the_home_directory() {
+        for (xdg, home, expected) in [
+            (Some("/config"), Some(home()), PathBuf::from("/config/ox")),
+            (
+                Some("config"),
+                Some(home()),
+                PathBuf::from("/home/user/.config/ox"),
+            ),
+            (
+                Some(""),
+                Some(home()),
+                PathBuf::from("/home/user/.config/ox"),
+            ),
+            (None, Some(home()), PathBuf::from("/home/user/.config/ox")),
+            (None, None, std::env::temp_dir().join("ox")),
+        ] {
+            assert_eq!(
+                config_dir_from(xdg.map(OsString::from), home),
+                expected,
+                "XDG_CONFIG_HOME {xdg:?}"
+            );
+        }
     }
 }

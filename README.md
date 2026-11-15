@@ -10,11 +10,11 @@ bridges for Claude Code and Pi.
 | `crates/pi-acp/`          | ACP bridge for the Pi CLI                                                         |
 | `crates/oxd/`             | Session daemon that owns ACP agent processes and serves Ox UIs over a Unix socket |
 | `crates/ox-protocol/`     | oxd wire types and client                                                         |
-| `crates/oxctl/`           | Daemon client for the desktop end-to-end and live smoke tests                      |
+| `crates/oxctl/`           | Daemon client for the end-to-end and live smoke tests, and for workflow runs      |
 | `ui/`                     | Ox frontend (TypeScript, Vite)                                                    |
 
 See [architecture](docs/dev/architecture.md), [where sessions run](docs/worktrees.md),
-and [ACP v2 support](docs/dev/acp-v2.md). Historical harness research covers
+[workflows](docs/workflows.md), and [ACP v2 support](docs/dev/acp-v2.md). Historical harness research covers
 [Claude Code](docs/research/harnesses/claude-code.md) and
 [Pi](docs/research/harnesses/pi.md).
 

@@ -10,10 +10,10 @@ use std::sync::{Arc, Mutex};
 
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, ListingChange, SessionInfo,
-    WorkspaceInfo, code, content, default_socket_path,
+    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, Harness, ListingChange,
+    SessionInfo, WorkspaceInfo, code, content, default_socket_path,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
@@ -74,34 +74,6 @@ enum WatchMessage {
     Disconnected,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum Agent {
-    Claude,
-    Pi,
-}
-
-impl Agent {
-    const ALL: [Agent; 2] = [Agent::Claude, Agent::Pi];
-
-    /// The name of the coding-agent CLI the agent's bridge drives.
-    fn harness(self) -> &'static str {
-        match self {
-            Agent::Claude => "claude",
-            Agent::Pi => "pi",
-        }
-    }
-
-    /// The name of the agent's ACP bridge, which ships beside the app's
-    /// executable.
-    fn bridge(self) -> &'static str {
-        match self {
-            Agent::Claude => "claude-code-acp",
-            Agent::Pi => "pi-acp",
-        }
-    }
-}
-
 /// Whether a directory of `path` holds an executable file named `name`.
 fn on_path(path: &OsStr, name: &str) -> bool {
     std::env::split_paths(path).any(|directory| {
@@ -110,15 +82,15 @@ fn on_path(path: &OsStr, name: &str) -> bool {
     })
 }
 
-/// The agents whose harnesses are on the `PATH` sessions get.
+/// The harnesses whose executables are on the `PATH` sessions get.
 #[tauri::command]
-fn agents() -> Vec<Agent> {
+fn agents() -> Vec<Harness> {
     let Some(path) = utf8_env().remove("PATH") else {
         return Vec::new();
     };
-    Agent::ALL
+    Harness::ALL
         .into_iter()
-        .filter(|agent| on_path(path.as_ref(), agent.harness()))
+        .filter(|harness| on_path(path.as_ref(), harness.executable()))
         .collect()
 }
 
@@ -302,7 +274,7 @@ async fn move_branch(
 #[tauri::command]
 async fn new_session(
     app: State<'_, App>,
-    agent: Agent,
+    agent: Harness,
     workspace_id: String,
     checkout: Checkout,
 ) -> Result<SessionInfo, String> {
@@ -567,15 +539,17 @@ mod tests {
             std::fs::write(&path, "#!/bin/sh\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
         };
-        file(&first, "claude", 0o755);
-        file(&first, "pi", 0o644);
-        std::fs::create_dir(second.path().join("pi")).unwrap();
+        let claude = Harness::Claude.executable();
+        let pi = Harness::Pi.executable();
+        file(&first, claude, 0o755);
+        file(&first, pi, 0o644);
+        std::fs::create_dir(second.path().join(pi)).unwrap();
         file(&second, "codex", 0o755);
         let path = std::env::join_paths([first.path(), second.path()]).unwrap();
 
         for (name, found) in [
-            ("claude", true),
-            ("pi", false),
+            (claude, true),
+            (pi, false),
             ("codex", true),
             ("gemini", false),
         ] {

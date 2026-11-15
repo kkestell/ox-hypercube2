@@ -75,7 +75,8 @@ does not keep the daemon alive between calls.
 
 `oxd` owns:
 
-- Shared persistent state: workspaces, sessions, and conversation history.
+- Shared persistent state: workspaces, sessions, workflow runs, and
+  conversation history.
 - Agent processes and work that must continue when a client disconnects.
 - State updates and pending requests that every connected client must see.
 - Repository writes and the coordination needed to complete or undo them.
@@ -108,7 +109,8 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, and conversation events.
+comparison refs, archive state, conversation events, and workflow runs with
+their steps.
 The database schema has no migrations.
 
 Session metadata is saved as sessions are created or changed. Conversation
@@ -132,7 +134,7 @@ session records separately from the daemon's database.
 A saved session belongs to a workspace and records its agent command,
 working directory, and agent session ID. Its lifetime is independent of any
 client connection and of the agent process currently serving it. A workspace
-cannot be removed while sessions still belong to it.
+cannot be removed while sessions or runs still belong to it.
 
 The daemon owns turn state, including turns the agent starts without a
 client prompt. Agent state updates drive the turn lifecycle; the prompt
@@ -160,13 +162,30 @@ repository cleanup governed by the
 
 Startup, load, parking, and deletion coordinate through a per-session
 lifecycle lock. Shutdown stops agents but preserves saved sessions. The
-daemon can exit when it has no clients or running agents; exited sessions
-do not keep it alive.
+daemon can exit when it has no clients, running agents, or running workflow
+runs; exited sessions do not keep it alive.
+
+## Workflow runs
+
+A run of a [workflow](../workflows.md) owns a worktree and the child
+sessions its steps run in. The daemon reads the workflow's definition when the
+run starts and runs the run's steps itself, so a run continues without
+clients. Its runner adds the worktree, then for each step starts a child
+session with the step's harness bridge from beside `oxd`'s executable, sets
+the step's config options, sends the prompt, and advances when the turn
+ends. A step's output is the final reply of its turn.
+
+Child sessions are ordinary sessions that refer to the run's worktree.
+Deleting or archiving one leaves the worktree; removing the run stops the
+child sessions' agents, removes the worktree, and deletes the child sessions.
+A running run keeps the daemon alive. A restart marks the runs and steps that
+were running `interrupted`, where they stay.
 
 ## Repository ownership
 
 A session runs in the workspace's existing checkout or in an additional Git
-worktree owned by Ox. The daemon uses the Git CLI for repository operations.
+worktree owned by Ox. Each worktree belongs to a session or to a workflow
+run. The daemon uses the Git CLI for repository operations.
 [Where sessions run](../worktrees.md) owns checkout choices, branch
 comparisons, merge behavior, and cleanup rules.
 

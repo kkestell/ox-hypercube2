@@ -411,14 +411,14 @@ impl Session {
         self.lock().events_after(after_seq)
     }
 
-    pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<(), ErrorBody> {
+    /// Sends a prompt and returns the seq of the `PromptStarted` event that
+    /// records it, which the turn's events follow.
+    pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<u64, ErrorBody> {
         self.update(|state| {
             state.request(Request::Prompt(prompt.clone()))?;
-            self.send(Command::Prompt {
-                prompt,
-                seq: state.last_seq(),
-            });
-            Ok(())
+            let seq = state.last_seq();
+            self.send(Command::Prompt { prompt, seq });
+            Ok(seq)
         })
     }
 

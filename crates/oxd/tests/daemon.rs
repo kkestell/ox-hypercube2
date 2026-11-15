@@ -469,6 +469,13 @@ fn apply(listing: &mut Listing, change: ListingChange) {
         ListingChange::SessionRemoved { session_id } => {
             listing.sessions.retain(|s| s.id != session_id);
         }
+        ListingChange::Run { run } => match listing.runs.iter_mut().find(|r| r.id == run.id) {
+            Some(listed) => *listed = run,
+            None => listing.runs.push(run),
+        },
+        ListingChange::RunRemoved { run_id } => {
+            listing.runs.retain(|r| r.id != run_id);
+        }
     }
 }
 

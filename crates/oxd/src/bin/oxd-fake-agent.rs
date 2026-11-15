@@ -69,7 +69,8 @@
 //! The agent advertises `session.mcp.stdio` and keeps the MCP servers of
 //! `session/new` and `session/resume`. It accepts image and embedded
 //! resource prompts, and has three
-//! select config options: `mode`, with values `ask` and `code`; `model`, in
+//! select config options: `mode`, in the `mode` category, with values `ask`
+//! and `code`; `model`, in
 //! the `model` category, with values `fast` and `smart`; and `effort`, in the
 //! `thought_level` category, with values `low`, `medium`, and `high`. Setting
 //! one sends a `config_option_update` before the response.
@@ -119,7 +120,7 @@ use tokio::sync::watch;
 struct ConfigOption {
     id: &'static str,
     name: &'static str,
-    category: Option<fn() -> acp::SessionConfigOptionCategory>,
+    category: fn() -> acp::SessionConfigOptionCategory,
     values: &'static [(&'static str, &'static str)],
     initial: &'static str,
 }
@@ -128,21 +129,21 @@ const CONFIG: [ConfigOption; 3] = [
     ConfigOption {
         id: "model",
         name: "Model",
-        category: Some(|| acp::SessionConfigOptionCategory::Model),
+        category: || acp::SessionConfigOptionCategory::Model,
         values: &[("fast", "Fast"), ("smart", "Smart")],
         initial: "smart",
     },
     ConfigOption {
         id: "effort",
         name: "Effort",
-        category: Some(|| acp::SessionConfigOptionCategory::ThoughtLevel),
+        category: || acp::SessionConfigOptionCategory::ThoughtLevel,
         values: &[("low", "Low"), ("medium", "Medium"), ("high", "High")],
         initial: "medium",
     },
     ConfigOption {
         id: "mode",
         name: "Mode",
-        category: None,
+        category: || acp::SessionConfigOptionCategory::Mode,
         values: &[("ask", "Ask"), ("code", "Code")],
         initial: "ask",
     },
@@ -238,10 +239,7 @@ impl State {
                         })
                         .collect::<Vec<_>>(),
                 );
-                match option.category {
-                    Some(category) => select.category(category()),
-                    None => select,
-                }
+                select.category((option.category)())
             })
             .collect()
     }

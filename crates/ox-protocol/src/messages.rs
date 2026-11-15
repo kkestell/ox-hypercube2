@@ -27,8 +27,8 @@ pub enum Method {
     Hello { protocol_version: u32 },
     #[serde(rename = "session.list")]
     SessionList,
-    /// Starts a watch: after the answer, the daemon sends every workspace and
-    /// session at once, then each workspace and session that is added,
+    /// Starts a watch: after the answer, the daemon sends every workspace,
+    /// worktree, session, and run at once, then each one that is added,
     /// changes, or is removed. A workspace's info is worked out again each
     /// time a workspace or session is added or removed or a client connects
     /// or disconnects. The request's `id` names the watch in every message.
@@ -38,8 +38,8 @@ pub enum Method {
     /// no workspace has.
     #[serde(rename = "workspace.add")]
     WorkspaceAdd { path: PathBuf },
-    /// Removes a workspace. Refused while any session, exited or not,
-    /// belongs to it.
+    /// Removes a workspace. Refused while any session, exited or not, or
+    /// any run belongs to it.
     #[serde(rename = "workspace.remove")]
     WorkspaceRemove { workspace_id: String },
     #[serde(rename = "workspace.list")]
@@ -238,6 +238,69 @@ pub enum Method {
     /// empty is refused with `invalid_request`. Answers `null`.
     #[serde(rename = "session.set_title")]
     SessionSetTitle { session_id: String, title: String },
+    /// Starts a run of the workflow defined in `<workflow>.yaml` in the
+    /// daemon's workflows directory, in a new worktree of the workspace's
+    /// repository on a new branch `ox/<first 8 digits of the worktree ID>`
+    /// that starts at `HEAD`. `input` goes to the first step. The result is
+    /// the run, `running`. Refused, changing nothing, for a workflow that is
+    /// not found (`NOT_FOUND`) or does not parse (`INVALID_REQUEST`), or a
+    /// workspace outside a Git working tree. Git and the steps' agents run
+    /// with `env` over the daemon's environment.
+    #[serde(rename = "run.start")]
+    RunStart {
+        workspace_id: String,
+        workflow: String,
+        input: String,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+    /// Cancels a running run: the active step's turn is cancelled, and the
+    /// step and the run end `cancelled`. Later steps do not start. Refused
+    /// for a run that is not `running`. Answers `null`.
+    #[serde(rename = "run.cancel")]
+    RunCancel { run_id: String },
+    /// Removes a run that is not `running`: stops its child sessions'
+    /// agents, removes its worktree, and deletes the run and its child
+    /// sessions. The worktree's removal and its branch follow the rules of
+    /// `session.delete`, including `discard`. Git runs with `env` over the
+    /// daemon's environment. The result is [`Deleted`].
+    #[serde(rename = "run.delete")]
+    RunDelete {
+        run_id: String,
+        #[serde(default)]
+        discard: bool,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
+}
+
+/// A coding-agent CLI that Ox drives through its ACP bridge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Harness {
+    Claude,
+    Pi,
+}
+
+impl Harness {
+    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Pi];
+
+    /// The name of the coding-agent CLI the harness's bridge drives.
+    pub fn executable(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude",
+            Harness::Pi => "pi",
+        }
+    }
+
+    /// The name of the harness's ACP bridge, which ships beside the app's
+    /// and the daemon's executables.
+    pub fn bridge(self) -> &'static str {
+        match self {
+            Harness::Claude => "claude-code-acp",
+            Harness::Pi => "pi-acp",
+        }
+    }
 }
 
 /// Where a new session runs.
@@ -279,7 +342,7 @@ pub enum WorktreeBranch {
     },
 }
 
-/// A worktree the daemon added for a session.
+/// A worktree the daemon added for a session or a run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeInfo {
     pub id: String,
@@ -318,10 +381,10 @@ pub enum Comparison {
     Failed { error: String },
 }
 
-/// The result of `session.delete`.
+/// The result of `session.delete` and `run.delete`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deleted {
-    /// The branch the daemon created for the session's worktree, kept
+    /// The branch the daemon created for the worktree, kept
     /// because it has commits on no other branch, tag or remote branch.
     pub kept_branch: Option<String>,
 }
@@ -404,19 +467,23 @@ pub struct LocalBranch {
     pub worktree: Option<PathBuf>,
 }
 
-/// The daemon's workspaces, in the order they were added, its worktrees, and
-/// its sessions, in the order they were created.
+/// The daemon's workspaces, in the order they were added, its worktrees, its
+/// sessions, in the order they were created, and its runs, in the order they
+/// were started.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Listing {
     pub workspaces: Vec<WorkspaceInfo>,
     pub worktrees: Vec<WorktreeInfo>,
     pub sessions: Vec<SessionInfo>,
+    pub runs: Vec<RunInfo>,
 }
 
-/// One change a watch delivers. A workspace, worktree or session that is new
-/// comes after every one listed before it; one that changed keeps its place.
-/// Each batch lists removals first, then workspaces, worktrees and sessions,
-/// so a session's worktree arrives before the session.
+/// One change a watch delivers. A workspace, worktree, session or run that is
+/// new comes after every one listed before it; one that changed keeps its
+/// place. Each batch lists removals first, runs before sessions before
+/// worktrees, then workspaces, worktrees, sessions and runs, so a session's
+/// worktree arrives before the session, and a run's worktree and child
+/// sessions before the run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ListingChange {
@@ -441,6 +508,72 @@ pub enum ListingChange {
     SessionRemoved {
         session_id: String,
     },
+    /// A run that was started, or whose info changed.
+    Run {
+        run: RunInfo,
+    },
+    RunRemoved {
+        run_id: String,
+    },
+}
+
+/// A run of a workflow: its steps, run one after another in child sessions
+/// in a worktree the run owns.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunInfo {
+    pub id: String,
+    pub workspace_id: String,
+    /// The name of the definition's file, without `.yaml`, that the run was
+    /// started with.
+    pub workflow: String,
+    /// The definition's `name`.
+    pub name: String,
+    /// The text the run was started with, which the first step receives.
+    pub input: String,
+    /// The worktree the run owns, which every step runs in.
+    pub worktree_id: String,
+    pub state: RunState,
+    /// Why the run failed.
+    pub error: Option<String>,
+    /// Every step of the definition, in order.
+    pub steps: Vec<StepInfo>,
+}
+
+/// A step of a run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepInfo {
+    pub name: String,
+    pub state: StepState,
+    /// The child session the step runs in, once the step has started. Unset
+    /// again when the session is deleted.
+    pub session_id: Option<String>,
+    /// The final reply of the step's turn, which the next step receives, once
+    /// the step has succeeded.
+    pub output: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// The daemon stopped while the run was running. The run stays
+    /// interrupted.
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    /// The daemon stopped while the step was running.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1037,6 +1170,77 @@ mod tests {
             assert_eq!(serde_json::to_value(&request).unwrap(), value);
         }
 
+        let method = Method::RunStart {
+            workspace_id: "w".into(),
+            workflow: "plan-work".into(),
+            input: "Fix the build".into(),
+            env: BTreeMap::from([("PATH".into(), "/bin".into())]),
+        };
+        let value = serde_json::to_value(Request { id: 25, method }).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id": 25,
+                "method": "run.start",
+                "params": {
+                    "workspace_id": "w",
+                    "workflow": "plan-work",
+                    "input": "Fix the build",
+                    "env": {"PATH": "/bin"}
+                }
+            })
+        );
+        let request: Request = serde_json::from_value(json!({
+            "id": 26,
+            "method": "run.start",
+            "params": {"workspace_id": "w", "workflow": "plan-work", "input": ""}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.method,
+            Method::RunStart { ref workflow, ref input, ref env, .. }
+                if workflow == "plan-work" && input.is_empty() && env.is_empty()
+        ));
+        let value = serde_json::to_value(Request {
+            id: 27,
+            method: Method::RunCancel { run_id: "r".into() },
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            json!({"id": 27, "method": "run.cancel", "params": {"run_id": "r"}})
+        );
+        let request: Request = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            request.method,
+            Method::RunCancel { ref run_id } if run_id == "r"
+        ));
+        let request: Request = serde_json::from_value(json!({
+            "id": 28,
+            "method": "run.delete",
+            "params": {"run_id": "r"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.method,
+            Method::RunDelete { ref run_id, discard: false, ref env }
+                if run_id == "r" && env.is_empty()
+        ));
+        let method = Method::RunDelete {
+            run_id: "r".into(),
+            discard: true,
+            env: BTreeMap::new(),
+        };
+        let value = serde_json::to_value(Request { id: 29, method }).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id": 29,
+                "method": "run.delete",
+                "params": {"run_id": "r", "discard": true, "env": {}}
+            })
+        );
+
         let value = serde_json::to_value(Request {
             id: 1,
             method: Method::Hello {
@@ -1175,7 +1379,23 @@ mod tests {
                 "worktree_id": "01234567-89ab",
                 "archived": false
                 }},
-                {"type": "session_removed", "session_id": "r"}
+                {"type": "session_removed", "session_id": "r"},
+                {"type": "run", "run": {
+                    "id": "run",
+                    "workspace_id": "w",
+                    "workflow": "plan-work",
+                    "name": "Plan and work",
+                    "input": "Fix the build",
+                    "worktree_id": "01234567-89ab",
+                    "state": "failed",
+                    "error": "boom",
+                    "steps": [
+                        {"name": "Plan", "state": "succeeded", "session_id": "s", "output": "planned"},
+                        {"name": "Work", "state": "failed", "session_id": null, "output": null},
+                        {"name": "Review", "state": "pending", "session_id": null, "output": null}
+                    ]
+                }},
+                {"type": "run_removed", "run_id": "q"}
             ]
         }))
         .unwrap();
@@ -1193,6 +1413,8 @@ mod tests {
             ListingChange::WorktreeRemoved { worktree_id },
             ListingChange::Session { session },
             ListingChange::SessionRemoved { session_id },
+            ListingChange::Run { run },
+            ListingChange::RunRemoved { run_id },
         ] = &changes[..]
         else {
             panic!("unexpected changes: {changes:?}");
@@ -1201,6 +1423,40 @@ mod tests {
         assert_eq!(workspace_id, "v");
         assert_eq!(worktree_id, "u");
         assert_eq!(session_id, "r");
+        assert_eq!(run_id, "q");
+        assert_eq!(
+            *run,
+            RunInfo {
+                id: "run".into(),
+                workspace_id: "w".into(),
+                workflow: "plan-work".into(),
+                name: "Plan and work".into(),
+                input: "Fix the build".into(),
+                worktree_id: "01234567-89ab".into(),
+                state: RunState::Failed,
+                error: Some("boom".into()),
+                steps: vec![
+                    StepInfo {
+                        name: "Plan".into(),
+                        state: StepState::Succeeded,
+                        session_id: Some("s".into()),
+                        output: Some("planned".into()),
+                    },
+                    StepInfo {
+                        name: "Work".into(),
+                        state: StepState::Failed,
+                        session_id: None,
+                        output: None,
+                    },
+                    StepInfo {
+                        name: "Review".into(),
+                        state: StepState::Pending,
+                        session_id: None,
+                        output: None,
+                    },
+                ],
+            }
+        );
         assert_eq!(session.workspace_id, "w");
         assert_eq!(session.title.as_deref(), Some("Fix the build"));
         assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));

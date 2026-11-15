@@ -16,12 +16,20 @@ ownership and lifecycle.
 - **Client**: The desktop app or `oxctl` when discussing the daemon protocol;
   `oxd` when discussing ACP. Qualify as daemon client or ACP client when ambiguous.
 - **Checkout**: A Git working tree, either the workspace's existing checkout or
-  a worktree created for a session.
-- **Worktree**: In session checkout choices, an additional Git working tree
-  created by Ox for that session.
+  a worktree created for a session or a run.
+- **Worktree**: An additional Git working tree created by Ox for a session or
+  a run.
 - **Comparison ref**: The Git ref against which a worktree's branch is
   compared for commits ahead and behind.
 - **Parking**: Stopping an idle session's agent while retaining its conversation
   and checkout.
 - **Archiving**: Retaining a session's conversation and branch while removing its
   worktree and preventing it from loading until unarchived.
+- **Workflow**: A named sequence of steps defined in a YAML file in Ox's
+  configuration directory.
+- **Run**: One execution of a workflow in a workspace, in a worktree the run
+  owns.
+- **Step**: One entry of a workflow. An agent step sends a prompt to a new
+  child session.
+- **Child session**: The session a run starts for one of its steps, in the
+  run's worktree.
