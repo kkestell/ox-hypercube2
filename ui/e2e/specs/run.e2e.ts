@@ -149,14 +149,15 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     expect(kinds).toEqual([["session", "run", "child", "child", "child", "session"]]);
     await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
     await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
-    await expect(runRow(cwd).$(".status")).toHaveAttribute("class", "status succeeded");
+    // The run ended in view, so nothing about it is unseen.
+    await expect(runRow(cwd).$(".status")).toHaveAttribute("class", "status");
     for (const step of ["First", "Build", "Second"]) {
-      await expect(childRow(cwd, step).$(".status")).toHaveAttribute("class", "status succeeded");
+      await expect(childRow(cwd, step).$(".status")).toHaveAttribute("class", "status");
     }
 
     await expect($$(".run-status-step .title")).toHaveText(["First", "Build", "Second"]);
     for (const step of ["First", "Build", "Second"]) {
-      await expect(stepStatus(step, "Succeeded")).toBeExisting();
+      await expect(stepStatus(step, "Succeeded")).toHaveAttribute("class", "status finished");
       await expect(statusStep(step).$(".run-status-time")).toHaveText(clockText);
     }
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
@@ -298,7 +299,7 @@ ${agentStep("Guarded", directive("text", "never"), "    preconditions:\n      - 
     await expect(runRow(cwd).$('.status[aria-label="Failed"]')).toBeExisting();
     await expect(childRow(cwd, "Guarded").$('.status[aria-label="Failed"]')).toBeExisting();
 
-    await expect(stepStatus("Guarded", "Failed")).toBeExisting();
+    await expect(stepStatus("Guarded", "Failed")).toHaveAttribute("class", "status error");
     await expect(statusStep("Guarded").$(".run-status-error")).toHaveText(
       expect.stringContaining("a precondition exited with status 3"),
     );

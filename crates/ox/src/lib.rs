@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, FileContent, Harness,
+    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, FileContent, Focus, Harness,
     ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code, content,
     default_socket_path,
 };
@@ -38,6 +38,9 @@ struct App {
     /// The conversation views and the directory and file watches, by the ID
     /// of the channel each sends on.
     streams: Mutex<HashMap<u32, Task>>,
+    /// The session or run the window shows while it is in front, which the
+    /// watch's task sends to oxd.
+    focus: tokio::sync::watch::Sender<Option<Focus>>,
 }
 
 impl App {
@@ -101,7 +104,9 @@ fn agents() -> Vec<Harness> {
 /// changes, replacing the previous watch. A new watch means the webview
 /// reloaded or reconnected, and in both it views its conversations and
 /// watches its files and directories again once the watch connects, so this
-/// ends their previous views and watches.
+/// ends their previous views and watches. Once connected, the watch's task
+/// also sends oxd the current focus and then each change to it, so a new
+/// connection has the window's focus.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
@@ -111,28 +116,59 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
     let task = tauri::async_runtime::spawn(async move {
         let app = handle.state::<App>();
         let watch = match app.client().await {
-            Ok(client) => client.watch().await.map_err(message),
+            Ok(client) => client
+                .watch()
+                .await
+                .map(|watch| (client, watch))
+                .map_err(message),
             Err(error) => Err(error),
         };
-        let mut watch = match watch {
+        let (client, mut watch) = match watch {
             Ok(watch) => watch,
             Err(message) => {
                 let _ = channel.send(WatchMessage::Error { message });
                 return;
             }
         };
+        let mut focus = app.focus.subscribe();
+        focus.mark_changed();
         loop {
-            let Ok(changes) = watch.next().await else {
-                let _ = channel.send(WatchMessage::Disconnected);
-                return;
-            };
-            if channel.send(WatchMessage::Changes { changes }).is_err() {
-                return;
+            // A focus change goes to oxd before the listing changes that
+            // follow it, so the webview sees what oxd did after the focus.
+            tokio::select! {
+                biased;
+                Ok(()) = focus.changed() => {
+                    let target = focus.borrow_and_update().clone();
+                    // A refused focus, such as on a session just deleted,
+                    // leaves the connection unfocused.
+                    let _ = client.focus(target).await;
+                }
+                changes = watch.next() => {
+                    let Ok(changes) = changes else {
+                        let _ = channel.send(WatchMessage::Disconnected);
+                        return;
+                    };
+                    if channel.send(WatchMessage::Changes { changes }).is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
     *app.watch.lock().unwrap() = Some(Task(task));
     app.streams.lock().unwrap().clear();
+}
+
+/// Sets the session or run the window shows in front of the user, or clears
+/// it with `None` while the window is in the background. The watch's task
+/// sends it to oxd.
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri passes managed state to commands as `State` by value"
+)]
+fn focus(app: State<'_, App>, focus: Option<Focus>) {
+    app.focus.send_replace(focus);
 }
 
 /// Sends a session's conversation on `channel` from its first event, in
@@ -574,6 +610,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             agents,
             watch,
+            focus,
             view_session,
             watch_directory,
             watch_file,

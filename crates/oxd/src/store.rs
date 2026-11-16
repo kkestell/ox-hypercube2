@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ox_protocol::{Event, EventKind, RunState, StepInfo};
+use ox_protocol::{Event, EventKind, RunState, StepInfo, Unseen};
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
@@ -34,6 +34,7 @@ pub struct SavedSession {
     pub archived: bool,
     /// When the session was created, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    pub unseen: Option<Unseen>,
 }
 
 /// A worktree as the database holds it.
@@ -72,6 +73,7 @@ pub struct SavedRun {
     pub steps: Vec<StepInfo>,
     /// When the run was started, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    pub unseen: Option<Unseen>,
 }
 
 /// The worktree a new session runs in.
@@ -159,6 +161,14 @@ impl Store {
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS archived (
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS session_unseen (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                unseen     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS run_unseen (
+                run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+                unseen TEXT NOT NULL
             );",
         )?;
         let connection = Arc::new(Mutex::new(connection));
@@ -268,7 +278,8 @@ impl Store {
             "SELECT number, id, workspace_id, command, cwd, title, agent_session_id, worktree_id,
                 (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
                 EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
-                created_at
+                created_at,
+                (SELECT unseen FROM session_unseen WHERE session_id = sessions.id)
             FROM sessions
             ORDER BY number",
         )?;
@@ -293,6 +304,7 @@ impl Store {
                     last_seq: u64::try_from(row.get::<_, i64>(8)?).expect("seqs are positive"),
                     archived: row.get(9)?,
                     created_at: time_value(row, 10)?,
+                    unseen: parse_unseen(row, 11)?,
                 })
             })?
             .collect()
@@ -374,7 +386,8 @@ impl Store {
         let connection = self.lock();
         let mut query = connection.prepare(
             "SELECT number, id, workspace_id, worktree_id, workflow, name, input, state, error,
-                steps, created_at
+                steps, created_at,
+                (SELECT unseen FROM run_unseen WHERE run_id = runs.id)
             FROM runs ORDER BY number",
         )?;
         query
@@ -398,24 +411,35 @@ impl Store {
                         )
                     })?,
                     created_at: time_value(row, 10)?,
+                    unseen: parse_unseen(row, 11)?,
                 })
             })?
             .collect()
     }
 
-    /// Saves a run's state, error and steps.
+    /// Saves a run's state, error, steps and unseen outcome.
     pub fn update_run(
         &self,
         id: &str,
         state: RunState,
         error: Option<&str>,
         steps: &[StepInfo],
+        unseen: Option<Unseen>,
     ) -> rusqlite::Result<()> {
-        self.lock().execute(
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "UPDATE runs SET state = ?2, error = ?3, steps = ?4 WHERE id = ?1",
             params![id, state_name(state), error, steps_json(steps)],
         )?;
-        Ok(())
+        match unseen {
+            Some(unseen) => transaction.execute(
+                "INSERT OR REPLACE INTO run_unseen (run_id, unseen) VALUES (?1, ?2)",
+                params![id, state_name(unseen)],
+            )?,
+            None => transaction.execute("DELETE FROM run_unseen WHERE run_id = ?1", [id])?,
+        };
+        transaction.commit()
     }
 
     /// Deletes a run, the sessions in its worktree and their events, and its
@@ -481,6 +505,19 @@ impl Store {
         Ok(())
     }
 
+    /// Saves a session's unseen outcome, or deletes it with `None`.
+    pub fn set_session_unseen(&self, id: &str, unseen: Option<Unseen>) -> rusqlite::Result<()> {
+        let connection = self.lock();
+        match unseen {
+            Some(unseen) => connection.execute(
+                "INSERT OR REPLACE INTO session_unseen (session_id, unseen) VALUES (?1, ?2)",
+                params![id, state_name(unseen)],
+            )?,
+            None => connection.execute("DELETE FROM session_unseen WHERE session_id = ?1", [id])?,
+        };
+        Ok(())
+    }
+
     /// Deletes a session, with its events and the worktree it runs in unless
     /// a run owns the worktree.
     pub fn remove_session(&self, id: &str) -> rusqlite::Result<()> {
@@ -531,11 +568,19 @@ fn time_value(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
     Ok(u64::try_from(row.get::<_, i64>(index)?).expect("times are positive"))
 }
 
-/// A run's state as its column holds it: its name on the wire.
+/// A state or unseen outcome as its column holds it: its name on the wire.
 fn state_name(state: impl serde::Serialize) -> String {
     match serde_json::to_value(state).expect("a state serializes") {
         serde_json::Value::String(name) => name,
         value => unreachable!("a state serializes as a string, not {value}"),
+    }
+}
+
+/// The unseen outcome in column `index`, which holds its name or `NULL`.
+fn parse_unseen(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<Unseen>> {
+    match row.get::<_, Option<String>>(index)? {
+        None => Ok(None),
+        Some(_) => parse_state(row, index).map(Some),
     }
 }
 
@@ -681,6 +726,7 @@ mod tests {
                     last_seq: 0,
                     archived: false,
                     created_at: 1_700_000_000_000,
+                    unseen: None,
                 },
                 SavedSession {
                     number: second,
@@ -694,6 +740,7 @@ mod tests {
                     last_seq: 0,
                     archived: false,
                     created_at: 1_700_000_000_001,
+                    unseen: None,
                 },
             ]
         );
@@ -721,6 +768,38 @@ mod tests {
         store.set_archived("one", true).unwrap();
         store.remove_session("one").unwrap();
         assert_eq!(count(&store, "archived"), 0);
+    }
+
+    #[test]
+    fn unseen_is_saved_replaced_and_deleted_with_the_session() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        store
+            .add_session(
+                "one",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+                0,
+            )
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].unseen, None);
+        store
+            .set_session_unseen("one", Some(Unseen::Finished))
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Finished));
+        store
+            .set_session_unseen("one", Some(Unseen::Error))
+            .unwrap();
+        assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Error));
+        store.set_session_unseen("one", None).unwrap();
+        assert_eq!(store.sessions().unwrap()[0].unseen, None);
+        store
+            .set_session_unseen("one", Some(Unseen::Error))
+            .unwrap();
+        store.remove_session("one").unwrap();
+        assert_eq!(count(&store, "session_unseen"), 0);
     }
 
     #[test]
@@ -947,6 +1026,7 @@ mod tests {
                 step("Work", StepState::Pending),
             ],
             created_at: 1_700_000_000_000,
+            unseen: None,
         }
     }
 
@@ -1000,8 +1080,26 @@ mod tests {
             },
             step("Work", StepState::Failed),
         ];
+        second.unseen = Some(Unseen::Error);
         store
-            .update_run("two", second.state, second.error.as_deref(), &second.steps)
+            .update_run(
+                "two",
+                second.state,
+                second.error.as_deref(),
+                &second.steps,
+                second.unseen,
+            )
+            .unwrap();
+        assert_eq!(store.runs().unwrap(), [first.clone(), second.clone()]);
+        second.unseen = None;
+        store
+            .update_run(
+                "two",
+                second.state,
+                second.error.as_deref(),
+                &second.steps,
+                None,
+            )
             .unwrap();
         assert_eq!(store.runs().unwrap(), [first, second]);
         assert_eq!(
@@ -1035,6 +1133,11 @@ mod tests {
         add_step_session(&store, "u", "q");
         store.log(vec![exited("s", 1), exited("u", 1)]);
         store.flush().await;
+        store.set_session_unseen("s", Some(Unseen::Error)).unwrap();
+        let run = run("r");
+        store
+            .update_run("r", run.state, None, &run.steps, Some(Unseen::Error))
+            .unwrap();
         store.remove_run("r").unwrap();
         let sessions: Vec<_> = store
             .sessions()
@@ -1046,6 +1149,8 @@ mod tests {
         assert!(store.events("s").unwrap().is_empty());
         assert_eq!(store.worktrees().unwrap(), [worktree("q")]);
         assert_eq!(store.runs().unwrap(), [other]);
+        assert_eq!(count(&store, "session_unseen"), 0);
+        assert_eq!(count(&store, "run_unseen"), 0);
     }
 
     #[test]

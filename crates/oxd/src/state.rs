@@ -1,6 +1,7 @@
 //! A session's state machine and the event history it writes.
 
 use agent_client_protocol::schema::MaybeUndefined;
+use agent_client_protocol::v2::schema::StopReason;
 use agent_client_protocol::v2::schema::{
     AvailableCommand, BackgroundWork, CancelledPermissionOutcome, ConfigOptionUpdate, ContentBlock,
     CreateElicitationRequest, ElicitationAction, ElicitationMode, ElicitationPropertySchema,
@@ -9,7 +10,7 @@ use agent_client_protocol::v2::schema::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
     SessionUpdate, StateUpdate, ToolCallId,
 };
-use ox_protocol::{ErrorBody, Event, EventKind, SessionState, code};
+use ox_protocol::{ErrorBody, Event, EventKind, SessionState, Unseen, code};
 use tokio::sync::oneshot;
 
 /// Events a subscriber is handed at a time.
@@ -650,6 +651,8 @@ impl State {
         for event in cancelled {
             self.append(event);
         }
+        // TODO: a turn a crash cut off gets its unseen error only here, when
+        // the session's history is first read, not when oxd restarts.
         if turn_open {
             self.append(EventKind::TurnEnded {
                 stop_reason: None,
@@ -957,6 +960,37 @@ pub fn check_form(
     Ok((request.message, scope.tool_call_id, schema))
 }
 
+/// The unseen outcome new `events` give a session that is out of focus:
+/// `Error` for a turn that failed or an agent that exited with an error,
+/// otherwise `Finished` for a turn that ended other than by cancellation.
+/// Events that park the agent, as a park or an archive does, give nothing.
+pub fn unseen(events: &[Event]) -> Option<Unseen> {
+    if events
+        .iter()
+        .any(|event| matches!(event.kind, EventKind::AgentParked))
+    {
+        return None;
+    }
+    let mut unseen = None;
+    for event in events {
+        match &event.kind {
+            EventKind::TurnEnded { error: Some(_), .. }
+            | EventKind::TurnEnded {
+                stop_reason: Some(StopReason::Error(_)),
+                ..
+            }
+            | EventKind::AgentExited { error: Some(_) } => return Some(Unseen::Error),
+            EventKind::TurnEnded {
+                stop_reason: Some(StopReason::Cancelled),
+                ..
+            } => {}
+            EventKind::TurnEnded { .. } => unseen = Some(Unseen::Finished),
+            _ => {}
+        }
+    }
+    unseen
+}
+
 fn invalid_request(message: String) -> ErrorBody {
     ErrorBody {
         code: code::INVALID_REQUEST,
@@ -985,9 +1019,10 @@ mod tests {
     use agent_client_protocol::v2::schema::{
         BackgroundToolCall, ContentChunk, ElicitationAcceptAction, ElicitationContentValue,
         ElicitationFormMode, ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode,
-        EnumOption, IdleStateUpdate, MultiSelectPropertySchema, OtherElicitationPropertySchema,
-        OtherStateUpdate, PermissionOptionKind, RequiresActionStateUpdate, RunningStateUpdate,
-        SessionInfoUpdate, StopReason, StringPropertySchema, TextContent,
+        EnumOption, ErrorStopReason, IdleStateUpdate, MultiSelectPropertySchema,
+        OtherElicitationPropertySchema, OtherStateUpdate, PermissionOptionKind,
+        RequiresActionStateUpdate, RunningStateUpdate, SessionInfoUpdate, StopReason,
+        StringPropertySchema, TextContent,
     };
     use serde_json::json;
 
@@ -2067,6 +2102,83 @@ mod tests {
         for request in refused {
             let error = check_form(request).unwrap_err();
             assert_eq!(error.code, agent_client_protocol::ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    #[test]
+    fn unseen_reads_how_turns_and_agents_ended() {
+        let event = |kind| Event {
+            session_id: "s".into(),
+            seq: 1,
+            kind,
+        };
+        let turn = |stop_reason, error: Option<&str>| {
+            event(EventKind::TurnEnded {
+                stop_reason,
+                error: error.map(String::from),
+            })
+        };
+        let exited = |error: Option<&str>| {
+            event(EventKind::AgentExited {
+                error: error.map(String::from),
+            })
+        };
+        let cases = [
+            (
+                "end turn",
+                vec![turn(Some(StopReason::EndTurn), None)],
+                Some(Unseen::Finished),
+            ),
+            (
+                "max tokens",
+                vec![turn(Some(StopReason::MaxTokens), None)],
+                Some(Unseen::Finished),
+            ),
+            (
+                "refusal",
+                vec![turn(Some(StopReason::Refusal), None)],
+                Some(Unseen::Finished),
+            ),
+            (
+                "no stop reason",
+                vec![turn(None, None)],
+                Some(Unseen::Finished),
+            ),
+            (
+                "cancelled",
+                vec![turn(Some(StopReason::Cancelled), None)],
+                None,
+            ),
+            (
+                "error stop reason",
+                vec![turn(Some(StopReason::Error(ErrorStopReason::new())), None)],
+                Some(Unseen::Error),
+            ),
+            (
+                "turn error",
+                vec![turn(None, Some("boom"))],
+                Some(Unseen::Error),
+            ),
+            (
+                "agent exited with an error",
+                vec![exited(Some("boom"))],
+                Some(Unseen::Error),
+            ),
+            ("agent exited", vec![exited(None)], None),
+            (
+                "error after a finish",
+                vec![turn(Some(StopReason::EndTurn), None), exited(Some("boom"))],
+                Some(Unseen::Error),
+            ),
+            (
+                "parked",
+                vec![turn(None, Some("parked")), event(EventKind::AgentParked)],
+                None,
+            ),
+            ("nothing ended", vec![event(EventKind::TurnStarted)], None),
+        ];
+        for (name, events, expected) in cases {
+            assert_eq!(unseen(&events), expected, "{name}");
         }
     }
 }

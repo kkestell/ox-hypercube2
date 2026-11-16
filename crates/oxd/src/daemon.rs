@@ -1,11 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ox_protocol::{
-    Branches, Checkout, CommandState, ConfigValue, Deleted, ErrorBody, Harness, ListingChange,
-    Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo, StepState, WorkspaceInfo, code,
+    Branches, Checkout, CommandState, ConfigValue, Deleted, ErrorBody, Focus, Harness,
+    ListingChange, Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo, StepState,
+    Unseen, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -14,8 +16,8 @@ use crate::branches;
 use crate::directories::Directories;
 use crate::instructions::StepRole;
 use crate::mcp::OxServer;
-use crate::run::Run;
-use crate::session::Session;
+use crate::run::{Run, RunFocus};
+use crate::session::{Session, SessionFocus};
 use crate::state::{Change, State};
 use crate::store::{SavedRun, SavedSession, SavedWorkspace, SessionWorktree, Store};
 use crate::workflow;
@@ -72,6 +74,13 @@ impl Drop for ClientGuard {
     }
 }
 
+/// A connection's focus on a session or a run, counted while it lives.
+#[expect(dead_code, reason = "a guard is held for its drop")]
+pub enum FocusGuard {
+    Session(SessionFocus),
+    Run(RunFocus),
+}
+
 struct CheckoutMove<'a> {
     daemon: &'a Daemon,
     checkout: PathBuf,
@@ -119,7 +128,8 @@ impl Daemon {
     /// `exited`, with no agent, until it loads. A saved session that never
     /// started has nothing to load. One without a worktree is deleted; one
     /// with a worktree stays `exited`. A run that was running is
-    /// `interrupted`, with its running step and command, and stays so.
+    /// `interrupted`, with its running step and command, and stays so, with
+    /// an unseen error.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
@@ -151,11 +161,13 @@ impl Daemon {
                             }
                         }
                     }
+                    saved.unseen = Some(Unseen::Error);
                     store.update_run(
                         &saved.id,
                         saved.state,
                         saved.error.as_deref(),
                         &saved.steps,
+                        saved.unseen,
                     )?;
                 }
                 let worktree = worktrees
@@ -188,6 +200,11 @@ impl Daemon {
                 ),
                 None => State::unstarted(saved.id.clone(), saved.title.clone()),
             };
+            let run_focused = worktree.as_ref().and_then(|worktree| {
+                runs.values()
+                    .find(|run| run.worktree.id == worktree.id)
+                    .map(|run| run.focused())
+            });
             let session = Session::new(
                 store.clone(),
                 changed.clone(),
@@ -196,6 +213,7 @@ impl Daemon {
                 saved,
                 worktree,
                 state,
+                run_focused,
             );
             sessions.insert(session.id.clone(), session);
         }
@@ -284,6 +302,32 @@ impl Daemon {
             .get(id)
             .cloned()
             .ok_or_else(|| not_found("session", id))
+    }
+
+    /// Counts a connection's focus on a session or a run while the guard
+    /// lives, and clears its unseen outcome: a run's, then its child
+    /// sessions'. Refused for an unknown ID.
+    pub fn focus(&self, focus: Focus) -> Result<FocusGuard, ErrorBody> {
+        match focus {
+            Focus::Session { session_id } => {
+                Ok(FocusGuard::Session(self.session(&session_id)?.focus()))
+            }
+            Focus::Run { run_id } => {
+                let run = self.run(&run_id)?;
+                let guard = run.focus();
+                let children: Vec<Arc<Session>> = {
+                    let registry = self.lock();
+                    run.session_ids()
+                        .iter()
+                        .filter_map(|id| registry.sessions.get(id).cloned())
+                        .collect()
+                };
+                for child in children {
+                    child.clear_unseen();
+                }
+                Ok(FocusGuard::Run(guard))
+            }
+        }
     }
 
     fn run(&self, id: &str) -> Result<Arc<Run>, ErrorBody> {
@@ -453,7 +497,8 @@ impl Daemon {
             | Method::Watch
             | Method::DirectoryWatch { .. }
             | Method::FileWatch { .. }
-            | Method::Unsubscribe { .. } => Err(ErrorBody {
+            | Method::Unsubscribe { .. }
+            | Method::Focus { .. } => Err(ErrorBody {
                 code: code::INVALID_REQUEST,
                 message: "unexpected method".into(),
             }),
@@ -692,6 +737,7 @@ impl Daemon {
                         .clone()
                         .map(|saved| Worktree::new(saved, self.changed.clone()))
                 },
+                None,
             )?;
             match (session.worktree(), worktree.take()) {
                 (Some(live_worktree), Some((git, plan))) => {
@@ -716,7 +762,8 @@ impl Daemon {
 
     /// Saves session `id`, `starting`, in `cwd` of the workspace, and
     /// registers it, with the worktree `worktree` gives once the session is
-    /// saved.
+    /// saved, and the focus count of its run, `run_focused`, if it is a
+    /// run's child.
     #[expect(
         clippy::too_many_arguments,
         reason = "the session's saved fields, which the two callers build differently"
@@ -730,6 +777,7 @@ impl Daemon {
         cwd: PathBuf,
         saved_worktree: SessionWorktree<'_>,
         worktree: impl FnOnce() -> Option<Arc<Worktree>>,
+        run_focused: Option<Arc<AtomicUsize>>,
     ) -> Result<Arc<Session>, ErrorBody> {
         registry.refuse_moving(&cwd)?;
         let created_at = now();
@@ -758,6 +806,7 @@ impl Daemon {
             last_seq: 0,
             archived: false,
             created_at,
+            unseen: None,
         };
         let session = Session::new(
             self.store.clone(),
@@ -767,6 +816,7 @@ impl Daemon {
             saved,
             worktree,
             state,
+            run_focused,
         );
         registry
             .sessions
@@ -850,6 +900,7 @@ impl Daemon {
                         })
                         .collect(),
                     created_at: now(),
+                    unseen: None,
                 };
                 saved.number = self
                     .store
@@ -900,6 +951,7 @@ impl Daemon {
                 cwd.to_owned(),
                 SessionWorktree::Run(&run.worktree.id),
                 || Some(run.worktree.clone()),
+                Some(run.focused()),
             )?;
             session.start(env, Some(role));
             run.set_step_session(position, &session.id);

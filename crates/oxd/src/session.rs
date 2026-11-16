@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -15,7 +15,9 @@ use agent_client_protocol::v2::schema::{
 };
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
-use ox_protocol::{ConfigValue, ErrorBody, Event, EventKind, SessionInfo, SessionState, code};
+use ox_protocol::{
+    ConfigValue, ErrorBody, Event, EventKind, SessionInfo, SessionState, Unseen, code,
+};
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -89,6 +91,13 @@ pub struct Session {
     parkable: Parkability,
     /// Stops the agent of a session that stays parkable for the park delay.
     parker: Mutex<Option<JoinHandle<()>>>,
+    /// How the session's turns ended while it was out of focus. Changed
+    /// under the state lock.
+    unseen: Mutex<Option<Unseen>>,
+    /// The connections that focus the session.
+    focused: AtomicUsize,
+    /// The focus count of the run whose child the session is.
+    run_focused: Option<Arc<AtomicUsize>>,
 }
 
 /// Whether a session is quiet and unviewed. `lapses` counts the times it
@@ -167,11 +176,25 @@ impl Drop for Viewer {
     }
 }
 
+/// A connection's focus on a session, counted while it lives.
+pub struct SessionFocus(Arc<Session>);
+
+impl Drop for SessionFocus {
+    fn drop(&mut self) {
+        self.0.focused.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Session {
     /// The session `saved` in `state`, in `worktree` if it runs in one: a
     /// session just saved is `starting`, and `start` launches its agent; a
     /// restored one is `exited`, and its stored history is read by
-    /// `history`.
+    /// `history`. A run's child session shares the run's focus count,
+    /// `run_focused`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the daemon's shared parts and the session's saved parts"
+    )]
     pub fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
@@ -180,6 +203,7 @@ impl Session {
         saved: SavedSession,
         worktree: Option<Arc<Worktree>>,
         state: State,
+        run_focused: Option<Arc<AtomicUsize>>,
     ) -> Arc<Self> {
         let session = Arc::new(Self {
             last_seq: watch::Sender::new(state.last_seq()),
@@ -203,6 +227,9 @@ impl Session {
             viewers: Mutex::new(0),
             parkable: Parkability::default(),
             parker: Mutex::new(None),
+            unseen: Mutex::new(saved.unseen),
+            focused: AtomicUsize::new(0),
+            run_focused,
         });
         *session.parker.lock().unwrap() =
             Some(tokio::spawn(session.clone().park_when_idle(park_after)));
@@ -382,6 +409,48 @@ impl Session {
             worktree_id,
             archived: *self.archived.lock().unwrap(),
             created_at: self.created_at,
+            unseen: *self.unseen.lock().unwrap(),
+        }
+    }
+
+    /// Counts a connection's focus on the session while the guard lives, and
+    /// clears its unseen outcome.
+    pub fn focus(self: &Arc<Self>) -> SessionFocus {
+        self.update(|_| {
+            self.focused.fetch_add(1, Ordering::SeqCst);
+            *self.unseen.lock().unwrap() = None;
+        });
+        SessionFocus(self.clone())
+    }
+
+    /// Clears the unseen outcome of a child session whose run was focused.
+    pub fn clear_unseen(&self) {
+        self.update(|_| *self.unseen.lock().unwrap() = None);
+    }
+
+    /// Whether a connection focuses the session or its run.
+    fn focused(&self) -> bool {
+        self.focused.load(Ordering::SeqCst) > 0
+            || self
+                .run_focused
+                .as_ref()
+                .is_some_and(|run| run.load(Ordering::SeqCst) > 0)
+    }
+
+    /// Records the unseen outcome `events` give a session out of focus. An
+    /// error replaces a finish but not the reverse, and a run's child
+    /// session takes no finish.
+    fn note_unseen(&self, events: &[Event]) {
+        if self.focused() {
+            return;
+        }
+        let mut unseen = self.unseen.lock().unwrap();
+        match state::unseen(events) {
+            Some(Unseen::Error) => *unseen = Some(Unseen::Error),
+            Some(Unseen::Finished) if unseen.is_none() && self.run_focused.is_none() => {
+                *unseen = Some(Unseen::Finished);
+            }
+            _ => {}
         }
     }
 
@@ -558,17 +627,18 @@ impl Session {
         let _ = self.commands.lock().unwrap().send(command);
     }
 
-    /// Changes the state, publishes the seq of its last event, queues its new
-    /// events for the database, saves a
-    /// changed title or agent session ID, signals the daemon if the
-    /// session's `SessionInfo` changed, and asks the worktree for its
-    /// comparison again when a turn ended.
+    /// Changes the state, publishes the seq of its last event, records the
+    /// unseen outcome its new events give, queues them for the database,
+    /// saves a changed title, agent session ID or unseen outcome, signals
+    /// the daemon if the session's `SessionInfo` changed, and asks the
+    /// worktree for its comparison again when a turn ended.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.lock();
         let before = self.info_of(&state);
         let result = change(&mut state);
         self.last_seq.send_replace(state.last_seq());
         let events = state.take_unlogged();
+        self.note_unseen(&events);
         if events
             .iter()
             .any(|event| matches!(event.kind, EventKind::TurnEnded { .. }))
@@ -604,6 +674,14 @@ impl Session {
         {
             eprintln!(
                 "oxd: saving the agent session of session {}: {error}",
+                self.id
+            );
+        }
+        if after.unseen != before.unseen
+            && let Err(error) = self.store.set_session_unseen(&self.id, after.unseen)
+        {
+            eprintln!(
+                "oxd: saving the unseen outcome of session {}: {error}",
                 self.id
             );
         }

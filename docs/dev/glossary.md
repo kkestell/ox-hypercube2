@@ -36,3 +36,10 @@ ownership and lifecycle.
   run's worktree.
 - **Run view**: The desktop view of a run: each step with its start time and
   its agent's messages.
+- **Focus**: The session or run a client shows in front of the user, which
+  the client's connection tells `oxd`. The desktop sets it only while its
+  window is in front of other apps. Distinct from viewing, the event
+  subscriptions that keep a session from being parked.
+- **Unseen**: How a session's turn or a run ended, `finished` or `error`,
+  while no client had it in focus. It turns the sidebar dot green or red
+  until a client focuses it.

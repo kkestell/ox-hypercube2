@@ -212,20 +212,32 @@ hovered, expands and collapses its steps, as does double-clicking the row; a
 run starts collapsed. Each step is listed beneath the run's row, titled with
 its name; an agent step's row is its child session once the step starts, and
 the other rows select the run. The run's row shows its worktree's branch icon
-as a [Session in Worktree](worktrees.md#comparing-a-sessions-branch) row does. Each row's status is a blue breathing dot
-while it runs, an amber dot while a permission request or question awaits an
-answer, a green dot once it succeeded, a red dot once it failed, and a
-hollow dot while it is pending or once it was cancelled or interrupted. A
-pending step's row is dimmed.
+as a [Session in Worktree](worktrees.md#comparing-a-sessions-branch) row does. Each row's dot shows what it needs from
+the user, as a session's [status dot](../spec/sessions.md#status-dots) does:
+
+- The run's row is orange while a child awaits an answer, red while the
+  run's failure or interruption or a child's error is unseen, blue while the
+  run runs, green while its success is unseen, and gray otherwise.
+- A step's row is orange while its child awaits an answer, red while its
+  child's error is unseen or, once the step failed or was interrupted, while
+  the run's failure is unseen, blue while it runs, and gray otherwise. A step
+  never turns green.
+- Viewing the run clears the run's and its children's red and green; viewing
+  a child clears only the child's. A run or child that ends while it is in
+  view turns nothing red or green.
+
+Each row's tooltip names its state, such as Succeeded or Failed, and the run
+view shows each step's outcome. A pending step's row is dimmed.
 
 Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
 and how it compares with its base, and the workflow's name. Below it is
 every step, in order, with its start time once it has started and the
-messages its agent wrote, oldest first. While the run is active, the view
-keeps the end of the active step's latest message in view as it grows, until
-you scroll it out of view; a new message is followed again. A failed or
-interrupted run's reason shows under the step it stopped at. The oldest
+messages its agent wrote, oldest first. A step's dot there is green once it
+succeeded and red once it failed. While the run is active, the view keeps the
+end of the active step's latest message in view as it grows, until you scroll
+it out of view; a new message is followed again. A failed or interrupted run's
+reason shows under the step it stopped at. The oldest
 permission request or question awaiting an answer among the children shows
 below the steps. Answering it there or in the child's own view resolves it in
 both. The right sidebar shows the run's worktree.

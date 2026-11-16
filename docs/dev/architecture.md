@@ -102,6 +102,9 @@ session's first prompt.
   conversation history.
 - Agent processes and work that must continue when a client disconnects.
 - State updates and pending requests that every connected client must see.
+- Each connection's [focus](glossary.md) and the unseen outcome of each
+  session and run, which a focus clears and a turn or run ending out of
+  focus sets.
 - Repository writes and the coordination needed to complete or undo them.
 
 Clients own presentation and workflow choices: which branch to use, which
@@ -135,7 +138,9 @@ database holds workspace and session metadata, worktrees with their
 comparison refs, archive state, conversation events, and workflow runs. A
 run's steps, with their commands, are saved as one JSON column of its row,
 rewritten whenever the run changes.
-The database schema has no migrations.
+The database schema has no migrations; data added later goes in tables of
+its own, such as `archived` and the `session_unseen` and `run_unseen` tables
+of unseen outcomes, so older databases keep working.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence

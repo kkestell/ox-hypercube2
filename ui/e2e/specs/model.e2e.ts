@@ -98,7 +98,7 @@ describe("The model picker", () => {
   it("reserves the settings row before the agent reports its configuration", async () => {
     // oxctl waits for startup; view the published Starting row while it waits.
     const opening = startSession("--hang-initialize").catch((error: unknown) => error);
-    const row = $(".session:has(.status.starting) button.select");
+    const row = $('.session:has(.status[aria-label="Starting"]) button.select');
     await expect(row).toBeDisplayed();
     const starting = (await row.getAttribute("title"))!;
     await openSession(starting);

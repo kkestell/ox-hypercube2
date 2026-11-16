@@ -1,7 +1,7 @@
 import { linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { binary, binDir, built, harnesses, resetDaemon } from "./helpers.ts";
+import { binary, binDir, built, harnesses, holdForeground, resetDaemon } from "./helpers.ts";
 
 // The launcher makes the run's directory and points the run at an oxd socket
 // in it. The app it launches, the oxd the app starts, and the workers it
@@ -56,12 +56,14 @@ export const config: WebdriverIO.Config = {
   },
 
   // The webview loads the UI after the WebDriver session starts; each spec
-  // begins once the sidebar has rendered. Choosing the app's one window
-  // explicitly turns off the service's window focus check before each
-  // command, which asks tauri-plugin-wdio, a plugin the app does not have.
+  // begins once the sidebar has rendered, with the window held in front.
+  // Choosing the app's one window explicitly turns off the service's window
+  // focus check before each command, which asks tauri-plugin-wdio, a plugin
+  // the app does not have.
   async before() {
     await browser.switchToWindow(await browser.getWindowHandle());
     await $('button[aria-label="Add Workspace"]').waitForDisplayed({ timeout: 30_000 });
+    await holdForeground();
   },
 
   // Each test starts with no runs, sessions, workspaces or workflows. Once the app exits,

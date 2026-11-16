@@ -162,6 +162,16 @@ async function addWorkspace(cwd: string): Promise<string> {
   return (await oxctl("workspace", "add", cwd)).trim();
 }
 
+/** The ID of the one session in `cwd`, as `oxctl ls` lists it. */
+export async function sessionId(cwd: string): Promise<string> {
+  const ids = lines(await oxctl("ls"))
+    .map((line) => line.split("\t"))
+    .filter(([, , , path]) => path?.replace(/\/$/, "") === cwd)
+    .map(([id]) => id!);
+  if (ids.length !== 1) throw new Error(`${cwd} has ${ids.length} sessions`);
+  return ids[0]!;
+}
+
 /** Deletes the sessions of the workspace in `cwd` with `oxctl`. */
 export async function deleteSessions(cwd: string) {
   const workspace = await workspaceId(cwd);
@@ -235,7 +245,8 @@ function lines(output: string): string[] {
   return output.split("\n").filter(Boolean);
 }
 
-async function oxctl(...args: string[]): Promise<string> {
+/** Runs `oxctl` with `args` and returns what it prints. */
+export async function oxctl(...args: string[]): Promise<string> {
   const { stdout } = await promisify(execFile)(binary("oxctl"), args);
   return stdout;
 }
@@ -309,6 +320,28 @@ export async function reload() {
   await browser.waitUntil(() =>
     browser.execute(() => !(window as unknown as { previous?: boolean }).previous),
   );
+  await holdForeground();
+}
+
+/**
+ * Keeps the app's window in front for the tests, whichever app the desktop
+ * puts in front: the window's own `focus` and `blur` events stop before the
+ * app sees them, and a dispatched `focus` puts the window in front. Tests
+ * dispatch `blur` and `focus` themselves to move it.
+ */
+export async function holdForeground() {
+  await browser.execute(() => {
+    for (const type of ["focus", "blur"]) {
+      window.addEventListener(
+        type,
+        (event) => {
+          if (event.isTrusted) event.stopImmediatePropagation();
+        },
+        true,
+      );
+    }
+    window.dispatchEvent(new Event("focus"));
+  });
 }
 
 /** Answers one native file picker or message box at the Tauri IPC boundary. */

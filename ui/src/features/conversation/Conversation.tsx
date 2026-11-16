@@ -115,7 +115,7 @@ function ToolStatus({ status }: { status: ToolCallStatus }) {
       );
     case "failed":
       return (
-        <span className="status failed" role="img" aria-label="Failed" title="Failed">
+        <span className="status error" role="img" aria-label="Failed" title="Failed">
           <X />
         </span>
       );

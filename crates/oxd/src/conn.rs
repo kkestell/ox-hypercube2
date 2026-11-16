@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
-use crate::daemon::{ClientGuard, Daemon, Sent};
+use crate::daemon::{ClientGuard, Daemon, FocusGuard, Sent};
 use crate::directories::{self, Changes};
 use crate::session::Session;
 
@@ -52,6 +52,8 @@ pub async fn serve(
     // and watches, by the id of the request that started each.
     let mut forwards: HashMap<u64, Task> = HashMap::new();
     let mut watches: HashMap<u64, Task> = HashMap::new();
+    // The session or run the client shows in front of the user.
+    let mut focus: Option<FocusGuard> = None;
     let mut lines = BufReader::new(read).lines();
     let mut greeted = false;
 
@@ -177,6 +179,18 @@ pub async fn serve(
                 forwards.remove(&subscription);
                 watches.remove(&subscription);
                 Ok(Value::Null)
+            }
+            // The last focus ends first, so a refused one leaves the
+            // connection unfocused.
+            Method::Focus { focus: target } => {
+                drop(focus.take());
+                target
+                    .map(|target| daemon.focus(target))
+                    .transpose()
+                    .map(|guard| {
+                        focus = guard;
+                        Value::Null
+                    })
             }
             // A config option change goes to the agent here, in the order of
             // the connection's requests, so a prompt sent after it reaches the

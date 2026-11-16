@@ -10,9 +10,9 @@ use ox_protocol::schema::{
     TextContent, TextResourceContents,
 };
 use ox_protocol::{
-    Checkout, Client, ConfigValue, DirEntry, End, EntryKind, Error, Event, EventKind, Listing,
-    ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream, Subscription,
-    WorkspaceInfo, code,
+    Checkout, Client, ConfigValue, DirEntry, End, EntryKind, Error, Event, EventKind, Focus,
+    Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream, Subscription,
+    Unseen, WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -2530,4 +2530,144 @@ async fn file_watch_follows_edits_replacement_and_recreation() {
             .await
             .is_err()
     );
+}
+
+/// The listed session's unseen outcome.
+async fn unseen(client: &Client, session_id: &str) -> Option<Unseen> {
+    info(client, session_id).await.unwrap().unseen
+}
+
+fn focus_session(session_id: &str) -> Focus {
+    Focus::Session {
+        session_id: session_id.into(),
+    }
+}
+
+/// Prompts `script` and returns once its turn has ended.
+async fn turn(client: &Client, events: &mut Subscription, session_id: &str, script: &str) {
+    client.prompt(session_id, text(script)).await.unwrap();
+    until(events, turn_ended).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_turn_that_ends_out_of_focus_is_unseen_until_the_session_is_focused() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    assert_eq!(unseen(&client, &session.id).await, None);
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
+
+    client
+        .focus(Some(focus_session(&session.id)))
+        .await
+        .unwrap();
+    assert_eq!(unseen(&client, &session.id).await, None);
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, None);
+
+    client.focus(None).await.unwrap();
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_turn_is_not_unseen_and_an_error_outlasts_a_finish() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .prompt(&session.id, text("say 1 0\nwait"))
+        .await
+        .unwrap();
+    until(&mut events, |kind| {
+        matches!(kind, EventKind::Update(SessionUpdate::AgentMessageChunk(_)))
+    })
+    .await;
+    client.cancel(&session.id).await.unwrap();
+    until(&mut events, turn_ended).await;
+    assert_eq!(unseen(&client, &session.id).await, None);
+
+    turn(&client, &mut events, &session.id, "reject not today").await;
+    assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Error));
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Error));
+
+    let (exiting, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&exiting.id, started).await.unwrap();
+    client.prompt(&exiting.id, text("exit 1")).await.unwrap();
+    until(&mut events, |kind| {
+        matches!(kind, EventKind::AgentExited { .. })
+    })
+    .await;
+    assert_eq!(unseen(&client, &exiting.id).await, Some(Unseen::Error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_the_focusing_connection_ends_its_focus() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    let mut watch = client.watch().await.unwrap();
+    next_changes(&mut watch).await;
+    let focusing = daemon.client().await;
+    focusing
+        .focus(Some(focus_session(&session.id)))
+        .await
+        .unwrap();
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, None);
+
+    // The daemon lists the workspaces again once a client has disconnected,
+    // so the workspace turning into a Git working tree shows when it has.
+    init(&daemon.cwd());
+    drop(focusing);
+    loop {
+        let changes = next_changes(&mut watch).await;
+        if changes.iter().any(|change| {
+            matches!(change, ListingChange::Workspace { workspace } if workspace.git_working_tree)
+        }) {
+            break;
+        }
+    }
+    turn(&client, &mut events, &session.id, "say 1 0").await;
+    assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unseen_outcomes_survive_a_restart() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (finished, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&finished.id, started).await.unwrap();
+    turn(&client, &mut events, &finished.id, "say 1 0").await;
+    // A turn still open when oxd stops ends with an error.
+    let (cut_off, _) = daemon.new_session(&client).await;
+    client.prompt(&cut_off.id, text("wait")).await.unwrap();
+    drop(events);
+    drop(client);
+
+    let daemon = daemon.restart().await;
+    let client = daemon.client().await;
+    assert_eq!(unseen(&client, &finished.id).await, Some(Unseen::Finished));
+    assert_eq!(unseen(&client, &cut_off.id).await, Some(Unseen::Error));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn focusing_an_unknown_session_or_run_is_refused() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let error = refusal(client.focus(Some(focus_session("missing"))).await);
+    assert_eq!(error.code, code::NOT_FOUND);
+    let error = refusal(
+        client
+            .focus(Some(Focus::Run {
+                run_id: "missing".into(),
+            }))
+            .await,
+    );
+    assert_eq!(error.code, code::NOT_FOUND);
 }

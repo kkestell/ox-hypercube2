@@ -252,6 +252,33 @@ pub enum Method {
     /// directory does not exist.
     #[serde(rename = "workflow.list")]
     WorkflowList,
+    /// Sets the session or run this connection shows in front of the user,
+    /// replacing the connection's last focus, or clears it with `null`.
+    /// Closing the connection clears it too. Focusing a session clears its
+    /// `unseen`; focusing a run clears the run's and its child sessions'.
+    /// While a session or its run is focused by any connection, the session
+    /// gets no `unseen`, and likewise a focused run. An unknown ID is
+    /// refused with `NOT_FOUND` and leaves the connection unfocused.
+    /// Answers `null`.
+    #[serde(rename = "focus")]
+    Focus { focus: Option<Focus> },
+}
+
+/// What a client shows in front of the user.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Focus {
+    Session { session_id: String },
+    Run { run_id: String },
+}
+
+/// How a session's turn or a run ended while no client had it in focus,
+/// kept until a client focuses it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Unseen {
+    Finished,
+    Error,
 }
 
 /// A coding-agent CLI that Ox drives through its ACP bridge.
@@ -492,6 +519,9 @@ pub struct RunInfo {
     pub steps: Vec<StepInfo>,
     /// When the run was started, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// How the run ended, while no client has focused it since: `finished`
+    /// when it succeeded, `error` when it failed or was interrupted.
+    pub unseen: Option<Unseen>,
 }
 
 /// A step of a run.
@@ -605,6 +635,11 @@ pub struct SessionInfo {
     pub archived: bool,
     /// When the session was created, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// How the session's turns ended while it was out of focus, until a
+    /// client focuses it: `error` when a turn failed or the agent exited
+    /// with an error, otherwise `finished` when a turn ended other than by
+    /// cancellation. A run's child session never has `finished`.
+    pub unseen: Option<Unseen>,
 }
 
 /// One entry in a session's history. `seq` starts at 1 and increases by one
@@ -1275,7 +1310,8 @@ mod tests {
                 "available_commands": [],
                 "worktree_id": "01234567-89ab",
                 "archived": false,
-                "created_at": 1_700_000_000_000_u64
+                "created_at": 1_700_000_000_000_u64,
+                "unseen": "finished"
                 }},
                 {"type": "session_removed", "session_id": "r"},
                 {"type": "run", "run": {
@@ -1307,7 +1343,8 @@ mod tests {
                          "session_id": null, "output": null,
                          "commands": []}
                     ],
-                    "created_at": 1_700_000_000_001_u64
+                    "created_at": 1_700_000_000_001_u64,
+                    "unseen": "error"
                 }},
                 {"type": "run_removed", "run_id": "q"}
             ]
@@ -1400,6 +1437,7 @@ mod tests {
                     },
                 ],
                 created_at: 1_700_000_000_001,
+                unseen: Some(Unseen::Error),
             }
         );
         let value = serde_json::to_value(run).unwrap();
@@ -1408,6 +1446,7 @@ mod tests {
         assert_eq!(session.title.as_deref(), Some("Fix the build"));
         assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));
         assert_eq!(session.created_at, 1_700_000_000_000);
+        assert_eq!(session.unseen, Some(Unseen::Finished));
         let value = serde_json::to_value(session).unwrap();
         assert_eq!(
             serde_json::from_value::<SessionInfo>(value).unwrap(),

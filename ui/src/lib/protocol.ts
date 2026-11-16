@@ -101,7 +101,15 @@ export interface SessionInfo {
   archived: boolean;
   /** When the session was created, in milliseconds since the Unix epoch. */
   created_at: number;
+  /** How the session's turns ended while it was out of focus, until it is focused. */
+  unseen: Unseen | null;
 }
+
+/** How a session's turn or a run ended while no client had it in focus. */
+export type Unseen = "finished" | "error";
+
+/** The session or run the window shows in front of the user. */
+export type Focus = { type: "session"; session_id: string } | { type: "run"; run_id: string };
 
 /** A definition in oxd's workflows directory. */
 export interface WorkflowInfo {
@@ -139,6 +147,8 @@ export interface RunInfo {
   steps: StepInfo[];
   /** When the run was started, in milliseconds since the Unix epoch. */
   created_at: number;
+  /** How the run ended while it was out of focus, until it is focused. */
+  unseen: Unseen | null;
 }
 
 export interface StepInfo {

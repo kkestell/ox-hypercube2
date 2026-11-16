@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol::v2::schema::{
@@ -13,7 +13,7 @@ use agent_client_protocol::v2::schema::{
 };
 use ox_protocol::{
     CommandInfo, CommandKind, CommandState, ConfigValue, ErrorBody, Event, EventKind,
-    MaybeUndefined, RunInfo, RunState, StepInfo, StepState, code,
+    MaybeUndefined, RunInfo, RunState, StepInfo, StepState, Unseen, code,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -49,6 +49,9 @@ pub struct Run {
     /// Set when the run is cancelled.
     cancel: watch::Sender<bool>,
     runner: Mutex<Option<JoinHandle<()>>>,
+    /// The connections that focus the run. Each child session holds a clone,
+    /// and is focused while it is above zero.
+    focused: Arc<AtomicUsize>,
 }
 
 /// What changes as a run advances.
@@ -56,6 +59,16 @@ struct RunRecord {
     state: RunState,
     error: Option<String>,
     steps: Vec<StepInfo>,
+    unseen: Option<Unseen>,
+}
+
+/// A connection's focus on a run, counted while it lives.
+pub struct RunFocus(Arc<Run>);
+
+impl Drop for RunFocus {
+    fn drop(&mut self) {
+        self.0.focused.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Why a step stopped before it succeeded.
@@ -99,12 +112,14 @@ impl Run {
                 state: saved.state,
                 error: saved.error,
                 steps: saved.steps,
+                unseen: saved.unseen,
             }),
             store,
             version: AtomicU64::new(0),
             changed,
             cancel: watch::Sender::new(false),
             runner: Mutex::new(None),
+            focused: Arc::default(),
         })
     }
 
@@ -139,6 +154,23 @@ impl Run {
 
     pub fn running(&self) -> bool {
         self.lock().state == RunState::Running
+    }
+
+    /// The focus count the run's child sessions share.
+    pub fn focused(&self) -> Arc<AtomicUsize> {
+        self.focused.clone()
+    }
+
+    /// Counts a connection's focus on the run while the guard lives, and
+    /// clears the run's unseen outcome. The caller clears its child
+    /// sessions' after, so a turn that ends meanwhile sees the focus or is
+    /// cleared.
+    pub fn focus(self: &Arc<Self>) -> RunFocus {
+        self.update(|record| {
+            self.focused.fetch_add(1, Ordering::SeqCst);
+            record.unseen = None;
+        });
+        RunFocus(self.clone())
     }
 
     /// The IDs of the run's child sessions.
@@ -198,6 +230,7 @@ impl Run {
             error: record.error.clone(),
             steps: record.steps.clone(),
             created_at: self.created_at,
+            unseen: record.unseen,
         }
     }
 
@@ -210,6 +243,7 @@ impl Run {
             record.state,
             record.error.as_deref(),
             &record.steps,
+            record.unseen,
         ) {
             eprintln!("oxd: saving run {}: {error}", self.id);
         }
@@ -241,7 +275,8 @@ impl Run {
     }
 
     /// Ends the run in `state` with `error`, and step `position`, if one was
-    /// running, in `step_state` with `output`.
+    /// running, in `step_state` with `output`. Out of focus, a run that
+    /// succeeded gets an unseen finish and one that failed an unseen error.
     fn end(
         &self,
         state: RunState,
@@ -255,6 +290,13 @@ impl Run {
             }
             record.state = state;
             record.error = error;
+            if self.focused.load(Ordering::SeqCst) == 0 {
+                record.unseen = match state {
+                    RunState::Succeeded => Some(Unseen::Finished),
+                    RunState::Failed => Some(Unseen::Error),
+                    _ => record.unseen,
+                };
+            }
         });
     }
 

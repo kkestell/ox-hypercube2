@@ -1,7 +1,14 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import type { Item, RunInfo, SessionInfo, StepInfo } from "../../lib/protocol";
 import { Markdown } from "../conversation/Markdown";
-import { childStatus, StatusIcon } from "../sessions/SessionList";
+import {
+  awaiting,
+  type Status,
+  StatusIcon,
+  stateLabels,
+  stepLabels,
+  working,
+} from "../sessions/SessionList";
 
 type AgentMessage = Extract<Item, { type: "text" }>;
 
@@ -25,6 +32,22 @@ export function runNotice(run: RunInfo): { text: string; index: number } | null 
   if (text === null) return null;
   const state = run.state === "failed" ? "failed" : "interrupted";
   return { text, index: run.steps.findIndex((step) => step.state === state) };
+}
+
+/**
+ * A step's outcome, from its state and its child session's, if it has one:
+ * what the session awaits, running, green succeeded, red failed, or gray.
+ */
+function stepOutcome(step: StepInfo, session: SessionInfo | undefined): Status {
+  if (session && awaiting(session)) {
+    return { className: "attention", label: stateLabels[session.state] };
+  }
+  if (step.state === "running" || working(session))
+    return { className: "running", label: "Running" };
+  const label = stepLabels[step.state];
+  if (step.state === "succeeded") return { className: "finished", label };
+  if (step.state === "failed") return { className: "error", label };
+  return { className: null, label };
 }
 
 /** A time as `HH:MM`. */
@@ -153,7 +176,7 @@ function StepStatus({
   /** The connector below the step: solid, dashed between two pending steps, or none. */
   connector: "solid" | "dashed" | null;
 }) {
-  const status = childStatus(step, session);
+  const status = stepOutcome(step, session);
   const latest = followMessages ? messages.at(-1) : undefined;
   const follow = useFollow(latest);
   const name = (

@@ -52,6 +52,7 @@ class Listing {
       worktree_id: worktreeId,
       archived: false,
       created_at: this.tick(),
+      unseen: null,
     };
     this.sessions.push(session);
     return session;
@@ -114,9 +115,17 @@ class Listing {
           sessionState === undefined ? null : this.session(name, sessionState, worktree.id).id,
       })),
       created_at,
+      unseen: null,
     };
     this.runs.push(run);
     return run;
+  }
+
+  /** The session with ID `id`. */
+  find(id: string | null) {
+    const session = this.sessions.find((session) => session.id === id);
+    if (session === undefined) throw new Error(`No session ${id}`);
+    return session;
   }
 
   changes(): ListingChange[] {
@@ -132,11 +141,13 @@ class Listing {
 /** Every session and run status in the sidebar. */
 function sidebar(): Scenario {
   const listing = new Listing();
-  listing.run("Fix the replay cursor", "failed", [
+  const failed = listing.run("Fix the replay cursor", "failed", [
     ["Plan", "succeeded", "exited"],
     ["Implement", "failed", "exited"],
     ["Review", "pending"],
   ]);
+  failed.unseen = "error";
+  listing.find(failed.steps[1]!.session_id).unseen = "error";
   listing.run("Rename the store module", "cancelled", [
     ["Plan", "succeeded", "exited"],
     ["Implement", "cancelled", "exited"],
@@ -145,7 +156,7 @@ function sidebar(): Scenario {
     ["Plan", "succeeded", "exited"],
     ["Implement", "succeeded", "exited"],
     ["Review", "succeeded", "exited"],
-  ]);
+  ]).unseen = "finished";
   listing.run("Inject agent instructions", "running", [
     ["Plan", "succeeded", "exited"],
     ["Implement", "running", "awaiting_permission"],
@@ -160,7 +171,8 @@ function sidebar(): Scenario {
     listing.session(title, "exited").archived = true;
   }
   listing.session("Old exploration", "exited");
-  listing.session("Explain the event store", "idle");
+  listing.session("Debug the parser crash", "exited").unseen = "error";
+  listing.session("Explain the event store", "idle").unseen = "finished";
   listing.session("Which bugs next?", "awaiting_input");
   const working = listing.session("Fix sidebar colors", "running");
   return {

@@ -63,10 +63,28 @@ The app treats a session another client already deleted as successfully deleted.
 
 Archiving is separate from these states. The command line displays archived in place of the state for an archived session.
 
+### Status dots
+
+Each session's dot in the sidebar shows what it needs from the user, the first that applies:
+
+| Dot | When |
+| --- | --- |
+| Orange | A permission request or question awaits an answer. |
+| Red | A turn failed, or the agent exited with an error, since the user last viewed the session. |
+| Blue | The agent is starting or a turn is in progress. |
+| Green | A turn ended since the user last viewed the session. |
+| Gray | Nothing needs the user. |
+
+- A turn that ends while the session is in front of the user, in a window in front of other apps, turns nothing red or green. A cancelled turn, a park and an archive turn nothing red or green either.
+- Red and green clear when the user views the session in a window in front of other apps. Prompting or answering a request does not clear them.
+- Red stays through later turns until it clears; green gives way to blue while the next turn runs.
+- A turn that oxd shutting down cuts off turns red.
+- Runs and their steps follow [workflow status dots](../docs/workflows.md#running-a-workflow).
+
 ### History and service restarts
 
 - Conversations, including reported tool output and images, remain readable until the session is deleted. Reading history does not require a running agent.
-- Workspaces, session identities, titles, archive status, and worktree associations survive a session-service restart. Agents do not: saved sessions return Exited and must be resumed to continue work.
+- Workspaces, session identities, titles, archive status, unseen finishes and errors (red and green dots), and worktree associations survive a session-service restart. Agents do not: saved sessions return Exited and must be resumed to continue work.
 - Graceful service shutdown stops active agents and retains their sessions. If a crash leaves a turn unfinished, the recovered conversation ends it with oxd stopped during the turn and cancels unanswered requests. The most recent output may be lost after an abrupt crash.
 - A session that never successfully started is cleaned up after a service restart. If its worktree cannot safely be removed, it is retained for deletion rather than resumed.
 - Agent-specific retention may prevent continuing a conversation that Ox can still display; see [Claude Code continuation](claude.md#continue-and-replay-conversations).

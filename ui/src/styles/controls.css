@@ -299,27 +299,16 @@ textarea.text-field {
   animation: glow var(--busy-dot-duration) ease-in-out infinite alternate;
 }
 
-.status.awaiting_permission,
-.status.awaiting_input,
 .status.attention {
   color: var(--warning);
 }
 
-.status.succeeded {
-  color: var(--success);
-}
-
-.status.failed {
+.status.error {
   color: var(--destructive);
 }
 
-/* An exited session, and a pending, cancelled or interrupted step or run,
-   shows a hollow dot. */
-.status.exited::before,
-.status.pending::before,
-.status.cancelled::before,
-.status.interrupted::before {
-  background: transparent;
+.status.finished {
+  color: var(--success);
 }
 
 /* A running dot fades from near white through its blue to faded blue. */
@@ -347,7 +336,7 @@ textarea.text-field {
   }
 }
 
-/* Without motion, a running dot stays faded, unlike a succeeded one. */
+/* Without motion, a running dot stays faded, unlike a finished one. */
 @media (prefers-reduced-motion: reduce) {
   .status.running,
   .status.running::before {

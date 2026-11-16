@@ -12,9 +12,10 @@ import { openFile } from "./features/files/viewerState";
 import { RunView } from "./features/runs/RunView";
 import { SessionHeader } from "./features/sessions/SessionHeader";
 import { runTitle, SessionList } from "./features/sessions/SessionList";
+import { useFocus } from "./features/sessions/useFocus";
 import { useSessionActions } from "./features/sessions/useSessionActions";
 import { useWorkspaces } from "./features/sessions/useWorkspaces";
-import { type Item, isRequest } from "./lib/protocol";
+import { type Focus, type Item, isRequest } from "./lib/protocol";
 
 const noItems: Item[] = [];
 
@@ -49,6 +50,14 @@ export function App() {
   const run = runs.find((run) => run.id === viewed);
   const session = run ? undefined : sessions.find((session) => session.id === viewed);
   const root = run ? worktrees.get(run.worktree_id)?.path : session?.cwd;
+  const runId = run?.id;
+  const sessionId = session?.id;
+  const focus = useMemo<Focus | null>(() => {
+    if (runId !== undefined) return { type: "run", run_id: runId };
+    if (sessionId !== undefined) return { type: "session", session_id: sessionId };
+    return null;
+  }, [runId, sessionId]);
+  useFocus(focus);
   const onOpenFile = useCallback(
     (path: string) => {
       if (viewed) openFile(viewed, path);

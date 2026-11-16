@@ -10,8 +10,9 @@ use std::path::Path;
 
 use ox_protocol::schema::{ContentBlock, SessionConfigKind, SessionUpdate, StopReason};
 use ox_protocol::{
-    Client, CommandInfo, CommandKind, CommandState, Error, EventKind, ListingChange,
-    MaybeUndefined, RunInfo, RunState, SessionInfo, SessionState, StepState, WorktreeInfo, code,
+    Client, CommandInfo, CommandKind, CommandState, Error, EventKind, Focus, ListingChange,
+    MaybeUndefined, RunInfo, RunState, SessionInfo, SessionState, StepState, Unseen, WorktreeInfo,
+    code,
 };
 use tempfile::TempDir;
 use tokio::time::{Duration, timeout};
@@ -276,6 +277,8 @@ async fn a_cancelled_run_stops_at_its_active_step() {
     assert_eq!(run.steps[0].session_id.as_deref(), Some(session.as_str()));
     assert_eq!(run.steps[1].state, StepState::Pending);
     assert_eq!(run.steps[1].session_id, None);
+    assert_eq!(run.unseen, None);
+    assert_eq!(info(&client, &session).await.unwrap().unseen, None);
     assert_eq!(
         first_turn_end(&client, &session).await,
         EventKind::TurnEnded {
@@ -357,6 +360,7 @@ async fn runs_survive_a_restart_and_running_ones_are_interrupted() {
     let client = daemon.client().await;
     let runs = until_run(&client, &waiting.id, |_| true).await;
     assert_eq!(runs.state, RunState::Interrupted);
+    assert_eq!(runs.unseen, Some(Unseen::Error));
     assert_eq!(runs.steps[0].state, StepState::Interrupted);
     assert_eq!(runs.steps[1].state, StepState::Pending);
     assert_eq!(until_run(&client, &done.id, |_| true).await, done);
@@ -1091,4 +1095,115 @@ async fn until_gone(pid: libc::pid_t) {
     })
     .await
     .expect("the process is still running");
+}
+
+/// The listed session's unseen outcome.
+async fn session_unseen(client: &Client, id: &str) -> Option<Unseen> {
+    info(client, id).await.unwrap().unseen
+}
+
+fn focus_run(run: &RunInfo) -> Focus {
+    Focus::Run {
+        run_id: run.id.clone(),
+    }
+}
+
+/// A run that ends out of focus shows its outcome until a client focuses
+/// it: a success on the run alone, a failure on the run and the failed
+/// step's child session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_ends_out_of_focus_is_unseen_until_it_is_focused() {
+    let repo = repo();
+    let daemon = start_daemon().await;
+    daemon.define_two("quick", r#"text "text \"two\"""#, r#"text "second ""#);
+    daemon.define_two("fails", "fail boom", r#"text "unreached""#);
+    let client = daemon.client().await;
+    let workspace = add_workspace(&client, repo.path()).await;
+
+    let run = start(&client, &workspace, "quick", "").await;
+    let run = until_ended(&client, &run.id).await;
+    assert_eq!(run.state, RunState::Succeeded, "{run:?}");
+    assert_eq!(run.unseen, Some(Unseen::Finished));
+    for step in &run.steps {
+        let child = step.session_id.as_deref().unwrap();
+        assert_eq!(session_unseen(&client, child).await, None);
+    }
+    client.focus(Some(focus_run(&run))).await.unwrap();
+    let run = until_run(&client, &run.id, |_| true).await;
+    assert_eq!(run.unseen, None);
+
+    let focused_child = start(&client, &workspace, "fails", "").await;
+    let focused_child = until_ended(&client, &focused_child.id).await;
+    let focused_run = start(&client, &workspace, "fails", "").await;
+    let focused_run = until_ended(&client, &focused_run.id).await;
+    let child_of = |run: &RunInfo| run.steps[0].session_id.clone().unwrap();
+    for run in [&focused_child, &focused_run] {
+        assert_eq!(run.state, RunState::Failed, "{run:?}");
+        assert_eq!(run.unseen, Some(Unseen::Error));
+        assert_eq!(
+            session_unseen(&client, &child_of(run)).await,
+            Some(Unseen::Error)
+        );
+    }
+
+    client
+        .focus(Some(Focus::Session {
+            session_id: child_of(&focused_child),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        session_unseen(&client, &child_of(&focused_child)).await,
+        None
+    );
+    let run = until_run(&client, &focused_child.id, |_| true).await;
+    assert_eq!(run.unseen, Some(Unseen::Error));
+
+    client.focus(Some(focus_run(&focused_run))).await.unwrap();
+    assert_eq!(session_unseen(&client, &child_of(&focused_run)).await, None);
+    let run = until_run(&client, &focused_run.id, |_| true).await;
+    assert_eq!(run.unseen, None);
+}
+
+/// A run that fails while a client focuses it leaves nothing unseen on the
+/// run or on the child session it started meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_that_fails_in_focus_is_not_unseen() {
+    let repo = repo();
+    let daemon = start_daemon().await;
+    let gate = tempfile::tempdir().unwrap();
+    mkfifos(gate.path());
+    let command = r#"echo blocked > "$OX_RUN_INPUT/blocked"; read _ < "$OX_RUN_INPUT/release""#;
+    daemon.define(
+        "gated-failure",
+        &format!(
+            "name: Gated failure
+steps:
+  - name: Gate
+    shell: {}
+  - name: Fail
+    agent: {{harness: claude}}
+    prompt: fail boom
+",
+            yaml_string(command)
+        ),
+    );
+    let client = daemon.client().await;
+    let workspace = add_workspace(&client, repo.path()).await;
+    let run = start(
+        &client,
+        &workspace,
+        "gated-failure",
+        gate.path().to_str().unwrap(),
+    )
+    .await;
+    blocked(gate.path()).await;
+    client.focus(Some(focus_run(&run))).await.unwrap();
+    release(gate.path()).await;
+
+    let run = until_ended(&client, &run.id).await;
+    assert_eq!(run.state, RunState::Failed, "{run:?}");
+    assert_eq!(run.unseen, None);
+    let child = run.steps[1].session_id.as_deref().unwrap();
+    assert_eq!(session_unseen(&client, child).await, None);
 }

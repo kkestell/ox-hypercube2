@@ -24,7 +24,7 @@ import { branchStatus, localMerge } from "./localMerge";
 import { type AgentId, agentNames, useAgents } from "./useAgents";
 import type { SessionActions } from "./useSessionActions";
 
-const stateLabels: Record<SessionState, string> = {
+export const stateLabels: Record<SessionState, string> = {
   starting: "Starting",
   idle: "Idle",
   running: "Running",
@@ -33,14 +33,35 @@ const stateLabels: Record<SessionState, string> = {
   exited: "Exited",
 };
 
+/** The label of a step's or a run's state. */
+export const stepLabels: Record<StepState, string> = {
+  pending: "Pending",
+  running: "Running",
+  succeeded: "Succeeded",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  interrupted: "Interrupted",
+};
+
 /** Whether the session awaits a permission answer or a form. */
-function awaiting(session: SessionInfo) {
+export function awaiting(session: SessionInfo) {
   return session.state === "awaiting_permission" || session.state === "awaiting_input";
 }
 
-/** A session's, a run's or a step's status class and its label. */
-interface Status {
-  className: string;
+/** Whether the session's agent is starting or in a turn. */
+export function working(session: SessionInfo | undefined) {
+  return session?.state === "starting" || session?.state === "running";
+}
+
+/**
+ * A dot's colour: blue working, orange blocked, red error, green finished,
+ * or gray, with no class.
+ */
+export type Dot = "running" | "attention" | "error" | "finished" | null;
+
+/** A session's, a run's or a step's dot and its label. */
+export interface Status {
+  className: Dot;
   label: string;
 }
 
@@ -48,7 +69,7 @@ interface Status {
 export function StatusIcon({ status }: { status: Status }) {
   return (
     <span
-      className={`status ${status.className}`}
+      className={status.className === null ? "status" : `status ${status.className}`}
       role="img"
       aria-label={status.label}
       title={status.label}
@@ -56,31 +77,55 @@ export function StatusIcon({ status }: { status: Status }) {
   );
 }
 
-const settled: Record<Exclude<StepState, "running">, Status> = {
-  pending: { className: "pending", label: "Pending" },
-  succeeded: { className: "succeeded", label: "Succeeded" },
-  failed: { className: "failed", label: "Failed" },
-  cancelled: { className: "cancelled", label: "Cancelled" },
-  interrupted: { className: "interrupted", label: "Interrupted" },
-};
+/**
+ * What a session needs from the user: an answer, a look at an unseen error,
+ * nothing while it works, or a look at an unseen finish.
+ */
+function sessionStatus(session: SessionInfo): Status {
+  const label = stateLabels[session.state];
+  if (awaiting(session)) return { className: "attention", label };
+  if (session.unseen === "error") return { className: "error", label: "Error" };
+  if (working(session)) return { className: "running", label };
+  if (session.unseen === "finished") return { className: "finished", label: "Finished" };
+  return { className: null, label };
+}
 
-/** A run's status, from its state and its child sessions'. */
+/**
+ * What a run needs from the user, from its state and unseen outcome and its
+ * child sessions'. The label is the run's state, or what a child awaits.
+ */
 function runStatus(run: RunInfo, children: readonly SessionInfo[]): Status {
   const waiting = children.find(awaiting);
   if (waiting) return { className: "attention", label: stateLabels[waiting.state] };
-  if (run.state === "running") return { className: "running", label: "Running" };
-  return settled[run.state];
+  const label = stepLabels[run.state];
+  if (run.unseen === "error" || children.some((child) => child.unseen === "error")) {
+    return { className: "error", label };
+  }
+  if (run.state === "running") return { className: "running", label };
+  if (run.unseen === "finished") return { className: "finished", label };
+  return { className: null, label };
 }
 
-/** A step's status, from its state and its child session's, if it has one. */
-export function childStatus(step: StepInfo, session: SessionInfo | undefined): Status {
+/**
+ * What a run's step needs from the user, from its state and its child
+ * session's, if it has one. A failed or interrupted step is red while its
+ * run's error is unseen, `runError`. The label is the step's state, or what
+ * its session awaits.
+ */
+function childStatus(step: StepInfo, session: SessionInfo | undefined, runError: boolean): Status {
   if (session && awaiting(session)) {
     return { className: "attention", label: stateLabels[session.state] };
   }
-  if (step.state === "running" || session?.state === "running") {
-    return { className: "running", label: "Running" };
+  const label = stepLabels[step.state];
+  if (
+    session?.unseen === "error" ||
+    (runError && (step.state === "failed" || step.state === "interrupted"))
+  ) {
+    return { className: "error", label };
   }
-  return settled[step.state];
+  if (step.state === "running" || working(session))
+    return { className: "running", label: "Running" };
+  return { className: null, label };
 }
 
 /**
@@ -231,7 +276,7 @@ export const SessionList = memo(function SessionList({
 
   const sessionRow = (
     session: SessionInfo,
-    child?: { step: StepInfo; first: boolean; last: boolean },
+    child?: { step: StepInfo; first: boolean; last: boolean; runError: boolean },
   ) => (
     <SessionRow
       key={session.id}
@@ -242,6 +287,7 @@ export const SessionList = memo(function SessionList({
       step={child?.step}
       first={child?.first ?? false}
       last={child?.last ?? false}
+      runError={child?.runError ?? false}
       onSelect={select}
       deleteSession={deleteSession}
       archiveSession={archiveSession}
@@ -258,8 +304,7 @@ export const SessionList = memo(function SessionList({
         key={run.id}
         run={run}
         worktree={worktrees.get(run.worktree_id)}
-        status={status.className}
-        label={status.label}
+        status={status}
         selected={run.id === selected}
         busy={busy.has(run.id)}
         expanded={expanded}
@@ -277,6 +322,7 @@ export const SessionList = memo(function SessionList({
           step,
           first: index === 0,
           last: index === run.steps.length - 1,
+          runError: run.unseen === "error",
         };
         const session = runChildren.find((session) => session.id === step.session_id);
         if (session !== undefined) return sessionRow(session, child);
@@ -287,6 +333,7 @@ export const SessionList = memo(function SessionList({
             step={step}
             first={child.first}
             last={child.last}
+            runError={child.runError}
             onSelect={() => onSelect(run.id)}
           />
         );
@@ -527,7 +574,6 @@ const RunRow = memo(function RunRow({
   run,
   worktree,
   status,
-  label,
   selected,
   busy,
   expanded,
@@ -538,9 +584,8 @@ const RunRow = memo(function RunRow({
 }: {
   run: RunInfo;
   worktree: WorktreeInfo | undefined;
-  /** The status class and its label, from `runStatus`. */
-  status: string;
-  label: string;
+  /** The run's dot and its label, from `runStatus`. */
+  status: Status;
   selected: boolean;
   /** Whether an action on the run is in flight. */
   busy: boolean;
@@ -576,7 +621,7 @@ const RunRow = memo(function RunRow({
         onClick={() => onSelect(run.id)}
         onDoubleClick={() => onToggle(run.id)}
       >
-        <StatusIcon status={{ className: status, label }} />
+        <StatusIcon status={status} />
         <span className="title-group">
           <span className="title">{runTitle(run)}</span>
           <span
@@ -604,14 +649,17 @@ function StepRow({
   step,
   first,
   last,
+  runError,
   onSelect,
 }: {
   step: StepInfo;
   first: boolean;
   last: boolean;
+  /** Whether the step's run has an unseen error. */
+  runError: boolean;
   onSelect: () => void;
 }) {
-  const status = childStatus(step, undefined);
+  const status = childStatus(step, undefined, runError);
   return (
     <li className={`sidebar-row session child${step.state === "pending" ? " pending" : ""}`}>
       <button type="button" className="select" onClick={onSelect}>
@@ -638,6 +686,7 @@ const SessionRow = memo(function SessionRow({
   step,
   first,
   last,
+  runError,
   onSelect,
   deleteSession,
   archiveSession,
@@ -653,12 +702,12 @@ const SessionRow = memo(function SessionRow({
   /** Whether a child is its run's first, or its last. */
   first: boolean;
   last: boolean;
+  /** Whether a child's run has an unseen error. */
+  runError: boolean;
   onSelect: (session: SessionInfo) => void;
 } & Pick<SessionActions, "deleteSession" | "archiveSession" | "unarchiveSession">) {
   const child = step !== undefined;
-  const status = step
-    ? childStatus(step, session)
-    : { className: session.state, label: stateLabels[session.state] };
+  const status = step ? childStatus(step, session, runError) : sessionStatus(session);
   // A run's children share its worktree, whose branch the run's row shows.
   const merge = child ? null : localMerge(session, worktree);
   const branch = merge && branchStatus(merge.compare, merge.comparison);

@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::messages::{
     Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
-    HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo, ServerMessage,
+    Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo, ServerMessage,
     SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
 };
 
@@ -597,6 +597,12 @@ impl Client {
     /// name.
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowInfo>, Error> {
         self.call(Method::WorkflowList).await
+    }
+
+    /// Sets the session or run this connection shows in front of the user,
+    /// or clears it with `None`.
+    pub async fn focus(&self, focus: Option<Focus>) -> Result<(), Error> {
+        self.ack(Method::Focus { focus }).await
     }
 
     /// Sends `method`, which starts a stream, routing the stream's messages
