@@ -1,0 +1,20 @@
+[package]
+name = "acp-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Shared parts of the ACP bridges"
+
+[dependencies]
+agent-client-protocol = { version = "=5.2.0", features = ["stdio", "unstable_protocol_v2"] }
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "process", "io-util", "sync", "time"] }
+
+[features]
+# Helpers for the bridges' protocol tests, which drive a bridge binary over
+# its stdio.
+testing = []
+
+[lints]
+workspace = true

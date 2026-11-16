@@ -51,16 +51,20 @@ passes to sessions, and checks again each time its window gains focus.
 over its standard input and output. Stopping the agent terminates that
 process group, including its children.
 
-The bundled agents bridge draft ACP v2 to the Claude Code and Pi CLIs.
+The bundled agents bridge draft ACP v2 to the Claude Code and Pi CLIs. Each
+bridge process serves one session, whose ID is the harness's own session ID.
+The harness keeps the conversation and `oxd` keeps everything else, so the
+bridges store nothing.
+
 `claude-code-acp` keeps one Claude process running between prompts, exchanging
 stream-json messages and control requests with it.
 Claude authenticates with the user's subscription. The bridge can restart
-an exited Claude process using its native session ID.
+an exited Claude process on the same session.
 
 `pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
 project's settings, skills, and extensions. The bridge exchanges JSONL commands
 and events with Pi, using the providers and credentials configured in Pi. It
-can restart an exited Pi on the same Pi session ID.
+can restart an exited Pi on the same session.
 
 [ACP v2 support](acp-v2.md) owns protocol details and integration caveats.
 
@@ -112,8 +116,9 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, conversation events, and workflow runs with
-their steps.
+comparison refs, archive state, conversation events, and workflow runs. A
+run's steps, with their commands, are saved as one JSON column of its row,
+rewritten whenever the run changes.
 The database schema has no migrations.
 
 Session metadata is saved as sessions are created or changed. Conversation
@@ -148,9 +153,10 @@ answered by clients.
 ### Loading and stopping agents
 
 After a daemon restart, saved sessions begin without running agents. Loading
-a session starts its stored command in its stored directory and resumes the
-agent's conversation, retaining the Ox session ID and subscriptions. Missing
-history can be recovered through the agent's replay support.
+a session starts its stored command in its stored directory, resumes the
+agent's conversation, and sets the session's config options again, retaining
+the Ox session ID and subscriptions. Missing history can be recovered through
+the agent's replay support.
 
 An idle session with no subscribers, pending requests, or reported background
 work can have its agent parked. Parking preserves the session's conversation
@@ -186,8 +192,8 @@ process groups.
 Child sessions are ordinary sessions that refer to the run's worktree: a
 session is a child of the run that owns its worktree. Deleting or archiving one leaves the worktree; removing the run stops the
 child sessions' agents, removes the worktree, and deletes the child sessions.
-A running run keeps the daemon alive. A restart marks the runs and steps that
-were running `interrupted`, where they stay.
+A running run keeps the daemon alive. A restart marks the runs, steps and
+commands that were running `interrupted`, where they stay.
 
 ## Repository ownership
 
@@ -206,9 +212,9 @@ session from adding the worktree. The daemon records the worktree and branch
 ownership before returning a starting session, and launches the session's
 agent once the worktree is added. Failure to add the worktree triggers
 cleanup of the partial worktree and of a newly created branch still at its
-starting commit, and the worktree's record is removed. Restart cleanup
-removes worktrees in which no agent ever started, together with their
-sessions, and keeps worktrees whose removal would lose work.
+starting commit, and the worktree's record is removed. A session whose agent
+never started keeps its worktree and stays `exited` with its error until it
+is deleted.
 
 Each worktree records the repository's common Git directory, so cleanup and
 branch operations do not depend on the workspace directory still existing.

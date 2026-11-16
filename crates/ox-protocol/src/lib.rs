@@ -18,8 +18,8 @@ mod messages;
 
 #[cfg(unix)]
 pub use client::{
-    Client, DirectoryWatch, End, Error, FileWatch, Subscription, Watch, config_dir, daemon_binary,
-    data_dir, default_socket_path,
+    Client, End, Error, Stream, Subscription, config_dir, daemon_binary, data_dir,
+    default_socket_path,
 };
 #[cfg(unix)]
 pub mod content;

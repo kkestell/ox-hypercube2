@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    os::fd::AsRawFd,
     path::Path,
     process::Stdio,
     sync::{Arc, Mutex},
@@ -11,16 +10,14 @@ use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
     ContentBlock, ErrorStopReason, PromptResponse, StateUpdate, StopReason,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    process::{Child, Command},
     sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinHandle},
+    task::AbortHandle,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct McpServer {
     pub name: String,
     pub command: String,
@@ -79,13 +76,14 @@ pub enum RunError {
 
 pub struct StartRequest<'a> {
     pub cwd: &'a Path,
-    pub resume: Option<&'a str>,
+    /// The Claude session ID, which is also the ACP session ID.
+    pub session_id: &'a str,
+    /// Claude has a transcript of the session to continue.
+    pub resume: bool,
     pub model: &'a str,
     pub effort: &'a str,
     pub mode: &'a str,
     pub mcp_servers: &'a [McpServer],
-    /// Claude may call `AskUserQuestion`, which the client is asked as a form.
-    pub ask_user_question: bool,
     /// The resumed conversation's transcript entries, from which the bridge
     /// finds the scheduled prompts Claude restores.
     pub transcript: &'a [Value],
@@ -96,17 +94,6 @@ pub enum Finish {
     EndTurn,
     MaxTurns,
 }
-
-/// How a turn ended, as far as the session's record of it goes.
-pub struct TurnEnd {
-    /// The Claude session id claude reported, whatever the outcome.
-    pub session_id: Option<String>,
-    /// The turn finished, rather than being cancelled or failing.
-    pub finished: bool,
-}
-
-/// Told when a turn ends, before the client learns claude is idle.
-pub type OnTurnEnd = Arc<dyn Fn(TurnEnd) + Send + Sync>;
 
 /// A prompt waiting for claude to take it into a turn, which inserts it into
 /// the conversation.
@@ -137,11 +124,8 @@ struct State {
     /// questions, by request ID.
     permissions: HashMap<String, AbortHandle>,
     control_counter: u64,
-    session_id: Option<String>,
     /// Why claude exited, once it has.
     exited: Option<String>,
-    /// The session is closing, so claude's exit is a cancellation.
-    closing: bool,
     /// The client cancelled the running turn, so the turn ends as cancelled
     /// however claude stops it.
     cancelling: bool,
@@ -157,16 +141,10 @@ pub struct Claude {
     input: mpsc::UnboundedSender<Value>,
     state: Arc<Mutex<State>>,
     updates: Arc<Updates>,
-    /// Closes once claude has exited.
-    exited: oneshot::Receiver<()>,
 }
 
 impl Claude {
-    pub fn start(
-        request: &StartRequest<'_>,
-        updates: Updates,
-        on_turn_end: OnTurnEnd,
-    ) -> Result<Self, String> {
+    pub fn start(request: &StartRequest<'_>, updates: Updates) -> Result<Self, String> {
         let mut command = Command::new("claude");
         command
             .arg("-p")
@@ -181,10 +159,6 @@ impl Claude {
             ])
             .args(["--model", request.model])
             .args(["--effort", request.effort]);
-        // The tool lists are variadic, so another flag follows them.
-        if !request.ask_user_question {
-            command.args(["--disallowedTools", "AskUserQuestion"]);
-        }
         // Claude uses every tool of the client's MCP servers without asking.
         if !request.mcp_servers.is_empty() {
             command.arg("--allowedTools").args(
@@ -200,8 +174,10 @@ impl Claude {
             "--permission-prompt-tool",
             "stdio",
         ]);
-        if let Some(id) = request.resume {
-            command.arg("--resume").arg(id);
+        if request.resume {
+            command.arg("--resume").arg(request.session_id);
+        } else {
+            command.arg("--session-id").arg(request.session_id);
         }
         if !request.mcp_servers.is_empty() {
             let servers: BTreeMap<_, _> = request
@@ -238,22 +214,19 @@ impl Claude {
             initializing: true,
             ..State::default()
         }));
-        tokio::spawn(write_input(
+        tokio::spawn(acp_bridge::pipes::write_input(
             child.stdin.take().expect("piped stdin"),
             messages,
         ));
         updates.seed(request.transcript);
         let updates = Arc::new(updates);
-        let (exit, exited) = oneshot::channel();
         let output = Output {
             updates: updates.clone(),
             state: state.clone(),
             input: input.downgrade(),
-            on_turn_end,
             text_id: None,
             thought_id: None,
             unclaimed_error: None,
-            _exit: exit,
         };
         tokio::spawn(output.read(child));
         let _ = input.send(json!({
@@ -265,7 +238,6 @@ impl Claude {
             input,
             state,
             updates,
-            exited,
         })
     }
 
@@ -280,17 +252,6 @@ impl Claude {
 
     pub fn has_exited(&self) -> bool {
         self.state.lock().unwrap().exited.is_some()
-    }
-
-    /// Stops claude and returns once it has exited. Its turn is cancelled,
-    /// and so are the prompts it has not taken.
-    pub async fn stop(self) {
-        self.state.lock().unwrap().closing = true;
-        self.interrupt();
-        let Self { input, exited, .. } = self;
-        // Claude exits when its stdin closes.
-        drop(input);
-        let _ = exited.await;
     }
 
     /// Sends a prompt. Once claude takes it into a turn, which inserts it
@@ -375,26 +336,6 @@ impl Claude {
     }
 }
 
-/// Writes each message to claude's stdin as a line, until the session drops
-/// its `Claude` or claude closes its stdin.
-async fn write_input(mut stdin: ChildStdin, mut messages: mpsc::UnboundedReceiver<Value>) {
-    while let Some(message) = messages.recv().await {
-        let mut line = message.to_string().into_bytes();
-        line.push(b'\n');
-        if stdin.write_all(&line).await.is_err() {
-            return;
-        }
-    }
-}
-
-/// Appends what claude's stdout holds once claude has exited: the reader's
-/// buffer, then the pipe's contents, read from the descriptor directly because
-/// the runtime may not yet have seen the pipe become readable.
-fn drain(stdout: &BufReader<ChildStdout>, bytes: &mut Vec<u8>) {
-    bytes.extend_from_slice(stdout.buffer());
-    read_buffered(stdout.get_ref(), bytes);
-}
-
 /// Claude's output, translated as it arrives.
 struct Output {
     updates: Arc<Updates>,
@@ -402,7 +343,6 @@ struct Output {
     /// Claude's stdin, for answers to its requests. It is weak so that the
     /// session's `Claude` alone keeps stdin open.
     input: mpsc::WeakUnboundedSender<Value>,
-    on_turn_end: OnTurnEnd,
     /// The message and thought being streamed, once they have sent a delta.
     text_id: Option<String>,
     thought_id: Option<String>,
@@ -410,46 +350,21 @@ struct Output {
     /// is why the prompt fails if claude exits, as when claude cannot resume
     /// the conversation.
     unclaimed_error: Option<String>,
-    /// Dropped once claude has exited.
-    _exit: oneshot::Sender<()>,
 }
 
 impl Output {
     /// Translates claude's output until claude exits, then ends what it left
     /// open.
     async fn read(mut self, mut child: Child) {
-        let mut stderr = Stderr::collect(child.stderr.take().expect("piped stderr"));
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        // A line being read; `read_until` keeps a partial line here when the
-        // other branch wins.
-        let mut line = Vec::new();
-        let status = loop {
-            tokio::select! {
-                biased;
-                read = stdout.read_until(b'\n', &mut line) => match read {
-                    Ok(n) if n > 0 => {
-                        self.translate_lines(&line);
-                        line.clear();
-                    }
-                    _ => break child.wait().await,
-                },
-                status = child.wait() => {
-                    // Everything claude wrote is in the pipe; a process it
-                    // started may hold the pipe open.
-                    drain(&stdout, &mut line);
-                    self.translate_lines(&line);
-                    break status;
-                }
-            }
-        };
-        let error = match status {
-            Ok(status) => format!(
-                "claude exited with {status}: {}",
-                String::from_utf8_lossy(&stderr.finish().await).trim()
-            ),
-            Err(error) => format!("claude process failed: {error}"),
-        };
-        let (prompts, session_id, closing, cancelling) = {
+        let error =
+            match acp_bridge::pipes::read_output(&mut child, |line| self.translate(line)).await {
+                Ok((status, stderr)) => format!(
+                    "claude exited with {status}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+                Err(error) => format!("claude process failed: {error}"),
+            };
+        let (prompts, cancelling) = {
             let mut state = self.state.lock().unwrap();
             state.exited = Some(error.clone());
             state.initializing = false;
@@ -457,39 +372,21 @@ impl Output {
             for (_, permission) in state.permissions.drain() {
                 permission.abort();
             }
-            (
-                std::mem::take(&mut state.prompts),
-                state.session_id.clone(),
-                state.closing,
-                state.cancelling,
-            )
+            (std::mem::take(&mut state.prompts), state.cancelling)
         };
         self.updates.exited();
-        let result = if closing || cancelling {
+        let result = if cancelling {
             Err(RunError::Cancelled)
         } else {
             Err(RunError::Failed(error.clone()))
         };
         if self.updates.is_working() {
-            self.end_turn(session_id, &result);
+            self.updates.idle(stop_reason(&result));
         }
         let failure = self.unclaimed_error.take().unwrap_or(error);
         for (_, prompt) in prompts {
-            prompt.fail(if closing {
-                RunError::Cancelled
-            } else {
-                RunError::Failed(failure.clone())
-            });
+            prompt.fail(RunError::Failed(failure.clone()));
         }
-    }
-
-    /// Records how a turn ended, then tells the client claude is idle.
-    fn end_turn(&self, session_id: Option<String>, result: &Result<Finish, RunError>) {
-        (self.on_turn_end)(TurnEnd {
-            session_id,
-            finished: result.is_ok(),
-        });
-        self.updates.idle(stop_reason(result));
     }
 
     fn send(&self, message: Value) {
@@ -498,28 +395,11 @@ impl Output {
         }
     }
 
-    /// Translates each complete or final line in `bytes`.
-    fn translate_lines(&mut self, bytes: &[u8]) {
-        for line in bytes.split(|&byte| byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if !line.is_empty() {
-                self.translate(&String::from_utf8_lossy(line));
-            }
-        }
-    }
-
     /// Translates a line of claude's output.
     fn translate(&mut self, line: &str) {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return;
         };
-        if let Some(id) = value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            self.state.lock().unwrap().session_id = Some(id.to_owned());
-        }
         // A subagent's messages show as activity of the tool call that
         // started it; its streamed text is not shown.
         if let Some(parent) = value["parent_tool_use_id"].as_str() {
@@ -743,7 +623,7 @@ impl Output {
         let aborted = result["terminal_reason"]
             .as_str()
             .is_some_and(|reason| reason.starts_with("aborted"));
-        let (dropped, waiting, session_id, cancelling) = {
+        let (dropped, waiting, cancelling) = {
             let mut state = self.state.lock().unwrap();
             for (_, permission) in state.permissions.drain() {
                 permission.abort();
@@ -756,7 +636,6 @@ impl Output {
             (
                 dropped,
                 !state.prompts.is_empty(),
-                state.session_id.clone(),
                 std::mem::take(&mut state.cancelling),
             )
         };
@@ -785,76 +664,12 @@ impl Output {
             self.unclaimed_error = Some(error.clone());
             return;
         }
-        self.end_turn(session_id, &outcome);
+        self.updates.idle(stop_reason(&outcome));
     }
 }
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
-}
-
-/// Reads claude's stderr while claude runs, so a full pipe never blocks it.
-struct Stderr {
-    finish: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Vec<u8>>,
-}
-
-impl Stderr {
-    fn collect(stderr: ChildStderr) -> Self {
-        let (finish, finished) = oneshot::channel();
-        Self {
-            finish: Some(finish),
-            task: tokio::spawn(read_stderr(stderr, finished)),
-        }
-    }
-
-    /// Everything claude wrote to stderr. Call it once claude has exited:
-    /// what it wrote is then in the pipe, and a process it started that still
-    /// holds the pipe open does not delay the result.
-    async fn finish(&mut self) -> Vec<u8> {
-        if let Some(finish) = self.finish.take() {
-            let _ = finish.send(());
-        }
-        (&mut self.task).await.unwrap_or_default()
-    }
-}
-
-impl Drop for Stderr {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn read_stderr(mut stderr: ChildStderr, mut finished: oneshot::Receiver<()>) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0; 8192];
-    loop {
-        tokio::select! {
-            read = stderr.read(&mut chunk) => match read {
-                Ok(n) if n > 0 => buffer.extend_from_slice(&chunk[..n]),
-                _ => return buffer,
-            },
-            _ = &mut finished => {
-                read_buffered(&stderr, &mut buffer);
-                return buffer;
-            }
-        }
-    }
-}
-
-/// Reads what the pipe holds now. Tokio opens child pipes non-blocking, so
-/// `read` fails with `EAGAIN` instead of waiting once the pipe is empty.
-fn read_buffered(pipe: &impl AsRawFd, buffer: &mut Vec<u8>) {
-    let mut chunk = [0u8; 8192];
-    loop {
-        // SAFETY: reads at most `chunk.len()` bytes into `chunk` from a
-        // descriptor `pipe` owns and keeps open for the call.
-        let n = unsafe { libc::read(pipe.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
-            return;
-        }
-        buffer.extend_from_slice(&chunk[..n.cast_unsigned()]);
-    }
 }
 
 /// The ACP stop reason of a turn's outcome. A failed turn ends with the
@@ -981,30 +796,4 @@ fn tool_output(content: &Value) -> Vec<ToolOutput> {
             _ => Some(ToolOutput::Text(block.to_string())),
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Claude's last lines reach the pipe before it exits, and the bridge
-    /// learns of the exit before the runtime sees the pipe become readable.
-    /// Draining reads them all the same.
-    #[tokio::test(flavor = "current_thread")]
-    async fn drain_reads_what_an_exited_process_left_in_the_pipe() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "printf 'first\\nsecond\\npartial'"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        assert!(child.wait().unwrap().success());
-        // The runtime registers the pipe here and, with this task not
-        // yielding, does not learn that it is readable.
-        let stdout = BufReader::new(ChildStdout::from_std(stdout).unwrap());
-
-        let mut bytes = Vec::new();
-        drain(&stdout, &mut bytes);
-        assert_eq!(bytes, b"first\nsecond\npartial");
-    }
 }

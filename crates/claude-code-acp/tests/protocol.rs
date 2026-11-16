@@ -2,11 +2,11 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio};
 
+use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::{Child, ChildStdout, Command},
-    time::{Duration, timeout},
 };
 
 /// What every fake claude does with its stdin, which stays open across
@@ -50,8 +50,9 @@ echoed() {
   uuid=$(printf '%s\n' "$message" | sed 's/.*"uuid":"\([^"]*\)".*/\1/')
   printf '{"type":"user","uuid":"%s","isReplay":true,"message":{"role":"user","content":[{"type":"text","text":"hello"}]}}\n' "$uuid"
 }
-# Accepts the control request in $message.
+# Accepts the control request in $message, and notes it in `controls`.
 accept() {
+  printf '%s\n' "$message" >> controls
   request=$(printf '%s\n' "$message" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
   printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$request"
 }
@@ -79,13 +80,12 @@ fn fake_claude_with_init(dir: &Path, initialization: &str, script: &str) {
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-fn start(dir: &Path, store: &Path) -> (Child, BufReader<ChildStdout>) {
+fn start(dir: &Path) -> (Child, BufReader<ChildStdout>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_claude-code-acp"))
         .env(
             "PATH",
             format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
         )
-        .env("CLAUDE_ACP_STORE_DIR", store)
         .env(
             "CLAUDE_CONFIG_DIR",
             dir.parent().unwrap().join("empty-claude"),
@@ -100,41 +100,6 @@ fn start(dir: &Path, store: &Path) -> (Child, BufReader<ChildStdout>) {
     (child, reader)
 }
 
-async fn send(child: &mut Child, message: Value) {
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin
-        .write_all(message.to_string().as_bytes())
-        .await
-        .unwrap();
-    stdin.write_all(b"\n").await.unwrap();
-}
-
-async fn receive(reader: &mut BufReader<ChildStdout>) -> Value {
-    let mut line = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for ACP response")
-        .unwrap();
-    assert!(!line.is_empty(), "ACP process closed stdout");
-    serde_json::from_str(&line).unwrap()
-}
-
-async fn response(reader: &mut BufReader<ChildStdout>, id: i64) -> (Value, Vec<Value>) {
-    let mut notifications = Vec::new();
-    loop {
-        let value = receive(reader).await;
-        if value["id"] == id {
-            return (value, notifications);
-        }
-        notifications.push(value);
-    }
-}
-
-/// The `session/update` update of a notification.
-fn update(notification: &Value) -> &Value {
-    &notification["params"]["update"]
-}
-
 /// The text an update shows: a chunk's, or the first block of a whole
 /// message.
 fn shown_text(notification: &Value) -> Option<&str> {
@@ -142,44 +107,6 @@ fn shown_text(notification: &Value) -> Option<&str> {
     content["text"]
         .as_str()
         .or_else(|| content[0]["text"].as_str())
-}
-
-fn is_state(notification: &Value, state: &str) -> bool {
-    notification["method"] == "session/update"
-        && update(notification)["sessionUpdate"] == "state_update"
-        && update(notification)["state"] == state
-}
-
-/// Reads until the prompt `id` is answered and its turn goes idle, with
-/// what was `seen` already, and checks that the response names the user
-/// message the bridge echoed. Returns the idle update, and the
-/// notifications from `seen` and after.
-async fn finish(
-    reader: &mut BufReader<ChildStdout>,
-    id: i64,
-    mut seen: Vec<Value>,
-) -> (Value, Vec<Value>) {
-    let idle = loop {
-        let answered = seen.iter().position(|value| value["id"] == id);
-        if let Some(answered) = answered
-            && let Some(idle) = seen[answered..].iter().find(|v| is_state(v, "idle"))
-        {
-            break update(idle).clone();
-        }
-        seen.push(receive(reader).await);
-    };
-    let response = seen.iter().find(|value| value["id"] == id).unwrap();
-    let message_id = &response["result"]["messageId"];
-    assert!(message_id.is_string(), "{response}");
-    assert!(
-        seen.iter().any(|value| {
-            update(value)["sessionUpdate"] == "user_message"
-                && update(value)["messageId"] == *message_id
-        }),
-        "no user message {message_id} in {seen:?}"
-    );
-    seen.retain(|value| value["method"] == "session/update");
-    (idle, seen)
 }
 
 /// Reads until the prompt `id` is answered and its turn goes idle.
@@ -194,19 +121,6 @@ async fn until_permission(reader: &mut BufReader<ChildStdout>) -> (Value, Vec<Va
     loop {
         let value = receive(reader).await;
         if value["method"] == "session/request_permission" {
-            return (value, seen);
-        }
-        seen.push(value);
-    }
-}
-
-/// Reads until the client gets a request or notification of `method`.
-/// Returns it and what was read before it.
-async fn until_method(reader: &mut BufReader<ChildStdout>, method: &str) -> (Value, Vec<Value>) {
-    let mut seen = Vec::new();
-    loop {
-        let value = receive(reader).await;
-        if value["method"] == method {
             return (value, seen);
         }
         seen.push(value);
@@ -242,7 +156,6 @@ async fn initialize_with(
 async fn commands_are_discovered_before_a_prompt_and_replaced_live() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
-    let store = temp.path().join("store");
     fake_claude_with_init(
         &bin,
         r#"
@@ -263,7 +176,7 @@ printf '%s\n' '{"type":"result","local_command":"clear","num_turns":0}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(
         &mut child,
@@ -325,18 +238,6 @@ next_message
         "plugin:check"
     );
 
-    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":session,"cwd":project}})).await;
-    let (resumed, _) = response(&mut reader, 4).await;
-    assert_eq!(
-        resumed["result"]["availableCommands"],
-        update(changed)["availableCommands"]
-    );
-    assert_eq!(
-        calls(&project).len(),
-        1,
-        "resume reuses the initialized process"
-    );
-
     send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"/clear"}]}})).await;
     let (idle, updates) = finished(&mut reader, 5).await;
     assert_eq!(idle["stopReason"], "end_turn");
@@ -349,7 +250,7 @@ next_message
     );
     child.kill().await.unwrap();
 
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":session,"cwd":project,"replayFrom":{"type":"start"}}})).await;
     response(&mut reader, 2).await;
@@ -380,9 +281,8 @@ next_message"#,
     ] {
         let temp = tempfile::tempdir().unwrap();
         let (bin, project) = dirs(temp.path());
-        let store = temp.path().join("store");
         fake_claude_with_init(&bin, initialization, "");
-        let (mut child, mut reader) = start(&bin, &store);
+        let (mut child, mut reader) = start(&bin);
         initialize(&mut child, &mut reader).await;
         send(
             &mut child,
@@ -411,7 +311,6 @@ async fn streams_and_resumes_a_persisted_session() {
     let temp = tempfile::tempdir().unwrap();
     let bin = temp.path().join("bin");
     let project = temp.path().join("project");
-    let store = temp.path().join("store");
     fs::create_dir_all(&bin).unwrap();
     fs::create_dir_all(&project).unwrap();
     fake_claude(
@@ -430,7 +329,7 @@ printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"
 printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2","result":"hello world"}'
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(
         &mut child,
@@ -484,15 +383,16 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
         })
     );
 
-    send(
+    let set = set_config(
         &mut child,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_config_option","params":{
-            "sessionId":id,"configId":"model","type":"id","value":"claude-opus-5-5"
-        }}),
+        &mut reader,
+        3,
+        &json!(id),
+        "model",
+        "claude-haiku-5-5",
     )
     .await;
-    let (set, _) = response(&mut reader, 3).await;
-    assert_eq!(option(&set, "model")["currentValue"], "claude-opus-5-5");
+    assert_eq!(option(&set, "model")["currentValue"], "claude-haiku-5-5");
 
     send(
         &mut child,
@@ -514,10 +414,12 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
             .iter()
             .any(|v| v["params"]["update"]["sessionUpdate"] == "tool_call_update")
     );
-    assert!(store.join("acp-sessions.json").exists());
     child.kill().await.unwrap();
+    fs::remove_file(project.join("controls")).unwrap();
 
-    let (mut child, mut reader) = start(&bin, &store);
+    // The client keeps the session's options and sets them again when a new
+    // bridge resumes the session.
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(
         &mut child,
@@ -526,13 +428,25 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
         }}),
     )
     .await;
-    let (resume, _) = response(&mut reader, 5).await;
-    assert_eq!(option(&resume, "model")["currentValue"], "claude-opus-5-5");
-    assert_eq!(option(&resume, "mode")["currentValue"], "plan");
+    response(&mut reader, 5).await;
+    let set = set_config(&mut child, &mut reader, 8, &json!(id), "mode", "plan").await;
+    assert_eq!(option(&set, "mode")["currentValue"], "plan");
+    let set = set_config(
+        &mut child,
+        &mut reader,
+        9,
+        &json!(id),
+        "model",
+        "claude-haiku-5-5",
+    )
+    .await;
+    assert_eq!(option(&set, "model")["currentValue"], "claude-haiku-5-5");
     prompt(&mut child, &mut reader, 6, &json!(id)).await;
-    assert_eq!(
-        fs::read_to_string(project.join("launch-modes")).unwrap(),
-        "manual\nplan\n"
+    let controls = fs::read_to_string(project.join("controls")).unwrap();
+    assert!(controls.contains(r#""mode":"plan""#), "{controls}");
+    assert!(
+        controls.contains(r#""model":"claude-haiku-5-5""#),
+        "{controls}"
     );
     child.kill().await.unwrap();
 }
@@ -601,7 +515,7 @@ while :; do
 done
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (_, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -632,10 +546,10 @@ done
             .any(|v| shown_text(v) == Some("plan claude-haiku-5-5 low")),
         "{updates:?}"
     );
-    send(&mut child, json!({"jsonrpc":"2.0","id":8,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
-    let (resumed, _) = response(&mut reader, 8).await;
-    assert_eq!(option(&resumed, "model")["currentValue"], model);
-    assert_eq!(option(&resumed, "effort")["currentValue"], "low");
+    // A bridge serves one session.
+    send(&mut child, json!({"jsonrpc":"2.0","id":8,"method":"session/new","params":{"cwd":project,"mcpServers":[]}})).await;
+    let (refused, _) = response(&mut reader, 8).await;
+    assert_eq!(refused["error"]["code"], -32600, "{refused}");
     assert_eq!(calls(&project).len(), 1);
     child.kill().await.unwrap();
 }
@@ -657,7 +571,7 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"wait"}]}})).await;
@@ -710,7 +624,7 @@ printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"
 printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2","result":"done"}'
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let id = new_session(&mut child, &mut reader, 2, &project).await;
     send(
@@ -788,7 +702,7 @@ case "$answer" in *'"behavior":"deny"'*) ;; *) exit 15;; esac
 printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2","result":"done"}'
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":project,"mcpServers":[]}})).await;
     let (new, _) = response(&mut reader, 2).await;
@@ -830,7 +744,7 @@ printf '%s\n' '{"type":"control_request","request_id":"permission-1","request":{
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"act"}]}})).await;
@@ -860,7 +774,7 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"run pwd"}]}})).await;
@@ -950,7 +864,7 @@ async fn asked(
 ) -> (Child, BufReader<ChildStdout>, Value, Value, Vec<Value>) {
     let (bin, project) = dirs(temp);
     fake_claude(&bin, script);
-    let (mut child, mut reader) = start(&bin, &temp.join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize_with(&mut child, &mut reader, forms()).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"ask me"}]}})).await;
@@ -1076,40 +990,6 @@ next_message
     child.kill().await.unwrap();
 }
 
-/// The arguments of the claude a bridge starts for a client with
-/// `capabilities`.
-async fn claude_arguments(capabilities: Value) -> String {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(
-        &bin,
-        r#"
-printf '%s\n' "$*" >> calls
-next_prompt
-printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2"}'
-next_message
-"#,
-    );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
-    initialize_with(&mut child, &mut reader, capabilities).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    prompt(&mut child, &mut reader, 3, &session).await;
-    child.kill().await.unwrap();
-    calls(&project).remove(0)
-}
-
-#[tokio::test]
-async fn clients_without_forms_disallow_ask_user_question() {
-    let arguments = claude_arguments(json!({})).await;
-    // The tool list is variadic, so a flag follows it.
-    assert!(
-        arguments.contains("--disallowedTools AskUserQuestion --"),
-        "{arguments}"
-    );
-    let arguments = claude_arguments(forms()).await;
-    assert!(!arguments.contains("--disallowedTools"), "{arguments}");
-}
-
 #[tokio::test]
 async fn passes_stdio_mcp_servers_to_claude() {
     let temp = tempfile::tempdir().unwrap();
@@ -1129,7 +1009,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let args = json!([
         "--url",
@@ -1171,130 +1051,56 @@ next_message
 }
 
 #[tokio::test]
-async fn lists_and_resumes_claude_history() {
-    let temp = tempfile::tempdir().unwrap();
-    let bin = temp.path().join("bin");
-    let project = temp.path().join("project");
-    let transcripts = temp.path().join("empty-claude/projects/sample");
-    fs::create_dir_all(&bin).unwrap();
-    fs::create_dir_all(&project).unwrap();
-    fs::create_dir_all(&transcripts).unwrap();
-    let history_id = "79ed6f89-b693-4192-8169-4554404b43a2";
-    fs::write(transcripts.join(format!("{history_id}.jsonl")), format!(
-        "{{\"cwd\":\"{}\",\"type\":\"user\",\"message\":{{\"content\":\"Original prompt\"}}}}\n",
-        project.display()
-    )).unwrap();
-    fake_claude(
-        &bin,
-        r#"
-found=0
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--resume" ] && [ "$2" = "79ed6f89-b693-4192-8169-4554404b43a2" ]; then found=1; break; fi
-  shift
-done
-if [ "$found" -ne 1 ]; then exit 13; fi
-next_prompt
-printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"resumed"}]}}'
-printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2","result":"resumed"}'
-"#,
-    );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
-    initialize(&mut child, &mut reader).await;
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":2,"method":"session/list","params":{"cwd":project}}),
-    )
-    .await;
-    let (list, _) = response(&mut reader, 2).await;
-    assert_eq!(
-        list["result"]["sessions"][0]["sessionId"], history_id,
-        "{list}"
-    );
-    assert_eq!(list["result"]["sessions"][0]["title"], "Original prompt");
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/resume","params":{
-            "sessionId":history_id,"cwd":project,"mcpServers":[]
-        }}),
-    )
-    .await;
-    response(&mut reader, 3).await;
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{
-            "sessionId":history_id,"prompt":[{"type":"text","text":"continue"}]
-        }}),
-    )
-    .await;
-    let (idle, updates) = finished(&mut reader, 4).await;
-    assert_eq!(idle["stopReason"], "end_turn");
-    assert!(updates.iter().any(|v| shown_text(v) == Some("resumed")));
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
 async fn new_sessions_are_fresh_and_resume_is_explicit() {
     let temp = tempfile::tempdir().unwrap();
-    let bin = temp.path().join("bin");
-    let project = temp.path().join("project");
-    let store = temp.path().join("store");
-    fs::create_dir_all(&bin).unwrap();
-    fs::create_dir_all(&project).unwrap();
+    let (bin, project) = dirs(temp.path());
     fake_claude(
         &bin,
         r#"
 printf '%s\n' "$*" >> calls
 next_prompt
-printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43a2"}'
+printf '%s\n' '{"type":"result"}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &store);
-    initialize(&mut child, &mut reader).await;
-    let mut first_id = Value::Null;
-    for index in 0..2 {
-        let new_id = 2 + index * 2;
-        send(&mut child, json!({"jsonrpc":"2.0","id":new_id,"method":"session/new","params":{"cwd":project,"mcpServers":[]}})).await;
-        let (new, _) = response(&mut reader, new_id).await;
-        let id = new["result"]["sessionId"].clone();
-        if index == 0 {
-            first_id = id.clone();
-        } else {
-            assert_ne!(id, first_id);
-        }
-        send(&mut child, json!({"jsonrpc":"2.0","id":new_id+1,"method":"session/prompt","params":{"sessionId":id,"prompt":[{"type":"text","text":"hello"}]}})).await;
-        let (idle, _) = finished(&mut reader, new_id + 1).await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (mut child, mut reader) = start(&bin);
+        initialize(&mut child, &mut reader).await;
+        let session = new_session(&mut child, &mut reader, 2, &project).await;
+        let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
         assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+        child.kill().await.unwrap();
+        ids.push(session.as_str().unwrap().to_owned());
     }
-    child.kill().await.unwrap();
+    assert_ne!(ids[0], ids[1]);
+    // Claude saved the first session's transcript.
+    write_transcript(temp.path(), &project, &ids[0]);
 
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
-    send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":first_id,"cwd":project,"mcpServers":[]}})).await;
+    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":"not-a-session","cwd":project,"mcpServers":[]}})).await;
+    let (unknown, _) = response(&mut reader, 4).await;
+    assert_eq!(unknown["error"]["code"], -32002);
+    send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":ids[0],"cwd":project,"mcpServers":[]}})).await;
     let (resumed, _) = response(&mut reader, 2).await;
     assert!(resumed.get("result").is_some(), "{resumed}");
-    send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":first_id,"prompt":[{"type":"text","text":"continue"}]}})).await;
+    send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":ids[0],"prompt":[{"type":"text","text":"continue"}]}})).await;
     finished(&mut reader, 3).await;
     let calls = calls(&project);
     assert_eq!(calls.len(), 3);
-    assert!(!calls[0].contains("--resume"));
-    assert!(!calls[1].contains("--resume"));
-    assert!(calls[2].contains("--resume 79ed6f89-b693-4192-8169-4554404b43a2"));
-    let stored: Vec<_> = fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name())
-        .collect();
-    assert_eq!(stored.len(), 2, "{stored:?}");
     assert!(
-        stored
-            .iter()
-            .all(|name| name == "acp-sessions.json" || name == "acp-sessions.lock")
+        calls[0].contains(&format!("--session-id {}", ids[0])),
+        "{calls:?}"
     );
-
-    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cwd":project,"mcpServers":[]}})).await;
-    let (unknown, _) = response(&mut reader, 4).await;
-    assert_eq!(unknown["error"]["code"], -32002);
+    assert!(
+        calls[1].contains(&format!("--session-id {}", ids[1])),
+        "{calls:?}"
+    );
+    assert!(
+        calls[2].contains(&format!("--resume {}", ids[0])),
+        "{calls:?}"
+    );
     child.kill().await.unwrap();
 }
 
@@ -1302,7 +1108,6 @@ next_message
 async fn failed_resume_fails_the_next_prompt() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
-    let store = temp.path().join("store");
     // A claude that cannot resume reports why and exits without reading
     // the prompt.
     fake_claude_with_init(
@@ -1323,14 +1128,15 @@ printf '%s\n' '{"type":"result","session_id":"79ed6f89-b693-4192-8169-4554404b43
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(idle["stopReason"], "end_turn", "{idle}");
     child.kill().await.unwrap();
+    write_transcript(temp.path(), &project, session.as_str().unwrap());
 
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
     let (resumed, _) = response(&mut reader, 2).await;
@@ -1456,7 +1262,7 @@ interrupted
 next_message
 ",
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let prompt = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}});
@@ -1485,7 +1291,7 @@ interrupted
 next_message
 ",
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let prompt = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}});
@@ -1506,32 +1312,37 @@ next_message
     child.kill().await.unwrap();
 }
 
-/// A claude that names its session and exits in its first turn, and one
-/// that answers after it.
+/// A claude that exits in its first turn, and one that answers after it.
 fn exiting_claude(bin: &Path) {
     fake_claude(
         bin,
-        &format!(
-            r#"
+        r#"
 printf '%s\n' "$*" >> calls
 next_prompt
-if [ "$(wc -l < calls)" -eq 1 ]; then
-  printf '%s\n' '{{"type":"system","subtype":"init","session_id":"{HISTORY_ID}"}}'
-  exit 1
-fi
-printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
+if [ "$(wc -l < calls)" -eq 1 ]; then exit 1; fi
+printf '%s\n' '{"type":"result"}'
 next_message
-"#
-        ),
+"#,
     );
 }
 
-async fn fail_then_prompt_again(temp: &Path, bin: &Path, project: &Path) -> Vec<String> {
-    let (mut child, mut reader) = start(bin, &temp.join("store"));
+/// Prompts an exiting claude twice, and returns the arguments of both
+/// claudes. When `transcript`, claude saved the session's transcript before
+/// it exited.
+async fn fail_then_prompt_again(
+    temp: &Path,
+    bin: &Path,
+    project: &Path,
+    transcript: bool,
+) -> Vec<String> {
+    let (mut child, mut reader) = start(bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert!(error_message(&idle).is_some(), "{idle}");
+    if transcript {
+        write_transcript(temp, project, session.as_str().unwrap());
+    }
     let (idle, _) = prompt(&mut child, &mut reader, 4, &session).await;
     assert_eq!(idle["stopReason"], "end_turn", "{idle}");
     child.kill().await.unwrap();
@@ -1543,13 +1354,9 @@ async fn a_claude_that_exits_is_replaced_by_one_that_resumes() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     exiting_claude(&bin);
-    write_transcript(temp.path(), &project, HISTORY_ID);
-    let calls = fail_then_prompt_again(temp.path(), &bin, &project).await;
+    let calls = fail_then_prompt_again(temp.path(), &bin, &project, true).await;
     assert_eq!(calls.len(), 2);
-    assert!(
-        calls[1].contains(&format!("--resume {HISTORY_ID}")),
-        "{calls:?}"
-    );
+    assert!(calls[1].contains(" --resume "), "{calls:?}");
 }
 
 #[tokio::test]
@@ -1557,7 +1364,7 @@ async fn a_claude_that_exits_without_a_transcript_is_replaced_by_a_fresh_one() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     exiting_claude(&bin);
-    let calls = fail_then_prompt_again(temp.path(), &bin, &project).await;
+    let calls = fail_then_prompt_again(temp.path(), &bin, &project, false).await;
     assert_eq!(calls.len(), 2);
     assert!(!calls[1].contains("--resume"), "{calls:?}");
 }
@@ -1576,7 +1383,7 @@ exit 1
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -1597,188 +1404,11 @@ printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":tr
 exit 1
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(error_message(&idle), Some("first; second"), "{idle}");
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn listed_sessions_can_be_loaded() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    write_transcript(temp.path(), &project, HISTORY_ID);
-    fake_claude(
-        &bin,
-        &format!(
-            r#"
-next_prompt
-printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
-"#
-        ),
-    );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
-    initialize(&mut child, &mut reader).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    prompt(&mut child, &mut reader, 3, &session).await;
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/list","params":{"cwd":project}}),
-    )
-    .await;
-    let (list, _) = response(&mut reader, 4).await;
-    let ids: Vec<&Value> = list["result"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|s| &s["sessionId"])
-        .collect();
-    assert_eq!(ids, [&session], "{list}");
-    assert_eq!(list["result"]["sessions"][0]["title"], "hello");
-
-    send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
-    let (load, _) = response(&mut reader, 5).await;
-    assert!(load.get("result").is_some(), "{load}");
-    send(&mut child, json!({"jsonrpc":"2.0","id":6,"method":"session/resume","params":{"sessionId":session,"cwd":temp.path(),"mcpServers":[]}})).await;
-    let (load, _) = response(&mut reader, 6).await;
-    assert!(load.get("error").is_some(), "{load}");
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn bridges_sharing_a_store_keep_each_others_sessions() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(&bin, "exit 0");
-    let store = temp.path().join("store");
-    let (mut a, mut a_reader) = start(&bin, &store);
-    let (mut b, mut b_reader) = start(&bin, &store);
-    initialize(&mut a, &mut a_reader).await;
-    initialize(&mut b, &mut b_reader).await;
-    let s1 = new_session(&mut a, &mut a_reader, 2, &project).await;
-    let s2 = new_session(&mut b, &mut b_reader, 2, &project).await;
-    let s3 = new_session(&mut a, &mut a_reader, 3, &project).await;
-
-    send(&mut b, json!({"jsonrpc":"2.0","id":3,"method":"session/resume","params":{"sessionId":s1,"cwd":project,"mcpServers":[]}})).await;
-    let (load, _) = response(&mut b_reader, 3).await;
-    assert!(load.get("result").is_some(), "{load}");
-
-    let saved: Value =
-        serde_json::from_slice(&fs::read(store.join("acp-sessions.json")).unwrap()).unwrap();
-    for id in [&s1, &s2, &s3] {
-        assert!(
-            saved.get(id.as_str().unwrap()).is_some(),
-            "{id} missing: {saved}"
-        );
-    }
-    a.kill().await.unwrap();
-    b.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_corrupt_store_is_set_aside() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(&bin, "exit 0");
-    let store = temp.path().join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(store.join("acp-sessions.json"), "not json").unwrap();
-    let (mut child, mut reader) = start(&bin, &store);
-    initialize(&mut child, &mut reader).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    let aside: Vec<_> = fs::read_dir(&store)
-        .unwrap()
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("acp-sessions.json.corrupt-")
-        })
-        .collect();
-    assert_eq!(aside.len(), 1);
-    assert_eq!(fs::read_to_string(aside[0].path()).unwrap(), "not json");
-    let saved: Value =
-        serde_json::from_slice(&fs::read(store.join("acp-sessions.json")).unwrap()).unwrap();
-    assert!(saved.get(session.as_str().unwrap()).is_some(), "{saved}");
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn an_unusable_store_fails_session_requests() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(&bin, "exit 0");
-    write_transcript(temp.path(), &project, HISTORY_ID);
-    let store = temp.path().join("store");
-    fs::write(&store, "").unwrap();
-    let (mut child, mut reader) = start(&bin, &store);
-    initialize(&mut child, &mut reader).await;
-    let requests = [
-        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":project,"mcpServers":[]}}),
-        json!({"jsonrpc":"2.0","id":3,"method":"session/list","params":{"cwd":project}}),
-        json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{
-            "sessionId":HISTORY_ID,"cwd":project,"mcpServers":[]
-        }}),
-    ];
-    for request in requests {
-        let id = request["id"].as_i64().unwrap();
-        let method = request["method"].clone();
-        send(&mut child, request).await;
-        let (answer, _) = response(&mut reader, id).await;
-        assert_eq!(answer["error"]["code"], -32603, "{method}: {answer}");
-    }
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn failed_registry_reads_and_writes_fail_session_new() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(&bin, "exit 0");
-    // A registry that is a directory cannot be read.
-    let unreadable = temp.path().join("unreadable");
-    fs::create_dir_all(unreadable.join("acp-sessions.json")).unwrap();
-    // A read-only store can be locked and read, but not written.
-    let read_only = temp.path().join("read-only");
-    fs::create_dir_all(&read_only).unwrap();
-    fs::write(read_only.join("acp-sessions.lock"), "").unwrap();
-    fs::write(read_only.join("acp-sessions.json"), "{}").unwrap();
-    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o555)).unwrap();
-    let mut answers = Vec::new();
-    for store in [&unreadable, &read_only] {
-        let (mut child, mut reader) = start(&bin, store);
-        initialize(&mut child, &mut reader).await;
-        send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":project,"mcpServers":[]}})).await;
-        let (answer, _) = response(&mut reader, 2).await;
-        child.kill().await.unwrap();
-        answers.push((store.display().to_string(), answer));
-    }
-    fs::set_permissions(&read_only, fs::Permissions::from_mode(0o755)).unwrap();
-    for (store, answer) in answers {
-        assert_eq!(answer["error"]["code"], -32603, "{store}: {answer}");
-    }
-}
-
-#[tokio::test]
-async fn unreadable_store_entries_survive_updates() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_claude(&bin, "exit 0");
-    let store = temp.path().join("store");
-    fs::create_dir_all(&store).unwrap();
-    fs::write(
-        store.join("acp-sessions.json"),
-        r#"{"other": {"unexpected": true}}"#,
-    )
-    .unwrap();
-    let (mut child, mut reader) = start(&bin, &store);
-    initialize(&mut child, &mut reader).await;
-    new_session(&mut child, &mut reader, 2, &project).await;
-    let saved: Value =
-        serde_json::from_slice(&fs::read(store.join("acp-sessions.json")).unwrap()).unwrap();
-    assert_eq!(saved["other"], json!({"unexpected": true}));
     child.kill().await.unwrap();
 }
 
@@ -1796,7 +1426,7 @@ interrupted
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
@@ -1835,7 +1465,7 @@ printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}","result":"done"}}'
             captured.display()
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     send(
         &mut child,
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"capabilities":{},"info":{"name":"test","version":"1"}}}),
@@ -1895,7 +1525,7 @@ done
             ran.display()
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let prompts = [
@@ -1932,7 +1562,7 @@ sleep 10 &
 exit 1
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2121,70 +1751,35 @@ fn replay_and_state() -> Vec<String> {
 async fn resume_replays_a_claude_session_from_its_transcript() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
-    write_conversation(temp.path(), &project, HISTORY_ID);
     fake_claude(
         &bin,
-        &format!(
-            r#"
+        r#"
 printf '%s\n' "$*" > args
 next_prompt
-printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
-"#
-        ),
+printf '%s\n' '{"type":"result"}'
+next_message
+"#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
-    initialize(&mut child, &mut reader).await;
-    send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":HISTORY_ID,"cwd":project,"mcpServers":[],"replayFrom":{"type":"start"}}})).await;
-    let (loaded, notifications) = response(&mut reader, 2).await;
-    assert!(loaded["result"].is_object(), "{loaded}");
-    // The replay comes first, then the session's state, then the response.
-    assert_eq!(describe_updates(&notifications), replay_and_state());
-
-    // Without `replayFrom`, nothing replays.
-    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":HISTORY_ID,"cwd":project,"mcpServers":[]}})).await;
-    let (resumed, notifications) = response(&mut reader, 4).await;
-    assert!(resumed["result"].is_object(), "{resumed}");
-    assert_eq!(describe_updates(&notifications), ["state_update: idle"]);
-
-    // A cursor other than the start is not supported.
-    send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":HISTORY_ID,"cwd":project,"mcpServers":[],"replayFrom":{"type":"cursor","cursor":"x"}}})).await;
-    let (refused, notifications) = response(&mut reader, 5).await;
-    assert_eq!(refused["error"]["code"], -32602, "{refused}");
-    assert!(notifications.is_empty(), "{notifications:?}");
-
-    let (result, _) = prompt(&mut child, &mut reader, 3, &json!(HISTORY_ID)).await;
-    assert_eq!(result["stopReason"], "end_turn", "{result}");
-    let args = fs::read_to_string(project.join("args")).unwrap();
-    assert!(args.contains(&format!("--resume {HISTORY_ID}")), "{args}");
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn resume_replays_a_bridge_session_from_its_claude_transcript() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    write_conversation(temp.path(), &project, HISTORY_ID);
-    fake_claude(
-        &bin,
-        &format!(
-            r#"
-next_prompt
-printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
-"#
-        ),
-    );
-    let store = temp.path().join("store");
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     prompt(&mut child, &mut reader, 3, &session).await;
     child.kill().await.unwrap();
+    // Claude saved the session's transcript.
+    write_conversation(temp.path(), &project, session.as_str().unwrap());
 
-    let (mut child, mut reader) = start(&bin, &store);
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
+    // A cursor other than the start is not supported.
+    send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[],"replayFrom":{"type":"cursor","cursor":"x"}}})).await;
+    let (refused, notifications) = response(&mut reader, 5).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    assert!(notifications.is_empty(), "{notifications:?}");
+
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[],"replayFrom":{"type":"start"}}})).await;
     let (loaded, notifications) = response(&mut reader, 2).await;
     assert!(loaded["result"].is_object(), "{loaded}");
+    // The replay comes first, then the session's state, then the response.
     assert!(
         notifications
             .iter()
@@ -2192,6 +1787,22 @@ printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
         "{notifications:?}"
     );
     assert_eq!(describe_updates(&notifications), replay_and_state());
+    let (result, _) = prompt(&mut child, &mut reader, 3, &session).await;
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    let args = fs::read_to_string(project.join("args")).unwrap();
+    assert!(
+        args.contains(&format!("--resume {}", session.as_str().unwrap())),
+        "{args}"
+    );
+    child.kill().await.unwrap();
+
+    // Without `replayFrom`, nothing replays.
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
+    let (resumed, notifications) = response(&mut reader, 4).await;
+    assert!(resumed["result"].is_object(), "{resumed}");
+    assert_eq!(describe_updates(&notifications), ["state_update: idle"]);
     child.kill().await.unwrap();
 }
 
@@ -2214,7 +1825,7 @@ done
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     for (request_id, text) in [(3, "turn 1"), (4, "turn 2"), (5, "turn 3")] {
@@ -2263,7 +1874,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (result, before) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2324,7 +1935,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (_, seen) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2362,7 +1973,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (_, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2392,10 +2003,15 @@ done
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     prompt(&mut child, &mut reader, 3, &session).await;
+    child.kill().await.unwrap();
+    write_transcript(temp.path(), &project, session.as_str().unwrap());
+
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
     send(
         &mut child,
         json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{
@@ -2411,7 +2027,8 @@ done
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(!calls[0].contains("--mcp-config"), "{calls:?}");
     assert!(
-        calls[1].contains("--mcp-config") && calls[1].contains(&format!("--resume {HISTORY_ID}")),
+        calls[1].contains("--mcp-config")
+            && calls[1].contains(&format!("--resume {}", session.as_str().unwrap())),
         "{calls:?}"
     );
     child.kill().await.unwrap();
@@ -2432,7 +2049,7 @@ printf '%s\n' '{"type":"result"}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (result, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2483,7 +2100,7 @@ printf '%s\n' '{"type":"result"}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
@@ -2532,7 +2149,7 @@ printf '%s\n' '{"type":"result"}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (result, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2565,7 +2182,7 @@ interrupted
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
@@ -2585,13 +2202,6 @@ next_message
     let after = until_text(&mut reader, "working").await;
     assert_eq!(describe_updates(&after[..1]), ["state_update: running"]);
 
-    // A client that resumes the session while it works is told so before
-    // the response.
-    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
-    let (resumed, notifications) = response(&mut reader, 4).await;
-    assert!(resumed["result"].is_object(), "{resumed}");
-    assert_eq!(describe_updates(&notifications), ["state_update: running"]);
-
     send(
         &mut child,
         json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}),
@@ -2603,75 +2213,11 @@ next_message
 }
 
 #[tokio::test]
-async fn close_stops_claude_and_the_session() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    // Claude ends when its stdin closes, after reading the interrupt.
-    fake_claude(
-        &bin,
-        r#"
-echo "$$" > pid
-next_prompt
-printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
-next_message
-next_message
-"#,
-    );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
-    initialize(&mut child, &mut reader).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
-    let seen = until_text(&mut reader, "working").await;
-    let pid = fs::read_to_string(project.join("pid")).unwrap();
-    let running = |pid: &str| {
-        std::process::Command::new("kill")
-            .args(["-0", pid.trim()])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success()
-    };
-    assert!(running(&pid));
-
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":session}}),
-    )
-    .await;
-    let (closed, notifications) = response(&mut reader, 4).await;
-    assert!(closed["result"].is_object(), "{closed}");
-    // Claude has exited, so its turn ended as cancelled before the response.
-    assert!(
-        notifications.iter().any(|v| is_state(v, "idle")),
-        "{notifications:?}"
-    );
-    let (idle, _) = finish(&mut reader, 3, [seen, notifications].concat()).await;
-    assert_eq!(idle["stopReason"], "cancelled", "{idle}");
-    assert!(!running(&pid), "claude {pid} still runs");
-
-    // A closed session takes no prompt until it is resumed, and closing it
-    // again, or one that never existed, succeeds.
-    send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
-    let (refused, _) = response(&mut reader, 5).await;
-    assert_eq!(refused["error"]["code"], -32002, "{refused}");
-    for (id, session) in [(6, json!(session)), (7, json!("nonexistent"))] {
-        send(
-            &mut child,
-            json!({"jsonrpc":"2.0","id":id,"method":"session/close","params":{"sessionId":session}}),
-        )
-        .await;
-        let (closed, _) = response(&mut reader, id).await;
-        assert!(closed["result"].is_object(), "{closed}");
-    }
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
 async fn mcp_commands_are_absolute_paths() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_claude(&bin, "exit 0");
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
         "cwd":project,"mcpServers":[{"type":"stdio","name":"x","command":"node","args":[],"env":[]}]
@@ -2696,7 +2242,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (_, live) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2709,12 +2255,16 @@ next_message
         serde_json::from_slice(&fs::read(project.join("captured.json")).unwrap()).unwrap();
     assert_eq!(retained["uuid"], original_id);
     retained["cwd"] = json!(project);
+    child.kill().await.unwrap();
     let transcripts = temp.path().join("empty-claude/projects/sample");
     fs::create_dir_all(&transcripts).unwrap();
     write_lines(
-        &transcripts.join(format!("{HISTORY_ID}.jsonl")),
+        &transcripts.join(format!("{}.jsonl", session.as_str().unwrap())),
         &[retained],
     );
+
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
     send(
         &mut child,
         json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{
@@ -2741,7 +2291,7 @@ async fn unsupported_mcp_transport_is_rejected() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_claude(&bin, "exit 0");
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
         "cwd":project,"mcpServers":[{"type":"http","name":"context","url":"https://example.com/mcp","headers":[]}]
@@ -2771,7 +2321,7 @@ printf '%s\n' '{"type":"result"}'
 next_message
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(
@@ -2816,7 +2366,7 @@ echo 'aborting the turn failed' >&2
 exit 1
 "#,
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(
@@ -2876,7 +2426,7 @@ next_message
 "#
         )),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, before) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2935,7 +2485,7 @@ async fn claude_exiting_fails_the_tool_calls_of_its_background_work() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_claude(&bin, &background_task("exit 0"));
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2955,7 +2505,7 @@ async fn claude_exiting_fails_the_tool_calls_of_its_background_work() {
 }
 
 #[tokio::test]
-async fn a_foreground_task_lists_nothing_and_a_resume_reports_the_list() {
+async fn a_foreground_task_lists_nothing_and_a_background_one_is_listed() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_claude(
@@ -2979,7 +2529,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, updates) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -2994,13 +2544,6 @@ next_message
     assert_eq!(
         idle["background"],
         json!([{"type": "_claude_task", "taskId": "t1"}])
-    );
-
-    send(&mut child, json!({"jsonrpc":"2.0","id":5,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
-    let (_, notifications) = response(&mut reader, 5).await;
-    assert_eq!(
-        describe_updates(&notifications),
-        ["state_update: idle [_claude_task:t1]"]
     );
     child.kill().await.unwrap();
 }
@@ -3062,7 +2605,7 @@ async fn scheduled_prompts_keep_the_session_listed() {
     ]
     .concat();
     fake_claude(&bin, &turns);
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let mut turn = async |id: i64| {
@@ -3157,7 +2700,7 @@ next_message
     ]
     .concat();
     fake_claude(&bin, &turns);
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
@@ -3231,7 +2774,7 @@ next_message
 "#
         ),
     );
-    let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
+    let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":HISTORY_ID,"cwd":project,"mcpServers":[]}})).await;
     response(&mut reader, 2).await;

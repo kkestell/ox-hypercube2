@@ -1,22 +1,15 @@
-//! A workspace's branches: listing them for a client naming the branch of a
-//! new worktree, the fetch that brings its remote branches up to date, and
-//! moving a branch along with the checkout that has it.
+//! A workspace's branches: the branch its checkout is on, and moving a
+//! branch along with the checkout that has it.
 
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
 
-use ox_protocol::{Branches, ErrorBody, LocalBranch, code};
-use tokio::io::AsyncReadExt;
+use ox_protocol::{Branches, ErrorBody, code};
 
 use crate::daemon::invalid_request;
 use crate::worktree::{Git, Repository, checked_out_at, not_a_working_tree};
-
-/// How long a fetch may run before it is stopped.
-const FETCH_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Whether `path` looks like it is in a Git working tree, without running
 /// git: no component of it is `.git`, and it or an ancestor has a `.git`
@@ -52,102 +45,31 @@ pub async fn common_dir(git: &Git, workspace: &Path) -> Result<PathBuf, ErrorBod
     Ok(PathBuf::from(OsStr::from_bytes(common_dir)))
 }
 
-/// The local and remote-tracking branches of the repository `workspace` is
-/// in, most recently committed first, without symbolic refs such as
-/// `origin/HEAD`, and the branch the checkout at `workspace` is on. Each
-/// local branch names the worktree that has it checked out; remote branches
-/// keep their remote's name. The result reports no fetch.
+/// The branches of the repository `workspace` is in: the local branch the
+/// checkout at `workspace` is on.
 pub async fn list(git: &Git, workspace: &Path) -> Result<Branches, ErrorBody> {
     let output = git
         .run(
             workspace,
             &[
                 &"for-each-ref",
-                &"--sort=-committerdate",
-                &"--format=%(refname)%00%(symref)%00%(worktreepath)%00%(HEAD)",
+                &"--format=%(HEAD)%(refname)",
                 &"refs/heads",
-                &"refs/remotes",
             ],
         )
         .await?;
-    let mut head = None;
-    let mut local = Vec::new();
-    let mut remote = Vec::new();
-    for line in output.split(|&byte| byte == b'\n') {
-        let mut fields = line.split(|&byte| byte == 0);
-        let (Some(name), Some(b""), Some(worktree), Some(current)) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        let name = String::from_utf8_lossy(name);
-        if let Some(branch) = name.strip_prefix("refs/heads/") {
-            if current == b"*" {
-                head = Some(branch.to_owned());
-            }
-            local.push(LocalBranch {
-                name: branch.to_owned(),
-                worktree: (!worktree.is_empty())
-                    .then(|| PathBuf::from(OsStr::from_bytes(worktree))),
-            });
-        } else if let Some(branch) = name.strip_prefix("refs/remotes/") {
-            remote.push(branch.to_owned());
-        }
-    }
-    Ok(Branches {
-        head,
-        local,
-        remote,
-        fetch_error: None,
-    })
-}
-
-/// Runs `git fetch --all` for the repository `workspace` is in, as the
-/// user's `fetch.prune` settings say. A fetch that runs longer than
-/// `FETCH_TIMEOUT` is sent `SIGTERM`, which lets git remove its lock files,
-/// with every process it started. Returns git's error output, or why the
-/// fetch stopped, when it fails.
-pub async fn fetch(git: &Git, workspace: &Path) -> Result<(), String> {
-    let mut child = git
-        .command(workspace, &[&"fetch", &"--all", &"--quiet"])
-        .stdout(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|error| format!("git fetch could not start: {error}"))?;
-    let group = child
-        .id()
-        .and_then(|id| libc::pid_t::try_from(id).ok())
-        .expect("a child that was not waited for has a process ID");
-    let mut stderr = child.stderr.take().expect("stderr is piped");
-    let mut errors = Vec::new();
-    let finished = tokio::time::timeout(FETCH_TIMEOUT, async {
-        let (_, status) = tokio::join!(stderr.read_to_end(&mut errors), child.wait());
-        status
-    })
-    .await;
-    match finished {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(_)) => Err(String::from_utf8_lossy(&errors).trim().to_owned()),
-        Ok(Err(error)) => Err(format!("waiting for git fetch failed: {error}")),
-        Err(_) => {
-            // SAFETY: sends SIGTERM to the process group of the fetch this
-            // function started, whose leader it has not yet waited for.
-            unsafe { libc::killpg(group, libc::SIGTERM) };
-            let _ = child.wait().await;
-            Err(format!(
-                "git fetch did not finish within {} seconds",
-                FETCH_TIMEOUT.as_secs()
-            ))
-        }
-    }
+    let head = String::from_utf8_lossy(&output)
+        .lines()
+        .find_map(|line| line.strip_prefix("*refs/heads/"))
+        .map(str::to_owned);
+    Ok(Branches { head })
 }
 
 pub(crate) struct Move<'a> {
     pub branch: &'a str,
     pub to: &'a str,
     pub expected: &'a str,
-    pub source_branch: Option<&'a str>,
-    pub force: bool,
+    pub source_branch: &'a str,
 }
 
 /// Moves a branch and its checkout. The reservation keeps Ox from starting
@@ -163,15 +85,11 @@ pub(crate) async fn move_branch<Reservation>(
         to,
         expected,
         source_branch,
-        force,
     } = movement;
     let repository = Repository::new(git, common_dir);
     let reference = branch_ref(&repository, branch).await?;
-    let source = match source_branch {
-        Some(branch) => Some(branch_ref(&repository, branch).await?),
-        None => None,
-    };
-    if source.as_ref() == Some(&reference) {
+    let source = branch_ref(&repository, source_branch).await?;
+    if source == reference {
         return Err(invalid_request(
             "source and destination are the same branch".into(),
         ));
@@ -195,11 +113,10 @@ pub(crate) async fn move_branch<Reservation>(
             message: format!("{branch} is at {current}, not {expected}"),
         });
     }
-    if !force
-        && repository
-            .run(&[&"merge-base", &"--is-ancestor", &expected, &target])
-            .await
-            .is_err()
+    if repository
+        .run(&[&"merge-base", &"--is-ancestor", &expected, &target])
+        .await
+        .is_err()
     {
         return Err(invalid_request(format!(
             "{to} is not a fast-forward of {branch}"
@@ -213,8 +130,7 @@ pub(crate) async fn move_branch<Reservation>(
         check_checkout(git, checkout, &expected, &target).await?;
     }
     let message = format!("ox: move {branch}");
-    let verify = source.map_or_else(String::new, |source| format!("verify {source} {target}\n"));
-    let update = format!("{verify}update {reference} {target} {expected}\n");
+    let update = format!("verify {source} {target}\nupdate {reference} {target} {expected}\n");
     repository
         .run_with_input(&[&"update-ref", &"-m", &message, &"--stdin"], Some(&update))
         .await?;

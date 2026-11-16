@@ -5,8 +5,7 @@ import {
   type SessionInfo,
   type WorktreeInfo,
 } from "../../lib/protocol";
-import { Elicitation } from "../composer/Elicitation";
-import { Permission } from "../composer/Permission";
+import { OpenRequest } from "../composer/OpenRequest";
 import { Transcript } from "../conversation/Conversation";
 import { useConversations } from "../conversation/useConversations";
 import { RunHeader } from "./RunHeader";
@@ -54,19 +53,11 @@ export function RunView({
       {request && (
         <div className="composer">
           <div className="stack">
-            {request.item.type === "permission" ? (
-              <Permission
-                key={`${request.sessionId}:${request.item.request_id}`}
-                item={request.item}
-                sessionId={request.sessionId}
-              />
-            ) : (
-              <Elicitation
-                key={`${request.sessionId}:${request.item.request_id}`}
-                item={request.item}
-                sessionId={request.sessionId}
-              />
-            )}
+            <OpenRequest
+              key={`${request.sessionId}:${request.item.request_id}`}
+              item={request.item}
+              sessionId={request.sessionId}
+            />
           </div>
         </div>
       )}

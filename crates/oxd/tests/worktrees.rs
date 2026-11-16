@@ -3,190 +3,30 @@
 //! Sessions that run in worktrees, against real repositories.
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-use ox_protocol::schema::{ContentBlock, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, Comparison, Deleted, Error, ErrorBody, EventKind, ListingChange,
-    SessionInfo, SessionState, Watch, WorktreeBranch, WorktreeInfo, code,
+    Branches, Checkout, Client, Comparison, Deleted, Error, EventKind, ListingChange, SessionInfo,
+    SessionState, WorktreeInfo, code,
 };
 use tempfile::TempDir;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
-const OXD: &str = env!("CARGO_BIN_EXE_oxd");
-const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_oxd-fake-agent");
+mod common;
 
-/// Runs git in `dir` without the user's or the system's configuration, and
-/// returns its output without the final newline.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let output = git_command(dir, args).output().unwrap();
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .trim_end()
-        .to_owned()
-}
+use common::*;
 
 /// Whether git succeeds in `dir`.
 fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
     git_command(dir, args).output().unwrap().status.success()
 }
 
-fn git_command(dir: &Path, args: &[&str]) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .stdin(Stdio::null());
-    command
-}
-
 /// A repository on branch `main` with one commit, and an identity to commit
 /// with.
 fn repo() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    init(dir.path());
-    std::fs::write(dir.path().join("README"), "committed\n").unwrap();
-    git(dir.path(), &["add", "README"]);
-    git(dir.path(), &["commit", "--quiet", "-m", "first"]);
-    dir
-}
-
-fn init(dir: &Path) {
-    git(dir, &["init", "--quiet", "-b", "main"]);
-    identify(dir);
-}
-
-/// Gives the repository at `dir` an identity, which git also writes in
-/// reflogs.
-fn identify(dir: &Path) {
-    git(dir, &["config", "user.name", "Test"]);
-    git(dir, &["config", "user.email", "test@example.com"]);
-}
-
-/// A bare remote with branches `main` and `feature`, and a clone of it with
-/// local `main` only and an identity, in `clone` under the returned
-/// directory.
-fn clone_with_remote() -> TempDir {
-    let source = repo();
-    git(source.path(), &["switch", "--quiet", "-c", "feature"]);
-    std::fs::write(source.path().join("feature"), "feature\n").unwrap();
-    git(source.path(), &["add", "feature"]);
-    git(source.path(), &["commit", "--quiet", "-m", "feature"]);
-    git(source.path(), &["switch", "--quiet", "main"]);
-    let dir = tempfile::tempdir().unwrap();
-    let remote = dir.path().join("remote.git");
-    let clone = dir.path().join("clone");
-    git(
-        dir.path(),
-        &[
-            "clone",
-            "--quiet",
-            "--bare",
-            source.path().to_str().unwrap(),
-            remote.to_str().unwrap(),
-        ],
-    );
-    git(
-        dir.path(),
-        &[
-            "clone",
-            "--quiet",
-            remote.to_str().unwrap(),
-            clone.to_str().unwrap(),
-        ],
-    );
-    identify(&clone);
-    dir
-}
-
-fn clone_of(dir: &TempDir) -> PathBuf {
-    dir.path().join("clone")
-}
-
-struct Daemon {
-    child: Child,
-    dir: TempDir,
-    socket: PathBuf,
-}
-
-impl Daemon {
-    async fn start() -> Self {
-        Self::start_in(tempfile::tempdir().unwrap()).await
-    }
-
-    /// Starts oxd on the socket in `dir`, without the user's or the
-    /// system's git configuration, and waits for it to report that it is
-    /// ready.
-    async fn start_in(dir: TempDir) -> Self {
-        Self::start_with(dir, BTreeMap::new()).await
-    }
-
-    /// Starts oxd as `start_in` does, with `env` over its environment.
-    async fn start_with(dir: TempDir, env: BTreeMap<String, String>) -> Self {
-        let socket = dir.path().join("oxd.sock");
-        let mut child = Command::new(OXD)
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--idle-exit-ms")
-            .arg("1000")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .envs(env)
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
-        let ready = timeout(TIMEOUT, stdout.next_line()).await;
-        assert_eq!(ready.unwrap().unwrap().as_deref(), Some("ready"));
-        Self { child, dir, socket }
-    }
-
-    async fn client(&self) -> Client {
-        timeout(TIMEOUT, Client::connect(&self.socket))
-            .await
-            .expect("timed out connecting")
-            .unwrap()
-    }
-
-    /// Stops the daemon with SIGTERM, which keeps its sessions saved, and
-    /// starts another on its socket.
-    async fn restart(self) -> Self {
-        self.restart_with(BTreeMap::new()).await
-    }
-
-    /// Restarts oxd as `restart` does, with `env` over its environment.
-    async fn restart_with(mut self, env: BTreeMap<String, String>) -> Self {
-        // SAFETY: sends SIGTERM to the daemon this test started.
-        unsafe { libc::kill(self.child.id().unwrap().cast_signed(), libc::SIGTERM) };
-        let status = timeout(TIMEOUT, self.child.wait())
-            .await
-            .expect("oxd did not exit")
-            .unwrap();
-        assert!(status.success());
-        Self::start_with(self.dir, env).await
-    }
-
-    fn worktrees(&self) -> PathBuf {
-        self.dir.path().join("worktrees")
-    }
+    repo_with("README", "committed\n")
 }
 
 /// A `git` for a client's `PATH` that stops at the first command whose
@@ -197,17 +37,7 @@ struct BlockedGit {
 }
 
 impl BlockedGit {
-    /// Stops before the command runs.
     fn new(pattern: &str) -> Self {
-        Self::stopping(pattern, false)
-    }
-
-    /// Stops once the command has run, before oxd sees it finish.
-    fn after(pattern: &str) -> Self {
-        Self::stopping(pattern, true)
-    }
-
-    fn stopping(pattern: &str, after: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         mkfifos(dir.path());
         let real = std::process::Command::new("sh")
@@ -226,11 +56,7 @@ impl BlockedGit {
              fi ;;\n\
              esac\n"
         );
-        let script = if after {
-            format!("#!/bin/sh\n{real} \"$@\"\nstatus=$?\n{stop}exit $status\n")
-        } else {
-            format!("#!/bin/sh\n{stop}exec {real} \"$@\"\n")
-        };
+        let script = format!("#!/bin/sh\n{stop}exec {real} \"$@\"\n");
         let git = dir.path().join("git");
         std::fs::write(&git, script).unwrap();
         std::fs::set_permissions(&git, PermissionsExt::from_mode(0o755)).unwrap();
@@ -290,181 +116,17 @@ async fn release(dir: &Path) {
         .unwrap();
 }
 
-/// An upload-pack for a clone's `origin` that counts the fetches that reach
-/// it, and stops the first until the test releases it.
-struct UploadPack {
-    dir: TempDir,
-}
-
-impl UploadPack {
-    /// Makes `origin` of the clone at `clone` fetch through this
-    /// upload-pack.
-    fn new(clone: &Path) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        mkfifos(dir.path());
-        let dir_path = dir.path().to_str().unwrap();
-        let script = format!(
-            "#!/bin/sh\n\
-             echo fetch >> \"{dir_path}/log\"\n\
-             if mkdir \"{dir_path}/once\" 2>/dev/null; then\n\
-             echo blocked > \"{dir_path}/blocked\"\n\
-             read _ < \"{dir_path}/release\"\n\
-             fi\n\
-             exec git upload-pack \"$@\"\n"
-        );
-        let upload_pack = dir.path().join("upload-pack");
-        std::fs::write(&upload_pack, script).unwrap();
-        std::fs::set_permissions(&upload_pack, PermissionsExt::from_mode(0o755)).unwrap();
-        git(
-            clone,
-            &[
-                "config",
-                "remote.origin.uploadpack",
-                upload_pack.to_str().unwrap(),
-            ],
-        );
-        Self { dir }
-    }
-
-    /// Waits until the first fetch has reached the remote.
-    async fn blocked(&self) {
-        blocked(self.dir.path()).await;
-    }
-
-    /// Lets the first fetch go on.
-    async fn release(&self) {
-        release(self.dir.path()).await;
-    }
-
-    /// How many fetches have reached the remote.
-    fn fetches(&self) -> usize {
-        std::fs::read_to_string(self.dir.path().join("log"))
-            .unwrap()
-            .lines()
-            .count()
-    }
-}
-
-/// A FIFO the fake agent holds open for as long as it runs (`--hold`), which
-/// tells the test when the agent starts and when it exits.
-struct ExitWatch {
-    path: PathBuf,
-    opened: Option<oneshot::Receiver<()>>,
-    done: Option<JoinHandle<()>>,
-}
-
-impl ExitWatch {
-    fn new(dir: &Path) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = dir.join(format!("hold-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let (opened, opened_rx) = oneshot::channel();
-        let reader = path.clone();
-        // Opening blocks until the agent opens the FIFO; reading ends once
-        // every process holding it has exited.
-        let done = tokio::task::spawn_blocking(move || {
-            let mut fifo = std::fs::File::open(reader).unwrap();
-            let _ = opened.send(());
-            let mut rest = Vec::new();
-            fifo.read_to_end(&mut rest).unwrap();
-        });
-        Self {
-            path,
-            opened: Some(opened_rx),
-            done: Some(done),
-        }
-    }
-
-    /// The fake agent's command, holding this FIFO.
-    fn command(&self) -> Vec<String> {
-        vec![
-            FAKE_AGENT.to_owned(),
-            "--hold".to_owned(),
-            self.path.to_str().unwrap().to_owned(),
-        ]
-    }
-
-    /// Waits for the agent process to start.
-    async fn started(&mut self) {
-        let opened = self.opened.take().unwrap();
-        timeout(TIMEOUT, opened)
-            .await
-            .expect("the agent did not start")
-            .unwrap();
-    }
-
-    /// Waits for the agent process to exit.
-    async fn exited(mut self) {
-        let done = self.done.take().unwrap();
-        timeout(TIMEOUT, done)
-            .await
-            .expect("the agent is still running")
-            .unwrap();
-    }
-}
-
-impl Drop for ExitWatch {
-    /// Ends the blocking reader if no agent ever opened the FIFO, so a
-    /// failing test does not hang.
-    fn drop(&mut self) {
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&self.path);
-    }
-}
-
-/// The ID of the workspace for `path`, which is added if there is none.
-async fn workspace_id(client: &Client, path: &Path) -> String {
-    let workspaces = client.list_workspaces().await.unwrap();
-    match workspaces.into_iter().find(|w| w.path == path) {
-        Some(workspace) => workspace.id,
-        None => client.add_workspace(path.to_owned()).await.unwrap().id,
-    }
-}
-
 /// The branches of the workspace for `path`.
-async fn branches(
-    client: &Client,
-    path: &Path,
-    fetch: bool,
-    env: BTreeMap<String, String>,
-) -> Result<Branches, Error> {
+async fn branches(client: &Client, path: &Path) -> Result<Branches, Error> {
     let workspace = workspace_id(client, path).await;
-    timeout(TIMEOUT, client.branches(&workspace, fetch, env))
+    timeout(TIMEOUT, client.branches(&workspace, BTreeMap::new()))
         .await
         .expect("timed out listing branches")
 }
 
 /// A new worktree on the session's `ox/<id8>` branch.
 fn on_ox_branch() -> Checkout {
-    Checkout::Worktree {
-        branch: None,
-        compare: None,
-    }
-}
-
-/// A new worktree on the existing branch `name`.
-fn on_existing(name: &str) -> Checkout {
-    Checkout::Worktree {
-        branch: Some(WorktreeBranch::Existing { name: name.into() }),
-        compare: None,
-    }
-}
-
-/// A new worktree on a new branch `name` that starts at `start`.
-fn on_new(name: &str, start: Option<&str>) -> Checkout {
-    Checkout::Worktree {
-        branch: Some(WorktreeBranch::New {
-            name: name.into(),
-            start: start.map(String::from),
-        }),
-        compare: None,
-    }
+    Checkout::Worktree { compare: None }
 }
 
 /// Asks for a session of the fake agent in a workspace for `path`.
@@ -558,23 +220,12 @@ fn assert_removed(repo: &Path, worktree: &WorktreeInfo) {
 /// Waits for the agent to answer a prompt, which shows it is running.
 async fn answers(client: &Client, session_id: &str) {
     let mut events = client.subscribe(session_id, 0).await.unwrap();
-    client
-        .prompt(
-            session_id,
-            vec![ContentBlock::Text(TextContent::new("say 1 0"))],
-        )
-        .await
-        .unwrap();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("the agent did not answer")
-            .unwrap();
-        if let EventKind::TurnEnded { error, .. } = event.kind {
-            assert_eq!(error, None);
-            return;
-        }
-    }
+    client.prompt(session_id, text("say 1 0")).await.unwrap();
+    let ended = until(&mut events, turn_ended).await.pop().unwrap();
+    assert!(
+        matches!(ended.kind, EventKind::TurnEnded { error: None, .. }),
+        "{ended:?}"
+    );
 }
 
 /// The session's info from each watch change that names it, from a new
@@ -612,20 +263,6 @@ async fn until_session(
     }
 }
 
-async fn next_changes(watch: &mut Watch) -> Vec<ListingChange> {
-    timeout(TIMEOUT, watch.next())
-        .await
-        .expect("timed out waiting for listing changes")
-        .unwrap()
-}
-
-/// Waits until the session is no longer listed.
-async fn until_gone(client: &Client, session_id: &str) {
-    if let Some(session) = until_session(client, session_id, |_| false).await {
-        panic!("the session is still listed: {session:?}");
-    }
-}
-
 /// Waits until the session is in `state`.
 async fn until_state(client: &Client, session_id: &str, state: SessionState) {
     until_session(client, session_id, |session| session.state == state)
@@ -658,22 +295,6 @@ async fn exited(client: &Client, session: &SessionInfo) -> String {
     match event.kind {
         EventKind::AgentExited { error: Some(error) } => error,
         kind => panic!("expected agent_exited with an error, got {kind:?}"),
-    }
-}
-
-async fn info(client: &Client, session_id: &str) -> Option<SessionInfo> {
-    client
-        .list()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|session| session.id == session_id)
-}
-
-fn refusal<T: std::fmt::Debug>(result: Result<T, Error>) -> ErrorBody {
-    match result {
-        Err(Error::Remote(body)) => body,
-        other => panic!("expected a daemon error, got {other:?}"),
     }
 }
 
@@ -805,163 +426,8 @@ async fn a_worktree_is_listed_before_its_session_and_removed_with_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_named_new_branch_starts_where_asked_without_an_upstream() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let session = new_session(&client, &clone, on_new("topic", Some("origin/feature")))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    let feature = git(&clone, &["rev-parse", "origin/feature"]);
-    let worktree = worktree_of(&client, &session).await;
-    assert_eq!(worktree.branch, "topic");
-    assert_eq!(worktree.base, feature);
-    assert!(worktree.created_branch);
-    assert_eq!(git(&clone, &["rev-parse", "topic"]), feature);
-    assert!(!git_succeeds(
-        &clone,
-        &["config", "--get", "branch.topic.remote"]
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_existing_branch_is_checked_out_unless_a_worktree_has_it() {
-    let repo = repo();
-    git(repo.path(), &["branch", "other"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let session = new_session(&client, repo.path(), on_existing("other"))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    let worktree = worktree_of(&client, &session).await;
-    assert_eq!(worktree.branch, "other");
-    assert!(!worktree.created_branch);
-    assert_eq!(worktree.base, git(repo.path(), &["rev-parse", "other"]));
-    assert_eq!(git(&worktree.path, &["branch", "--show-current"]), "other");
-
-    let refused = refusal(new_session(&client, repo.path(), on_existing("main")).await);
-    assert_eq!(refused.code, code::INVALID_REQUEST);
-    let top = canonical(repo.path());
-    assert!(
-        refused.message.contains(top.to_str().unwrap()),
-        "{refused:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_branch_only_on_a_remote_is_tracked() {
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    // By its name.
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let session = new_session(&client, &clone, on_existing("feature"))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    let worktree = worktree_of(&client, &session).await;
-    assert_eq!(worktree.branch, "feature");
-    assert!(worktree.created_branch);
-    assert_eq!(worktree.base, git(&clone, &["rev-parse", "origin/feature"]));
-    assert_eq!(
-        git(&clone, &["config", "--get", "branch.feature.remote"]),
-        "origin"
-    );
-    // Named by its remote, once the local branch exists.
-    let refused = refusal(new_session(&client, &clone, on_existing("origin/feature")).await);
-    assert_eq!(refused.code, code::INVALID_REQUEST);
-    assert!(refused.message.contains("feature"), "{refused:?}");
-
-    // By its remote and name.
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let session = new_session(&client, &clone, on_existing("origin/feature"))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    assert_eq!(worktree_of(&client, &session).await.branch, "feature");
-    assert_eq!(
-        git(&clone, &["config", "--get", "branch.feature.remote"]),
-        "origin"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_branch_on_several_remotes_follows_the_default_remote() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let remote = dir.path().join("remote.git");
-    git(
-        &clone,
-        &["remote", "add", "upstream", remote.to_str().unwrap()],
-    );
-    git(&clone, &["fetch", "--quiet", "upstream"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let refused = refusal(new_session(&client, &clone, on_existing("feature")).await);
-    assert_eq!(refused.code, code::INVALID_REQUEST);
-    assert!(
-        refused.message.contains("origin") && refused.message.contains("upstream"),
-        "{refused:?}"
-    );
-
-    // The setting is only in the configuration the client's environment
-    // names, so git runs with that environment.
-    let config = dir.path().join("gitconfig");
-    std::fs::write(&config, "[checkout]\n\tdefaultRemote = upstream\n").unwrap();
-    let env = BTreeMap::from([(
-        "GIT_CONFIG_GLOBAL".to_owned(),
-        config.to_str().unwrap().to_owned(),
-    )]);
-    let session = new_session_with(&client, &clone, on_existing("feature"), env)
-        .await
-        .unwrap();
-    started(&client, &session).await;
-    assert_eq!(
-        git(&clone, &["config", "--get", "branch.feature.remote"]),
-        "upstream"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_existing_branch_that_is_not_there_is_refused() {
-    let repo = repo();
-    let branches = git(repo.path(), &["branch", "--list"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let refused = refusal(new_session(&client, repo.path(), on_existing("nonexistent")).await);
-    assert_eq!(refused.code, code::INVALID_REQUEST);
-    assert!(refused.message.contains("nonexistent"), "{refused:?}");
-    assert!(client.list().await.unwrap().is_empty());
-    assert_eq!(git(repo.path(), &["branch", "--list"]), branches);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_new_branch_is_refused_when_its_name_is_taken() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    git(&clone, &["branch", "other"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    for branch in ["other", "feature", "origin/feature"] {
-        let refused = refusal(new_session(&client, &clone, on_new(branch, None)).await);
-        assert_eq!(refused.code, code::INVALID_REQUEST, "{branch}");
-    }
-    assert!(client.list().await.unwrap().is_empty());
-    assert_eq!(git(&clone, &["branch", "--list"]), "* main\n  other");
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_subdirectory_workspace_runs_in_the_same_subdirectory() {
     let repo = repo();
-    let first = git(repo.path(), &["rev-parse", "HEAD"]);
     std::fs::create_dir(repo.path().join("sub")).unwrap();
     std::fs::write(repo.path().join("sub/file"), "in sub\n").unwrap();
     git(repo.path(), &["add", "sub"]);
@@ -976,10 +442,13 @@ async fn a_subdirectory_workspace_runs_in_the_same_subdirectory() {
     assert_eq!(session.cwd, worktree.path.join("sub"));
     assert!(session.cwd.join("file").is_file());
 
+    // A subdirectory with nothing committed is not at the starting commit.
+    let untracked = repo.path().join("untracked");
+    std::fs::create_dir(&untracked).unwrap();
     let branches = git(repo.path(), &["branch", "--list"]);
-    let refused = refusal(new_session(&client, &sub, on_new("old", Some(&first))).await);
+    let refused = refusal(new_session(&client, &untracked, on_ox_branch()).await);
     assert_eq!(refused.code, code::INVALID_REQUEST);
-    assert!(refused.message.contains("sub"), "{refused:?}");
+    assert!(refused.message.contains("untracked"), "{refused:?}");
     assert_eq!(git(repo.path(), &["branch", "--list"]), branches);
 }
 
@@ -1005,22 +474,6 @@ async fn a_request_git_cannot_satisfy_is_refused_with_nothing_created() {
         "{refused:?}"
     );
 
-    let repo = repo();
-    let branches = git(repo.path(), &["branch", "--list"]);
-    let worktrees = git(repo.path(), &["worktree", "list"]);
-    for checkout in [
-        on_new("-x", None),
-        on_new("HEAD", None),
-        on_new("a..b", None),
-        on_new("topic", Some("nonexistent")),
-        on_new("topic", Some("--output=/tmp/x")),
-    ] {
-        let refused = refusal(new_session(&client, repo.path(), checkout.clone()).await);
-        assert_eq!(refused.code, code::INVALID_REQUEST, "{checkout:?}");
-    }
-    assert_eq!(git(repo.path(), &["branch", "--list"]), branches);
-    assert_eq!(git(repo.path(), &["worktree", "list"]), worktrees);
-
     let unborn = tempfile::tempdir().unwrap();
     init(unborn.path());
     let refused = refusal(new_session(&client, unborn.path(), on_ox_branch()).await);
@@ -1028,32 +481,8 @@ async fn a_request_git_cannot_satisfy_is_refused_with_nothing_created() {
     assert!(refused.message.contains("no commits"), "{refused:?}");
     assert_eq!(git(unborn.path(), &["branch", "--list"]), "");
 
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
     assert!(!daemon.worktrees().exists());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn of_two_creations_of_one_branch_one_wins() {
-    let repo = repo();
-    let head = git(repo.path(), &["rev-parse", "HEAD"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    // Add the workspace first, so the two requests share it.
-    client.add_workspace(repo.path().to_owned()).await.unwrap();
-
-    let (first, second) = tokio::join!(
-        new_session(&client, repo.path(), on_new("same", None)),
-        new_session(&client, repo.path(), on_new("same", None)),
-    );
-    let (winner, loser) = match (first, second) {
-        (Ok(winner), loser @ Err(_)) | (loser @ Err(_), Ok(winner)) => (winner, loser),
-        other => panic!("expected one creation to succeed, got {other:?}"),
-    };
-    assert_eq!(refusal(loser).code, code::INVALID_REQUEST);
-    let winner = started(&client, &winner).await;
-    assert_eq!(git(repo.path(), &["rev-parse", "same"]), head);
-    assert!(worktree_of(&client, &winner).await.path.is_dir());
-    assert_eq!(client.list().await.unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1081,7 +510,7 @@ async fn a_worktree_that_cannot_be_added_is_undone() {
     drop(client);
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1110,25 +539,6 @@ async fn a_linked_worktree_workspace_names_the_worktree_after_itself() {
         worktree.path.file_name().unwrap().to_str().unwrap(),
         format!("linked-{}", &worktree.id[..8])
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn uncommitted_changes_stay_in_the_workspace() {
-    let repo = repo();
-    std::fs::write(repo.path().join("README"), "changed\n").unwrap();
-    std::fs::write(repo.path().join("untracked"), "new\n").unwrap();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let session = new_session(&client, repo.path(), on_ox_branch())
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    assert_eq!(
-        std::fs::read_to_string(session.cwd.join("README")).unwrap(),
-        "committed\n"
-    );
-    assert!(!session.cwd.join("untracked").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1187,12 +597,13 @@ async fn a_failed_worktree_leaves_a_branch_another_worktree_checked_out() {
     let client = daemon.client().await;
     let blocked = BlockedGit::new(" worktree add ");
 
-    let session = new_session_with(&client, repo.path(), on_new("topic", None), blocked.env())
+    let session = new_session_with(&client, repo.path(), on_ox_branch(), blocked.env())
         .await
         .unwrap();
+    let branch = format!("ox/{}", &session.worktree_id.as_ref().unwrap()[..8]);
     blocked.blocked().await;
     // Another worktree checks the new branch out before the session's
-    // worktree is added, as a second session asking for it can.
+    // worktree is added.
     let other = tempfile::tempdir().unwrap();
     let other = other.path().join("other");
     git(
@@ -1202,7 +613,7 @@ async fn a_failed_worktree_leaves_a_branch_another_worktree_checked_out() {
             "add",
             "--quiet",
             other.to_str().unwrap(),
-            "topic",
+            &branch,
         ],
     );
     blocked.release().await;
@@ -1210,74 +621,8 @@ async fn a_failed_worktree_leaves_a_branch_another_worktree_checked_out() {
     let error = exited(&client, &session).await;
     assert!(error.contains("worktree add"), "{error}");
     assert_eq!(info(&client, &session.id).await.unwrap().worktree_id, None);
-    assert!(git_succeeds(
-        repo.path(),
-        &["rev-parse", "--verify", "--quiet", "refs/heads/topic"]
-    ));
-    assert_eq!(git(&other, &["branch", "--show-current"]), "topic");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tracking_branch_starts_at_the_commit_it_records() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let base = git(&clone, &["rev-parse", "origin/feature"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let blocked = BlockedGit::new(" branch ");
-
-    let creating = new_session_with(&client, &clone, on_existing("feature"), blocked.env());
-    let moving = async {
-        blocked.blocked().await;
-        // A fetch moves the remote branch after it was resolved.
-        let tree = format!("{base}^{{tree}}");
-        let newer = git(&clone, &["commit-tree", &tree, "-p", &base, "-m", "newer"]);
-        git(
-            &clone,
-            &["update-ref", "refs/remotes/origin/feature", &newer],
-        );
-        blocked.release().await;
-    };
-    let (session, ()) = tokio::join!(creating, moving);
-    let session = started(&client, &session.unwrap()).await;
-
-    let worktree = worktree_of(&client, &session).await;
-    assert_eq!(worktree.base, base);
-    assert_eq!(git(&clone, &["rev-parse", "feature"]), base);
-    assert_eq!(
-        git(&clone, &["config", "--get", "branch.feature.remote"]),
-        "origin"
-    );
-    assert_eq!(
-        git(&clone, &["config", "--get", "branch.feature.merge"]),
-        "refs/heads/feature"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tracking_branch_whose_upstream_cannot_be_set_is_undone() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let blocked = BlockedGit::new(" --set-upstream-to");
-
-    let creating = new_session_with(&client, &clone, on_existing("feature"), blocked.env());
-    let removing = async {
-        blocked.blocked().await;
-        // The remote branch goes away between creating the local branch and
-        // setting its upstream, as a pruning fetch can make it.
-        git(&clone, &["update-ref", "-d", "refs/remotes/origin/feature"]);
-        blocked.release().await;
-    };
-    let (refused, ()) = tokio::join!(creating, removing);
-    let refused = refusal(refused);
-    assert_eq!(refused.code, code::GIT, "{refused:?}");
-    assert!(!git_succeeds(
-        &clone,
-        &["rev-parse", "--verify", "--quiet", "refs/heads/feature"]
-    ));
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(branch_exists(repo.path(), &branch));
+    assert_eq!(git(&other, &["branch", "--show-current"]), branch);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1300,8 +645,8 @@ async fn a_workspace_removed_during_a_creation() {
     let refused = refusal(refused);
     assert_eq!(refused.code, code::NOT_FOUND, "{refused:?}");
     assert_eq!(git(repo.path(), &["branch", "--list"]), "* main");
-    assert!(client.list().await.unwrap().is_empty());
-    assert!(client.list_workspaces().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
+    assert!(workspaces(&client).await.is_empty());
 
     // Removed once the session is saved: the removal is refused.
     let workspace = client.add_workspace(repo.path().to_owned()).await.unwrap();
@@ -1317,208 +662,43 @@ async fn a_workspace_removed_during_a_creation() {
     assert_eq!(refused.code, code::INVALID_STATE);
     blocked.release().await;
     started(&client, &session).await;
-    assert_eq!(client.list_workspaces().await.unwrap(), [workspace]);
+    assert_eq!(workspaces(&client).await, [workspace]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn branches_are_listed_most_recently_committed_first() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    // A branch committed after `main`, which sorts after it by name.
-    git(&clone, &["switch", "--quiet", "-c", "newer"]);
-    let committed = git_command(
-        &clone,
-        &["commit", "--quiet", "--allow-empty", "-m", "newer"],
-    )
-    .env("GIT_COMMITTER_DATE", "2090-01-01T00:00:00Z")
-    .status()
-    .unwrap();
-    assert!(committed.success());
-    git(&clone, &["switch", "--quiet", "main"]);
-    assert!(git_succeeds(
-        &clone,
-        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]
-    ));
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let listed = branches(&client, &clone, false, BTreeMap::new())
-        .await
-        .unwrap();
-    let names: Vec<&str> = listed
-        .local
-        .iter()
-        .map(|branch| branch.name.as_str())
-        .collect();
-    assert_eq!(names, ["newer", "main"]);
-    assert_eq!(listed.local[0].worktree, None);
-    assert_eq!(listed.local[1].worktree, Some(canonical(&clone)));
-    let mut remote = listed.remote.clone();
-    remote.sort();
-    assert_eq!(remote, ["origin/feature", "origin/main"]);
-    assert_eq!(listed.fetch_error, None);
-    assert_eq!(listed.head.as_deref(), Some("main"));
-
-    // A subdirectory of the checkout lists the same branches and head.
-    std::fs::create_dir(clone.join("sub")).unwrap();
-    let from_subdirectory = branches(&client, &clone.join("sub"), false, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(from_subdirectory, listed);
-
-    // A detached checkout is on no branch.
-    git(&clone, &["switch", "--quiet", "--detach"]);
-    let detached = branches(&client, &clone, false, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(detached.head, None);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn branches_name_the_worktree_that_has_them_checked_out() {
+async fn branches_name_the_branch_the_checkout_is_on() {
     let repo = repo();
     git(repo.path(), &["branch", "other"]);
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
-    let session = new_session(&client, repo.path(), on_existing("other"))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
 
-    let listed = branches(&client, repo.path(), false, BTreeMap::new())
-        .await
-        .unwrap();
-    let other = listed
-        .local
-        .iter()
-        .find(|branch| branch.name == "other")
-        .expect("other is listed");
-    assert_eq!(
-        other.worktree,
-        Some(canonical(&worktree_of(&client, &session).await.path))
-    );
-    // The session's worktree being on `other` leaves the workspace's head.
+    let listed = branches(&client, repo.path()).await.unwrap();
     assert_eq!(listed.head.as_deref(), Some("main"));
+
+    // A subdirectory of the checkout names the same head.
+    std::fs::create_dir(repo.path().join("sub")).unwrap();
+    let from_subdirectory = branches(&client, &repo.path().join("sub")).await.unwrap();
+    assert_eq!(from_subdirectory, listed);
+
+    // A detached checkout is on no branch.
+    git(repo.path(), &["switch", "--quiet", "--detach"]);
+    let detached = branches(&client, repo.path()).await.unwrap();
+    assert_eq!(detached.head, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn branches_are_refused_outside_a_working_tree() {
-    let dir = clone_with_remote();
     let plain = tempfile::tempdir().unwrap();
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "--quiet", "--bare"]);
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
 
-    for path in [plain.path(), &dir.path().join("remote.git")] {
-        for fetch in [false, true] {
-            let refused = refusal(branches(&client, path, fetch, BTreeMap::new()).await);
-            assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
-            assert!(refused.message.contains("is not in a Git working tree"));
-        }
+    for path in [plain.path(), bare.path()] {
+        let refused = refusal(branches(&client, path).await);
+        assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
+        assert!(refused.message.contains("is not in a Git working tree"));
     }
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fetch_brings_in_new_remote_branches() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    git(&dir.path().join("remote.git"), &["branch", "later", "main"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let unfetched = branches(&client, &clone, false, BTreeMap::new())
-        .await
-        .unwrap();
-    assert!(!unfetched.remote.contains(&"origin/later".to_owned()));
-    let fetched = branches(&client, &clone, true, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(fetched.fetch_error, None);
-    assert!(fetched.remote.contains(&"origin/later".to_owned()));
-    assert_eq!(fetched.local, unfetched.local);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_fetch_is_reported_beside_the_branches_as_they_stand() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let missing = dir.path().join("missing.git");
-    git(
-        &clone,
-        &["config", "remote.origin.url", missing.to_str().unwrap()],
-    );
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let unfetched = branches(&client, &clone, false, BTreeMap::new())
-        .await
-        .unwrap();
-    let fetched = branches(&client, &clone, true, BTreeMap::new())
-        .await
-        .unwrap();
-    let error = fetched.fetch_error.expect("the fetch failed");
-    assert!(error.contains("missing.git"), "{error}");
-    assert_eq!(fetched.local, unfetched.local);
-    assert_eq!(fetched.remote, unfetched.remote);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn requests_for_one_repository_share_its_fetch() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let upload_pack = UploadPack::new(&clone);
-    // Shows when the second request has found the repository it is in,
-    // after which it looks for a fetch running.
-    let found = BlockedGit::after(" rev-parse ");
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let workspace = workspace_id(&client, &clone).await;
-
-    let first = client.branches(&workspace, true, BTreeMap::new());
-    let second = async {
-        upload_pack.blocked().await;
-        let second = client.branches(&workspace, true, found.env());
-        let releasing = async {
-            found.blocked().await;
-            found.release().await;
-            upload_pack.release().await;
-        };
-        let (second, ()) = tokio::join!(second, releasing);
-        second
-    };
-    let (first, second) = timeout(TIMEOUT, async { tokio::join!(first, second) })
-        .await
-        .expect("timed out listing branches");
-    assert_eq!(first.unwrap().fetch_error, None);
-    assert_eq!(second.unwrap().fetch_error, None);
-    assert_eq!(upload_pack.fetches(), 1);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fetch_runs_with_the_clients_environment() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let remote = git(&clone, &["config", "--get", "remote.origin.url"]);
-    let config = dir.path().join("gitconfig");
-    let missing = dir.path().join("missing.git");
-    std::fs::write(
-        &config,
-        format!("[url \"{}\"]\n\tinsteadOf = {remote}\n", missing.display()),
-    )
-    .unwrap();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-
-    let env = BTreeMap::from([(
-        "GIT_CONFIG_GLOBAL".to_owned(),
-        config.to_str().unwrap().to_owned(),
-    )]);
-    let redirected = branches(&client, &clone, true, env).await.unwrap();
-    let error = redirected.fetch_error.expect("the fetch failed");
-    assert!(error.contains("missing.git"), "{error}");
-    let fetched = branches(&client, &clone, true, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(fetched.fetch_error, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1582,7 +762,7 @@ async fn a_git_directory_git_rejects_is_refused_with_gits_reason() {
     assert!(!reason.is_empty());
 
     let refused = refusal(new_session(&client, dir.path(), on_ox_branch()).await);
-    let listing = refusal(branches(&client, dir.path(), false, BTreeMap::new()).await);
+    let listing = refusal(branches(&client, dir.path()).await);
     for refused in [refused, listing] {
         assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
         assert!(
@@ -1621,7 +801,7 @@ async fn a_clean_delete_removes_the_worktree_and_the_branch() {
         git(repo.path(), &["status", "--porcelain", "--ignored"]),
         status
     );
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1666,51 +846,41 @@ async fn a_branch_merged_elsewhere_is_deleted_and_one_with_its_own_commits_is_ke
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_branch_that_existed_before_the_session_is_never_deleted() {
+async fn a_branch_is_kept_until_its_commits_are_pushed() {
     let repo = repo();
-    git(repo.path(), &["branch", "other"]);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let session = new_session(&client, repo.path(), on_existing("other"))
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    let worktree = worktree_of(&client, &session).await;
-    commit_file(&worktree.path, "new");
-    let tip = git(&worktree.path, &["rev-parse", "HEAD"]);
-
-    let deleted = delete(&client, &session.id, false).await.unwrap();
-    assert_eq!(deleted.kept_branch, None);
-    assert_removed(repo.path(), &worktree);
-    assert_eq!(git(repo.path(), &["rev-parse", "other"]), tip);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_tracking_branch_is_kept_until_its_commits_are_pushed() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--quiet", "--bare"]);
+    git(
+        repo.path(),
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
 
     for push in [true, false] {
-        let session = new_session(&client, &clone, on_existing("feature"))
+        let session = new_session(&client, repo.path(), on_ox_branch())
             .await
             .unwrap();
         let session = started(&client, &session).await;
         let worktree = worktree_of(&client, &session).await;
-        assert!(worktree.created_branch);
         commit_file(&worktree.path, if push { "pushed" } else { "unpushed" });
         if push {
-            git(&worktree.path, &["push", "--quiet"]);
+            git(
+                &worktree.path,
+                &["push", "--quiet", "origin", &worktree.branch],
+            );
         }
         let deleted = delete(&client, &session.id, false).await.unwrap();
-        assert_removed(&clone, &worktree);
+        assert_removed(repo.path(), &worktree);
         if push {
             assert_eq!(deleted.kept_branch, None);
-            assert!(!branch_exists(&clone, "feature"));
+            assert!(!branch_exists(repo.path(), &worktree.branch));
         } else {
-            assert_eq!(deleted.kept_branch.as_deref(), Some("feature"));
-            assert!(branch_exists(&clone, "feature"));
+            assert_eq!(
+                deleted.kept_branch.as_deref(),
+                Some(worktree.branch.as_str())
+            );
+            assert!(branch_exists(repo.path(), &worktree.branch));
         }
     }
 }
@@ -1742,7 +912,7 @@ async fn uncommitted_changes_refuse_the_delete_until_it_discards_them() {
     agent.exited().await;
     assert_removed(repo.path(), &worktree);
     assert!(!branch_exists(repo.path(), &worktree.branch));
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1876,7 +1046,7 @@ async fn a_worktree_whose_repository_moved_is_removed_only_with_discard() {
         Some(worktree.branch.as_str())
     );
     assert!(!worktree.path.exists());
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
     assert!(branch_exists(
         &parent.path().join("moved"),
         &worktree.branch
@@ -1954,11 +1124,10 @@ async fn a_branch_another_worktree_has_checked_out_is_kept() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delete_during_startup_waits_for_the_worktree() {
     let repo = repo();
-    git(repo.path(), &["branch", "other"]);
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let blocked = BlockedGit::new(" worktree add ");
-    let session = new_session_with(&client, repo.path(), on_existing("other"), blocked.env())
+    let session = new_session_with(&client, repo.path(), on_ox_branch(), blocked.env())
         .await
         .unwrap();
     let worktree = worktree_of(&client, &session).await;
@@ -1968,82 +1137,8 @@ async fn a_delete_during_startup_waits_for_the_worktree() {
     let (deleted, ()) = tokio::join!(delete(&client, &session.id, false), releasing);
     assert_eq!(deleted.unwrap().kept_branch, None);
     assert_removed(repo.path(), &worktree);
-    assert!(branch_exists(repo.path(), "other"));
-    assert!(client.list().await.unwrap().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn startup_removes_the_worktrees_of_sessions_that_never_started() {
-    let repo = repo();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let missing = vec![
-        daemon
-            .dir
-            .path()
-            .join("missing")
-            .to_str()
-            .unwrap()
-            .to_owned(),
-    ];
-    let mut sessions = Vec::new();
-    for _ in 0..2 {
-        let session = new_session_running(
-            &client,
-            repo.path(),
-            on_ox_branch(),
-            BTreeMap::new(),
-            missing.clone(),
-        )
-        .await
-        .unwrap();
-        exited(&client, &session).await;
-        sessions.push(info(&client, &session.id).await.unwrap());
-    }
-    let clean = worktree_of(&client, &sessions[0]).await;
-    let dirty = worktree_of(&client, &sessions[1]).await;
-    std::fs::write(dirty.path.join("untracked"), "work\n").unwrap();
-    drop(client);
-
-    let daemon = daemon.restart().await;
-    let client = daemon.client().await;
-    until_gone(&client, &sessions[0].id).await;
-    assert_removed(repo.path(), &clean);
-    assert!(!branch_exists(repo.path(), &clean.branch));
-
-    let kept = info(&client, &sessions[1].id).await.unwrap();
-    assert_eq!(kept.state, SessionState::Exited);
-    assert_eq!(worktree_of(&client, &kept).await, dirty);
-    let refused = refusal(client.load_session(&kept.id, BTreeMap::new()).await);
-    assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
-    delete(&client, &kept.id, true).await.unwrap();
-    assert_removed(repo.path(), &dirty);
-    assert!(!branch_exists(repo.path(), &dirty.branch));
-    assert!(client.list().await.unwrap().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn startup_leaves_a_branch_named_like_a_worktree_that_could_not_be_added() {
-    let repo = repo();
-    let daemon = Daemon::start().await;
-    std::fs::create_dir(daemon.worktrees()).unwrap();
-    std::fs::set_permissions(daemon.worktrees(), PermissionsExt::from_mode(0o555)).unwrap();
-    let client = daemon.client().await;
-    let session = new_session(&client, repo.path(), on_new("topic", None))
-        .await
-        .unwrap();
-    exited(&client, &session).await;
-    std::fs::set_permissions(daemon.worktrees(), PermissionsExt::from_mode(0o755)).unwrap();
-    assert!(!branch_exists(repo.path(), "topic"));
-    // A branch of the same name, made after the session's was undone, is
-    // not the session's to delete.
-    git(repo.path(), &["branch", "topic"]);
-    drop(client);
-
-    let daemon = daemon.restart().await;
-    let client = daemon.client().await;
-    assert!(client.list().await.unwrap().is_empty());
-    assert!(branch_exists(repo.path(), "topic"));
+    assert!(!branch_exists(repo.path(), &worktree.branch));
+    assert!(sessions(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2103,76 +1198,7 @@ async fn a_worktree_whose_registration_was_removed_is_removed_only_with_discard(
 
     delete(&client, &session.id, true).await.unwrap();
     assert!(!worktree.path.exists());
-    assert!(client.list().await.unwrap().is_empty());
-}
-
-/// Makes a worktree session of an agent that cannot start, in the repository
-/// at `path`, and returns it once it has exited, with its worktree in place.
-async fn unstarted(daemon: &Daemon, client: &Client, path: &Path) -> SessionInfo {
-    let missing = daemon.dir.path().join("missing");
-    let session = new_session_running(
-        client,
-        path,
-        on_ox_branch(),
-        BTreeMap::new(),
-        vec![missing.to_str().unwrap().to_owned()],
-    )
-    .await
-    .unwrap();
-    exited(client, &session).await;
-    info(client, &session.id).await.unwrap()
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn startup_cleanup_runs_after_ready_and_holds_the_session() {
-    let repo = repo();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let session = unstarted(&daemon, &client, repo.path()).await;
-    let worktree = worktree_of(&client, &session).await;
-    drop(client);
-
-    let blocked = BlockedGit::new(" worktree remove ");
-    // `restart_with` returns once oxd reports `ready`.
-    let daemon = daemon.restart_with(blocked.env()).await;
-    blocked.blocked().await;
-    let client = daemon.client().await;
-    let listed = info(&client, &session.id).await.unwrap();
-    assert_eq!(listed.state, SessionState::Exited);
-
-    let loading = client.load_session(&session.id, BTreeMap::new());
-    let releasing = async { blocked.release().await };
-    let (loaded, ()) = tokio::join!(loading, releasing);
-    assert_eq!(refusal(loaded).code, code::NOT_FOUND);
-    until_gone(&client, &session.id).await;
-    assert_removed(repo.path(), &worktree);
-    assert!(!branch_exists(repo.path(), &worktree.branch));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn the_daemon_stays_up_until_startup_cleanup_ends() {
-    let repo = repo();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    unstarted(&daemon, &client, repo.path()).await;
-    drop(client);
-
-    let blocked = BlockedGit::new(" worktree remove ");
-    let mut daemon = daemon.restart_with(blocked.env()).await;
-    blocked.blocked().await;
-    // Two idle periods pass with no client while cleanup is held.
-    let waited = timeout(Duration::from_secs(2), daemon.child.wait()).await;
-    assert!(waited.is_err(), "oxd exited during cleanup: {waited:?}");
-    blocked.release().await;
-    let status = timeout(TIMEOUT, daemon.child.wait())
-        .await
-        .expect("oxd did not exit once idle")
-        .unwrap();
-    assert!(status.success());
-}
-
-fn text(prompt: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(prompt))]
+    assert!(sessions(&client).await.is_empty());
 }
 
 async fn archive(client: &Client, session_id: &str, discard: bool) -> Result<SessionInfo, Error> {
@@ -2199,18 +1225,7 @@ async fn events_until(
     last: impl Fn(&EventKind) -> bool,
 ) -> Vec<ox_protocol::Event> {
     let mut events = client.subscribe(session_id, seq).await.unwrap();
-    let mut seen = Vec::new();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("timed out waiting for an event")
-            .unwrap();
-        let done = last(&event.kind);
-        seen.push(event);
-        if done {
-            return seen;
-        }
-    }
+    until(&mut events, last).await
 }
 
 /// A session of the fake agent in a new worktree that has had one turn, with
@@ -2224,18 +1239,7 @@ async fn session_with_a_turn(
     let session = started(client, &session).await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     client.prompt(&session.id, text("say 1 0")).await.unwrap();
-    let mut seen = Vec::new();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("the agent did not answer")
-            .unwrap();
-        let done = matches!(event.kind, EventKind::TurnEnded { .. });
-        seen.push(event);
-        if done {
-            break;
-        }
-    }
+    let seen = until(&mut events, turn_ended).await;
     let worktree = worktree_of(client, &session).await;
     git(&worktree.path, &["add", "."]);
     git(&worktree.path, &["commit", "--quiet", "-m", "transcript"]);
@@ -2308,16 +1312,11 @@ async fn archiving_removes_the_worktree_and_keeps_the_branch_and_the_conversatio
     let next = resumed[0].seq;
     let mut events = client.subscribe(&session.id, next).await.unwrap();
     client.prompt(&session.id, text("say 1 0")).await.unwrap();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("the agent did not answer")
-            .unwrap();
-        if let EventKind::TurnEnded { error, .. } = event.kind {
-            assert_eq!(error, None);
-            break;
-        }
-    }
+    let ended = until(&mut events, turn_ended).await.pop().unwrap();
+    assert!(
+        matches!(ended.kind, EventKind::TurnEnded { error: None, .. }),
+        "{ended:?}"
+    );
 
     let refused = refusal(unarchive(&client, &session.id).await);
     assert_eq!(refused.code, code::INVALID_STATE);
@@ -2362,16 +1361,11 @@ async fn archiving_a_running_session_ends_its_turn() {
     until_state(&client, &session.id, SessionState::Running).await;
 
     archive(&client, &session.id, true).await.unwrap();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("the turn did not end")
-            .unwrap();
-        if let EventKind::TurnEnded { error, .. } = event.kind {
-            assert_eq!(error.as_deref(), Some("the agent was stopped"));
-            break;
-        }
-    }
+    let ended = until(&mut events, turn_ended).await.pop().unwrap();
+    let EventKind::TurnEnded { error, .. } = ended.kind else {
+        unreachable!("`until` stops at the turn's end");
+    };
+    assert_eq!(error.as_deref(), Some("the agent was stopped"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2452,25 +1446,24 @@ async fn deleting_an_archived_session_removes_it_and_applies_the_branch_rule() {
 /// `reference`.
 fn compared_with(reference: &str) -> Checkout {
     Checkout::Worktree {
-        branch: None,
         compare: Some(reference.into()),
     }
 }
 
-/// Moves `branch` of the workspace for `path` from `expected` to `to`, with
-/// git run with the daemon's environment.
+/// Moves `branch` of the workspace for `path` from `expected` to `to`, from
+/// a source branch at `to`, with git run with the daemon's environment.
 async fn move_branch(
     client: &Client,
     path: &Path,
     branch: &str,
     to: &str,
     expected: &str,
-    force: bool,
 ) -> Result<(), Error> {
+    git(path, &["branch", "--force", "source", to]);
     let workspace = workspace_id(client, path).await;
     timeout(
         TIMEOUT,
-        client.move_branch(&workspace, branch, to, expected, force, BTreeMap::new()),
+        client.fast_forward_branch(&workspace, branch, expected, "source", to, BTreeMap::new()),
     )
     .await
     .expect("timed out moving the branch")
@@ -2561,24 +1554,19 @@ async fn a_branch_no_checkout_has_moves_only_from_where_it_is_expected() {
     commit_file(repo.path(), "second");
     let second = commit_of(repo.path(), "HEAD");
 
-    let refused = refusal(move_branch(&client, repo.path(), "topic", "main", &second, false).await);
+    let refused = refusal(move_branch(&client, repo.path(), "topic", "main", &second).await);
     assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "topic"), first);
 
-    move_branch(&client, repo.path(), "topic", "main", &first, false)
+    move_branch(&client, repo.path(), "topic", "main", &first)
         .await
         .unwrap();
     assert_eq!(commit_of(repo.path(), "topic"), second);
 
     let side = commit_beside(repo.path(), &first, "side");
-    let refused = refusal(move_branch(&client, repo.path(), "topic", &side, &second, false).await);
+    let refused = refusal(move_branch(&client, repo.path(), "topic", &side, &second).await);
     assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "topic"), second);
-
-    move_branch(&client, repo.path(), "topic", &side, &second, true)
-        .await
-        .unwrap();
-    assert_eq!(commit_of(repo.path(), "topic"), side);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2589,7 +1577,7 @@ async fn moving_a_checked_out_branch_moves_its_checkout() {
     let first = commit_of(repo.path(), "HEAD");
     let topic = commit_beside(repo.path(), &first, "added");
 
-    move_branch(&client, repo.path(), "main", &topic, &first, false)
+    move_branch(&client, repo.path(), "main", &topic, &first)
         .await
         .unwrap();
     assert_eq!(commit_of(repo.path(), "HEAD"), topic);
@@ -2609,7 +1597,7 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
     let topic = commit_beside(repo.path(), &first, "added");
 
     std::fs::write(repo.path().join("README"), "changed\n").unwrap();
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first, false).await);
+    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
     assert_eq!(refused.code, code::UNSAVED_WORK, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
     assert_eq!(
@@ -2621,7 +1609,7 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
     // An untracked file where the move adds one fails it in git, and the
     // branch goes back.
     std::fs::write(repo.path().join("added"), "mine\n").unwrap();
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first, false).await);
+    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
     assert_eq!(refused.code, code::GIT, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
     assert_eq!(
@@ -2633,7 +1621,7 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
 
     // An untracked file the move leaves alone does not stop it.
     std::fs::write(repo.path().join("notes"), "notes\n").unwrap();
-    move_branch(&client, repo.path(), "main", &topic, &first, false)
+    move_branch(&client, repo.path(), "main", &topic, &first)
         .await
         .unwrap();
     assert_eq!(commit_of(repo.path(), "HEAD"), topic);
@@ -2656,49 +1644,17 @@ async fn a_move_waits_for_an_agent_in_the_checkout_to_end_its_turn() {
     client.prompt(&session.id, text("wait")).await.unwrap();
     until_state(&client, &session.id, SessionState::Running).await;
 
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first, false).await);
+    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
     assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
     assert!(refused.message.contains(&session.id), "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
 
     client.cancel(&session.id).await.unwrap();
-    loop {
-        let event = timeout(TIMEOUT, events.next())
-            .await
-            .expect("the turn did not end")
-            .unwrap();
-        if matches!(event.kind, EventKind::TurnEnded { .. }) {
-            break;
-        }
-    }
-    move_branch(&client, repo.path(), "main", &topic, &first, false)
+    until(&mut events, turn_ended).await;
+    move_branch(&client, repo.path(), "main", &topic, &first)
         .await
         .unwrap();
     assert_eq!(commit_of(repo.path(), "HEAD"), topic);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_forced_move_of_a_sessions_branch_moves_its_worktree() {
-    let repo = repo();
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let first = commit_of(repo.path(), "HEAD");
-    let other = commit_beside(repo.path(), &first, "other");
-    let session = new_session(&client, repo.path(), on_ox_branch())
-        .await
-        .unwrap();
-    let session = started(&client, &session).await;
-    let worktree = worktree_of(&client, &session).await;
-    commit_file(&worktree.path, "mine");
-    let mine = commit_of(&worktree.path, "HEAD");
-
-    move_branch(&client, repo.path(), &worktree.branch, &other, &mine, true)
-        .await
-        .unwrap();
-    assert_eq!(commit_of(&worktree.path, "HEAD"), other);
-    assert!(worktree.path.join("other").exists());
-    assert!(!worktree.path.join("mine").exists());
-    assert_eq!(git(&worktree.path, &["status", "--porcelain"]), "");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2710,7 +1666,7 @@ async fn a_new_session_publishes_its_comparison() {
 
     let refused = refusal(new_session(&client, repo.path(), compared_with("nothing")).await);
     assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
     assert_eq!(
         git(repo.path(), &["branch", "--format=%(refname:short)"]),
         "main"
@@ -2764,41 +1720,9 @@ async fn a_move_compares_the_repositorys_sessions_again() {
         .unwrap();
     until_compared(&client, &session, counts(0, 0)).await;
 
-    move_branch(&client, repo.path(), "main", &topic, &first, false)
+    move_branch(&client, repo.path(), "main", &topic, &first)
         .await
         .unwrap();
-    until_compared(&client, &session, counts(0, 1)).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_fetch_compares_the_repositorys_sessions_again() {
-    let dir = clone_with_remote();
-    let clone = clone_of(&dir);
-    let daemon = Daemon::start().await;
-    let client = daemon.client().await;
-    let session = new_session(&client, &clone, compared_with("origin/main"))
-        .await
-        .unwrap();
-    until_compared(&client, &session, counts(0, 0)).await;
-
-    let pusher = dir.path().join("pusher");
-    git(
-        dir.path(),
-        &[
-            "clone",
-            "--quiet",
-            dir.path().join("remote.git").to_str().unwrap(),
-            pusher.to_str().unwrap(),
-        ],
-    );
-    identify(&pusher);
-    commit_file(&pusher, "pushed");
-    git(&pusher, &["push", "--quiet", "origin", "main"]);
-
-    let listed = branches(&client, &clone, true, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(listed.fetch_error, None);
     until_compared(&client, &session, counts(0, 1)).await;
 }
 
@@ -2832,11 +1756,10 @@ async fn a_delete_compares_the_repositorys_sessions_again() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_comparison_is_refreshed_set_and_cleared_on_request() {
+async fn a_comparison_is_refreshed_on_request() {
     let repo = repo();
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
-    let first = commit_of(repo.path(), "HEAD");
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
@@ -2849,34 +1772,6 @@ async fn a_comparison_is_refreshed_set_and_cleared_on_request() {
         "{:?}",
         refreshed.comparison
     );
-
-    let set = client
-        .set_compare(&worktree_id, Some(first.clone()))
-        .await
-        .unwrap();
-    assert_eq!(set.compare.as_deref(), Some(first.as_str()));
-    assert!(
-        set.comparison.as_ref().is_some_and(counts(0, 0)),
-        "{:?}",
-        set.comparison
-    );
-    let refused = refusal(
-        client
-            .set_compare(&worktree_id, Some("nothing".into()))
-            .await,
-    );
-    assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
-    assert_eq!(
-        worktree_of(&client, &session).await.compare.as_deref(),
-        Some(first.as_str())
-    );
-
-    let cleared = client.set_compare(&worktree_id, None).await.unwrap();
-    assert_eq!(cleared.compare, None);
-    assert_eq!(cleared.comparison, None);
-
-    let refused = refusal(client.set_compare("nothing", Some("main".into())).await);
-    assert_eq!(refused.code, code::NOT_FOUND, "{refused:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

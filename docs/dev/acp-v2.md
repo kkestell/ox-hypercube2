@@ -28,10 +28,10 @@ relays the update or acts on it as the protocol requires.
 | `providers/list` (unstable) | ❌ | ❌ | ❌ | |
 | `providers/set` (unstable) | ❌ | ❌ | ❌ | |
 | `providers/disable` (unstable) | ❌ | ❌ | ❌ | |
-| `session/new` | ✅ | ✅ | ✅ | Both bridges start their harness asynchronously; a successful response does not guarantee the harness has started. See `session.mcp.stdio` for MCP support. |
-| `session/list` | ❌ | ✅ | ❌ | Claude includes native transcripts. Ox uses its own session list. |
-| `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. Pi also rejects a changed `cwd` or MCP servers. See [Resume and replay](#resume-and-replay). |
-| `session/close` | ❌ | ✅ | ✅ | Both bridges leave the session resumable. Ox deletes sessions by stopping the agent process. |
+| `session/new` | ✅ | ✅ | ✅ | Both bridges start their harness asynchronously; a successful response does not guarantee the harness has started. A bridge process serves one session and refuses a second `session/new` or `session/resume`. See `session.mcp.stdio` for MCP support. |
+| `session/list` | ❌ | ❌ | ❌ | |
+| `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. Pi rejects MCP servers. See [Resume and replay](#resume-and-replay). |
+| `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |
 | `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude waits to accept the next prompt; Pi queues it as a follow-up. |
 | `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Pi model choices carry a provider display label in `_meta["ox/provider"]`. Ox supports select and boolean options. |
 | `session/delete` | ❌ | ❌ | ❌ | |
@@ -60,7 +60,7 @@ relays the update or acts on it as the protocol requires.
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
 | `session/request_permission` | ✅ | ✅ | ❌ | Pi runs tools without asking. Claude's AskUserQuestion uses `elicitation/create` instead. |
-| `elicitation/create` | ✅ | ✅ | ✅ | Claude: AskUserQuestion forms. Pi: extension dialogs. Ox supports session-scoped forms only; URL mode and request scope are unsupported. Schema `pattern` and `format` are not validated; unknown required field types and fields combining `enum` with `oneOf` are rejected. |
+| `elicitation/create` | ✅ | ✅ | ✅ | Claude: AskUserQuestion forms. Pi: extension dialogs. Ox supports session-scoped forms only; URL mode and request scope are unsupported. Forms show string choices (`oneOf`), text fields and multiple choices (`anyOf`); oxd rejects forms with other field kinds, except optional fields of unknown type, which are left out. The client constrains answers to the form. |
 | `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
 | Extension requests (`_`-prefixed) | ❌ | ❌ | ❌ | |
 
@@ -168,10 +168,17 @@ completion. It does not display tool diffs, terminals, or other update types;
 | Capability | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
 | `auth.terminal` | ❌ | ❌ | ❌ | |
-| `elicitation.form` | ✅ | ✅ | ✅ | Without this capability, Claude asks questions in plain text; Pi cancels extension dialogs. |
+| `elicitation.form` | ✅ | ✅ | ✅ | Both bridges ask Claude's questions and Pi's extension dialogs as forms. |
 | `elicitation.url` | ❌ | ❌ | ❌ | |
 
 ## Resume and replay
+
+Each bridge's ACP session ID is its harness's session ID, and the harness
+keeps the conversation: `claude --resume` continues Claude's transcript, and
+`pi --session-id` opens Pi's session. The bridges keep no state between
+processes. `oxd` sends the session's working directory and MCP servers on
+`session/resume` as on `session/new`, then sets each select option whose
+saved value differs from what the agent reports.
 
 `oxd` requests `replayFrom: start` on `session/resume` only when its saved
 history lacks an `agent_started` event. The agent sends any requested replay,

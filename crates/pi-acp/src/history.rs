@@ -86,3 +86,12 @@ pub fn replay(path: &Path, cwd: &Path, updates: &Updates) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Whether the Pi session file at `path` has a prompt.
+pub fn has_prompts(path: &Path) -> bool {
+    fs::read_to_string(path).is_ok_and(|text| {
+        text.lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|entry| entry["type"] == "message" && entry["message"]["role"] == "user")
+    })
+}

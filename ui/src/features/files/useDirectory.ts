@@ -23,7 +23,7 @@ export function useDirectory(path: string, connection: number): DirEntry[] {
     invoke("watch_directory", { path, channel });
     return () => {
       current = false;
-      invoke("unwatch_directory", { channelId: channel.id });
+      invoke("unwatch", { channelId: channel.id });
     };
   }, [path, connection]);
 

@@ -5,11 +5,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use acp_bridge::notify;
 use agent_client_protocol::Client;
 use agent_client_protocol::v2::ConnectionTo;
 use agent_client_protocol::v2::schema::{
     self as acp, ContentBlock, ContentChunk, SessionUpdate, StateUpdate, StopReason, TextContent,
-    ToolCallContent, ToolCallStatus, UpdateSessionNotification,
+    ToolCallContent, ToolCallStatus,
 };
 use serde_json::Value;
 
@@ -38,26 +39,20 @@ enum Sent {
 pub struct Updates {
     connection: ConnectionTo<Client>,
     session_id: String,
-    forms: bool,
     state: Arc<Mutex<State>>,
 }
 
 impl Updates {
-    pub fn new(connection: ConnectionTo<Client>, session_id: &str, forms: bool) -> Self {
+    pub fn new(connection: ConnectionTo<Client>, session_id: &str) -> Self {
         Self {
             connection,
             session_id: session_id.to_owned(),
-            forms,
             state: Arc::new(Mutex::new(State::default())),
         }
     }
 
     fn send(&self, update: SessionUpdate) {
         notify(&self.connection, &self.session_id, update);
-    }
-
-    pub fn forms(&self) -> bool {
-        self.forms
     }
 
     pub fn snapshot(&self) -> StateUpdate {
@@ -249,12 +244,4 @@ fn state_update(state: Sent, stop_reason: Option<StopReason>) -> StateUpdate {
 /// The state of a session that is idle with nothing running.
 pub fn idle_state() -> StateUpdate {
     state_update(Sent::Idle, None)
-}
-
-pub fn notify(connection: &ConnectionTo<Client>, id: &str, update: SessionUpdate) {
-    if let Err(error) =
-        connection.send_notification(UpdateSessionNotification::new(id.to_owned(), update))
-    {
-        eprintln!("failed to send session update: {error}");
-    }
 }

@@ -104,14 +104,18 @@ impl Drop for Viewer {
 }
 
 impl Session {
-    fn new(
+    /// The session `saved` in `state`, in `worktree` if it runs in one: a
+    /// session just saved is `starting`, and `start` launches its agent; a
+    /// restored one is `exited`, and its stored history is read by
+    /// `history`.
+    pub fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
+        park_after: Duration,
         ox_server: Arc<OxServer>,
         saved: SavedSession,
         worktree: Option<Arc<Worktree>>,
         state: State,
-        park_after: Duration,
     ) -> Arc<Self> {
         let session = Arc::new(Self {
             last_seq: watch::Sender::new(state.last_seq()),
@@ -170,22 +174,6 @@ impl Session {
         }
     }
 
-    /// A session just saved, `starting`, in `worktree` if it runs in one.
-    /// `start` launches its agent.
-    pub fn create(
-        store: Arc<Store>,
-        changed: watch::Sender<()>,
-        park_after: Duration,
-        ox_server: Arc<OxServer>,
-        saved: SavedSession,
-        worktree: Option<Arc<Worktree>>,
-    ) -> Arc<Self> {
-        let state = State::new(saved.id.clone());
-        Self::new(
-            store, changed, ox_server, saved, worktree, state, park_after,
-        )
-    }
-
     /// Launches the agent of a session that is still `starting`. The session
     /// records `AgentStarted` once the ACP session is open, or `AgentExited`
     /// if it cannot be opened. A session closed before it started stays
@@ -206,31 +194,6 @@ impl Session {
             *self.worktree.lock().unwrap() = None;
             state.record(Change::Exited(Some(message)));
         });
-    }
-
-    /// A saved session whose agent is not running: it is `exited`, and its
-    /// stored history is read by `history`. A session whose agent never started has
-    /// nothing to load.
-    pub fn restore(
-        store: Arc<Store>,
-        changed: watch::Sender<()>,
-        park_after: Duration,
-        ox_server: Arc<OxServer>,
-        saved: SavedSession,
-        worktree: Option<Arc<Worktree>>,
-    ) -> Arc<Self> {
-        let state = match saved.agent_session_id.clone() {
-            Some(agent_session_id) => State::restored(
-                saved.id.clone(),
-                saved.title.clone(),
-                agent_session_id,
-                saved.last_seq,
-            ),
-            None => State::unstarted(saved.id.clone(), saved.title.clone()),
-        };
-        Self::new(
-            store, changed, ox_server, saved, worktree, state, park_after,
-        )
     }
 
     /// Starts the agent task in `task`, which opens or resumes an ACP session.
@@ -750,24 +713,35 @@ impl Session {
                             let _ = opened.send(result);
                         }
                     };
+                    let mut saved_options = Vec::new();
                     match resume {
-                        Some(Resume { session_id, replay }) => connection
-                            .prepare_request(
-                                ResumeSessionRequest::new(session_id.clone(), session.cwd.clone())
+                        Some(Resume {
+                            session_id,
+                            replay,
+                            options,
+                        }) => {
+                            saved_options = options;
+                            connection
+                                .prepare_request(
+                                    ResumeSessionRequest::new(
+                                        session_id.clone(),
+                                        session.cwd.clone(),
+                                    )
                                     .replay_from(
                                         replay.then(|| ReplayFrom::Start(ReplayFromStart::new())),
                                     )
                                     .mcp_servers(mcp_servers),
-                            )
-                            .on_receiving_result(async move |result| {
-                                start(result.map(|resumed| state::Agent {
-                                    session_id,
-                                    prompt_capabilities,
-                                    config_options: resumed.config_options,
-                                    available_commands: resumed.available_commands,
-                                }));
-                                Ok(())
-                            })?,
+                                )
+                                .on_receiving_result(async move |result| {
+                                    start(result.map(|resumed| state::Agent {
+                                        session_id,
+                                        prompt_capabilities,
+                                        config_options: resumed.config_options,
+                                        available_commands: resumed.available_commands,
+                                    }));
+                                    Ok(())
+                                })?;
+                        }
                         None => connection
                             .prepare_request(
                                 NewSessionRequest::new(session.cwd.clone())
@@ -787,6 +761,35 @@ impl Session {
                         agent_client_protocol::Error::internal_error()
                             .data("the agent closed the connection before the session opened")
                     })??;
+                    // A resumed agent reports its own option values, and is
+                    // set to the session's where they differ.
+                    let reported = state::option_values(&session.info().config_options);
+                    for (config_id, value) in saved_options {
+                        if !reported
+                            .iter()
+                            .any(|(id, current)| *id == config_id && *current != value)
+                        {
+                            continue;
+                        }
+                        let session = session.clone();
+                        connection
+                            .send_request(SetSessionConfigOptionRequest::new(
+                                acp_session.clone(),
+                                config_id,
+                                value,
+                            ))
+                            .on_receiving_result(async move |result| {
+                                match result {
+                                    Ok(response) => session
+                                        .record(Change::ConfigOptionsSet(response.config_options)),
+                                    Err(error) => eprintln!(
+                                        "oxd: restoring a config option of session {}: {error}",
+                                        session.id
+                                    ),
+                                }
+                                Ok(())
+                            })?;
+                    }
                     loop {
                         let command = tokio::select! {
                             () = connection.incoming_closed() => break,

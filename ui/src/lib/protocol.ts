@@ -176,23 +176,12 @@ export type Field = {
   title?: string;
   description?: string;
 } & (
-  | {
-      type: "string";
-      minLength?: number;
-      maxLength?: number;
-      pattern?: string;
-      format?: string;
-      default?: string;
-      enum?: string[];
-      oneOf?: EnumOption[];
-    }
-  | { type: "number" | "integer"; minimum?: number; maximum?: number; default?: number }
-  | { type: "boolean"; default?: boolean }
+  | { type: "string"; default?: string; oneOf?: EnumOption[] }
   | {
       type: "array";
       minItems?: number;
       maxItems?: number;
-      items: { enum?: string[]; anyOf?: EnumOption[] };
+      items: { anyOf?: EnumOption[] };
       default?: string[];
     }
 );

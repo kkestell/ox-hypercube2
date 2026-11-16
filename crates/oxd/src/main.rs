@@ -173,13 +173,6 @@ async fn run(args: Args) -> io::Result<()> {
 
     report_ready();
     startup.unlock()?;
-    // Clients connect while the worktrees of sessions that never started are
-    // removed. Shutting down does not wait for it.
-    tokio::spawn({
-        let daemon = daemon.clone();
-        async move { daemon.clean_up().await }
-    });
-
     // SAFETY: `geteuid` has no preconditions.
     let uid = unsafe { libc::geteuid() };
     let idle = daemon.idle(args.idle_exit);

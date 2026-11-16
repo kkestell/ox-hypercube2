@@ -208,13 +208,19 @@ describe("The file viewer", () => {
     await browser.saveScreenshot("/tmp/ox-file-viewer.png");
     // Observe real IPC cleanup without replacing the commands themselves.
     await browser.execute(() => {
-      const observed = { count: 0, fetch: window.fetch };
+      const observed = { files: [] as number[], unwatched: [] as number[], fetch: window.fetch };
       (window as unknown as { fileUnwatch: typeof observed }).fileUnwatch = observed;
       window.fetch = (input, options) => {
-        if (decodeURIComponent(String(input)).includes("unwatch_file")) observed.count++;
+        const url = decodeURIComponent(String(input));
+        const body = typeof options?.body === "string" ? options.body : "";
+        if (url.endsWith("/watch_file")) {
+          observed.files.push(Number(/__CHANNEL__:(\d+)/.exec(body)?.[1]));
+        }
+        if (url.endsWith("/unwatch")) observed.unwatched.push(JSON.parse(body).channelId);
         return observed.fetch.call(window, input, options);
       };
     });
+    type Observed = { fileUnwatch: { files: number[]; unwatched: number[] } };
     try {
       await $('button[aria-label="Close file"]').click();
       await expect($(".file-pane")).not.toBeExisting();
@@ -223,15 +229,14 @@ describe("The file viewer", () => {
       await expect($(".file-body pre")).toHaveText("closed edit");
       expect(await ratio()).toBeCloseTo(savedRatio, 2);
       await browser.waitUntil(async () =>
-        browser.execute(
-          () => (window as unknown as { fileUnwatch: { count: number } }).fileUnwatch.count === 1,
-        ),
+        browser.execute(() => (window as unknown as Observed).fileUnwatch.unwatched.length === 1),
       );
       await deleteSessions(cwd);
       await browser.waitUntil(async () =>
-        browser.execute(
-          () => (window as unknown as { fileUnwatch: { count: number } }).fileUnwatch.count === 2,
-        ),
+        browser.execute(() => {
+          const { files, unwatched } = (window as unknown as Observed).fileUnwatch;
+          return files.length === 1 && files.every((id) => unwatched.includes(id));
+        }),
       );
       await expect($(".file-pane")).not.toBeExisting();
     } finally {

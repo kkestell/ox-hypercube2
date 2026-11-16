@@ -8,9 +8,6 @@ import { binary, binDir, built, harnesses, resetDaemon } from "./helpers.ts";
 // starts inherit both.
 process.env.OX_E2E_DIR ??= mkdtempSync(join(tmpdir(), "ox-e2e-"));
 process.env.OX_SOCKET = join(process.env.OX_E2E_DIR, "oxd.sock");
-// The sessions the app starts run the Claude bridge, which keeps its store
-// in the run's directory.
-process.env.CLAUDE_ACP_STORE_DIR = process.env.OX_E2E_DIR;
 // oxd reads workflow definitions from `config/ox/workflows` in the run's
 // directory.
 process.env.XDG_CONFIG_HOME = join(process.env.OX_E2E_DIR, "config");

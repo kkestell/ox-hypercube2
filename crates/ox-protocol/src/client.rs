@@ -203,12 +203,29 @@ impl Drop for Unsubscribe {
     }
 }
 
+/// A stream's messages: a watch's changes to the daemon's workspaces and
+/// sessions, a directory watch's entries, or a file watch's contents. The
+/// first message is the state when the stream started; each later one
+/// differs from the one before it. Dropping it unsubscribes.
+#[derive(Debug)]
+pub struct Stream<T> {
+    messages: mpsc::UnboundedReceiver<T>,
+    _unsubscribe: Unsubscribe,
+}
+
+impl<T> Stream<T> {
+    /// The next message, in order. A stream ends only with
+    /// [`End::Disconnected`].
+    pub async fn next(&mut self) -> Result<T, End> {
+        self.messages.recv().await.ok_or(End::Disconnected)
+    }
+}
+
 /// Events of one session, in `seq` order. Dropping it unsubscribes.
 #[derive(Debug)]
 pub struct Subscription {
-    events: mpsc::UnboundedReceiver<Event>,
+    events: Stream<Event>,
     session_closed: bool,
-    _unsubscribe: Unsubscribe,
 }
 
 /// Why a stream has no more messages.
@@ -225,7 +242,7 @@ impl Subscription {
         if self.session_closed {
             return Err(End::SessionClosed);
         }
-        let event = self.events.recv().await.ok_or(End::Disconnected)?;
+        let event = self.events.next().await?;
         self.session_closed = matches!(event.kind, EventKind::SessionClosed);
         Ok(event)
     }
@@ -235,59 +252,12 @@ impl Subscription {
     pub async fn next_batch(&mut self) -> Result<Vec<Event>, End> {
         let mut batch = vec![self.next().await?];
         while !self.session_closed
-            && let Ok(event) = self.events.try_recv()
+            && let Ok(event) = self.events.messages.try_recv()
         {
             self.session_closed = matches!(event.kind, EventKind::SessionClosed);
             batch.push(event);
         }
         Ok(batch)
-    }
-}
-
-/// The changes to the daemon's workspaces and sessions. Dropping it
-/// unsubscribes.
-#[derive(Debug)]
-pub struct Watch {
-    changes: mpsc::UnboundedReceiver<Vec<ListingChange>>,
-    _unsubscribe: Unsubscribe,
-}
-
-impl Watch {
-    /// The next changes, in order. The first lists every workspace and
-    /// session when the watch started. A watch ends only with
-    /// [`End::Disconnected`].
-    pub async fn next(&mut self) -> Result<Vec<ListingChange>, End> {
-        self.changes.recv().await.ok_or(End::Disconnected)
-    }
-}
-
-/// A directory's entries, each time they change. Dropping it unsubscribes.
-#[derive(Debug)]
-pub struct DirectoryWatch {
-    entries: mpsc::UnboundedReceiver<Vec<DirEntry>>,
-    _unsubscribe: Unsubscribe,
-}
-
-impl DirectoryWatch {
-    /// The next entries, which differ from the ones before them. The first
-    /// are the entries when the watch started. A directory watch ends only
-    /// with [`End::Disconnected`].
-    pub async fn next(&mut self) -> Result<Vec<DirEntry>, End> {
-        self.entries.recv().await.ok_or(End::Disconnected)
-    }
-}
-
-/// A file’s contents, each time they change. Dropping it unsubscribes.
-#[derive(Debug)]
-pub struct FileWatch {
-    content: mpsc::UnboundedReceiver<FileContent>,
-    _unsubscribe: Unsubscribe,
-}
-
-impl FileWatch {
-    /// Waits for the initial snapshot or a changed snapshot.
-    pub async fn next(&mut self) -> Result<FileContent, End> {
-        self.content.recv().await.ok_or(End::Disconnected)
     }
 }
 
@@ -344,10 +314,6 @@ impl Client {
         self.connection.routes.lock().unwrap().closed
     }
 
-    pub async fn list(&self) -> Result<Vec<SessionInfo>, Error> {
-        self.call(Method::SessionList).await
-    }
-
     pub async fn add_workspace(&self, path: PathBuf) -> Result<WorkspaceInfo, Error> {
         self.call(Method::WorkspaceAdd { path }).await
     }
@@ -359,21 +325,15 @@ impl Client {
         .await
     }
 
-    pub async fn list_workspaces(&self) -> Result<Vec<WorkspaceInfo>, Error> {
-        self.call(Method::WorkspaceList).await
-    }
-
-    /// The workspace's branches, after fetching its remotes when `fetch` is
-    /// set. Git runs with `env` over the daemon's environment.
+    /// The workspace's branches. Git runs with `env` over the daemon's
+    /// environment.
     pub async fn branches(
         &self,
         workspace_id: &str,
-        fetch: bool,
         env: BTreeMap<String, String>,
     ) -> Result<Branches, Error> {
         self.call(Method::WorkspaceBranches {
             workspace_id: workspace_id.into(),
-            fetch,
             env,
         })
         .await
@@ -440,71 +400,38 @@ impl Client {
     /// Subscribes to a session's events with `seq > after_seq`, followed by
     /// live events.
     pub async fn subscribe(&self, session_id: &str, after_seq: u64) -> Result<Subscription, Error> {
-        let id = self.connection.next_id();
-        let (sender, events) = mpsc::unbounded_channel();
-        let subscription = Subscription {
+        let events = self
+            .open(
+                Method::SessionSubscribe {
+                    session_id: session_id.into(),
+                    after_seq,
+                },
+                Route::Events,
+            )
+            .await?;
+        Ok(Subscription {
             events,
             session_closed: false,
-            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Events(sender)),
-        };
-        self.send::<Value>(
-            id,
-            Method::SessionSubscribe {
-                session_id: session_id.into(),
-                after_seq,
-            },
-        )
-        .await?;
-        Ok(subscription)
+        })
     }
 
     /// Watches the changes to the daemon's workspaces and sessions.
-    pub async fn watch(&self) -> Result<Watch, Error> {
-        let id = self.connection.next_id();
-        let (sender, changes) = mpsc::unbounded_channel();
-        let watch = Watch {
-            changes,
-            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Changes(sender)),
-        };
-        self.send::<Value>(id, Method::Watch).await?;
-        Ok(watch)
+    pub async fn watch(&self) -> Result<Stream<Vec<ListingChange>>, Error> {
+        self.open(Method::Watch, Route::Changes).await
     }
 
     /// Watches the entries of the directory at `path`, which must be
     /// absolute.
-    pub async fn watch_directory(&self, path: &Path) -> Result<DirectoryWatch, Error> {
-        let id = self.connection.next_id();
-        let (sender, entries) = mpsc::unbounded_channel();
-        let watch = DirectoryWatch {
-            entries,
-            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::Entries(sender)),
-        };
-        self.send::<Value>(
-            id,
-            Method::DirectoryWatch {
-                path: path.to_owned(),
-            },
-        )
-        .await?;
-        Ok(watch)
+    pub async fn watch_directory(&self, path: &Path) -> Result<Stream<Vec<DirEntry>>, Error> {
+        let path = path.to_owned();
+        self.open(Method::DirectoryWatch { path }, Route::Entries)
+            .await
     }
 
     /// Follows the contents of an absolute file path.
-    pub async fn watch_file(&self, path: &Path) -> Result<FileWatch, Error> {
-        let id = self.connection.next_id();
-        let (sender, content) = mpsc::unbounded_channel();
-        let watch = FileWatch {
-            content,
-            _unsubscribe: Unsubscribe::route(&self.connection, id, Route::File(sender)),
-        };
-        self.send::<Value>(
-            id,
-            Method::FileWatch {
-                path: path.to_owned(),
-            },
-        )
-        .await?;
-        Ok(watch)
+    pub async fn watch_file(&self, path: &Path) -> Result<Stream<FileContent>, Error> {
+        let path = path.to_owned();
+        self.open(Method::FileWatch { path }, Route::File).await
     }
 
     pub async fn permit(
@@ -583,29 +510,6 @@ impl Client {
         .await
     }
 
-    /// Sets the workspace's local branch `branch` to `to`, if it is at
-    /// `expected`. Git runs with `env` over the daemon's environment.
-    pub async fn move_branch(
-        &self,
-        workspace_id: &str,
-        branch: &str,
-        to: &str,
-        expected: &str,
-        force: bool,
-        env: BTreeMap<String, String>,
-    ) -> Result<(), Error> {
-        self.ack(Method::BranchMove {
-            workspace_id: workspace_id.into(),
-            branch: branch.into(),
-            to: to.into(),
-            expected: expected.into(),
-            source_branch: None,
-            force,
-            env,
-        })
-        .await
-    }
-
     /// Fast-forwards a local branch while both branches are at the supplied
     /// commits. Git runs with `env` over the daemon's environment.
     pub async fn fast_forward_branch(
@@ -622,23 +526,8 @@ impl Client {
             branch: branch.into(),
             to: source_tip.into(),
             expected: expected.into(),
-            source_branch: Some(source_branch.into()),
-            force: false,
+            source_branch: source_branch.into(),
             env,
-        })
-        .await
-    }
-
-    /// Sets or clears the worktree's comparison ref and returns the worktree
-    /// with its comparison recomputed.
-    pub async fn set_compare(
-        &self,
-        worktree_id: &str,
-        compare: Option<String>,
-    ) -> Result<WorktreeInfo, Error> {
-        self.call(Method::WorktreeSetCompare {
-            worktree_id: worktree_id.into(),
-            compare,
         })
         .await
     }
@@ -717,6 +606,23 @@ impl Client {
     /// name.
     pub async fn list_workflows(&self) -> Result<Vec<WorkflowInfo>, Error> {
         self.call(Method::WorkflowList).await
+    }
+
+    /// Sends `method`, which starts a stream, routing the stream's messages
+    /// through `route` until the returned stream is dropped.
+    async fn open<T>(
+        &self,
+        method: Method,
+        route: fn(mpsc::UnboundedSender<T>) -> Route,
+    ) -> Result<Stream<T>, Error> {
+        let id = self.connection.next_id();
+        let (sender, messages) = mpsc::unbounded_channel();
+        let stream = Stream {
+            messages,
+            _unsubscribe: Unsubscribe::route(&self.connection, id, route(sender)),
+        };
+        self.send::<Value>(id, method).await?;
+        Ok(stream)
     }
 
     async fn ack(&self, method: Method) -> Result<(), Error> {
@@ -958,38 +864,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_watch_unsubscribes() {
-        let (client, mut daemon) = connect().await;
-        let (watch, request) = tokio::join!(client.watch(), daemon.answer(Value::Null));
-        assert!(matches!(request.method, Method::Watch));
-        drop(watch.unwrap());
-        let unsubscribe = daemon.answer(Value::Null).await;
-        assert!(matches!(
-            unsubscribe.method,
-            Method::Unsubscribe { subscription } if subscription == request.id
-        ));
-    }
-
-    #[tokio::test]
-    async fn dropping_a_directory_watch_unsubscribes() {
-        let (client, mut daemon) = connect().await;
-        let (watch, request) = tokio::join!(
-            client.watch_directory(Path::new("/work")),
-            daemon.answer(Value::Null)
-        );
-        assert!(matches!(
-            request.method,
-            Method::DirectoryWatch { ref path } if path == Path::new("/work")
-        ));
-        drop(watch.unwrap());
-        let unsubscribe = daemon.answer(Value::Null).await;
-        assert!(matches!(
-            unsubscribe.method,
-            Method::Unsubscribe { subscription } if subscription == request.id
-        ));
-    }
-
-    #[tokio::test]
     async fn file_snapshots_route_and_drop_unsubscribes() {
         let (client, mut daemon) = connect().await;
         let (watch, request) = tokio::join!(
@@ -1035,7 +909,7 @@ mod tests {
         let end = timeout(TIMEOUT, watch.next()).await.unwrap();
         assert_eq!(end, Err(End::Disconnected));
         assert!(client.is_closed());
-        assert!(matches!(client.list().await, Err(Error::Closed)));
+        assert!(matches!(client.list_workflows().await, Err(Error::Closed)));
     }
 
     #[tokio::test]

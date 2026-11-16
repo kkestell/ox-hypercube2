@@ -27,7 +27,7 @@ export function useFileViewers(views: readonly { id: string; cwd: string }[], co
     const stop = (id: string) => {
       const subscription = subscriptions.get(id)!;
       subscriptions.delete(id);
-      invoke("unwatch_file", { channelId: subscription.channel.id });
+      invoke("unwatch", { channelId: subscription.channel.id });
     };
     const reconcile = () => {
       const open = new Map(openViewers());

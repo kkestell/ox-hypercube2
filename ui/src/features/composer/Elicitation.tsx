@@ -3,63 +3,17 @@ import { useEffect, useRef, useState } from "react";
 import type { EnumOption, Field, Item } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 
-/** What a field holds while the form is open: text for text and number
- * inputs, a value for a choice, values for a multiple choice. */
-type Value = string | boolean | string[];
-
-/** The input type for a string's `format`. */
-const inputTypes: Record<string, string> = {
-  email: "email",
-  uri: "url",
-  date: "date",
-  "date-time": "datetime-local",
-};
-
-/** A `date-time` value as a `datetime-local` input shows it, in local time. */
-function localDateTime(value: string) {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "";
-  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
-}
+/** What a field holds while the form is open: text, a choice's value, or
+ * a multiple choice's values. */
+type Value = string | string[];
 
 function initial(field: Field): Value {
-  switch (field.type) {
-    case "boolean":
-      return field.default ?? false;
-    case "array":
-      return field.default ?? [];
-    case "number":
-    case "integer":
-      return field.default?.toString() ?? "";
-    case "string":
-      if (field.default === undefined) return "";
-      return field.format === "date-time" ? localDateTime(field.default) : field.default;
-    default:
-      return "";
-  }
+  return field.default ?? (field.type === "array" ? [] : "");
 }
 
 /** The answer a field sends, or `undefined` when it is left empty. */
-function answer(field: Field, value: Value | undefined) {
-  switch (field.type) {
-    case "boolean":
-      return value;
-    case "array":
-      return (value as string[]).length > 0 ? value : undefined;
-    case "number":
-    case "integer":
-      return value === "" ? undefined : Number(value);
-    case "string":
-      if (value === "") return undefined;
-      return field.format === "date-time" ? new Date(value as string).toISOString() : value;
-    default:
-      return undefined;
-  }
-}
-
-/** A string or array field's choices, with plain values as their own titles. */
-function choices(values: string[] | undefined, options: EnumOption[] | undefined): EnumOption[] {
-  return options ?? values?.map((value) => ({ const: value, title: value })) ?? [];
+function answer(value: Value | undefined) {
+  return value && value.length > 0 ? value : undefined;
 }
 
 /** Why a multiple choice's selection is invalid, or `""` when it is valid.
@@ -70,30 +24,6 @@ function selectionError(field: Extract<Field, { type: "array" }>, count: number)
   if (count < min) return `Select at least ${min}.`;
   if (field.maxItems !== undefined && count > field.maxItems) {
     return `Select at most ${field.maxItems}.`;
-  }
-  return "";
-}
-
-/** Why a text field's value does not match its pattern, or `""` when it
- * does. A JSON Schema pattern is an ECMAScript regular expression that may
- * match anywhere in the value. A pattern that does not compile is not
- * checked. */
-function patternError(pattern: string, value: string) {
-  let regex: RegExp;
-  try {
-    regex = new RegExp(pattern, "u");
-  } catch {
-    return "";
-  }
-  return value === "" || regex.test(value) ? "" : `Enter a value that matches ${pattern}.`;
-}
-
-/** Why a field's value is invalid by the checks the browser does not make,
- * or `""` when it is valid. */
-function customError(field: Field, value: Value | undefined) {
-  if (field.type === "array") return selectionError(field, (value as string[]).length);
-  if (field.type === "string" && field.pattern !== undefined) {
-    return patternError(field.pattern, value as string);
   }
   return "";
 }
@@ -115,15 +45,15 @@ export function Elicitation({
   const set = (name: string, value: Value) =>
     setValues((current) => ({ ...current, [name]: value }));
 
-  // A text field's pattern and a multiple choice's bounds are checked with
-  // the browser's own validation, on the field's input or the group's first
-  // checkbox.
+  // A multiple choice's bounds are checked with the browser's own
+  // validation, on the group's first checkbox.
   useEffect(() => {
     for (const field of item.fields) {
+      if (field.type !== "array") continue;
       const group = form.current?.elements.namedItem(field.name);
       const first = group instanceof RadioNodeList ? group[0] : group;
-      if (first instanceof HTMLInputElement || first instanceof HTMLTextAreaElement) {
-        first.setCustomValidity(customError(field, values[field.name]));
+      if (first instanceof HTMLInputElement) {
+        first.setCustomValidity(selectionError(field, (values[field.name] as string[]).length));
       }
     }
   }, [item.fields, values]);
@@ -141,7 +71,7 @@ export function Elicitation({
   const submit = () => {
     const content: Record<string, unknown> = {};
     for (const field of item.fields) {
-      const value = answer(field, values[field.name]);
+      const value = answer(values[field.name]);
       if (value !== undefined) content[field.name] = value;
     }
     respond({ action: "accept", content });
@@ -152,10 +82,9 @@ export function Elicitation({
     const label = field.title ?? field.name;
     switch (field.type) {
       case "string": {
-        if (field.oneOf || field.enum) {
-          const options = choices(field.enum, field.oneOf);
-          if (options.length === 0) return null;
-          return options.map((option, index) => (
+        if (field.oneOf) {
+          if (field.oneOf.length === 0) return null;
+          return field.oneOf.map((option, index) => (
             <Choice
               key={option.const}
               type="radio"
@@ -167,63 +96,20 @@ export function Elicitation({
             />
           ));
         }
-        if (!field.format) {
-          return (
-            <textarea
-              className="text-field"
-              name={field.name}
-              aria-label={label}
-              required={field.required}
-              minLength={field.minLength}
-              maxLength={field.maxLength}
-              value={value as string}
-              onChange={(event) => set(field.name, event.target.value)}
-            />
-          );
-        }
         return (
-          <input
+          <textarea
             className="text-field"
             name={field.name}
-            type={inputTypes[field.format] ?? "text"}
             aria-label={label}
             required={field.required}
-            minLength={field.minLength}
-            maxLength={field.maxLength}
             value={value as string}
             onChange={(event) => set(field.name, event.target.value)}
           />
         );
       }
-      case "number":
-      case "integer":
-        return (
-          <input
-            className="text-field"
-            name={field.name}
-            type="number"
-            aria-label={label}
-            required={field.required}
-            min={field.minimum}
-            max={field.maximum}
-            step={field.type === "integer" ? 1 : "any"}
-            value={value as string}
-            onChange={(event) => set(field.name, event.target.value)}
-          />
-        );
-      case "boolean":
-        return (
-          <Choice
-            type="checkbox"
-            name={field.name}
-            option={{ const: "true", title: label, description: field.description }}
-            checked={value as boolean}
-            onChange={(checked) => set(field.name, checked)}
-          />
-        );
       case "array": {
         // Items of a type the app does not know have no choices to show.
-        const options = choices(field.items.enum, field.items.anyOf);
+        const options = field.items.anyOf ?? [];
         if (options.length === 0) return null;
         const selected = value as string[];
         return options.map((option) => (
@@ -266,14 +152,6 @@ export function Elicitation({
         {item.fields.map((field) => {
           const input = control(field);
           if (input === null) return null;
-          // A boolean's checkbox carries its title and description.
-          if (field.type === "boolean") {
-            return (
-              <fieldset key={field.name} disabled={pending}>
-                {input}
-              </fieldset>
-            );
-          }
           return (
             <fieldset key={field.name} disabled={pending}>
               <legend>{field.title ?? field.name}</legend>

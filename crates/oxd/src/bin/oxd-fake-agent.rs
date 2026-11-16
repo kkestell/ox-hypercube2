@@ -19,12 +19,8 @@
 //!   `rejected` or `cancelled`
 //! - `elicit`: `requires_action` and a form `elicitation/create` with the
 //!   message `Order` and the fields `color` (required, one of `red` "Red"
-//!   and `blue` "Blue"), `size` (one of `small` and `large`), `extras` (at
-//!   most two of `sprinkles`, `nuts` and `cherries`), `sauces` (at least two
-//!   of `ketchup`, `mustard` and `mayo`), `note` (text, by default `first\nsecond`), `code` (text
-//!   containing three digits), `email` (an email address), `when` (a date
-//!   and time, by default `2026-11-12T08:30:00Z`), `count` (an integer from
-//!   1 to 9), `weight` (a number from 0.5 to 10), and `rush` (a boolean). Then
+//!   and `blue` "Blue"), `extras` (at most two of `sprinkles`, `nuts` and
+//!   `cherries`), and `note` (text, by default `first\nsecond`). Then
 //!   `running` and a chunk `accepted <content as compact JSON>`, `declined`,
 //!   or `cancelled`. When the turn is cancelled first, the agent withdraws
 //!   the elicitation with `$/cancel_request`, waits for its answer, sends
@@ -1235,68 +1231,10 @@ fn order(session_id: acp::SessionId) -> acp::CreateElicitationRequest {
             false,
         )
         .property(
-            "size",
-            acp::StringPropertySchema::new()
-                .title("Size")
-                .enum_values(vec!["small".into(), "large".into()]),
-            false,
-        )
-        .property(
-            "sauces",
-            acp::MultiSelectPropertySchema::new(vec![
-                "ketchup".into(),
-                "mustard".into(),
-                "mayo".into(),
-            ])
-            .title("Sauces")
-            .min_items(2),
-            false,
-        )
-        .property(
-            "code",
-            acp::StringPropertySchema::new()
-                .title("Code")
-                .pattern(r"\d{3}"),
-            false,
-        )
-        .property(
-            "email",
-            acp::StringPropertySchema::email().title("Email"),
-            false,
-        )
-        .property(
-            "when",
-            acp::StringPropertySchema::date_time()
-                .title("When")
-                .default_value("2026-11-12T08:30:00Z"),
-            false,
-        )
-        .property(
-            "weight",
-            acp::NumberPropertySchema::new()
-                .title("Weight")
-                .minimum(0.5)
-                .maximum(10.0),
-            false,
-        )
-        .property(
             "note",
             acp::StringPropertySchema::new()
                 .title("Note")
                 .default_value("first\nsecond"),
-            false,
-        )
-        .property(
-            "count",
-            acp::IntegerPropertySchema::new()
-                .title("Count")
-                .minimum(1)
-                .maximum(9),
-            false,
-        )
-        .property(
-            "rush",
-            acp::BooleanPropertySchema::new().title("Rush"),
             false,
         );
     acp::CreateElicitationRequest::new(

@@ -7,9 +7,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use ox_protocol::schema::{
-    ContentBlock, ElicitationAcceptAction, ElicitationAction, SessionConfigKind, TextContent,
-};
+use ox_protocol::schema::{ContentBlock, SessionConfigKind, TextContent};
 use ox_protocol::{
     Checkout, Client, Comparison, ConfigValue, End, EventKind, ListingChange, RunInfo, RunState,
     SessionState,
@@ -76,13 +74,6 @@ enum Command {
         session: String,
         request_id: String,
         option_id: String,
-    },
-    /// Accept an elicitation
-    Answer {
-        session: String,
-        request_id: String,
-        /// The form's content as a JSON object, such as '{"color": "blue"}'
-        content: String,
     },
     /// Cancel the running turn
     Cancel { session: String },
@@ -168,7 +159,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let client = Client::connect_or_start(&socket).await?;
     match cli.command {
         Command::Ls => {
-            for session in client.list().await? {
+            for change in listing(&client).await? {
+                let ListingChange::Session { session } = change else {
+                    continue;
+                };
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     session.id,
@@ -191,8 +185,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 println!("{}", workspace.id);
             }
             WorkspaceCommand::Ls => {
-                for workspace in client.list_workspaces().await? {
-                    println!("{}\t{}", workspace.id, workspace.path.display());
+                for change in listing(&client).await? {
+                    if let ListingChange::Workspace { workspace } = change {
+                        println!("{}\t{}", workspace.id, workspace.path.display());
+                    }
                 }
             }
             WorkspaceCommand::Rm { workspace } => client.remove_workspace(&workspace).await?,
@@ -203,10 +199,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             command,
         } => {
             let checkout = if worktree {
-                Checkout::Worktree {
-                    branch: None,
-                    compare: None,
-                }
+                Checkout::Worktree { compare: None }
             } else {
                 Checkout::Workspace
             };
@@ -256,18 +249,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             request_id,
             option_id,
         } => client.permit(&session, &request_id, &option_id).await?,
-        Command::Answer {
-            session,
-            request_id,
-            content,
-        } => {
-            let fields = serde_json::from_str::<BTreeMap<_, _>>(&content)
-                .map_err(|error| format!("the content is not a JSON object: {error}"))?;
-            let action = ElicitationAction::Accept(ElicitationAcceptAction::new().content(fields));
-            client
-                .respond_elicitation(&session, &request_id, action)
-                .await?;
-        }
         Command::Cancel { session } => client.cancel(&session).await?,
         Command::Delete { session, discard } => {
             client.delete(&session, discard, utf8_env()).await?;
@@ -279,11 +260,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             client.unarchive(&session, utf8_env()).await?;
         }
         Command::Compare { session } => {
-            let worktree_id = client
-                .list()
+            let worktree_id = listing(&client)
                 .await?
                 .into_iter()
-                .find(|info| info.id == session)
+                .find_map(|change| match change {
+                    ListingChange::Session { session: info } if info.id == session => Some(info),
+                    _ => None,
+                })
                 .ok_or_else(|| format!("no session {session}"))?
                 .worktree_id;
             let Some(worktree_id) = worktree_id else {
@@ -316,10 +299,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 println!("{}", run.id);
             }
             RunCommand::Ls => {
-                let mut watch = client.watch().await?;
-                // The watch's first changes list every run.
-                let changes = watch.next().await.map_err(|_| ox_protocol::Error::Closed)?;
-                for change in changes {
+                for change in listing(&client).await? {
                     if let ListingChange::Run { run } = change {
                         let state = serde_json::to_value(run.state)?;
                         let state = state.as_str().unwrap_or_default();
@@ -347,6 +327,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         },
     }
     Ok(())
+}
+
+/// Every workspace, worktree, session and run, as a watch's first changes
+/// list them.
+async fn listing(client: &Client) -> Result<Vec<ListingChange>, Box<dyn Error>> {
+    let mut watch = client.watch().await?;
+    Ok(watch.next().await.map_err(|_| ox_protocol::Error::Closed)?)
 }
 
 /// Waits until a run is not running and returns it.

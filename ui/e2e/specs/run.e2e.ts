@@ -205,27 +205,6 @@ ${agentStep("Second", "permission")}`,
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
   });
 
-  it("runs a repair turn in the child after a failed postcondition", async () => {
-    const { cwd } = await gitWorkspace();
-    const repair = `${directive("shell", "touch fixed")}\n${directive("text", "fixed it")}`;
-    await defineWorkflow(
-      "repair",
-      `name: Repair
-steps:
-${agentStep(
-  "Fix",
-  `${directive("next", repair)}\n${directive("text", "done")}`,
-  "    postconditions:\n      - shell: test -f fixed\n",
-)}`,
-    );
-    await startRun(cwd, "Repair", "");
-    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-    await expect(stepStatus("Fix", "Succeeded")).toBeExisting();
-    await viewChild(cwd, "Fix");
-    await expect($$(".conversation > .prompt")).toBeElementsArrayOfSize(2);
-    await expect(lastReply()).toHaveText("fixed it");
-  });
-
   it("disables a child's entry while it runs, and takes prompts once it has ended", async () => {
     const { cwd } = await gitWorkspace();
     await defineWorkflow("hold", `name: Hold\nsteps:\n${agentStep("Hold", "wait")}`);

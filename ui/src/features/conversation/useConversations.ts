@@ -82,7 +82,7 @@ export function useConversations(
     for (const [sessionId, channel] of current) {
       if (wanted.has(sessionId)) continue;
       current.delete(sessionId);
-      invoke("unview_session", { channelId: channel.id });
+      invoke("unwatch", { channelId: channel.id });
       dispatch({ type: "forget", sessionId });
     }
     for (const sessionId of wanted) {
@@ -103,7 +103,7 @@ export function useConversations(
   useEffect(
     () => () => {
       for (const channel of views.current.values()) {
-        invoke("unview_session", { channelId: channel.id });
+        invoke("unwatch", { channelId: channel.id });
       }
       views.current.clear();
     },

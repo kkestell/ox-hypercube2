@@ -1,11 +1,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_protocol::schema::{
     AudioContent, ContentBlock, ElicitationAcceptAction, ElicitationAction, EmbeddedResource,
@@ -14,130 +10,28 @@ use ox_protocol::schema::{
     TextContent, TextResourceContents,
 };
 use ox_protocol::{
-    Checkout, Client, ConfigValue, DirEntry, DirectoryWatch, End, EntryKind, Error, Event,
-    EventKind, Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Subscription,
-    Watch, WorkspaceInfo, code,
+    Checkout, Client, ConfigValue, DirEntry, End, EntryKind, Error, Event, EventKind, Listing,
+    ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream, Subscription,
+    WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
-use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::process::{Child, ChildStderr, Command};
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
-const TIMEOUT: Duration = Duration::from_secs(10);
-const OXD: &str = env!("CARGO_BIN_EXE_oxd");
-const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_oxd-fake-agent");
+mod common;
 
-struct Daemon {
-    child: Child,
-    stderr: Lines<BufReader<ChildStderr>>,
-    dir: TempDir,
-    socket: PathBuf,
-}
+use common::*;
 
 impl Daemon {
-    async fn start(idle_exit_ms: u64) -> Self {
-        Self::start_with(idle_exit_ms, None).await
-    }
-
-    /// Starts oxd, optionally with a limit on open file descriptors, and
-    /// waits for it to report that it is ready.
-    async fn start_with(idle_exit_ms: u64, fd_limit: Option<u32>) -> Self {
-        Self::start_in(tempfile::tempdir().unwrap(), idle_exit_ms, fd_limit, None).await
-    }
-
-    /// Starts oxd with sessions parking after `park_after_ms`.
-    async fn start_parking(idle_exit_ms: u64, park_after_ms: u64) -> Self {
-        Self::start_in(
-            tempfile::tempdir().unwrap(),
-            idle_exit_ms,
-            None,
-            Some(park_after_ms),
-        )
-        .await
-    }
-
-    /// Like `start_with`, on the socket in `dir`. A daemon started on the
-    /// socket of one that exited finds its workspaces and sessions.
-    async fn start_in(
-        dir: TempDir,
-        idle_exit_ms: u64,
-        fd_limit: Option<u32>,
-        park_after_ms: Option<u64>,
-    ) -> Self {
-        let socket = dir.path().join("oxd.sock");
-        let mut command = match fd_limit {
-            Some(limit) => {
-                let mut command = Command::new("sh");
-                command.args([
-                    "-c",
-                    &format!("ulimit -n {limit} && exec \"$0\" \"$@\""),
-                    OXD,
-                ]);
-                command
-            }
-            None => Command::new(OXD),
-        };
-        let mut child = command
-            .arg("--socket")
-            .arg(&socket)
-            .arg("--idle-exit-ms")
-            .arg(idle_exit_ms.to_string())
-            .args(
-                park_after_ms
-                    .iter()
-                    .flat_map(|ms| ["--park-after-ms".to_owned(), ms.to_string()]),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap()).lines();
-        let ready = timeout(TIMEOUT, stdout.next_line()).await;
-        assert_eq!(ready.unwrap().unwrap().as_deref(), Some("ready"));
-        let stderr = BufReader::new(child.stderr.take().unwrap()).lines();
-        Self {
-            child,
-            stderr,
-            dir,
-            socket,
-        }
-    }
-
-    async fn client(&self) -> Client {
-        timeout(TIMEOUT, Client::connect(&self.socket))
-            .await
-            .expect("timed out connecting")
-            .unwrap()
-    }
-
-    /// Stops the daemon with SIGTERM, which keeps its sessions saved, and
-    /// waits for it to exit.
-    async fn stop(&mut self) {
-        self.stop_signal();
-        assert!(self.wait_for_exit().await.success());
-    }
-
-    /// Sends the daemon SIGTERM without waiting for it to exit.
-    fn stop_signal(&self) {
-        // SAFETY: sends SIGTERM to the daemon this test started.
-        unsafe { libc::kill(self.child.id().unwrap().cast_signed(), libc::SIGTERM) };
-    }
-
-    /// Starts another daemon on the socket of this one, which has exited.
-    async fn again(self, idle_exit_ms: u64) -> Self {
-        Self::start_in(self.dir, idle_exit_ms, None, None).await
-    }
-
     /// The workspace for the daemon's directory, which sessions run in.
     async fn workspace(&self, client: &Client) -> WorkspaceInfo {
-        let existing = client.list_workspaces().await.unwrap();
-        match existing.into_iter().find(|w| w.path == self.cwd()) {
+        match workspaces(client)
+            .await
+            .into_iter()
+            .find(|w| w.path == self.cwd())
+        {
             Some(workspace) => workspace,
             None => client.add_workspace(self.cwd()).await.unwrap(),
         }
@@ -168,34 +62,9 @@ impl Daemon {
             matches!(started.kind, EventKind::AgentStarted { .. }),
             "{started:?}"
         );
-        let session = info(client, &session.id).await;
+        let session = info(client, &session.id).await.unwrap();
         assert_eq!(session.state, SessionState::Idle);
         (session, started.seq)
-    }
-
-    fn cwd(&self) -> PathBuf {
-        self.dir.path().canonicalize().unwrap()
-    }
-
-    async fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-        timeout(TIMEOUT, self.child.wait())
-            .await
-            .expect("oxd did not exit")
-            .unwrap()
-    }
-
-    /// Waits for a line of oxd's stderr that contains `text`.
-    async fn wait_for_log(&mut self, text: &str) {
-        loop {
-            let line = timeout(TIMEOUT, self.stderr.next_line())
-                .await
-                .unwrap_or_else(|_| panic!("oxd never logged {text:?}"))
-                .unwrap()
-                .expect("oxd closed stderr");
-            if line.contains(text) {
-                return;
-            }
-        }
     }
 }
 
@@ -205,84 +74,6 @@ fn fake_agent(args: &[&str]) -> Vec<String> {
         .chain(args.iter().copied())
         .map(String::from)
         .collect()
-}
-
-async fn info(client: &Client, session_id: &str) -> SessionInfo {
-    client
-        .list()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|session| session.id == session_id)
-        .unwrap()
-}
-
-/// A FIFO that a fake agent started with `--hold <path>` keeps open, which
-/// tells when the agent has started and when it has exited.
-struct ExitWatch {
-    path: PathBuf,
-    opened: Option<oneshot::Receiver<()>>,
-    done: Option<JoinHandle<()>>,
-}
-
-impl ExitWatch {
-    fn new(dir: &Path) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = dir.join(format!("hold-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
-        let status = std::process::Command::new("mkfifo")
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(status.success());
-        let (opened, opened_rx) = oneshot::channel();
-        let reader = path.clone();
-        // Opening blocks until the agent opens the FIFO; reading ends once
-        // every process holding it has exited.
-        let done = tokio::task::spawn_blocking(move || {
-            let mut fifo = std::fs::File::open(reader).unwrap();
-            let _ = opened.send(());
-            let mut rest = Vec::new();
-            fifo.read_to_end(&mut rest).unwrap();
-        });
-        Self {
-            path,
-            opened: Some(opened_rx),
-            done: Some(done),
-        }
-    }
-
-    fn arg(&self) -> [&str; 2] {
-        ["--hold", self.path.to_str().unwrap()]
-    }
-
-    /// Waits for the agent process to start.
-    async fn started(&mut self) {
-        let opened = self.opened.take().unwrap();
-        timeout(TIMEOUT, opened)
-            .await
-            .expect("the agent did not start")
-            .unwrap();
-    }
-
-    /// Waits for the agent process to exit.
-    async fn exited(mut self) {
-        let done = self.done.take().unwrap();
-        timeout(TIMEOUT, done)
-            .await
-            .expect("the agent is still running")
-            .unwrap();
-    }
-}
-
-impl Drop for ExitWatch {
-    /// Ends the blocking reader if no agent ever opened the FIFO, so a
-    /// failing test does not hang.
-    fn drop(&mut self) {
-        let _ = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&self.path);
-    }
 }
 
 /// A connection that speaks the wire protocol itself and reads only when
@@ -372,13 +163,6 @@ fn raw_turn_ended(message: &Value) -> bool {
     message["event"]["kind"]["type"] == "turn_ended"
 }
 
-async fn next(subscription: &mut Subscription) -> Event {
-    timeout(TIMEOUT, subscription.next())
-        .await
-        .expect("timed out waiting for an event")
-        .expect("subscription ended")
-}
-
 /// Why the subscription has no more events.
 async fn end(subscription: &mut Subscription) -> End {
     timeout(TIMEOUT, subscription.next())
@@ -387,22 +171,9 @@ async fn end(subscription: &mut Subscription) -> End {
         .expect_err("subscription did not end")
 }
 
-/// Events up to and including the first one matching `last`.
-async fn until(subscription: &mut Subscription, last: impl Fn(&EventKind) -> bool) -> Vec<Event> {
-    let mut events = Vec::new();
-    loop {
-        let event = next(subscription).await;
-        let done = last(&event.kind);
-        events.push(event);
-        if done {
-            return events;
-        }
-    }
-}
-
 /// A watch and the listing its changes add up to.
 struct Listings {
-    watch: Watch,
+    watch: Stream<Vec<ListingChange>>,
     current: Listing,
 }
 
@@ -432,67 +203,11 @@ impl Listings {
     }
 }
 
-async fn next_changes(watch: &mut Watch) -> Vec<ListingChange> {
-    timeout(TIMEOUT, watch.next())
-        .await
-        .expect("timed out waiting for listing changes")
-        .expect("the watch ended")
-}
-
-/// Applies a watch's change to `listing`, as a client keeps its listing.
-fn apply(listing: &mut Listing, change: ListingChange) {
-    match change {
-        ListingChange::Workspace { workspace } => {
-            match listing.workspaces.iter_mut().find(|w| w.id == workspace.id) {
-                Some(listed) => *listed = workspace,
-                None => listing.workspaces.push(workspace),
-            }
-        }
-        ListingChange::WorkspaceRemoved { workspace_id } => {
-            listing.workspaces.retain(|w| w.id != workspace_id);
-        }
-        ListingChange::Worktree { worktree } => {
-            match listing.worktrees.iter_mut().find(|w| w.id == worktree.id) {
-                Some(listed) => *listed = worktree,
-                None => listing.worktrees.push(worktree),
-            }
-        }
-        ListingChange::WorktreeRemoved { worktree_id } => {
-            listing.worktrees.retain(|w| w.id != worktree_id);
-        }
-        ListingChange::Session { session } => {
-            match listing.sessions.iter_mut().find(|s| s.id == session.id) {
-                Some(listed) => *listed = *session,
-                None => listing.sessions.push(*session),
-            }
-        }
-        ListingChange::SessionRemoved { session_id } => {
-            listing.sessions.retain(|s| s.id != session_id);
-        }
-        ListingChange::Run { run } => match listing.runs.iter_mut().find(|r| r.id == run.id) {
-            Some(listed) => *listed = run,
-            None => listing.runs.push(run),
-        },
-        ListingChange::RunRemoved { run_id } => {
-            listing.runs.retain(|r| r.id != run_id);
-        }
-    }
-}
-
 /// The state of session `id` in a sessions list, if it is listed.
 fn state_in(list: &[SessionInfo], id: &str) -> Option<SessionState> {
     list.iter()
         .find(|session| session.id == id)
         .map(|session| session.state)
-}
-
-/// A prompt of one text block.
-fn text(text: &str) -> Vec<ContentBlock> {
-    vec![ContentBlock::Text(TextContent::new(text))]
-}
-
-fn turn_ended(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::TurnEnded { .. })
 }
 
 fn chunk(event: &Event) -> Option<&str> {
@@ -557,7 +272,7 @@ fn remote_code(error: Error) -> i32 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reattach_mid_turn() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -581,6 +296,13 @@ async fn reattach_mid_turn() {
     assert_contiguous(&seen, started + 1);
     // The prompt, its echo, `running`, the chunks, `idle`, and the turn's end.
     assert_eq!(seen.len(), 26);
+    assert!(matches!(
+        seen.last().unwrap().kind,
+        EventKind::TurnEnded {
+            stop_reason: Some(StopReason::EndTurn),
+            ..
+        }
+    ));
     let pid = chunk(&seen[3]).unwrap().to_owned();
     assert_eq!(
         chunks(&seen[4..]),
@@ -593,39 +315,8 @@ async fn reattach_mid_turn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn turn_continues_after_its_client_disconnects() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let (session, started) = daemon.new_session(&client).await;
-    client.prompt(&session.id, text("say 5 20")).await.unwrap();
-    drop(client);
-
-    let client = daemon.client().await;
-    let mut events = client.subscribe(&session.id, started).await.unwrap();
-    let turn = until(&mut events, turn_ended).await;
-    assert_contiguous(&turn, started + 1);
-    assert_eq!(
-        turn[0].kind,
-        EventKind::PromptStarted {
-            prompt: text("say 5 20")
-        }
-    );
-    assert_eq!(
-        chunks(&turn),
-        ["chunk-1", "chunk-2", "chunk-3", "chunk-4", "chunk-5"]
-    );
-    assert!(matches!(
-        turn.last().unwrap().kind,
-        EventKind::TurnEnded {
-            stop_reason: Some(StopReason::EndTurn),
-            ..
-        }
-    ));
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn permission_across_disconnect() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, _) = daemon.new_session(&client).await;
     client
@@ -641,7 +332,7 @@ async fn permission_across_disconnect() {
     })
     .await;
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::AwaitingPermission
     );
     let EventKind::PermissionRequested { request_id, .. } = &requested.last().unwrap().kind else {
@@ -671,7 +362,7 @@ async fn permission_across_disconnect() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_with_pending_permission() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -723,7 +414,7 @@ async fn elicit(client: &Client, session_id: &str, events: &mut Subscription) ->
     assert_eq!(message, "Order");
     assert_eq!(requested_schema.required, Some(vec!["color".into()]));
     assert_eq!(
-        info(client, session_id).await.state,
+        info(client, session_id).await.unwrap().state,
         SessionState::AwaitingInput
     );
     request_id.clone()
@@ -738,25 +429,11 @@ fn accept(content: Value) -> ElicitationAction {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn elicitation_round_trip() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     let request_id = elicit(&client, &session.id, &mut events).await;
-
-    let error = client
-        .respond_elicitation(
-            &session.id,
-            &request_id,
-            accept(json!({"extras": ["nuts"]})),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(remote_code(error), code::INVALID_REQUEST);
-    assert_eq!(
-        info(&client, &session.id).await.state,
-        SessionState::AwaitingInput
-    );
 
     let answer = json!({"color": "blue", "extras": ["nuts"]});
     client
@@ -783,9 +460,11 @@ async fn elicitation_round_trip() {
     assert_eq!(remote_code(error), code::INVALID_STATE);
 }
 
+/// A decline reaches the agent. `session/cancel` leaves the elicitation to
+/// the agent, which withdraws it with `$/cancel_request`.
 #[tokio::test(flavor = "multi_thread")]
-async fn decline_reaches_the_agent() {
-    let daemon = Daemon::start(1000).await;
+async fn cancel_withdraws_an_elicitation() {
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -803,16 +482,7 @@ async fn decline_reaches_the_agent() {
         }
     );
     assert_eq!(chunks(&rest), ["declined"]);
-}
 
-/// `session/cancel` leaves the elicitation to the agent, which withdraws it
-/// with `$/cancel_request`.
-#[tokio::test(flavor = "multi_thread")]
-async fn cancel_withdraws_an_elicitation() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let (session, started) = daemon.new_session(&client).await;
-    let mut events = client.subscribe(&session.id, started).await.unwrap();
     let request_id = elicit(&client, &session.id, &mut events).await;
     client.cancel(&session.id).await.unwrap();
 
@@ -832,14 +502,17 @@ async fn cancel_withdraws_an_elicitation() {
             ..
         }
     ));
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
 }
 
 /// A client that vanishes mid-stream, leaving events unread in its socket,
 /// does not disturb the daemon or the turn.
 #[tokio::test(flavor = "multi_thread")]
 async fn vanished_client() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
 
@@ -859,7 +532,7 @@ async fn vanished_client() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_exit() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -868,7 +541,10 @@ async fn agent_exit() {
         matches!(kind, EventKind::AgentExited { .. })
     })
     .await;
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Exited);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Exited
+    );
     assert_contiguous(&history, started + 1);
     assert!(matches!(history[0].kind, EventKind::PromptStarted { .. }));
     assert!(turn_ended(&history[history.len() - 2].kind));
@@ -879,37 +555,18 @@ async fn agent_exit() {
         .delete(&session.id, false, BTreeMap::new())
         .await
         .unwrap();
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
     let error = client.subscribe(&session.id, 0).await.unwrap_err();
     assert_eq!(remote_code(error), code::NOT_FOUND);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_that_cannot_start() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let workspace = daemon.workspace(&client).await;
-    let session = client
-        .new_session(
-            &workspace.id,
-            vec![daemon.cwd().join("missing").to_string_lossy().into()],
-            BTreeMap::new(),
-            Checkout::Workspace,
-        )
-        .await
-        .unwrap();
-    let mut events = client.subscribe(&session.id, 0).await.unwrap();
-    let exited = next(&mut events).await;
-    assert!(
-        matches!(exited.kind, EventKind::AgentExited { error: Some(_) }),
-        "{exited:?}"
-    );
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Exited);
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn lifetime() {
-    let mut daemon = Daemon::start(300).await;
+    let mut daemon = Daemon::start_with(Options {
+        idle_exit_ms: 300,
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (session, _) = daemon.new_session(&client).await;
     drop(client);
@@ -942,7 +599,7 @@ async fn single_instance_and_on_demand_start() {
     .await
     .unwrap()
     .unwrap();
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
 
     let second = std::process::Command::new(OXD)
         .arg("--socket")
@@ -952,14 +609,14 @@ async fn single_instance_and_on_demand_start() {
     assert!(second.status.success());
     assert_eq!(second.stdout, b"ready\n");
 
-    assert!(client.list().await.unwrap().is_empty());
+    assert!(sessions(&client).await.is_empty());
     let other = Client::connect(&socket).await.unwrap();
-    assert!(other.list().await.unwrap().is_empty());
+    assert!(sessions(&other).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn version_mismatch() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let stream = UnixStream::connect(&daemon.socket).await.unwrap();
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
@@ -986,7 +643,7 @@ async fn version_mismatch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn subscriptions_to_one_session_are_independent() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut all = client.subscribe(&session.id, 0).await.unwrap();
@@ -1008,7 +665,7 @@ async fn subscriptions_to_one_session_are_independent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unsubscribe_ends_a_subscription() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut raw = Raw::connect(&daemon).await;
@@ -1041,7 +698,7 @@ async fn unsubscribe_ends_a_subscription() {
 /// reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_subscriber_receives_every_event() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut raw = Raw::connect(&daemon).await;
@@ -1068,7 +725,11 @@ async fn slow_subscriber_receives_every_event() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_while_starting() {
-    let mut daemon = Daemon::start(300).await;
+    let mut daemon = Daemon::start_with(Options {
+        idle_exit_ms: 300,
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let mut agent = ExitWatch::new(daemon.dir.path());
     let mut args = vec!["--hang-initialize"];
@@ -1087,7 +748,7 @@ async fn delete_while_starting() {
     // The agent runs and never answers `initialize`.
     agent.started().await;
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::Starting
     );
 
@@ -1115,7 +776,7 @@ async fn delete_while_starting() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_ends_other_clients_subscriptions() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let watcher = daemon.client().await;
     let (session, started) = daemon.new_session(&watcher).await;
     let mut events = watcher.subscribe(&session.id, started).await.unwrap();
@@ -1131,7 +792,7 @@ async fn delete_ends_other_clients_subscriptions() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_ends_the_turn_and_its_permission_request() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1168,7 +829,7 @@ async fn delete_ends_the_turn_and_its_permission_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn permission_after_turn_returns_session_to_idle() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1182,7 +843,7 @@ async fn permission_after_turn_returns_session_to_idle() {
     .await;
     assert!(history.iter().any(|event| turn_ended(&event.kind)));
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::AwaitingPermission
     );
     let EventKind::PermissionRequested { request_id, .. } = &history.last().unwrap().kind else {
@@ -1196,13 +857,16 @@ async fn permission_after_turn_returns_session_to_idle() {
         matches!(kind, EventKind::PermissionResolved { .. })
     })
     .await;
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
     client.prompt(&session.id, text("pid")).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_the_agent_starts_runs_until_the_agent_is_idle() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1226,7 +890,7 @@ async fn a_turn_the_agent_starts_runs_until_the_agent_is_idle() {
         ]
     );
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::Running
     );
     let refused = client.prompt(&session.id, text("pid")).await.unwrap_err();
@@ -1242,13 +906,16 @@ async fn a_turn_the_agent_starts_runs_until_the_agent_is_idle() {
             error: None
         }
     );
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
     client.prompt(&session.id, text("pid")).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_ends_with_the_stop_reason_the_agent_reports() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1269,12 +936,15 @@ async fn a_turn_ends_with_the_stop_reason_the_agent_reports() {
         Some("the model failed"),
         "{details:?}"
     );
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_the_agent_rejects_ends_its_turn_with_the_error() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1288,13 +958,21 @@ async fn a_prompt_the_agent_rejects_ends_its_turn_with_the_error() {
         matches!(&turn[1].kind, EventKind::TurnEnded { stop_reason: None, error: Some(error) } if error.contains("Invalid params")),
         "{turn:?}"
     );
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
     client.prompt(&session.id, text("pid")).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exhausted_descriptors_do_not_stop_the_daemon() {
-    let mut daemon = Daemon::start_with(1000, Some(64)).await;
+    let mut daemon = Daemon::start_with(Options {
+        fd_limit: Some(64),
+        log: true,
+        ..Options::default()
+    })
+    .await;
     let mut streams = Vec::new();
     for _ in 0..100 {
         if let Ok(stream) = UnixStream::connect(&daemon.socket).await {
@@ -1314,7 +992,7 @@ async fn exhausted_descriptors_do_not_stop_the_daemon() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_late_rejection_does_not_end_the_next_prompt() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1323,7 +1001,10 @@ async fn a_late_rejection_does_not_end_the_next_prompt() {
         .await
         .unwrap();
     until(&mut events, turn_ended).await;
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
     client.prompt(&session.id, text("pid\nwait")).await.unwrap();
     // The fake agent answers the first prompt with an error only after the
     // second arrives, then starts the second prompt and reports its PID.
@@ -1337,7 +1018,7 @@ async fn a_late_rejection_does_not_end_the_next_prompt() {
         update_names(&second)
     );
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::Running
     );
     client.cancel(&session.id).await.unwrap();
@@ -1346,7 +1027,7 @@ async fn a_late_rejection_does_not_end_the_next_prompt() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_turn_after_the_resume_answer_is_live() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon
         .new_session_with(&client, &["--turn-after-resume"])
@@ -1386,7 +1067,7 @@ async fn a_turn_after_the_resume_answer_is_live() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_stops_agents_and_removes_the_socket() {
-    let mut daemon = Daemon::start(1000).await;
+    let mut daemon = Daemon::start().await;
     let client = daemon.client().await;
     let agent = ExitWatch::new(daemon.dir.path());
     daemon.new_session_with(&client, &agent.arg()).await;
@@ -1400,7 +1081,7 @@ async fn sigterm_stops_agents_and_removes_the_socket() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_stops_the_agent() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let agent = ExitWatch::new(daemon.dir.path());
     let (session, _) = daemon.new_session_with(&client, &agent.arg()).await;
@@ -1414,12 +1095,48 @@ async fn delete_stops_the_agent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn socket_is_private() {
     use std::os::unix::fs::PermissionsExt;
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let mode = std::fs::metadata(&daemon.socket)
         .unwrap()
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o600);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loaded_agent_is_set_to_the_sessions_options() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .set_config_option(&session.id, "mode", ConfigValue::Id("code".into()))
+        .await
+        .unwrap();
+    client.prompt(&session.id, text("exit 1")).await.unwrap();
+    until(&mut events, agent_exited).await;
+
+    // The new agent starts in its default mode.
+    client
+        .load_session(&session.id, BTreeMap::new())
+        .await
+        .unwrap();
+    let started = until(&mut events, agent_started).await;
+    let Some(EventKind::AgentStarted { config_options, .. }) =
+        started.last().map(|event| &event.kind)
+    else {
+        panic!("{started:?}");
+    };
+    assert_eq!(current(config_options, "mode"), "ask");
+    until(&mut events, |kind| {
+        matches!(
+            kind,
+            EventKind::Update(SessionUpdate::ConfigOptionUpdate(_))
+        )
+    })
+    .await;
+    let options = info(&client, &session.id).await.unwrap().config_options;
+    assert_eq!(current(&options, "mode"), "code");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1432,7 +1149,7 @@ async fn config_options_are_listed_and_set() {
         (&["--silent-config"][..], 1),
         (&["--late-config-update"][..], 2),
     ] {
-        let daemon = Daemon::start(1000).await;
+        let daemon = Daemon::start().await;
         let client = daemon.client().await;
         let (session, started) = daemon.new_session_with(&client, flags).await;
         assert_eq!(current(&session.config_options, "mode"), "ask");
@@ -1444,7 +1161,7 @@ async fn config_options_are_listed_and_set() {
             .await
             .unwrap();
         assert_eq!(current(&options, "mode"), "code");
-        let listed = other.list().await.unwrap();
+        let listed = sessions(&other).await;
         assert_eq!(current(&listed[0].config_options, "mode"), "code");
 
         let error = other
@@ -1452,7 +1169,7 @@ async fn config_options_are_listed_and_set() {
             .await
             .unwrap_err();
         assert_eq!(remote_code(error), code::AGENT);
-        let listed = other.list().await.unwrap();
+        let listed = sessions(&other).await;
         assert_eq!(current(&listed[0].config_options, "mode"), "code");
 
         client
@@ -1480,7 +1197,7 @@ async fn config_options_are_listed_and_set() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn prompt_content_reaches_the_agent() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     assert!(session.prompt_capabilities.image.is_some());
@@ -1508,7 +1225,7 @@ async fn prompt_content_reaches_the_agent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn prompt_content_the_agent_does_not_accept_is_rejected() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session_with(&client, &["--text-only"]).await;
     let text = ContentBlock::Text(TextContent::new("describe"));
@@ -1533,7 +1250,7 @@ async fn prompt_content_the_agent_does_not_accept_is_rejected() {
         let error = client.prompt(&session.id, prompt).await.unwrap_err();
         assert_eq!(remote_code(error), code::INVALID_REQUEST);
     }
-    let listed = client.list().await.unwrap();
+    let listed = sessions(&client).await;
     assert_eq!(listed[0].state, SessionState::Idle);
 
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1572,7 +1289,7 @@ fn agent_exited(kind: &EventKind) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workspace_add_refuses_what_is_not_a_new_directory() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let file = daemon.cwd().join("file");
     std::fs::write(&file, "").unwrap();
@@ -1584,18 +1301,18 @@ async fn workspace_add_refuses_what_is_not_a_new_directory() {
         let error = client.add_workspace(path.clone()).await.unwrap_err();
         assert_eq!(remote_code(error), code::INVALID_REQUEST, "{path:?}");
     }
-    assert!(client.list_workspaces().await.unwrap().is_empty());
+    assert!(workspaces(&client).await.is_empty());
 
     let workspace = client.add_workspace(daemon.cwd()).await.unwrap();
     assert_eq!(workspace.path, daemon.cwd());
     let error = client.add_workspace(daemon.cwd()).await.unwrap_err();
     assert_eq!(remote_code(error), code::INVALID_REQUEST);
-    assert_eq!(client.list_workspaces().await.unwrap(), [workspace]);
+    assert_eq!(workspaces(&client).await, [workspace]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_workspace_with_sessions_cannot_be_removed() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let workspace = daemon.workspace(&client).await;
@@ -1611,22 +1328,19 @@ async fn a_workspace_with_sessions_cannot_be_removed() {
     until(&mut events, agent_exited).await;
     let error = client.remove_workspace(&workspace.id).await.unwrap_err();
     assert_eq!(remote_code(error), code::INVALID_STATE);
-    assert_eq!(
-        client.list_workspaces().await.unwrap(),
-        std::slice::from_ref(&workspace)
-    );
+    assert_eq!(workspaces(&client).await, std::slice::from_ref(&workspace));
 
     client
         .delete(&session.id, false, BTreeMap::new())
         .await
         .unwrap();
     client.remove_workspace(&workspace.id).await.unwrap();
-    assert!(client.list_workspaces().await.unwrap().is_empty());
+    assert!(workspaces(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_runs_in_its_workspace() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, _) = daemon.new_session(&client).await;
     let workspace = daemon.workspace(&client).await;
@@ -1657,7 +1371,7 @@ async fn a_session_runs_in_its_workspace() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn workspaces_and_sessions_survive_a_restart() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let workspace = first.workspace(&client).await;
     let (titled, started) = first.new_session(&client).await;
@@ -1678,15 +1392,15 @@ async fn workspaces_and_sessions_survive_a_restart() {
         )
         .await
         .unwrap();
-    let titled = info(&client, &titled.id).await;
+    let titled = info(&client, &titled.id).await.unwrap();
     assert_eq!(titled.title.as_deref(), Some("Fix the build"));
     drop(events);
     drop(client);
     first.stop().await;
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
-    assert_eq!(client.list_workspaces().await.unwrap(), [workspace]);
+    assert_eq!(workspaces(&client).await, [workspace]);
     let saved = |session: SessionInfo| SessionInfo {
         state: SessionState::Exited,
         prompt_capabilities: PromptCapabilities::default(),
@@ -1695,7 +1409,7 @@ async fn workspaces_and_sessions_survive_a_restart() {
         ..session
     };
     assert_eq!(
-        client.list().await.unwrap(),
+        sessions(&client).await,
         [saved(titled), saved(plain)],
         "the session that never started ({}) is gone",
         unstarted.id
@@ -1703,10 +1417,8 @@ async fn workspaces_and_sessions_survive_a_restart() {
 
     // Sessions created after the restart follow the saved ones.
     let (new, _) = second.new_session(&client).await;
-    let ids: Vec<String> = client
-        .list()
+    let ids: Vec<String> = sessions(&client)
         .await
-        .unwrap()
         .into_iter()
         .map(|session| session.id)
         .collect();
@@ -1714,25 +1426,8 @@ async fn workspaces_and_sessions_survive_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_deleted_session_is_not_saved() {
-    let mut first = Daemon::start(1000).await;
-    let client = first.client().await;
-    let (session, _) = first.new_session(&client).await;
-    client
-        .delete(&session.id, false, BTreeMap::new())
-        .await
-        .unwrap();
-    drop(client);
-    first.stop().await;
-
-    let second = first.again(1000).await;
-    let client = second.client().await;
-    assert!(client.list().await.unwrap().is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn loading_a_restored_session_keeps_its_stored_history() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let (session, started) = first
         .new_session_with(&client, &["--no-resume-replay"])
@@ -1749,7 +1444,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
     drop(client);
     first.stop().await;
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
     // The history comes from the database with its seqs, and the
     // subscription stays open for what follows.
@@ -1789,7 +1484,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
         &restarted.kind,
         EventKind::AgentStarted { agent_session_id: id, .. } if *id == agent_session_id
     ));
-    let loaded = info(&client, &loaded.id).await;
+    let loaded = info(&client, &loaded.id).await.unwrap();
     assert_eq!(loaded.state, SessionState::Idle);
     assert_eq!(loaded.title.as_deref(), Some("Replay me"));
     assert_eq!(loaded.config_options, session.config_options);
@@ -1803,7 +1498,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loading_a_restored_session_recovers_missing_history_from_the_agent() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let (session, started) = first.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1819,7 +1514,7 @@ async fn loading_a_restored_session_recovers_missing_history_from_the_agent() {
         .unwrap();
     drop(database);
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     client
@@ -1832,7 +1527,7 @@ async fn loading_a_restored_session_recovers_missing_history_from_the_agent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stopped_daemon_stores_the_end_of_the_turn_it_interrupted() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let (session, started) = first.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1854,7 +1549,7 @@ async fn a_stopped_daemon_stores_the_end_of_the_turn_it_interrupted() {
     drop(events);
     drop(client);
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     let history = until(&mut events, turn_ended).await;
@@ -1863,7 +1558,7 @@ async fn a_stopped_daemon_stores_the_end_of_the_turn_it_interrupted() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_history_that_a_crash_left_open_ends_its_turn() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let (session, started) = first.new_session(&client).await;
     drop(client);
@@ -1910,7 +1605,7 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
     }
     drop(database);
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     let rest = until(&mut events, turn_ended).await;
@@ -1946,7 +1641,7 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deleted_session_loses_its_history() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let (session, _) = first.new_session(&client).await;
     let (kept, _) = first.new_session(&client).await;
@@ -1957,8 +1652,10 @@ async fn a_deleted_session_loses_its_history() {
     drop(client);
     first.stop().await;
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
+    let ids: Vec<String> = sessions(&client).await.into_iter().map(|s| s.id).collect();
+    assert_eq!(ids, [kept.id.as_str()]);
     let error = client.subscribe(&session.id, 0).await.unwrap_err();
     assert_eq!(remote_code(error), code::NOT_FOUND);
     let mut events = client.subscribe(&kept.id, 0).await.unwrap();
@@ -1970,7 +1667,7 @@ async fn a_deleted_session_loses_its_history() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loading_a_session_whose_agent_exited_keeps_its_history() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -1996,7 +1693,10 @@ async fn loading_a_session_whose_agent_exited_keeps_its_history() {
     }
     // The history holds the echo of the prompt and its reply once.
     assert_eq!(replayed(&history), ["user: say 1 0", "agent: chunk-1"]);
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
 
     client.prompt(&session.id, text("say 1 0")).await.unwrap();
     let turn = until(&mut events, turn_ended).await;
@@ -2005,7 +1705,7 @@ async fn loading_a_session_whose_agent_exited_keeps_its_history() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_loaded_agent_gets_new_permission_request_ids() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -2052,7 +1752,7 @@ async fn a_loaded_agent_gets_new_permission_request_ids() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn only_an_exited_session_that_started_can_be_loaded() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let error = client
         .load_session("unknown", BTreeMap::new())
@@ -2066,7 +1766,10 @@ async fn only_an_exited_session_that_started_can_be_loaded() {
         .await
         .unwrap_err();
     assert_eq!(remote_code(error), code::INVALID_STATE);
-    assert_eq!(info(&client, &running.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &running.id).await.unwrap().state,
+        SessionState::Idle
+    );
 
     let workspace = daemon.workspace(&client).await;
     let unstarted = client
@@ -2079,7 +1782,15 @@ async fn only_an_exited_session_that_started_can_be_loaded() {
         .await
         .unwrap();
     let mut events = client.subscribe(&unstarted.id, 0).await.unwrap();
-    until(&mut events, agent_exited).await;
+    let exited = next(&mut events).await;
+    assert!(
+        matches!(exited.kind, EventKind::AgentExited { error: Some(_) }),
+        "{exited:?}"
+    );
+    assert_eq!(
+        info(&client, &unstarted.id).await.unwrap().state,
+        SessionState::Exited
+    );
     let error = client
         .load_session(&unstarted.id, BTreeMap::new())
         .await
@@ -2089,7 +1800,7 @@ async fn only_an_exited_session_that_started_can_be_loaded() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_agent_without_session_capabilities_cannot_run_sessions() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let workspace = daemon.workspace(&client).await;
     let session = client
@@ -2107,12 +1818,15 @@ async fn an_agent_without_session_capabilities_cannot_run_sessions() {
         matches!(&exited.kind, EventKind::AgentExited { error: Some(error) } if error.contains("does not support sessions")),
         "{exited:?}"
     );
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Exited);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Exited
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_idle() {
-    let mut first = Daemon::start(1000).await;
+    let mut first = Daemon::start().await;
     let client = first.client().await;
     let workspace = first.workspace(&client).await;
     let session = client
@@ -2132,7 +1846,7 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
     drop(client);
     first.stop().await;
 
-    let second = first.again(1000).await;
+    let second = first.again(Options::default()).await;
     let client = second.client().await;
     client
         .load_session(&session.id, BTreeMap::new())
@@ -2145,7 +1859,7 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
     // The agent reported `running` on resume: the session is running, and no
     // turn began that the history saw.
     assert_eq!(
-        info(&client, &session.id).await.state,
+        info(&client, &session.id).await.unwrap().state,
         SessionState::Running
     );
     let refused = client.prompt(&session.id, text("pid")).await.unwrap_err();
@@ -2160,7 +1874,10 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
     })
     .await;
     assert_eq!(update_names(&rest), ["idle"]);
-    assert_eq!(info(&client, &session.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Idle
+    );
     let mut all = client.subscribe(&session.id, 0).await.unwrap();
     let mut history = Vec::new();
     while history.len() < usize::try_from(started_seq).unwrap() + 1 {
@@ -2176,7 +1893,11 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
 
 #[tokio::test(flavor = "multi_thread")]
 async fn exited_sessions_do_not_keep_the_daemon_alive() {
-    let mut daemon = Daemon::start(300).await;
+    let mut daemon = Daemon::start_with(Options {
+        idle_exit_ms: 300,
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -2187,163 +1908,29 @@ async fn exited_sessions_do_not_keep_the_daemon_alive() {
     assert!(daemon.wait_for_exit().await.success());
 
     // The session was saved, so the next daemon lists it.
-    let daemon = daemon.again(1000).await;
+    let daemon = daemon.again(Options::default()).await;
     let client = daemon.client().await;
-    let sessions = client.list().await.unwrap();
+    let sessions = sessions(&client).await;
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].id, session.id);
     assert_eq!(sessions[0].state, SessionState::Exited);
 }
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_starts_with_the_workspaces_and_sessions() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let (session, _) = daemon.new_session(&client).await;
-    let workspace = daemon.workspace(&client).await;
-    let mut watch = listings(&client).await;
-    let first = watch.until(|_| true).await.remove(0);
-    assert_eq!(first.workspaces, [workspace]);
-    assert_eq!(first.sessions, [session]);
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn command_catalogs_reach_current_and_reconnecting_watchers() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let (session, seq) = daemon.new_session(&client).await;
-    assert_eq!(session.available_commands.len(), 3);
-    let mut events = client.subscribe(&session.id, seq).await.unwrap();
-    let mut watch = listings(&client).await;
-    let initial = watch.until(|_| true).await.remove(0);
-    assert_eq!(
-        initial.sessions[0].available_commands,
-        session.available_commands
-    );
-    let replacement = json!([{"type":"command","name":"echo","description":"Updated","input":{"type":"text","hint":"message"}}]);
-    client
-        .prompt(&session.id, text(&format!("commands {replacement}")))
-        .await
-        .unwrap();
-    until(&mut events, |kind| {
-        matches!(kind, EventKind::TurnEnded { .. })
-    })
-    .await;
-    let changed = watch
-        .until(|listing| listing.sessions[0].available_commands.len() == 1)
-        .await
-        .pop()
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(&changed.sessions[0].available_commands).unwrap(),
-        replacement
-    );
-
-    let reconnected = daemon.client().await;
-    let mut fresh = listings(&reconnected).await;
-    let snapshot = fresh.until(|_| true).await.remove(0);
-    assert_eq!(
-        snapshot.sessions[0].available_commands,
-        changed.sessions[0].available_commands
-    );
-
-    client
-        .prompt(&session.id, text("commands []"))
-        .await
-        .unwrap();
-    until(&mut events, |kind| {
-        matches!(kind, EventKind::TurnEnded { .. })
-    })
-    .await;
-    watch
-        .until(|listing| listing.sessions[0].available_commands.is_empty())
-        .await;
-    assert!(
-        info(&client, &session.id)
-            .await
-            .available_commands
-            .is_empty()
-    );
-    let (empty, _) = daemon.new_session_with(&client, &["--no-commands"]).await;
-    assert!(empty.available_commands.is_empty());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_follows_workspaces() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let mut watch = listings(&client).await;
-    watch.until(|listing| listing.workspaces.is_empty()).await;
-
-    let workspace = client.add_workspace(daemon.cwd()).await.unwrap();
-    watch
-        .until(|listing| listing.workspaces == [workspace.clone()])
-        .await;
-    client.remove_workspace(&workspace.id).await.unwrap();
-    watch.until(|listing| listing.workspaces.is_empty()).await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn watch_follows_a_session() {
-    let daemon = Daemon::start(1000).await;
-    let client = daemon.client().await;
-    let mut watch = listings(&client).await;
-    watch.until(|listing| listing.sessions.is_empty()).await;
-
-    let workspace = daemon.workspace(&client).await;
-    let session = client
-        .new_session(
-            &workspace.id,
-            fake_agent(&[]),
-            BTreeMap::new(),
-            Checkout::Workspace,
-        )
-        .await
-        .unwrap();
-    let id = session.id.as_str();
-    let mut events = client.subscribe(id, 0).await.unwrap();
-    let mut reach = async |state: SessionState| {
-        watch
-            .until(|listing| state_in(&listing.sessions, id) == Some(state))
-            .await;
-    };
-    reach(SessionState::Idle).await;
-
-    client.prompt(id, text("wait")).await.unwrap();
-    reach(SessionState::Running).await;
-    client.cancel(id).await.unwrap();
-    reach(SessionState::Idle).await;
-
-    client.prompt(id, text("permission")).await.unwrap();
-    reach(SessionState::AwaitingPermission).await;
-    let requested = until(&mut events, |kind| {
-        matches!(kind, EventKind::PermissionRequested { .. })
-    })
-    .await;
-    let EventKind::PermissionRequested { request_id, .. } = &requested.last().unwrap().kind else {
-        unreachable!()
-    };
-    client.permit(id, request_id, "allow").await.unwrap();
-    reach(SessionState::Idle).await;
-
-    client.delete(id, false, BTreeMap::new()).await.unwrap();
-    watch
-        .until(|listing| state_in(&listing.sessions, id).is_none())
-        .await;
-}
-
-/// After its first message, a watch sends a session only when its info
-/// changed, and never the sessions that did not change.
+/// A watch's first message lists the workspaces and sessions. After it, a
+/// watch sends a session only when its info changed, and never the sessions
+/// that did not change.
 #[tokio::test(flavor = "multi_thread")]
 async fn watch_sends_only_sessions_whose_info_changed() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (quiet, _) = daemon.new_session(&client).await;
     let (busy, started) = daemon.new_session(&client).await;
+    let workspace = daemon.workspace(&client).await;
     let mut watch = client.watch().await.unwrap();
     let mut listing = Listing::default();
     for change in next_changes(&mut watch).await {
         apply(&mut listing, change);
     }
+    assert_eq!(listing.workspaces, [workspace]);
     assert_eq!(listing.sessions, [quiet, busy.clone()]);
 
     let mut events = client.subscribe(&busy.id, started).await.unwrap();
@@ -2378,7 +1965,7 @@ async fn watch_sends_only_sessions_whose_info_changed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn session_info_updates_set_the_title() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     assert_eq!(session.title, None);
@@ -2392,7 +1979,7 @@ async fn session_info_updates_set_the_title() {
         client.prompt(&session.id, text(script)).await.unwrap();
         until(&mut events, turn_ended).await;
         assert_eq!(
-            info(&client, &session.id).await.title.as_deref(),
+            info(&client, &session.id).await.unwrap().title.as_deref(),
             title,
             "{script}"
         );
@@ -2409,7 +1996,7 @@ async fn session_info_updates_set_the_title() {
 /// its session. Needs `ox-mcp` built beside `oxd`.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_sets_title_through_ox_mcp_server() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -2420,7 +2007,7 @@ async fn agent_sets_title_through_ox_mcp_server() {
     let turn = until(&mut events, turn_ended).await;
     assert_eq!(chunks(&turn), ["Title set."]);
     assert_eq!(
-        info(&client, &session.id).await.title.as_deref(),
+        info(&client, &session.id).await.unwrap().title.as_deref(),
         Some("Renamed by agent")
     );
 }
@@ -2429,7 +2016,7 @@ async fn agent_sets_title_through_ox_mcp_server() {
 /// listings.
 #[tokio::test(flavor = "multi_thread")]
 async fn unsubscribe_ends_a_watch() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut raw = Raw::connect(&daemon).await;
@@ -2503,7 +2090,12 @@ async fn parked_seq(client: &Client, id: &str) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_idle_unviewed_session_is_parked_and_its_agent_exits() {
-    let daemon = Daemon::start_parking(5000, 300).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let agent = ExitWatch::new(daemon.dir.path());
     let (session, _) = parking_session(&daemon, &client, &agent.arg()).await;
@@ -2515,7 +2107,12 @@ async fn an_idle_unviewed_session_is_parked_and_its_agent_exits() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_session_loads_again() {
-    let daemon = Daemon::start_parking(5000, 300).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (session, started) = parking_session(&daemon, &client, &[]).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
@@ -2543,14 +2140,22 @@ async fn a_parked_session_loads_again() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_viewed_session_is_not_parked() {
-    let daemon = Daemon::start_parking(5000, 300).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (viewed, started) = parking_session(&daemon, &client, &[]).await;
     let view = client.subscribe(&viewed.id, started).await.unwrap();
     let (control, _) = parking_session(&daemon, &client, &[]).await;
     let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
-    assert_ne!(info(&client, &viewed.id).await.state, SessionState::Exited);
+    assert_ne!(
+        info(&client, &viewed.id).await.unwrap().state,
+        SessionState::Exited
+    );
 
     drop(view);
     parked(&mut watch, &viewed.id).await;
@@ -2558,7 +2163,12 @@ async fn a_viewed_session_is_not_parked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_background_work_is_not_parked() {
-    let daemon = Daemon::start_parking(5000, 300).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (busy, started) = parking_session(&daemon, &client, &[]).await;
     let mut events = client.subscribe(&busy.id, started).await.unwrap();
@@ -2571,7 +2181,10 @@ async fn a_session_with_background_work_is_not_parked() {
     let (control, _) = parking_session(&daemon, &client, &[]).await;
     let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
-    assert_eq!(info(&client, &busy.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &busy.id).await.unwrap().state,
+        SessionState::Idle
+    );
 
     let mut events = client.subscribe(&busy.id, 0).await.unwrap();
     client
@@ -2585,18 +2198,31 @@ async fn a_session_with_background_work_is_not_parked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_whose_agent_reports_no_background_work_is_not_parked() {
-    let daemon = Daemon::start_parking(5000, 300).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (silent, _) = daemon.new_session(&client).await;
     let (control, _) = parking_session(&daemon, &client, &[]).await;
     let mut watch = listings(&client).await;
     parked(&mut watch, &control.id).await;
-    assert_eq!(info(&client, &silent.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &silent.id).await.unwrap().state,
+        SessionState::Idle
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn becoming_busy_restarts_the_park_delay() {
-    let daemon = Daemon::start_parking(5000, 800).await;
+    let daemon = Daemon::start_with(Options {
+        idle_exit_ms: 5000,
+        park_after_ms: Some(800),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let (restarted, _) = parking_session(&daemon, &client, &[]).await;
     let (control, _) = parking_session(&daemon, &client, &[]).await;
@@ -2609,13 +2235,21 @@ async fn becoming_busy_restarts_the_park_delay() {
     until(&mut events, turn_ended).await;
     drop(events);
     parked(&mut watch, &control.id).await;
-    assert_eq!(info(&client, &restarted.id).await.state, SessionState::Idle);
+    assert_eq!(
+        info(&client, &restarted.id).await.unwrap().state,
+        SessionState::Idle
+    );
     parked(&mut watch, &restarted.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_whose_sessions_are_parked_exits() {
-    let mut daemon = Daemon::start_parking(300, 300).await;
+    let mut daemon = Daemon::start_with(Options {
+        idle_exit_ms: 300,
+        park_after_ms: Some(300),
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     parking_session(&daemon, &client, &[]).await;
     drop(client);
@@ -2625,7 +2259,7 @@ async fn a_daemon_whose_sessions_are_parked_exits() {
 
 /// Waits for a directory watch to list exactly `expected`, as name and kind
 /// pairs.
-async fn entries_until(watch: &mut DirectoryWatch, expected: &[(&str, EntryKind)]) {
+async fn entries_until(watch: &mut Stream<Vec<DirEntry>>, expected: &[(&str, EntryKind)]) {
     let expected: Vec<DirEntry> = expected
         .iter()
         .map(|&(name, kind)| DirEntry {
@@ -2646,7 +2280,7 @@ async fn entries_until(watch: &mut DirectoryWatch, expected: &[(&str, EntryKind)
 
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_watch_follows_changes() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -2692,7 +2326,7 @@ async fn directory_watch_follows_changes() {
 /// of a session that is starting, lists the directory once it is created.
 #[tokio::test(flavor = "multi_thread")]
 async fn directory_watch_lists_a_directory_once_it_exists() {
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let dir = tempfile::tempdir().unwrap();
     let parent = dir.path().join("parent");
@@ -2710,7 +2344,7 @@ async fn directory_watch_lists_a_directory_once_it_exists() {
 #[tokio::test(flavor = "multi_thread")]
 async fn file_watch_follows_edits_replacement_and_recreation() {
     use ox_protocol::FileContent;
-    async fn text(watch: &mut ox_protocol::FileWatch, expected: &str) {
+    async fn text(watch: &mut Stream<ox_protocol::FileContent>, expected: &str) {
         timeout(TIMEOUT, async {
             loop {
                 if watch.next().await.unwrap()
@@ -2725,7 +2359,7 @@ async fn file_watch_follows_edits_replacement_and_recreation() {
         .await
         .unwrap();
     }
-    let daemon = Daemon::start(1000).await;
+    let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("file.txt");
@@ -2754,7 +2388,7 @@ async fn file_watch_follows_edits_replacement_and_recreation() {
     }
     let fifo = dir.path().join("fifo");
     assert!(
-        Command::new("mkfifo")
+        tokio::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
             .await

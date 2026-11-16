@@ -21,7 +21,7 @@ import { type Item, isRequest } from "./lib/protocol";
 const noItems: Item[] = [];
 
 export function App() {
-  const { workspaces, worktrees, sessions, runs, connection } = useWorkspaces();
+  const { workspaces, worktrees, sessions, runs, parents, connection } = useWorkspaces();
   // Each session's files are under its directory, and each run's under its
   // worktree.
   const views = useMemo(
@@ -49,11 +49,6 @@ export function App() {
   }, [views, connection]);
   const run = runs.find((run) => run.id === viewed);
   const session = run ? undefined : sessions.find((session) => session.id === viewed);
-  // A session is a child of the run that owns its worktree.
-  const parent =
-    session?.worktree_id == null
-      ? undefined
-      : runs.find((run) => run.worktree_id === session.worktree_id);
   const root = run ? worktrees.get(run.worktree_id)?.path : session?.cwd;
   const onOpenFile = useCallback(
     (path: string) => {
@@ -88,7 +83,7 @@ export function App() {
           <Composer
             key={session.id}
             session={session}
-            run={parent}
+            run={parents.get(session.id)}
             request={request}
             drafts={drafts}
           />
@@ -138,6 +133,7 @@ export function App() {
             worktrees={worktrees}
             sessions={sessions}
             runs={runs}
+            parents={parents}
             selected={viewed}
             onSelect={setViewed}
             actions={actions}

@@ -1,6 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   ListingChange,
   RunInfo,
@@ -137,11 +137,24 @@ export function useWorkspaces() {
     };
   }, [attempt]);
 
+  // A session is a child of the run that owns its worktree.
+  const parents = useMemo(() => {
+    const runOfWorktree = new Map(listing.runs.map((run) => [run.worktree_id, run]));
+    const parents = new Map<string, RunInfo>();
+    for (const session of listing.sessions) {
+      const run = session.worktree_id === null ? undefined : runOfWorktree.get(session.worktree_id);
+      if (run !== undefined) parents.set(session.id, run);
+    }
+    return parents;
+  }, [listing.sessions, listing.runs]);
+
   return {
     workspaces: listing.workspaces,
     worktrees: listing.worktrees,
     sessions: listing.sessions,
     runs: listing.runs,
+    /** The run each child session belongs to, by session ID. */
+    parents,
     connection,
   };
 }

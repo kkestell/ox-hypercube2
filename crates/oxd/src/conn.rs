@@ -181,7 +181,6 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
             | Method::SessionUnarchive { .. }
             | Method::WorkspaceBranches { .. }
             | Method::BranchMove { .. }
-            | Method::WorktreeSetCompare { .. }
             | Method::WorktreeRefresh { .. }) => {
                 let daemon = daemon.clone();
                 let outgoing = outgoing.clone();

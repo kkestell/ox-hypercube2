@@ -1,15 +1,13 @@
 //! A session's state machine and the event history it writes.
 
-use std::collections::BTreeMap;
-
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v2::schema::{
     AvailableCommand, BackgroundWork, CancelledPermissionOutcome, ConfigOptionUpdate, ContentBlock,
-    CreateElicitationRequest, ElicitationAction, ElicitationContentValue, ElicitationMode,
-    ElicitationPropertySchema, ElicitationSchema, ElicitationScope, EmbeddedResourceResource,
-    MultiSelectItems, PermissionOption, PromptCapabilities, RequestPermissionOutcome,
-    RequestPermissionRequest, SelectedPermissionOutcome, SessionConfigOption, SessionUpdate,
-    StateUpdate, ToolCallId,
+    CreateElicitationRequest, ElicitationAction, ElicitationMode, ElicitationPropertySchema,
+    ElicitationSchema, ElicitationScope, EmbeddedResourceResource, PermissionOption,
+    PromptCapabilities, RequestPermissionOutcome, RequestPermissionRequest,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
+    SessionUpdate, StateUpdate, ToolCallId,
 };
 use ox_protocol::{ErrorBody, Event, EventKind, SessionState, code};
 use tokio::sync::oneshot;
@@ -121,7 +119,6 @@ enum PendingKind {
         answer: oneshot::Sender<RequestPermissionOutcome>,
     },
     Elicitation {
-        schema: ElicitationSchema,
         answer: oneshot::Sender<ElicitationAction>,
     },
 }
@@ -423,10 +420,7 @@ impl Phase {
                 *next_request += 1;
                 live.pending.push(Pending {
                     request_id: request_id.clone(),
-                    kind: PendingKind::Elicitation {
-                        schema: schema.clone(),
-                        answer,
-                    },
+                    kind: PendingKind::Elicitation { answer },
                 });
                 let requested = EventKind::ElicitationRequested {
                     request_id,
@@ -534,6 +528,28 @@ pub struct State {
 pub struct Resume {
     pub session_id: String,
     pub replay: bool,
+    /// The value of each option the agent last reported, which the resumed
+    /// agent is set to again.
+    pub options: Vec<(String, SessionConfigOptionValue)>,
+}
+
+/// The value of each select and boolean option in `options`, by option ID.
+pub fn option_values(options: &[SessionConfigOption]) -> Vec<(String, SessionConfigOptionValue)> {
+    options
+        .iter()
+        .filter_map(|option| {
+            let value = match &option.kind {
+                SessionConfigKind::Select(select) => {
+                    SessionConfigOptionValue::id(select.current_value.clone())
+                }
+                SessionConfigKind::Boolean(boolean) => {
+                    SessionConfigOptionValue::boolean(boolean.current_value)
+                }
+                _ => return None,
+            };
+            Some((option.config_id.to_string(), value))
+        })
+        .collect()
 }
 
 impl State {
@@ -667,11 +683,21 @@ impl State {
             }
             phase => return Err(invalid_state(phase.state())),
         };
-        let replay = !self
-            .events
-            .iter()
-            .flatten()
+        let events = self.events.iter().flatten();
+        let replay = !events
+            .clone()
             .any(|event| matches!(event.kind, EventKind::AgentStarted { .. }));
+        let options = events
+            .rev()
+            .find_map(|event| match &event.kind {
+                EventKind::AgentStarted { config_options, .. } => Some(config_options),
+                EventKind::Update(SessionUpdate::ConfigOptionUpdate(update)) => {
+                    Some(&update.config_options)
+                }
+                _ => None,
+            })
+            .map(|options| option_values(options))
+            .unwrap_or_default();
         self.phase = Phase::Starting {
             busy: false,
             background: None,
@@ -681,6 +707,7 @@ impl State {
         Ok(Resume {
             session_id: id,
             replay,
+            options,
         })
     }
 
@@ -800,17 +827,13 @@ impl State {
                 }) else {
                     return Err(not_pending(&request_id));
                 };
-                let PendingKind::Elicitation { schema, .. } = &live.pending[index].kind else {
-                    unreachable!("the request found is an elicitation");
-                };
-                match &action {
-                    ElicitationAction::Accept(accepted) => {
-                        let empty = BTreeMap::new();
-                        check_content(schema, accepted.content.as_ref().unwrap_or(&empty))
-                            .map_err(invalid_request)?;
-                    }
-                    ElicitationAction::Decline | ElicitationAction::Cancel => {}
-                    _ => return Err(invalid_request("unknown elicitation action".into())),
+                if !matches!(
+                    action,
+                    ElicitationAction::Accept(_)
+                        | ElicitationAction::Decline
+                        | ElicitationAction::Cancel
+                ) {
+                    return Err(invalid_request("unknown elicitation action".into()));
                 }
                 let PendingKind::Elicitation { answer, .. } = live.pending.remove(index).kind
                 else {
@@ -901,9 +924,9 @@ fn check_prompt(prompt: &[ContentBlock], accepts: &PromptCapabilities) -> Result
 
 /// Checks a form elicitation that oxd can show to clients, and returns its
 /// message, tool call, and schema. Other modes, a request scope, and forms a
-/// client cannot render are refused with `-32602`: a required property of
-/// unknown type or with no schema, and a property with both `enum` and
-/// `oneOf`.
+/// client cannot render are refused with `-32602`. A client renders text,
+/// `oneOf` choices and multi-selects, and leaves out an optional property of
+/// unknown type.
 pub fn check_form(
     request: CreateElicitationRequest,
 ) -> Result<(String, Option<ToolCallId>, ElicitationSchema), agent_client_protocol::Error> {
@@ -918,11 +941,14 @@ pub fn check_form(
     };
     let schema = form.requested_schema;
     for (name, property) in &schema.properties {
-        if let ElicitationPropertySchema::String(string) = property
-            && string.enum_values.is_some()
-            && string.one_of.is_some()
-        {
-            return Err(refuse(format!("property {name} has both enum and oneOf")));
+        match property {
+            ElicitationPropertySchema::String(string) if string.enum_values.is_none() => {}
+            ElicitationPropertySchema::Array(_) | ElicitationPropertySchema::Other(_) => {}
+            _ => {
+                return Err(refuse(format!(
+                    "property {name} is of a kind oxd cannot show"
+                )));
+            }
         }
     }
     for name in schema.required.iter().flatten() {
@@ -938,147 +964,6 @@ pub fn check_form(
         }
     }
     Ok((request.message, scope.tool_call_id, schema))
-}
-
-/// Checks accepted content against an elicitation's schema: every key names
-/// a property, each value fits its property, and every required property is
-/// present. A property of unknown type takes any value. `pattern` and
-/// `format` are not checked.
-fn check_content(
-    schema: &ElicitationSchema,
-    content: &BTreeMap<String, ElicitationContentValue>,
-) -> Result<(), String> {
-    for (name, value) in content {
-        let Some(property) = schema.properties.get(name) else {
-            return Err(format!("{name} is not a field of the form"));
-        };
-        check_value(name, property, value)?;
-    }
-    for name in schema.required.iter().flatten() {
-        if !content.contains_key(name) {
-            return Err(format!("{name} is required"));
-        }
-    }
-    Ok(())
-}
-
-/// Checks one value of accepted content against its property.
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "a number field's limits are floats, so an integer answer is compared as one"
-)]
-fn check_value(
-    name: &str,
-    property: &ElicitationPropertySchema,
-    value: &ElicitationContentValue,
-) -> Result<(), String> {
-    match (property, value) {
-        (ElicitationPropertySchema::String(string), ElicitationContentValue::String(text)) => {
-            let choices = string
-                .enum_values
-                .as_ref()
-                .map(|values| values.iter().map(String::as_str).collect::<Vec<_>>())
-                .or_else(|| {
-                    string
-                        .one_of
-                        .as_ref()
-                        .map(|options| options.iter().map(|o| o.value.as_str()).collect())
-                });
-            if let Some(choices) = choices
-                && !choices.contains(&text.as_str())
-            {
-                return Err(format!("{text} is not a choice of {name}"));
-            }
-            let length = text.chars().count();
-            if let Some(min) = string.min_length
-                && length < min as usize
-            {
-                return Err(format!("{name} needs at least {min} characters"));
-            }
-            if let Some(max) = string.max_length
-                && length > max as usize
-            {
-                return Err(format!("{name} takes at most {max} characters"));
-            }
-            Ok(())
-        }
-        (
-            ElicitationPropertySchema::Number(number),
-            ElicitationContentValue::Integer(_) | ElicitationContentValue::Number(_),
-        ) => {
-            let value = match value {
-                ElicitationContentValue::Integer(integer) => *integer as f64,
-                ElicitationContentValue::Number(float) => *float,
-                _ => unreachable!("the value is a number"),
-            };
-            check_range(name, value, number.minimum, number.maximum)
-        }
-        (ElicitationPropertySchema::Integer(integer), ElicitationContentValue::Integer(value)) => {
-            check_range(name, *value, integer.minimum, integer.maximum)
-        }
-        (ElicitationPropertySchema::Boolean(_), ElicitationContentValue::Boolean(_))
-        | (ElicitationPropertySchema::Other(_), _) => Ok(()),
-        (ElicitationPropertySchema::Array(array), ElicitationContentValue::StringArray(items)) => {
-            let choices: Option<Vec<&str>> = match &array.items {
-                MultiSelectItems::String(items) => {
-                    Some(items.values.iter().map(String::as_str).collect())
-                }
-                MultiSelectItems::Titled(items) => {
-                    Some(items.options.iter().map(|o| o.value.as_str()).collect())
-                }
-                _ => None,
-            };
-            if let Some(choices) = choices
-                && let Some(item) = items.iter().find(|item| !choices.contains(&item.as_str()))
-            {
-                return Err(format!("{item} is not a choice of {name}"));
-            }
-            let count = items.len() as u64;
-            if let Some(min) = array.min_items
-                && count < min
-            {
-                return Err(format!("{name} needs at least {min} choices"));
-            }
-            if let Some(max) = array.max_items
-                && count > max
-            {
-                return Err(format!("{name} takes at most {max} choices"));
-            }
-            Ok(())
-        }
-        (property, _) => Err(format!("{name} takes {}", kind_name(property))),
-    }
-}
-
-fn check_range<T: Copy + PartialOrd + std::fmt::Display>(
-    name: &str,
-    value: T,
-    minimum: Option<T>,
-    maximum: Option<T>,
-) -> Result<(), String> {
-    if let Some(minimum) = minimum
-        && value < minimum
-    {
-        return Err(format!("{name} is at least {minimum}"));
-    }
-    if let Some(maximum) = maximum
-        && value > maximum
-    {
-        return Err(format!("{name} is at most {maximum}"));
-    }
-    Ok(())
-}
-
-/// What a property's values are, for an error.
-fn kind_name(property: &ElicitationPropertySchema) -> &'static str {
-    match property {
-        ElicitationPropertySchema::String(_) => "text",
-        ElicitationPropertySchema::Number(_) => "a number",
-        ElicitationPropertySchema::Integer(_) => "an integer",
-        ElicitationPropertySchema::Boolean(_) => "true or false",
-        ElicitationPropertySchema::Array(_) => "a list of choices",
-        _ => "another kind of value",
-    }
 }
 
 fn invalid_request(message: String) -> ErrorBody {
@@ -1107,12 +992,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use agent_client_protocol::v2::schema::{
-        BackgroundToolCall, ContentChunk, ElicitationAcceptAction, ElicitationFormMode,
-        ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode, EnumOption,
-        IdleStateUpdate, IntegerPropertySchema, MultiSelectPropertySchema,
-        OtherElicitationPropertySchema, OtherStateUpdate, PermissionOptionKind,
-        RequiresActionStateUpdate, RunningStateUpdate, SessionInfoUpdate, StopReason,
-        StringPropertySchema, TextContent,
+        BackgroundToolCall, ContentChunk, ElicitationAcceptAction, ElicitationContentValue,
+        ElicitationFormMode, ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode,
+        EnumOption, IdleStateUpdate, MultiSelectPropertySchema, OtherElicitationPropertySchema,
+        OtherStateUpdate, PermissionOptionKind, RequiresActionStateUpdate, RunningStateUpdate,
+        SessionInfoUpdate, StopReason, StringPropertySchema, TextContent,
     };
     use serde_json::json;
 
@@ -2003,15 +1887,9 @@ mod tests {
             )
             .property(
                 "note",
-                StringPropertySchema::new().min_length(2).max_length(5),
+                StringPropertySchema::new().default_value("first"),
                 false,
             )
-            .property(
-                "count",
-                IntegerPropertySchema::new().minimum(1).maximum(9),
-                false,
-            )
-            .boolean("rush", false)
     }
 
     /// Records an elicitation of `order()` and returns the receiver of its
@@ -2073,9 +1951,6 @@ mod tests {
         let error = respond(&mut state, "2", ElicitationAction::Decline).unwrap_err();
         assert_eq!(error.code, code::INVALID_STATE);
 
-        let error = respond(&mut state, "1", accept(json!({"count": 3}))).unwrap_err();
-        assert_eq!(error.code, code::INVALID_REQUEST);
-        assert_eq!(state.state(), SessionState::AwaitingInput);
         respond(&mut state, "1", accept(json!({"color": "blue"}))).unwrap();
         assert_eq!(action.try_recv(), Ok(accept(json!({"color": "blue"}))));
         assert_eq!(state.state(), SessionState::Running);
@@ -2186,86 +2061,6 @@ mod tests {
     }
 
     #[test]
-    fn content_must_fit_the_schema() {
-        let check = |content: serde_json::Value| {
-            check_content(&order(), &serde_json::from_value(content).unwrap())
-        };
-        check(json!({"color": "red"})).unwrap();
-        check(json!({
-            "color": "blue", "extras": ["nuts"], "note": "héllo", "count": 9, "rush": false
-        }))
-        .unwrap();
-        check(json!({"color": "blue", "extras": []})).unwrap();
-        for (content, error) in [
-            (
-                json!({"color": "red", "size": 2}),
-                "size is not a field of the form",
-            ),
-            (json!({"color": "green"}), "green is not a choice of color"),
-            (json!({"color": 1}), "color takes text"),
-            (
-                json!({"color": "red", "count": "3"}),
-                "count takes an integer",
-            ),
-            (
-                json!({"color": "red", "count": 2.5}),
-                "count takes an integer",
-            ),
-            (json!({"color": "red", "count": 10}), "count is at most 9"),
-            (
-                json!({"color": "red", "rush": "yes"}),
-                "rush takes true or false",
-            ),
-            (
-                json!({"color": "red", "note": "x"}),
-                "note needs at least 2 characters",
-            ),
-            (
-                json!({"color": "red", "note": "toolong"}),
-                "note takes at most 5 characters",
-            ),
-            (
-                json!({"color": "red", "extras": ["nuts", "sprinkles"]}),
-                "extras takes at most 1 choices",
-            ),
-            (
-                json!({"color": "red", "extras": ["ham"]}),
-                "ham is not a choice of extras",
-            ),
-            (json!({"extras": ["nuts"]}), "color is required"),
-        ] {
-            assert_eq!(check(content.clone()).unwrap_err(), error, "{content}");
-        }
-        let schema = ElicitationSchema::new()
-            .number("ratio", 0.0, 1.0, false)
-            .property(
-                "enumerated",
-                StringPropertySchema::new().enum_values(vec!["a".into()]),
-                false,
-            )
-            .property(
-                "location",
-                ElicitationPropertySchema::Other(OtherElicitationPropertySchema::new(
-                    "_point",
-                    BTreeMap::new(),
-                )),
-                false,
-            );
-        let check = |content: serde_json::Value| {
-            check_content(&schema, &serde_json::from_value(content).unwrap())
-        };
-        check(json!({"ratio": 1, "enumerated": "a", "location": {"x": 1}})).unwrap();
-        assert_eq!(
-            check(json!({"ratio": 1.5})).unwrap_err(),
-            "ratio is at most 1"
-        );
-        assert_eq!(
-            check(json!({"enumerated": "b"})).unwrap_err(),
-            "b is not a choice of enumerated"
-        );
-    }
-
-    #[test]
     fn forms_a_client_cannot_render_are_refused() {
         let form = |schema: ElicitationSchema| {
             CreateElicitationRequest::new(
@@ -2308,15 +2103,7 @@ mod tests {
             ),
             form(ElicitationSchema::new().property("location", unknown, true)),
             form(missing),
-            form(
-                ElicitationSchema::new().property(
-                    "color",
-                    StringPropertySchema::new()
-                        .enum_values(vec!["red".into()])
-                        .one_of(vec![EnumOption::new("red", "Red")]),
-                    false,
-                ),
-            ),
+            form(ElicitationSchema::new().boolean("rush", false)),
         ];
         for request in refused {
             let error = check_form(request).unwrap_err();

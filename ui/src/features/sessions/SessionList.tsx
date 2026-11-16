@@ -109,6 +109,7 @@ export const SessionList = memo(function SessionList({
   worktrees,
   sessions,
   runs,
+  parents,
   selected,
   onSelect,
   actions: { busy, deleteSession, archiveSession, unarchiveSession, cancelRun, deleteRun },
@@ -117,6 +118,8 @@ export const SessionList = memo(function SessionList({
   worktrees: Map<string, WorktreeInfo>;
   sessions: SessionInfo[];
   runs: RunInfo[];
+  /** The run each child session belongs to, by session ID. */
+  parents: Map<string, RunInfo>;
   selected: string | null;
   /** Views the session or run with this ID. */
   onSelect: (id: string) => void;
@@ -192,12 +195,9 @@ export const SessionList = memo(function SessionList({
       return next;
     });
 
-  // A session is a child of the run that owns its worktree.
-  const runOfWorktree = new Map(runs.map((run) => [run.worktree_id, run]));
   const children = new Map<string, SessionInfo[]>();
   for (const session of sessions) {
-    const parent =
-      session.worktree_id === null ? undefined : runOfWorktree.get(session.worktree_id);
+    const parent = parents.get(session.id);
     if (parent === undefined) continue;
     const list = children.get(parent.id) ?? [];
     list.push(session);
@@ -281,9 +281,7 @@ export const SessionList = memo(function SessionList({
           (session) => session.workspace_id === workspace.id,
         );
         const workspaceRuns = runs.filter((run) => run.workspace_id === workspace.id);
-        const topLevel = workspaceSessions.filter(
-          (session) => session.worktree_id === null || !runOfWorktree.has(session.worktree_id),
-        );
+        const topLevel = workspaceSessions.filter((session) => !parents.has(session.id));
         const entries: Entry[] = [
           ...workspaceRuns.map((run) => ({ run })),
           ...topLevel.filter((session) => !session.archived).map((session) => ({ session })),

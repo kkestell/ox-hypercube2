@@ -150,7 +150,7 @@ impl Run {
     }
 
     /// Clears the session of the step that ran in session `id`, which was
-    /// deleted. The database clears it with the session's row.
+    /// deleted.
     pub fn forget_session(&self, id: &str) {
         self.update(|record| {
             for step in &mut record.steps {
@@ -200,42 +200,38 @@ impl Run {
         }
     }
 
-    /// Changes the record and signals the change.
+    /// Changes the record, saves it, and signals the change.
     fn update(&self, change: impl FnOnce(&mut RunRecord)) {
         let mut record = self.lock();
         change(&mut record);
+        if let Err(error) = self.store.update_run(
+            &self.id,
+            record.state,
+            record.error.as_deref(),
+            &record.steps,
+        ) {
+            eprintln!("oxd: saving run {}: {error}", self.id);
+        }
         self.version.fetch_add(1, Ordering::Release);
         self.changed.send_replace(());
     }
 
-    /// Records that step `position` runs in session `session_id`, which the
-    /// database saved with the session.
+    /// Records that step `position` runs in session `session_id`.
     pub fn set_step_session(&self, position: usize, session_id: &str) {
         self.update(|record| record.steps[position].session_id = Some(session_id.into()));
     }
 
-    /// Saves and records that step `position` is running, and when it
-    /// started.
+    /// Records that step `position` is running, and when it started.
     fn start_step(&self, position: usize) {
-        let started_at = now();
-        if let Err(error) = self.store.start_step(&self.id, position, started_at) {
-            eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
-        }
         self.update(|record| {
             let step = &mut record.steps[position];
             step.state = StepState::Running;
-            step.started_at = Some(started_at);
+            step.started_at = Some(now());
         });
     }
 
-    /// Saves and records step `position`'s success and output.
+    /// Records step `position`'s success and output.
     fn succeed_step(&self, position: usize, output: String) {
-        if let Err(error) =
-            self.store
-                .set_step(&self.id, position, StepState::Succeeded, Some(&output))
-        {
-            eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
-        }
         self.update(|record| {
             let step = &mut record.steps[position];
             step.state = StepState::Succeeded;
@@ -251,16 +247,6 @@ impl Run {
         error: Option<String>,
         step: Option<(usize, StepState, Option<String>)>,
     ) {
-        if let Some((position, step_state, output)) = &step
-            && let Err(error) =
-                self.store
-                    .set_step(&self.id, *position, *step_state, output.as_deref())
-        {
-            eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
-        }
-        if let Err(error) = self.store.set_run_state(&self.id, state, error.as_deref()) {
-            eprintln!("oxd: saving run {}: {error}", self.id);
-        }
         self.update(|record| {
             if let Some((position, step_state, output)) = step {
                 record.steps[position].state = step_state;
@@ -274,17 +260,19 @@ impl Run {
     /// Records that step `step` started `command`, and returns the command's
     /// index among the step's commands.
     fn start_command(&self, step: usize, kind: CommandKind, command: &str) -> usize {
-        let info = CommandInfo {
-            kind,
-            command: command.into(),
-            state: CommandState::Running,
-            exit_code: None,
-            output: String::new(),
-            truncated: false,
-        };
-        let index = self.lock().steps[step].commands.len();
-        self.save_command(step, index, &info);
-        self.update(|record| record.steps[step].commands.push(info));
+        let mut index = 0;
+        self.update(|record| {
+            let commands = &mut record.steps[step].commands;
+            index = commands.len();
+            commands.push(CommandInfo {
+                kind,
+                command: command.into(),
+                state: CommandState::Running,
+                exit_code: None,
+                output: String::new(),
+                truncated: false,
+            });
+        });
         index
     }
 
@@ -298,22 +286,13 @@ impl Run {
         output: String,
         truncated: bool,
     ) {
-        let mut info = self.lock().steps[step].commands[index].clone();
-        info.state = state;
-        info.exit_code = exit_code;
-        info.output = output;
-        info.truncated = truncated;
-        self.save_command(step, index, &info);
-        self.update(|record| record.steps[step].commands[index] = info);
-    }
-
-    fn save_command(&self, step: usize, index: usize, info: &CommandInfo) {
-        if let Err(error) = self.store.save_command(&self.id, step, index, info) {
-            eprintln!(
-                "oxd: saving command {index} of step {step} of run {}: {error}",
-                self.id
-            );
-        }
+        self.update(|record| {
+            let info = &mut record.steps[step].commands[index];
+            info.state = state;
+            info.exit_code = exit_code;
+            info.output = output;
+            info.truncated = truncated;
+        });
     }
 
     fn cancelled(&self) -> bool {
@@ -332,10 +311,7 @@ async fn advance(
     plan: WorktreePlan,
     env: BTreeMap<String, String>,
 ) {
-    if let Err(mut message) = worktree::add(&git, &plan).await {
-        if let Err(error) = worktree::roll_back(&git, &plan, true).await {
-            message = format!("{message}; undoing it failed: {error}");
-        }
+    if let Err(message) = worktree::add(&git, &plan).await {
         run.end(RunState::Failed, Some(message), None);
         return;
     }

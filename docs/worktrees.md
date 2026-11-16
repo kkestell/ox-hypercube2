@@ -46,15 +46,14 @@ Submodule checkouts stay at their current commits when the branch moves.
 
 ## Deleting and archiving
 
-| Action | Worktree | Branch Ox created | Branch that existed before the session |
-|---|---|---|---|
-| Delete | Removed | Deleted when it passes the branch cleanup rule below | Kept |
-| Archive | Removed | Kept | Kept |
-| Unarchive | Added again, on the session's branch | — | — |
+| Action | Worktree | Branch |
+|---|---|---|
+| Delete | Removed | Deleted when it passes the branch cleanup rule below |
+| Archive | Removed | Kept |
+| Unarchive | Added again, on the session's branch | — |
 
-Ox creates the branch for every worktree session except one on an existing
-local branch. Delete removes an Ox-created branch when no worktree has it
-checked out and every commit on it outside the ancestry of the session's
+Ox creates the branch for every worktree session. Delete removes the branch
+when no worktree has it checked out and every commit on it outside the ancestry of the session's
 starting commit is reachable from another branch, a remote branch, or a tag.
 If those conditions fail or the repository is missing, Ox keeps the branch
 and reports its name.

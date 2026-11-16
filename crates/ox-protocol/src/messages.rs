@@ -25,8 +25,6 @@ pub struct Request {
 pub enum Method {
     #[serde(rename = "hello")]
     Hello { protocol_version: u32 },
-    #[serde(rename = "session.list")]
-    SessionList,
     /// Starts a watch: after the answer, the daemon sends every workspace,
     /// worktree, session, and run at once, then each one that is added,
     /// changes, or is removed. A workspace's info is worked out again each
@@ -42,21 +40,12 @@ pub enum Method {
     /// any run belongs to it.
     #[serde(rename = "workspace.remove")]
     WorkspaceRemove { workspace_id: String },
-    #[serde(rename = "workspace.list")]
-    WorkspaceList,
-    /// The workspace's local and remote-tracking branches, for naming the
-    /// branch of a new worktree, with the worktree that has each local
-    /// branch checked out, and the branch the workspace's checkout is on.
-    /// Refused outside a Git working tree. With `fetch`, the daemon first
-    /// runs `git fetch --all`, shared with any fetch of the same repository
-    /// already running and stopped after 60 seconds; a fetch that fails sets
-    /// `fetch_error` and the lists are answered as they stand. Git runs with `env` over the daemon's
-    /// environment, as for `session.new`.
+    /// The branch the workspace's checkout is on. Refused outside a Git
+    /// working tree. Git runs with `env` over the daemon's environment, as
+    /// for `session.new`.
     #[serde(rename = "workspace.branches")]
     WorkspaceBranches {
         workspace_id: String,
-        #[serde(default)]
-        fetch: bool,
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
@@ -137,10 +126,6 @@ pub enum Method {
     },
     /// Answers an open elicitation: `{"action": "accept", "content": {...}}`,
     /// `{"action": "decline"}`, or `{"action": "cancel"}` beside the IDs.
-    /// Accepted content must match the request's schema: every key names a
-    /// property, each value has its property's type and lies within its
-    /// choices and limits, and every required property is present. `pattern`
-    /// and `format` are not checked.
     #[serde(rename = "elicitation.respond")]
     ElicitationRespond {
         session_id: String,
@@ -200,9 +185,9 @@ pub enum Method {
     },
     /// Sets local branch `branch` of the workspace's repository to commit
     /// `to`. Refused, changing nothing, when the branch is not at
-    /// `expected`, or when `to` does not descend from `expected` unless
-    /// `force` is set. When `source_branch` is supplied, that local branch
-    /// must still be at `to` when the destination ref moves.
+    /// `expected`, or when `to` does not descend from `expected`. Local
+    /// branch `source_branch` must still be at `to` when the destination ref
+    /// moves.
     /// When a checkout has the branch, its files and index
     /// move with it; the move is refused with `UNSAVED_WORK` while tracked
     /// files there have uncommitted changes or the move would overwrite
@@ -215,20 +200,9 @@ pub enum Method {
         branch: String,
         to: String,
         expected: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_branch: Option<String>,
-        #[serde(default)]
-        force: bool,
+        source_branch: String,
         #[serde(default)]
         env: BTreeMap<String, String>,
-    },
-    /// Sets or clears a worktree's comparison ref and answers the worktree
-    /// with its comparison recomputed. Refused for a ref that names no
-    /// commit.
-    #[serde(rename = "worktree.set_compare")]
-    WorktreeSetCompare {
-        worktree_id: String,
-        compare: Option<String>,
     },
     /// Recomputes the worktree's comparison and answers the worktree.
     #[serde(rename = "worktree.refresh")]
@@ -324,34 +298,13 @@ pub enum Checkout {
     #[default]
     Workspace,
     /// A new worktree of the workspace's repository, in the same
-    /// subdirectory the workspace is of its checkout, on `branch`. With no
-    /// `branch`, the worktree is on a new branch `ox/<first 8 digits of the
-    /// worktree ID>` that starts at `HEAD`. With `compare`, a ref such as
-    /// `main` that must name a commit, the worktree publishes how its branch
-    /// compares with the ref.
+    /// subdirectory the workspace is of its checkout, on a new branch
+    /// `ox/<first 8 digits of the worktree ID>` that starts at `HEAD`. With
+    /// `compare`, a ref such as `main` that must name a commit, the worktree
+    /// publishes how its branch compares with the ref.
     Worktree {
         #[serde(default)]
-        branch: Option<WorktreeBranch>,
-        #[serde(default)]
         compare: Option<String>,
-    },
-}
-
-/// The branch a new worktree is on.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WorktreeBranch {
-    /// A local branch no worktree has checked out, or a remote branch,
-    /// named `<branch>` or `<remote>/<branch>`, that becomes a local branch
-    /// tracking it. Refused if no such branch exists.
-    Existing { name: String },
-    /// A new branch that starts at `start`, `HEAD` when unset, with no
-    /// upstream. Refused if a local branch, a remote branch's full name
-    /// `<remote>/<branch>`, or a branch on any remote has the name.
-    New {
-        name: String,
-        #[serde(default)]
-        start: Option<String>,
     },
 }
 
@@ -455,29 +408,12 @@ pub struct WorkspaceInfo {
     pub git_working_tree: bool,
 }
 
-/// A workspace's branches, each list most recently committed first.
+/// A workspace's branches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Branches {
     /// The local branch the workspace's checkout is on, unset when its
     /// `HEAD` is detached or unborn.
     pub head: Option<String>,
-    /// Local branches, such as `main`.
-    pub local: Vec<LocalBranch>,
-    /// Remote-tracking branch names with their remote, such as
-    /// `origin/main`, without symbolic refs such as `origin/HEAD`.
-    pub remote: Vec<String>,
-    /// Why the fetch the request asked for failed, if it did.
-    pub fetch_error: Option<String>,
-}
-
-/// A local branch.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LocalBranch {
-    pub name: String,
-    /// The top level of the worktree that has the branch checked out: the
-    /// repository's own checkout, a session's worktree, or any other
-    /// worktree of the repository.
-    pub worktree: Option<PathBuf>,
 }
 
 /// The daemon's workspaces, in the order they were added, its worktrees, its
@@ -850,10 +786,6 @@ mod tests {
 
     #[test]
     fn request_round_trip() {
-        let request: Request =
-            serde_json::from_value(json!({"id": 3, "method": "session.list"})).unwrap();
-        assert!(matches!(request.method, Method::SessionList));
-
         let request: Request = serde_json::from_value(json!({
             "id": 4,
             "method": "session.subscribe",
@@ -925,87 +857,22 @@ mod tests {
         assert!(matches!(
             request.method,
             Method::SessionNew {
-                checkout: Checkout::Worktree {
-                    branch: None,
-                    compare: None
-                },
+                checkout: Checkout::Worktree { compare: None },
                 ..
             }
         ));
-        for (branch, wire) in [
-            (
-                None,
-                json!({"type": "worktree", "branch": null, "compare": null}),
-            ),
-            (
-                Some(WorktreeBranch::Existing {
-                    name: "feature".into(),
-                }),
-                json!({"type": "worktree", "branch": {"type": "existing", "name": "feature"}, "compare": null}),
-            ),
-            (
-                Some(WorktreeBranch::New {
-                    name: "topic".into(),
-                    start: None,
-                }),
-                json!({"type": "worktree", "branch": {"type": "new", "name": "topic", "start": null}, "compare": null}),
-            ),
-            (
-                Some(WorktreeBranch::New {
-                    name: "topic".into(),
-                    start: Some("main".into()),
-                }),
-                json!({"type": "worktree", "branch": {"type": "new", "name": "topic", "start": "main"}, "compare": null}),
-            ),
-        ] {
-            let checkout = Checkout::Worktree {
-                branch,
-                compare: None,
-            };
-            let method = Method::SessionNew {
-                workspace_id: "w".into(),
-                command: vec!["agent".into()],
-                env: BTreeMap::new(),
-                checkout: checkout.clone(),
-            };
-            let value = serde_json::to_value(Request { id: 13, method }).unwrap();
-            assert_eq!(value["params"]["checkout"], wire);
-            let request: Request = serde_json::from_value(value).unwrap();
-            assert!(matches!(
-                request.method,
-                Method::SessionNew { checkout: ref decoded, .. } if *decoded == checkout
-            ));
-        }
-        assert_eq!(
-            serde_json::from_value::<Checkout>(
-                json!({"type": "worktree", "branch": {"type": "new", "name": "topic"}})
-            )
-            .unwrap(),
-            Checkout::Worktree {
-                branch: Some(WorktreeBranch::New {
-                    name: "topic".into(),
-                    start: None
-                }),
-                compare: None,
-            }
-        );
         let checkout = Checkout::Worktree {
-            branch: None,
             compare: Some("main".into()),
         };
         let value = serde_json::to_value(&checkout).unwrap();
-        assert_eq!(
-            value,
-            json!({"type": "worktree", "branch": null, "compare": "main"})
-        );
+        assert_eq!(value, json!({"type": "worktree", "compare": "main"}));
         assert_eq!(serde_json::from_value::<Checkout>(value).unwrap(), checkout);
         let method = Method::BranchMove {
             workspace_id: "w".into(),
             branch: "main".into(),
             to: "abc".into(),
             expected: "def".into(),
-            source_branch: Some("topic".into()),
-            force: true,
+            source_branch: "topic".into(),
             env: BTreeMap::from([("PATH".into(), "/bin".into())]),
         };
         let value = serde_json::to_value(Request { id: 21, method }).unwrap();
@@ -1020,7 +887,6 @@ mod tests {
                     "to": "abc",
                     "expected": "def",
                     "source_branch": "topic",
-                    "force": true,
                     "env": {"PATH": "/bin"}
                 }
             })
@@ -1028,35 +894,14 @@ mod tests {
         let request: Request = serde_json::from_value(json!({
             "id": 22,
             "method": "branch.move",
-            "params": {"workspace_id": "w", "branch": "main", "to": "abc", "expected": "def"}
+            "params": {"workspace_id": "w", "branch": "main", "to": "abc", "expected": "def", "source_branch": "topic"}
         }))
         .unwrap();
         assert!(matches!(
             request.method,
-            Method::BranchMove { ref branch, ref to, ref expected, source_branch: None, force: false, ref env, .. }
-                if branch == "main" && to == "abc" && expected == "def" && env.is_empty()
+            Method::BranchMove { ref branch, ref to, ref expected, ref source_branch, ref env, .. }
+                if branch == "main" && to == "abc" && expected == "def" && source_branch == "topic" && env.is_empty()
         ));
-        for compare in [Some("origin/main".to_owned()), None] {
-            let method = Method::WorktreeSetCompare {
-                worktree_id: "t".into(),
-                compare: compare.clone(),
-            };
-            let value = serde_json::to_value(Request { id: 23, method }).unwrap();
-            assert_eq!(
-                value,
-                json!({
-                    "id": 23,
-                    "method": "worktree.set_compare",
-                    "params": {"worktree_id": "t", "compare": compare}
-                })
-            );
-            let request: Request = serde_json::from_value(value).unwrap();
-            assert!(matches!(
-                request.method,
-                Method::WorktreeSetCompare { ref worktree_id, compare: ref decoded }
-                    if worktree_id == "t" && *decoded == compare
-            ));
-        }
         let value = serde_json::to_value(Request {
             id: 24,
             method: Method::WorktreeRefresh {
@@ -1114,64 +959,15 @@ mod tests {
         .unwrap();
         assert!(matches!(
             request.method,
-            Method::WorkspaceBranches { ref workspace_id, fetch: false, ref env }
+            Method::WorkspaceBranches { ref workspace_id, ref env }
                 if workspace_id == "w" && env.is_empty()
         ));
-        let method = Method::WorkspaceBranches {
-            workspace_id: "w".into(),
-            fetch: true,
-            env: BTreeMap::from([("PATH".into(), "/bin".into())]),
-        };
-        let value = serde_json::to_value(Request { id: 16, method }).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "id": 16,
-                "method": "workspace.branches",
-                "params": {"workspace_id": "w", "fetch": true, "env": {"PATH": "/bin"}}
-            })
-        );
         let branches = Branches {
             head: Some("main".into()),
-            local: vec![
-                LocalBranch {
-                    name: "main".into(),
-                    worktree: Some("/work".into()),
-                },
-                LocalBranch {
-                    name: "topic".into(),
-                    worktree: None,
-                },
-            ],
-            remote: vec!["origin/main".into()],
-            fetch_error: Some("no network".into()),
         };
         let value = serde_json::to_value(&branches).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "head": "main",
-                "local": [
-                    {"name": "main", "worktree": "/work"},
-                    {"name": "topic", "worktree": null}
-                ],
-                "remote": ["origin/main"],
-                "fetch_error": "no network"
-            })
-        );
+        assert_eq!(value, json!({"head": "main"}));
         assert_eq!(serde_json::from_value::<Branches>(value).unwrap(), branches);
-        let detached = Branches {
-            head: None,
-            local: Vec::new(),
-            remote: Vec::new(),
-            fetch_error: None,
-        };
-        let value = serde_json::to_value(&detached).unwrap();
-        assert_eq!(
-            value,
-            json!({"head": null, "local": [], "remote": [], "fetch_error": null})
-        );
-        assert_eq!(serde_json::from_value::<Branches>(value).unwrap(), detached);
         let request: Request = serde_json::from_value(json!({
             "id": 12,
             "method": "session.load",

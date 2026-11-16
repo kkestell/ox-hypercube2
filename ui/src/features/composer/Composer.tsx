@@ -7,9 +7,8 @@ import { SelectPicker } from "../../components/SelectPicker";
 import type { ConfigOption, Request, RunInfo, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
-import { Elicitation } from "./Elicitation";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
-import { Permission } from "./Permission";
+import { OpenRequest } from "./OpenRequest";
 import type { Drafts } from "./useDrafts";
 
 /**
@@ -92,12 +91,7 @@ export const Composer = memo(function Composer({
   return (
     <div className="composer">
       <div className="stack">
-        {request?.type === "permission" && (
-          <Permission key={request.request_id} item={request} sessionId={session.id} />
-        )}
-        {request?.type === "elicitation" && (
-          <Elicitation key={request.request_id} item={request} sessionId={session.id} />
-        )}
+        {request && <OpenRequest key={request.request_id} item={request} sessionId={session.id} />}
         <div className="entry">
           <form
             className="box"

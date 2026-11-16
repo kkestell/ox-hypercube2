@@ -7,9 +7,10 @@ use std::{
     process::Stdio,
 };
 
+use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     process::{Child, ChildStdout, Command},
     time::{Duration, Instant, sleep, timeout},
 };
@@ -115,7 +116,6 @@ fn start(bin: &Path) -> (Child, BufReader<ChildStdout>) {
             "PATH",
             format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
         )
-        .env("PI_ACP_STORE_DIR", bin.join("store"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -126,47 +126,6 @@ fn start(bin: &Path) -> (Child, BufReader<ChildStdout>) {
     (child, reader)
 }
 
-async fn send(child: &mut Child, message: Value) {
-    let stdin = child.stdin.as_mut().unwrap();
-    stdin
-        .write_all(message.to_string().as_bytes())
-        .await
-        .unwrap();
-    stdin.write_all(b"\n").await.unwrap();
-}
-
-async fn receive(reader: &mut BufReader<ChildStdout>) -> Value {
-    let mut line = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut line))
-        .await
-        .expect("timed out waiting for ACP response")
-        .unwrap();
-    assert!(!line.is_empty(), "ACP process closed stdout");
-    serde_json::from_str(&line).unwrap()
-}
-
-async fn response(reader: &mut BufReader<ChildStdout>, id: i64) -> (Value, Vec<Value>) {
-    let mut notifications = Vec::new();
-    loop {
-        let value = receive(reader).await;
-        if value["id"] == id {
-            return (value, notifications);
-        }
-        notifications.push(value);
-    }
-}
-
-async fn until_method(reader: &mut BufReader<ChildStdout>, method: &str) -> (Value, Vec<Value>) {
-    let mut seen = Vec::new();
-    loop {
-        let value = receive(reader).await;
-        if value["method"] == method {
-            return (value, seen);
-        }
-        seen.push(value);
-    }
-}
-
 async fn answer_form(child: &mut Child, request: &Value, action: Value) {
     send(
         child,
@@ -175,48 +134,8 @@ async fn answer_form(child: &mut Child, request: &Value, action: Value) {
     .await;
 }
 
-/// The `session/update` update of a notification.
-fn update(notification: &Value) -> &Value {
-    &notification["params"]["update"]
-}
-
 fn kind(notification: &Value) -> &Value {
     &update(notification)["sessionUpdate"]
-}
-
-fn is_state(notification: &Value, state: &str) -> bool {
-    kind(notification) == "state_update" && update(notification)["state"] == state
-}
-
-/// Reads until the prompt `id` is answered and its turn goes idle, with
-/// what was `seen` already, and checks that the response names the user
-/// message the bridge sent. Returns the idle update, and the notifications
-/// from `seen` and after.
-async fn finish(
-    reader: &mut BufReader<ChildStdout>,
-    id: i64,
-    mut seen: Vec<Value>,
-) -> (Value, Vec<Value>) {
-    let idle = loop {
-        let answered = seen.iter().position(|value| value["id"] == id);
-        if let Some(answered) = answered
-            && let Some(idle) = seen[answered..].iter().find(|v| is_state(v, "idle"))
-        {
-            break update(idle).clone();
-        }
-        seen.push(receive(reader).await);
-    };
-    let response = seen.iter().find(|value| value["id"] == id).unwrap();
-    let message_id = &response["result"]["messageId"];
-    assert!(message_id.is_string(), "{response}");
-    assert!(
-        seen.iter().any(|value| {
-            kind(value) == "user_message" && update(value)["messageId"] == *message_id
-        }),
-        "no user message {message_id} in {seen:?}"
-    );
-    seen.retain(|value| value["method"] == "session/update");
-    (idle, seen)
 }
 
 async fn initialize(child: &mut Child, reader: &mut BufReader<ChildStdout>, capabilities: Value) {
@@ -271,24 +190,11 @@ async fn session(
     BufReader<ChildStdout>,
     Value,
 ) {
-    session_with_capabilities(script, json!({"elicitation":{"form":{}}})).await
-}
-
-async fn session_with_capabilities(
-    script: &str,
-    capabilities: Value,
-) -> (
-    tempfile::TempDir,
-    PathBuf,
-    Child,
-    BufReader<ChildStdout>,
-    Value,
-) {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_pi(&bin, script);
     let (mut child, mut reader) = start(&bin);
-    initialize(&mut child, &mut reader, capabilities).await;
+    initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     startup_catalog(&mut reader).await;
     (temp, project, child, reader, session)
@@ -709,50 +615,6 @@ settled
 }
 
 #[tokio::test]
-async fn closing_a_session_stops_pi() {
-    let (_temp, project, mut child, mut reader, session) = session("").await;
-    lines(&project, "calls", 2).await;
-    send(
-        &mut child,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/close","params":{"sessionId":session}}),
-    )
-    .await;
-    let (closed, _) = response(&mut reader, 3).await;
-    assert!(closed["result"].is_object(), "{closed}");
-    assert!(project.join("closed").exists(), "pi saw its stdin close");
-    send(&mut child, prompt_request(4, &session)).await;
-    let (result, _) = response(&mut reader, 4).await;
-    assert_eq!(result["error"]["code"], -32002, "{result}");
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
-async fn clients_without_forms_get_no_dialogs() {
-    let (_temp, project, mut child, mut reader, session) = session_with_capabilities(
-        r#"
-next_prompt
-accept
-emit '{"type":"agent_start"}'
-emit '{"type":"extension_ui_request","id":"note-1","method":"notify","message":"Checking"}'
-emit '{"type":"extension_ui_request","id":"ask-1","method":"confirm","title":"Run it?","message":"rm -rf build"}'
-next_command
-printf '%s\n' "$command" > dialog
-settled
-"#,
-        json!({}),
-    )
-    .await;
-    let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
-    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
-    let dialog: Value = serde_json::from_str(&lines(&project, "dialog", 1).await[0]).unwrap();
-    assert_eq!(
-        dialog,
-        json!({"type": "extension_ui_response", "id": "ask-1", "cancelled": true})
-    );
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
 async fn extension_dialogs_become_forms() {
     let (_temp, project, mut child, mut reader, session) = session(r#"
 next_prompt
@@ -997,9 +859,24 @@ fn resume_request(id: i64, session: &Value, project: &Path, replay: Option<Value
     request
 }
 
+/// Starts a bridge beside `project` and asks it to resume `session`. Returns
+/// the bridge, the response and the notifications before it.
+async fn resume_in_new_bridge(
+    project: &Path,
+    session: &Value,
+    id: i64,
+    replay: Option<Value>,
+) -> (Child, BufReader<ChildStdout>, Value, Vec<Value>) {
+    let (mut child, mut reader) = start(&project.parent().unwrap().join("bin"));
+    initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
+    send(&mut child, resume_request(id, session, project, replay)).await;
+    let (result, notifications) = response(&mut reader, id).await;
+    (child, reader, result, notifications)
+}
+
 #[tokio::test]
-async fn replacement_bridge_and_close_retain_native_identity() {
-    let (temp, project, mut child, mut reader, session) = session(
+async fn a_replacement_bridge_resumes_the_pi_session_and_takes_its_options_again() {
+    let (_temp, project, mut child, mut reader, session) = session(
         r#"
 next_prompt
 accept
@@ -1008,39 +885,86 @@ settled
 "#,
     )
     .await;
-    prompt(&mut child, &mut reader, 3, &session).await;
+    let (_, updates) = prompt(&mut child, &mut reader, 3, &session).await;
+    assert!(
+        updates.iter().any(|v| kind(v) == "session_info_update"),
+        "the first prompt titles the session: {updates:?}"
+    );
     child.kill().await.unwrap();
-    let (mut child, mut reader) = start(&temp.path().join("bin"));
-    initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
-    send(&mut child, resume_request(2, &session, &project, None)).await;
-    let (resumed, notifications) = response(&mut reader, 2).await;
+    // Pi saved the prompt in its session file.
+    fs::write(
+        project.join("history.jsonl"),
+        json!({"type":"message","id":"u1","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}).to_string(),
+    )
+    .unwrap();
+
+    // The client sets the session's model and thinking level again on the
+    // replacement Pi.
+    fake_pi(
+        &project.parent().unwrap().join("bin"),
+        r#"
+next_command
+expect set_model
+printf '%s\n' "$command" >> changes
+current_model='{"provider":"second","id":"org/two","name":"Two"}'
+answer set_model
+describe
+next_command
+expect set_thinking_level
+printf '%s\n' "$command" >> changes
+thinking=low
+answer set_thinking_level
+describe
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+settled
+"#,
+    );
+    let (mut child, mut reader, resumed, notifications) =
+        resume_in_new_bridge(&project, &session, 2, None).await;
     assert!(resumed["result"].is_object(), "{resumed}");
     assert_eq!(notifications.len(), 1, "{notifications:?}");
     assert!(is_state(&notifications[0], "idle"));
-    prompt(&mut child, &mut reader, 3, &session).await;
     send(
         &mut child,
-        json!({"jsonrpc":"2.0","id":4,"method":"session/close","params":{"sessionId":session}}),
+        config_request(4, &session, "model", "second/org/two"),
     )
     .await;
-    response(&mut reader, 4).await;
-    send(&mut child, resume_request(5, &session, &project, None)).await;
-    let (resumed, _) = response(&mut reader, 5).await;
-    assert!(resumed["result"].is_object(), "{resumed}");
-    prompt(&mut child, &mut reader, 6, &session).await;
-    let calls = lines(&project, "calls", 6).await;
+    let (set, _) = response(&mut reader, 4).await;
+    assert_eq!(
+        set["result"]["configOptions"][0]["currentValue"],
+        "second/org/two"
+    );
+    send(&mut child, config_request(5, &session, "thinking", "low")).await;
+    let (set, _) = response(&mut reader, 5).await;
+    assert_eq!(set["result"]["configOptions"][1]["currentValue"], "low");
+    let (_, updates) = prompt(&mut child, &mut reader, 6, &session).await;
+    assert!(
+        !updates.iter().any(|v| kind(v) == "session_info_update"),
+        "a resumed session keeps its title: {updates:?}"
+    );
+
+    let calls = lines(&project, "calls", 4).await;
+    assert_eq!(
+        calls[0],
+        format!(
+            "--mode rpc --approve --session-id {}",
+            session.as_str().unwrap()
+        )
+    );
     assert_eq!(calls[0], calls[2]);
-    assert_eq!(calls[0], calls[4]);
-    let registry: Value =
-        serde_json::from_slice(&fs::read(temp.path().join("bin/store/acp-sessions.json")).unwrap())
-            .unwrap();
-    assert_eq!(registry[session.as_str().unwrap()]["title"], "hello");
+    let changes = lines(&project, "changes", 2).await;
+    let model: Value = serde_json::from_str(&changes[0]).unwrap();
+    assert_eq!(model["modelId"], "org/two");
+    let thinking: Value = serde_json::from_str(&changes[1]).unwrap();
+    assert_eq!(thinking["level"], "low");
     child.kill().await.unwrap();
 }
 
 #[tokio::test]
 async fn replay_recovers_recorded_messages_tools_and_patches_before_state_and_response() {
-    let (_temp, project, mut child, mut reader, session) = session(
+    let (_temp, project, mut child, _reader, session) = session(
         r"
 while :; do describe; done
 ",
@@ -1063,12 +987,9 @@ while :; do describe; done
             .join("\n"),
     )
     .unwrap();
-    send(
-        &mut child,
-        resume_request(3, &session, &project, Some(json!({"type":"start"}))),
-    )
-    .await;
-    let (resumed, notifications) = response(&mut reader, 3).await;
+    child.kill().await.unwrap();
+    let (mut child, _reader, resumed, notifications) =
+        resume_in_new_bridge(&project, &session, 3, Some(json!({"type":"start"}))).await;
     assert!(resumed["result"].is_object(), "{resumed}");
     assert!(is_state(notifications.last().unwrap(), "idle"));
     assert_eq!(notifications.len(), 8, "{notifications:?}");
@@ -1118,12 +1039,9 @@ while :; do describe; done
             .join("\n"),
     )
     .unwrap();
-    send(
-        &mut child,
-        resume_request(4, &session, &project, Some(json!({"type":"start"}))),
-    )
-    .await;
-    let (_, notifications) = response(&mut reader, 4).await;
+    child.kill().await.unwrap();
+    let (mut child, _reader, _, notifications) =
+        resume_in_new_bridge(&project, &session, 4, Some(json!({"type":"start"}))).await;
     let write = tool_updates(&notifications, "write-1");
     assert_eq!(statuses(&write), ["pending", "completed"]);
     assert_eq!(write[1]["content"][0]["type"], "content");
@@ -1132,40 +1050,30 @@ while :; do describe; done
 
 #[tokio::test]
 async fn replay_empty_and_invalid_history_and_exited_pi() {
-    let (_temp, project, mut child, mut reader, session) = session(
-        r"
-describe
-describe
-next_command
-expect get_state
-exit 3
-",
-    )
-    .await;
-    send(
-        &mut child,
-        resume_request(3, &session, &project, Some(json!({"type":"start"}))),
-    )
-    .await;
-    let (result, notifications) = response(&mut reader, 3).await;
+    let (_temp, project, mut child, _reader, session) = session("").await;
+    child.kill().await.unwrap();
+    let replay = || Some(json!({"type":"start"}));
+
+    let (mut child, _reader, result, notifications) =
+        resume_in_new_bridge(&project, &session, 3, replay()).await;
     assert!(result["result"].is_object(), "{result}");
     assert_eq!(notifications.len(), 1);
     assert!(is_state(&notifications[0], "idle"));
+    child.kill().await.unwrap();
+
     fs::write(project.join("history.jsonl"), "broken json").unwrap();
-    send(
-        &mut child,
-        resume_request(4, &session, &project, Some(json!({"type":"start"}))),
-    )
-    .await;
-    let (result, notifications) = response(&mut reader, 4).await;
+    let (mut child, _reader, result, notifications) =
+        resume_in_new_bridge(&project, &session, 4, replay()).await;
     assert_eq!(result["error"]["code"], -32603, "{result}");
     assert!(notifications.is_empty());
-    send(
-        &mut child,
-        resume_request(5, &session, &project, Some(json!({"type":"start"}))),
-    )
-    .await;
-    let (result, _) = response(&mut reader, 5).await;
+    child.kill().await.unwrap();
+
+    fake_pi_script(
+        &project.parent().unwrap().join("bin"),
+        "next_command\nexpect get_state\nexit 3",
+    );
+    let (mut child, _reader, result, _) =
+        resume_in_new_bridge(&project, &session, 5, replay()).await;
     assert!(
         result["error"]["message"]
             .as_str()
@@ -1177,34 +1085,24 @@ exit 3
 }
 
 #[tokio::test]
-async fn resume_rejects_unknown_ids_cursors_and_mismatched_cwd() {
-    let (_temp, project, mut child, mut reader, session) = session("").await;
-    for (id, request, code) in [
-        (
-            3,
-            resume_request(3, &json!("unknown"), &project, None),
-            -32002,
-        ),
-        (
+async fn resume_rejects_unknown_ids_and_cursors() {
+    let (_temp, project, mut child, _reader, session) = session("").await;
+    child.kill().await.unwrap();
+    let (mut child, mut reader, result, _) =
+        resume_in_new_bridge(&project, &json!("unknown"), 3, None).await;
+    assert_eq!(result["error"]["code"], -32002, "{result}");
+    send(
+        &mut child,
+        resume_request(
             4,
-            resume_request(
-                4,
-                &session,
-                &project,
-                Some(json!({"type":"cursor","cursor":"a"})),
-            ),
-            -32602,
+            &session,
+            &project,
+            Some(json!({"type":"cursor","cursor":"a"})),
         ),
-        (
-            5,
-            resume_request(5, &session, project.parent().unwrap(), None),
-            -32602,
-        ),
-    ] {
-        send(&mut child, request).await;
-        let (result, _) = response(&mut reader, id).await;
-        assert_eq!(result["error"]["code"], code, "{result}");
-    }
+    )
+    .await;
+    let (result, _) = response(&mut reader, 4).await;
+    assert_eq!(result["error"]["code"], -32602, "{result}");
     child.kill().await.unwrap();
 }
 

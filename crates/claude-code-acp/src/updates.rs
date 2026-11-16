@@ -3,6 +3,7 @@ use std::{
     sync::Mutex,
 };
 
+use acp_bridge::notify;
 use agent_client_protocol::Client;
 use agent_client_protocol::v2::ConnectionTo;
 use agent_client_protocol::v2::schema::{
@@ -10,7 +11,6 @@ use agent_client_protocol::v2::schema::{
     ElicitationAction, ElicitationFormMode, ElicitationSessionScope, MessageId, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest, SessionUpdate,
     StateUpdate, StopReason, TextContent, ToolCallContent, ToolCallStatus, ToolKind,
-    UpdateSessionNotification,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -63,20 +63,16 @@ enum Sent {
 pub struct Updates {
     connection: ConnectionTo<Client>,
     session_id: String,
-    /// The client takes form elicitations, so `AskUserQuestion`'s questions
-    /// can be asked.
-    forms: bool,
     commands: Mutex<Vec<acp::AvailableCommand>>,
     tools: Mutex<Tools>,
     work: Mutex<Work>,
 }
 
 impl Updates {
-    pub fn new(connection: ConnectionTo<Client>, session_id: &str, forms: bool) -> Self {
+    pub fn new(connection: ConnectionTo<Client>, session_id: &str) -> Self {
         Self {
             connection,
             session_id: session_id.to_owned(),
-            forms,
             commands: Mutex::new(Vec::new()),
             tools: Mutex::new(Tools::default()),
             work: Mutex::new(Work::default()),
@@ -574,10 +570,6 @@ impl Updates {
     /// tool's decision: allowed with the answers, or denied when the user
     /// does not answer or the questions cannot be asked.
     pub async fn ask_user(&self, permission: PermissionRequest) -> Value {
-        // Claude starts without the tool when the client takes no forms.
-        if !self.forms {
-            return deny(&permission, "The questions could not be shown.");
-        }
         let Some((message, schema)) = questions::form(&permission.input) else {
             return deny(&permission, "The questions could not be shown.");
         };
@@ -795,14 +787,6 @@ fn code_span(text: &str) -> String {
         ""
     };
     format!("{fence}{pad}{text}{pad}{fence}")
-}
-
-pub fn notify(connection: &ConnectionTo<Client>, id: &str, update: SessionUpdate) {
-    if let Err(error) =
-        connection.send_notification(UpdateSessionNotification::new(id.to_owned(), update))
-    {
-        eprintln!("failed to send session update: {error}");
-    }
 }
 
 #[cfg(test)]

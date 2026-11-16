@@ -1,5 +1,4 @@
 mod conversation;
-mod files;
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsStr;
@@ -10,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, Harness, ListingChange,
-    RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code, content, default_socket_path,
+    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, FileContent, Harness,
+    ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code, content,
+    default_socket_path,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -35,11 +35,9 @@ impl Drop for Task {
 struct App {
     client: tokio::sync::Mutex<Option<Arc<Client>>>,
     watch: Mutex<Option<Task>>,
-    /// The conversation views, by the ID of the channel each sends on.
-    views: Mutex<HashMap<u32, Task>>,
-    /// The directory watches, by the ID of the channel each sends on.
-    directories: Mutex<HashMap<u32, Task>>,
-    files: Mutex<HashMap<u32, Task>>,
+    /// The conversation views and the directory and file watches, by the ID
+    /// of the channel each sends on.
+    streams: Mutex<HashMap<u32, Task>>,
 }
 
 impl App {
@@ -134,14 +132,12 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
         }
     });
     *app.watch.lock().unwrap() = Some(Task(task));
-    app.views.lock().unwrap().clear();
-    app.directories.lock().unwrap().clear();
-    app.files.lock().unwrap().clear();
+    app.streams.lock().unwrap().clear();
 }
 
 /// Sends a session's conversation on `channel` from its first event, in
-/// batches of the items from the events received together, until
-/// `unview_session` ends it. The view ends when the session closes or the
+/// batches of the items from the events received together, until `unwatch`
+/// ends it. The view ends when the session closes or the
 /// connection drops, and a view that cannot connect or subscribe sends
 /// nothing. The workspace watch reports the connection, and the webview
 /// views the session again once the watch reconnects.
@@ -173,21 +169,11 @@ fn view_session(
             }
         }
     });
-    app.views.lock().unwrap().insert(id, Task(task));
-}
-
-/// Ends the conversation view that sends on the channel `channel_id`.
-#[tauri::command]
-#[expect(
-    clippy::needless_pass_by_value,
-    reason = "Tauri passes managed state to commands as `State` by value"
-)]
-fn unview_session(app: State<'_, App>, channel_id: u32) {
-    app.views.lock().unwrap().remove(&channel_id);
+    app.streams.lock().unwrap().insert(id, Task(task));
 }
 
 /// Sends the entries of the directory at `path` on `channel` each time they
-/// change, until `unwatch_directory` ends it. The watch ends when the
+/// change, until `unwatch` ends it. The watch ends when the
 /// connection drops, and a watch that cannot connect sends nothing; the
 /// webview watches again once the workspace watch reconnects.
 #[tauri::command]
@@ -216,17 +202,55 @@ fn watch_directory(
             }
         }
     });
-    app.directories.lock().unwrap().insert(id, Task(task));
+    app.streams.lock().unwrap().insert(id, Task(task));
 }
 
-/// Ends the directory watch that sends on the channel `channel_id`.
+/// Sends the contents of the file at `path` on `channel` each time they
+/// change, until `unwatch` ends it. A watch that cannot connect sends the
+/// error.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Tauri passes managed state to commands as `State` by value"
 )]
-fn unwatch_directory(app: State<'_, App>, channel_id: u32) {
-    app.directories.lock().unwrap().remove(&channel_id);
+fn watch_file(
+    handle: AppHandle,
+    app: State<'_, App>,
+    path: PathBuf,
+    channel: Channel<FileContent>,
+) {
+    let id = channel.id();
+    let task = tauri::async_runtime::spawn(async move {
+        let app = handle.state::<App>();
+        let watch = match app.client().await {
+            Ok(client) => client.watch_file(&path).await.map_err(message),
+            Err(error) => Err(error),
+        };
+        let mut watch = match watch {
+            Ok(watch) => watch,
+            Err(message) => {
+                let _ = channel.send(FileContent::Error { message });
+                return;
+            }
+        };
+        while let Ok(content) = watch.next().await {
+            if channel.send(content).is_err() {
+                return;
+            }
+        }
+    });
+    app.streams.lock().unwrap().insert(id, Task(task));
+}
+
+/// Ends the conversation view, directory watch or file watch that sends on
+/// the channel `channel_id`.
+#[tauri::command]
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Tauri passes managed state to commands as `State` by value"
+)]
+fn unwatch(app: State<'_, App>, channel_id: u32) {
+    app.streams.lock().unwrap().remove(&channel_id);
 }
 
 #[tauri::command]
@@ -247,12 +271,12 @@ async fn remove_workspace(app: State<'_, App>, workspace_id: String) -> Result<(
         .map_err(message)
 }
 
-/// The workspace's branches, as they stand without a fetch.
+/// The workspace's branches.
 #[tauri::command]
 async fn workspace_branches(app: State<'_, App>, workspace_id: String) -> Result<Branches, String> {
     app.client()
         .await?
-        .branches(&workspace_id, false, utf8_env())
+        .branches(&workspace_id, utf8_env())
         .await
         .map_err(message)
 }
@@ -551,11 +575,9 @@ pub fn run() {
             agents,
             watch,
             view_session,
-            unview_session,
-            files::watch_file,
-            files::unwatch_file,
             watch_directory,
-            unwatch_directory,
+            watch_file,
+            unwatch,
             add_workspace,
             remove_workspace,
             workspace_branches,

@@ -1,5 +1,5 @@
-//! Worktrees that sessions run in: resolving and creating a worktree's
-//! branch, adding the worktree, undoing both when it cannot be added, and
+//! Worktrees that sessions run in: creating a worktree's branch, adding the
+//! worktree, undoing both when it cannot be added, and
 //! removing the worktree and the branch when its session goes. A
 //! [`Worktree`] is the daemon's live record of one, which publishes how its
 //! branch compares with its comparison ref.
@@ -13,7 +13,7 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ox_protocol::{Comparison, ErrorBody, WorktreeBranch, WorktreeInfo, code};
+use ox_protocol::{Comparison, ErrorBody, WorktreeInfo, code};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::{Notify, watch};
@@ -51,6 +51,8 @@ pub type Arg<'a> = &'a (dyn AsRef<OsStr> + Sync);
 #[derive(Clone)]
 pub struct Git {
     env: BTreeMap<String, String>,
+    /// Arguments that come before every command's own.
+    prefix: Vec<OsString>,
 }
 
 /// A git command that failed, with git's error output.
@@ -86,7 +88,10 @@ impl Git {
     /// Git with `env` over the daemon's environment, as the client's agent
     /// gets it, and `git` found on that environment's `PATH`.
     pub fn for_client(env: BTreeMap<String, String>) -> Self {
-        Self { env }
+        Self {
+            env,
+            prefix: Vec::new(),
+        }
     }
 
     /// Git with the daemon's own environment, for work no client asked for.
@@ -101,6 +106,7 @@ impl Git {
         command
             .arg("-C")
             .arg(dir)
+            .args(&self.prefix)
             .args(args.iter().map(AsRef::as_ref))
             .envs(&self.env)
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -160,14 +166,14 @@ impl Git {
     }
 
     /// Like `run`, with the output as text without its final newline.
-    async fn text(&self, dir: &Path, args: &[Arg<'_>]) -> Result<String, GitError> {
+    pub(crate) async fn text(&self, dir: &Path, args: &[Arg<'_>]) -> Result<String, GitError> {
         let output = self.run(dir, args).await?;
         let text = String::from_utf8_lossy(&output);
         Ok(text.strip_suffix('\n').unwrap_or(&text).to_owned())
     }
 
     /// The commit `rev` names, if it names one.
-    async fn commit(&self, dir: &Path, rev: &str) -> Option<String> {
+    pub(crate) async fn commit(&self, dir: &Path, rev: &str) -> Option<String> {
         let rev = format!("{rev}^{{commit}}");
         self.text(
             dir,
@@ -188,24 +194,21 @@ impl Git {
 /// directory with `--git-dir` set to it, so it never discovers another
 /// repository, whatever has become of the checkouts.
 pub(crate) struct Repository<'a> {
-    git: &'a Git,
+    git: Git,
     common_dir: &'a Path,
-    git_dir: OsString,
 }
 
 impl<'a> Repository<'a> {
-    pub(crate) fn new(git: &'a Git, common_dir: &'a Path) -> Self {
+    pub(crate) fn new(git: &Git, common_dir: &'a Path) -> Self {
         let mut git_dir = OsString::from("--git-dir=");
         git_dir.push(common_dir);
-        Self {
-            git,
-            common_dir,
-            git_dir,
-        }
+        let mut git = git.clone();
+        git.prefix.push(git_dir);
+        Self { git, common_dir }
     }
 
     pub(crate) async fn run(&self, args: &[Arg<'_>]) -> Result<Vec<u8>, GitError> {
-        self.run_with_input(args, None).await
+        self.git.run(self.common_dir, args).await
     }
 
     pub(crate) async fn run_with_input(
@@ -213,48 +216,22 @@ impl<'a> Repository<'a> {
         args: &[Arg<'_>],
         input: Option<&str>,
     ) -> Result<Vec<u8>, GitError> {
-        let mut all: Vec<Arg<'_>> = vec![&self.git_dir];
-        all.extend_from_slice(args);
-        self.git.run_with_input(self.common_dir, &all, input).await
+        self.git.run_with_input(self.common_dir, args, input).await
     }
 
     pub(crate) async fn text(&self, args: &[Arg<'_>]) -> Result<String, GitError> {
-        let output = self.run(args).await?;
-        let text = String::from_utf8_lossy(&output);
-        Ok(text.strip_suffix('\n').unwrap_or(&text).to_owned())
+        self.git.text(self.common_dir, args).await
     }
 
     /// The commit `rev` names, if it names one.
     pub(crate) async fn commit(&self, rev: &str) -> Option<String> {
-        let rev = format!("{rev}^{{commit}}");
-        self.text(&[
-            &"rev-parse",
-            &"--verify",
-            &"--quiet",
-            &"--end-of-options",
-            &rev,
-        ])
-        .await
-        .ok()
+        self.git.commit(self.common_dir, rev).await
     }
 
     /// Whether git finds the repository.
     async fn found(&self) -> bool {
         self.run(&[&"rev-parse", &"--git-dir"]).await.is_ok()
     }
-}
-
-/// How a worktree's branch comes to exist.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Kind {
-    /// A branch created from `base`, with no upstream: the worktree's
-    /// `ox/<id8>` branch, or a new branch the client named.
-    New,
-    /// A local branch that already exists.
-    Existing,
-    /// A local branch created from the remote branch of the same name on
-    /// `remote`, tracking it.
-    Track { remote: String },
 }
 
 /// A worktree to add for a new session, resolved and checked.
@@ -271,7 +248,6 @@ pub struct WorktreePlan {
     /// workspace is of its checkout.
     pub cwd: PathBuf,
     branch: String,
-    kind: Kind,
     /// The commit the worktree starts at.
     base: String,
     /// The ref the branch is compared with.
@@ -286,23 +262,21 @@ impl WorktreePlan {
             path: self.path.clone(),
             branch: self.branch.clone(),
             base: self.base.clone(),
-            created_branch: self.kind != Kind::Existing,
+            created_branch: true,
             compare: self.compare.clone(),
             common_dir: self.common_dir.clone(),
         }
     }
 }
 
-/// Resolves worktree `worktree_id` of `workspace`, on `branch`, or on a new
-/// branch named for the worktree that starts at `HEAD` when there is none, compared with `compare`. Refuses, having changed
-/// nothing, a workspace outside a Git working tree, an existing branch that
-/// is not there or is checked out, a new branch whose name is taken, a start
-/// point or comparison ref that is not a commit, or a worktree directory in
-/// `worktrees_dir` that exists already.
+/// Resolves worktree `worktree_id` of `workspace`, on a new branch named for
+/// the worktree that starts at `HEAD`, compared with `compare`. Refuses,
+/// having changed nothing, a workspace outside a Git working tree, a
+/// repository with no commits, a comparison ref that is not a commit, or a
+/// worktree directory in `worktrees_dir` that exists already.
 pub async fn plan(
     git: &Git,
     workspace: &Path,
-    branch: Option<WorktreeBranch>,
     compare: Option<String>,
     worktrees_dir: &Path,
     worktree_id: &str,
@@ -342,31 +316,11 @@ pub async fn plan(
         )));
     }
 
-    let (branch, kind, start) = match branch {
-        None => (format!("ox/{id8}"), Kind::New, None),
-        Some(WorktreeBranch::Existing { name }) => {
-            let (name, kind) = resolve_existing(git, &top, &common_dir, name).await?;
-            (name, kind, None)
-        }
-        Some(WorktreeBranch::New { name, start }) => {
-            check_new(git, &top, &name).await?;
-            (name, Kind::New, start)
-        }
-    };
-    let base = match (&kind, start) {
-        (Kind::New, Some(start)) => git
-            .commit(&top, &start)
-            .await
-            .ok_or_else(|| invalid_request(format!("{start} is not a commit")))?,
-        (Kind::New, None) => git
-            .commit(&top, "HEAD")
-            .await
-            .ok_or_else(|| invalid_request("the repository has no commits".into()))?,
-        (Kind::Existing, _) => tip(git, &top, &format!("refs/heads/{branch}")).await?,
-        (Kind::Track { remote }, _) => {
-            tip(git, &top, &format!("refs/remotes/{remote}/{branch}")).await?
-        }
-    };
+    let branch = format!("ox/{id8}");
+    let base = git
+        .commit(&top, "HEAD")
+        .await
+        .ok_or_else(|| invalid_request("the repository has no commits".into()))?;
     if let Some(compare) = &compare
         && git.commit(&top, compare).await.is_none()
     {
@@ -389,7 +343,6 @@ pub async fn plan(
         common_dir,
         path,
         branch,
-        kind,
         base,
         compare,
     })
@@ -406,138 +359,6 @@ pub fn not_a_working_tree(workspace: &Path, reason: &str) -> ErrorBody {
     } else {
         format!("{refusal}: {reason}")
     })
-}
-
-/// What an existing branch the user named is: a local branch that no
-/// worktree has checked out, or a remote branch, named `<branch>` or
-/// `<remote>/<branch>`, to track. Refuses a name that is neither.
-async fn resolve_existing(
-    git: &Git,
-    top: &Path,
-    common_dir: &Path,
-    name: String,
-) -> Result<(String, Kind), ErrorBody> {
-    check_branch_name(git, top, &name).await?;
-    if git
-        .commit(top, &format!("refs/heads/{name}"))
-        .await
-        .is_some()
-    {
-        if let Some(worktree) = checked_out_at(&Repository::new(git, common_dir), &name).await? {
-            return Err(invalid_request(format!(
-                "{name} is checked out at {worktree}"
-            )));
-        }
-        return Ok((name, Kind::Existing));
-    }
-
-    let remotes = git.text(top, &[&"remote"]).await?;
-    let remotes: Vec<&str> = remotes.lines().collect();
-    // A remote branch picked by its full name.
-    for remote in &remotes {
-        if let Some(local) = name.strip_prefix(&format!("{remote}/"))
-            && git
-                .commit(top, &format!("refs/remotes/{remote}/{local}"))
-                .await
-                .is_some()
-        {
-            check_branch_name(git, top, local).await?;
-            if git
-                .commit(top, &format!("refs/heads/{local}"))
-                .await
-                .is_some()
-            {
-                return Err(invalid_request(format!(
-                    "a local branch {local} exists; name it instead"
-                )));
-            }
-            let kind = Kind::Track {
-                remote: (*remote).to_owned(),
-            };
-            return Ok((local.to_owned(), kind));
-        }
-    }
-
-    let mut found = Vec::new();
-    for remote in remotes {
-        if git
-            .commit(top, &format!("refs/remotes/{remote}/{name}"))
-            .await
-            .is_some()
-        {
-            found.push(remote);
-        }
-    }
-    let remote = match found[..] {
-        [] => {
-            return Err(invalid_request(format!(
-                "no branch {name} locally or on a remote"
-            )));
-        }
-        [remote] => remote.to_owned(),
-        _ => {
-            let default = git
-                .text(top, &[&"config", &"--get", &"checkout.defaultRemote"])
-                .await
-                .ok();
-            match default.filter(|default| found.contains(&default.as_str())) {
-                Some(default) => default,
-                None => {
-                    return Err(invalid_request(format!(
-                        "{name} exists on remotes {}; set checkout.defaultRemote or create \
-                         the local branch first",
-                        found.join(", ")
-                    )));
-                }
-            }
-        }
-    };
-    Ok((name, Kind::Track { remote }))
-}
-
-/// Refuses a new branch name that git does not take as written, or that a
-/// local branch, a remote branch's full name `<remote>/<branch>`, or a
-/// branch on any remote already has.
-async fn check_new(git: &Git, top: &Path, name: &str) -> Result<(), ErrorBody> {
-    check_branch_name(git, top, name).await?;
-    if git
-        .commit(top, &format!("refs/heads/{name}"))
-        .await
-        .is_some()
-    {
-        return Err(invalid_request(format!("a branch {name} exists")));
-    }
-    if git
-        .commit(top, &format!("refs/remotes/{name}"))
-        .await
-        .is_some()
-    {
-        return Err(invalid_request(format!("a remote branch {name} exists")));
-    }
-    let remotes = git.text(top, &[&"remote"]).await?;
-    for remote in remotes.lines() {
-        if git
-            .commit(top, &format!("refs/remotes/{remote}/{name}"))
-            .await
-            .is_some()
-        {
-            return Err(invalid_request(format!("{name} exists on {remote}")));
-        }
-    }
-    Ok(())
-}
-
-/// Refuses a name git does not take as a branch name as written.
-async fn check_branch_name(git: &Git, top: &Path, name: &str) -> Result<(), ErrorBody> {
-    let checked = git
-        .text(top, &[&"check-ref-format", &"--branch", &name])
-        .await;
-    match checked {
-        Ok(checked) if checked == name => Ok(()),
-        _ => Err(invalid_request(format!(
-            "{name} is not a valid branch name"
-        ))),
-    }
 }
 
 /// The worktree that has local branch `branch` checked out, if any.
@@ -560,20 +381,9 @@ pub(crate) async fn checked_out_at(
     Ok(None)
 }
 
-/// The commit a ref that was just found points at.
-async fn tip(git: &Git, top: &Path, reference: &str) -> Result<String, ErrorBody> {
-    git.commit(top, reference)
-        .await
-        .ok_or_else(|| invalid_request(format!("{reference} no longer exists")))
-}
-
-/// Creates the plan's branch at its base, unless it exists already, with
-/// the remote branch as its upstream for **Track**. Creation fails if a
-/// branch of that name was created meanwhile.
+/// Creates the plan's branch at its base. Creation fails if a branch of that
+/// name was created meanwhile.
 pub async fn create_branch(git: &Git, plan: &WorktreePlan) -> Result<(), ErrorBody> {
-    if plan.kind == Kind::Existing {
-        return Ok(());
-    }
     let branch = plan.branch.as_str();
     let base = plan.base.as_str();
     git.run(
@@ -587,28 +397,24 @@ pub async fn create_branch(git: &Git, plan: &WorktreePlan) -> Result<(), ErrorBo
         ],
     )
     .await
-    .map_err(|error| invalid_request(error.stderr))?;
-    if let Kind::Track { remote } = &plan.kind {
-        let upstream = format!("--set-upstream-to=refs/remotes/{remote}/{branch}");
-        if let Err(error) = git
-            .run(
-                &plan.top,
-                &[&"branch", &upstream, &"--end-of-options", &branch],
-            )
-            .await
-        {
-            let mut error = ErrorBody::from(error);
-            if let Err(failure) = roll_back(git, plan, false).await {
-                error.message = format!("{}; undoing it failed: {failure}", error.message);
-            }
-            return Err(error);
-        }
-    }
-    Ok(())
+    .map(drop)
+    .map_err(|error| invalid_request(error.stderr))
 }
 
-/// Adds the plan's worktree on its branch, which exists.
+/// Adds the plan's worktree on its branch, which exists. A worktree that
+/// cannot be added is undone with its branch, as `roll_back` does. Returns
+/// why it could not be added, and what could not be undone.
 pub async fn add(git: &Git, plan: &WorktreePlan) -> Result<(), String> {
+    let Err(mut message) = add_worktree(git, plan).await else {
+        return Ok(());
+    };
+    if let Err(error) = roll_back(git, plan, true).await {
+        message = format!("{message}; undoing it failed: {error}");
+    }
+    Err(message)
+}
+
+async fn add_worktree(git: &Git, plan: &WorktreePlan) -> Result<(), String> {
     if let Some(dir) = plan.path.parent() {
         tokio::fs::create_dir_all(dir)
             .await
@@ -663,8 +469,8 @@ async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
 
 /// Undoes `create_branch`, and a failed `add` when `added` says it ran:
 /// removes the worktree if git registered it, and deletes the branch if it
-/// was created, still points at its base, and no worktree has it checked
-/// out. Returns what could not be undone.
+/// still points at its base and no worktree has it checked out. Returns what
+/// could not be undone.
 pub async fn roll_back(git: &Git, plan: &WorktreePlan, added: bool) -> Result<(), String> {
     let mut failures = Vec::new();
     if added
@@ -675,18 +481,16 @@ pub async fn roll_back(git: &Git, plan: &WorktreePlan, added: bool) -> Result<()
     {
         failures.push(error.to_string());
     }
-    if plan.kind != Kind::Existing {
-        // Another worktree may have checked the branch out
-        // meanwhile, which is what made `add` fail.
-        match checked_out_at(&Repository::new(git, &plan.common_dir), &plan.branch).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                if let Err(error) = delete_branch(git, plan).await {
-                    failures.push(error);
-                }
+    // Another worktree may have checked the branch out meanwhile, which is
+    // what made `add` fail.
+    match checked_out_at(&Repository::new(git, &plan.common_dir), &plan.branch).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(error) = delete_branch(git, plan).await {
+                failures.push(error);
             }
-            Err(error) => failures.push(error.to_string()),
         }
+        Err(error) => failures.push(error.to_string()),
     }
     if failures.is_empty() {
         Ok(())
@@ -1088,19 +892,6 @@ impl Worktree {
     /// Asks the comparing task to compute the comparison again.
     pub fn recompare(&self) {
         self.recompare.notify_one();
-    }
-
-    /// Sets or clears the comparison ref, which the caller has saved, and
-    /// publishes it with the comparison computed for it.
-    pub async fn set_compare(&self, compare_ref: Option<String>) {
-        let _comparing = self.comparing.lock().await;
-        let mut saved = self.saved();
-        saved.compare = compare_ref;
-        let comparison = compare(&Git::own(), &saved).await;
-        self.update(|current, current_comparison| {
-            current.compare = saved.compare;
-            *current_comparison = comparison;
-        });
     }
 
     /// Removes the worktree once `stop` has stopped the agent running in it.

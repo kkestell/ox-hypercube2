@@ -77,17 +77,11 @@ describe("A session stuck starting", () => {
 });
 
 describe("Archiving a worktree session", () => {
-  it("has no Archived group until a session is archived", async () => {
-    const { cwd, workspace } = await gitWorkspace();
-    await startWorktreeSession(workspace);
-    await expect(entry(cwd)).toBeExisting();
-    await expect(archivedToggle(cwd)).not.toBeExisting();
-  });
-
   it("moves a clean session into the collapsed Archived group and keeps its branch", async () => {
     const { cwd, workspace } = await gitWorkspace();
     await startWorktreeSession(workspace);
     await expect(entry(cwd)).toBeExisting();
+    await expect(archivedToggle(cwd)).not.toBeExisting();
     const path = (await entry(cwd).$("button.select").getAttribute("title"))!.replace(/\/$/, "");
     const branch = (await git(path, "branch", "--show-current")).trim();
 

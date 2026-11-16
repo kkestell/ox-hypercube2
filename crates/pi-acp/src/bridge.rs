@@ -1,12 +1,10 @@
 use std::{
-    collections::HashMap,
     future::Future,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard},
 };
 
+use acp_bridge::{invalid, notify};
 use agent_client_protocol::v2::schema::{self as acp, SessionUpdate};
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error};
@@ -15,18 +13,18 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
-    commands,
-    config::Config,
-    content, history, options,
+    commands, content, history, options,
     pi::Pi,
-    store::{Session as Metadata, Store},
-    updates::{Updates, notify},
-    validation,
+    updates::{self, Updates},
 };
 
-/// A session opened on this connection.
+/// The session a bridge process serves. Its ID is also its Pi session ID,
+/// and Pi keeps the session, with its model and thinking level.
 struct Session {
-    metadata: Metadata,
+    id: String,
+    cwd: PathBuf,
+    /// The session has had a prompt, which titled it.
+    titled: bool,
     /// The session's Pi, once started.
     pi: Option<Pi>,
 }
@@ -37,30 +35,22 @@ struct Description {
     available_commands: Vec<acp::AvailableCommand>,
 }
 
+/// A bridge process serves one session, opened with `session/new` or
+/// `session/resume`.
 pub struct Bridge {
-    sessions: Mutex<HashMap<String, Session>>,
-    store: Store,
-    forms: AtomicBool,
+    session: Mutex<Option<Session>>,
 }
 
 impl Bridge {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            sessions: Mutex::new(HashMap::new()),
-            forms: AtomicBool::new(false),
-            store: Store::new(Config::from_env().store_dir),
+            session: Mutex::new(None),
         })
     }
+}
 
-    pub fn initialize(&self, request: &acp::InitializeRequest) -> acp::InitializeResponse {
-        self.forms.store(
-            request
-                .capabilities
-                .elicitation
-                .as_ref()
-                .is_some_and(acp::ElicitationCapabilities::supports_form),
-            Ordering::Relaxed,
-        );
+impl acp_bridge::Bridge for Bridge {
+    fn initialize(&self, request: &acp::InitializeRequest) -> acp::InitializeResponse {
         acp::InitializeResponse::new(
             request.protocol_version,
             acp::Implementation::new("pi-acp", env!("CARGO_PKG_VERSION")).title("Pi ACP Bridge"),
@@ -74,35 +64,36 @@ impl Bridge {
         )
     }
 
-    /// Opens a new session without starting its Pi: the client learns the
-    /// session first, then `start_new` starts Pi.
-    pub fn new_session(
+    fn new_session(
         &self,
-        request: &acp::NewSessionRequest,
+        request: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
-        let cwd = validation::cwd(&request.cwd.0).map_err(invalid)?;
+        let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
         if !request.mcp_servers.is_empty() {
             return Err(invalid("MCP servers are not supported"));
         }
-        let id = Uuid::new_v4().simple().to_string();
-        let metadata = Metadata {
+        let mut open = self.session.lock().unwrap();
+        if open.is_some() {
+            return Err(acp_bridge::already_open());
+        }
+        let id = Uuid::new_v4().to_string();
+        *open = Some(Session {
+            id: id.clone(),
             cwd,
-            pi_session_id: Uuid::new_v4().to_string(),
-            title: None,
-        };
-        self.store
-            .create(id.clone(), &metadata)
-            .map_err(|error| store_error(&error))?;
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(id.clone(), Session { metadata, pi: None });
+            titled: false,
+            pi: None,
+        });
         Ok(acp::NewSessionResponse::new(id))
     }
 
-    /// Starts a new session's Pi once the client knows the session. A Pi that
-    /// fails to start is started again by the session's first prompt.
-    pub fn start_new(&self, id: &str, connection: &ConnectionTo<Client>) {
+    /// A Pi that fails to start is started again by the session's first
+    /// prompt.
+    fn start_new(self: &Arc<Self>, id: &str, connection: &ConnectionTo<Client>) {
+        notify(
+            connection,
+            id,
+            SessionUpdate::StateUpdate(updates::idle_state()),
+        );
         match self.start_pi(id, connection) {
             Ok(true) => self.publish_description(id, connection),
             Ok(false) => {}
@@ -110,31 +101,10 @@ impl Bridge {
         }
     }
 
-    /// Closes a session: its Pi stops and later requests for it fail. The
-    /// returned future finishes once Pi has exited. A session that is not
-    /// open closes without effect.
-    pub fn close_session(&self, id: &str) -> impl Future<Output = ()> + Send + 'static {
-        let pi = self
-            .sessions
-            .lock()
-            .unwrap()
-            .remove(id)
-            .and_then(|session| session.pi);
-        async move {
-            if let Some(pi) = pi {
-                pi.stop().await;
-            }
-        }
-    }
-
     /// Stops the session's run, whether a prompt or Pi started it.
-    pub fn cancel(&self, id: &str) {
-        if let Some(pi) = self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(id)
-            .and_then(|session| session.pi.as_ref())
+    fn cancel(&self, id: &str) {
+        if let Ok(mut open) = self.require(id)
+            && let Some(pi) = &open_session(&mut open).pi
         {
             pi.abort();
         }
@@ -143,8 +113,8 @@ impl Bridge {
     /// Sends a prompt to its session's Pi, which answers `responder` once it
     /// accepts the prompt. The prompt is sent before this returns, so a
     /// cancel that arrives right after the prompt follows it.
-    pub fn prompt(
-        &self,
+    fn prompt(
+        self: &Arc<Self>,
         request: &acp::PromptRequest,
         responder: Responder<acp::PromptResponse>,
         connection: &ConnectionTo<Client>,
@@ -159,32 +129,12 @@ impl Bridge {
             Ok(false) => {}
             Err(error) => return responder.respond_with_error(error),
         }
-        // Save the title before submitting a prompt so registry errors can be
-        // returned to its caller without accepting work first.
         let text = content::prompt_text(&request.prompt);
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions.get_mut(&id).expect("start_pi found the session");
-        let title = if session.metadata.title.is_none() && !text.trim().is_empty() {
-            Some(
-                text.split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-                    .chars()
-                    .take(120)
-                    .collect::<String>(),
-            )
-        } else {
-            None
+        let mut open = match self.require(&id) {
+            Ok(open) => open,
+            Err(error) => return responder.respond_with_error(error),
         };
-        if let Some(title) = &title {
-            if let Err(error) = self
-                .store
-                .update(&id, |metadata| metadata.title = Some(title.clone()))
-            {
-                return responder.respond_with_error(store_error(&error));
-            }
-            session.metadata.title = Some(title.clone());
-        }
+        let session = open_session(&mut open);
         let message_id = Uuid::new_v4().to_string();
         let pi = session.pi.as_ref().expect("start_pi started pi");
         if let Err(responder) = pi.prompt(
@@ -196,9 +146,11 @@ impl Bridge {
         ) {
             return responder.respond_with_error(Error::new(-32603, "pi exited"));
         }
-
-        if let Some(title) = title {
-            drop(sessions);
+        if !session.titled
+            && let Some(title) = acp_bridge::title(&text)
+        {
+            session.titled = true;
+            drop(open);
             notify(
                 connection,
                 &id,
@@ -208,9 +160,12 @@ impl Bridge {
         Ok(())
     }
 
-    pub fn resume_session(
+    /// Opens the session and starts its Pi, which opens the Pi session.
+    /// Replay and the current state precede the response, as on the live
+    /// update path.
+    fn resume_session(
         self: &Arc<Self>,
-        request: &acp::ResumeSessionRequest,
+        request: acp::ResumeSessionRequest,
         connection: &ConnectionTo<Client>,
     ) -> impl Future<Output = Result<acp::ResumeSessionResponse, Error>> + Send + 'static {
         let prepared = (|| {
@@ -219,24 +174,28 @@ impl Bridge {
                 Some(acp::ReplayFrom::Start(_)) => true,
                 Some(_) => return Err(invalid("Unsupported replay cursor")),
             };
-            let cwd = validation::cwd(&request.cwd.0).map_err(invalid)?;
+            let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
             if !request.mcp_servers.is_empty() {
                 return Err(invalid("MCP servers are not supported"));
             }
             let id = request.session_id.to_string();
-            let metadata = self
-                .store
-                .get(&id)
-                .map_err(|error| store_error(&error))?
-                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.clone())))?;
-            if metadata.cwd != cwd {
-                return Err(invalid("Session cwd does not match"));
+            if Uuid::parse_str(&id).is_err() {
+                return Err(acp::Error::session_not_found(id).into());
             }
-            self.sessions
-                .lock()
-                .unwrap()
-                .entry(id.clone())
-                .or_insert(Session { metadata, pi: None });
+            {
+                let mut open = self.session.lock().unwrap();
+                if open.is_some() {
+                    return Err(acp_bridge::already_open());
+                }
+                // Whether the session has had a prompt is known once Pi
+                // names its session file.
+                *open = Some(Session {
+                    id: id.clone(),
+                    cwd: cwd.clone(),
+                    titled: true,
+                    pi: None,
+                });
+            }
             self.start_pi(&id, connection)?;
             let description = self.describe(&id);
             Ok((id, cwd, replay, description))
@@ -246,22 +205,16 @@ impl Bridge {
         async move {
             let (id, cwd, replay, description) = prepared?;
             let description = description.await?;
-            if replay && let Some(path) = description.state["sessionFile"].as_str() {
-                history::replay(
-                    std::path::Path::new(path),
-                    &cwd,
-                    &Updates::new(
-                        connection.clone(),
-                        &id,
-                        bridge.forms.load(Ordering::Relaxed),
-                    ),
-                )
-                .map_err(|error| store_error(&error))?;
+            let file = description.state["sessionFile"]
+                .as_str()
+                .map(std::path::Path::new);
+            if replay && let Some(file) = file {
+                history::replay(file, &cwd, &Updates::new(connection.clone(), &id))
+                    .map_err(|error| Error::new(-32603, error.to_string()))?;
             }
-            let sessions = bridge.sessions.lock().unwrap();
-            let session = sessions
-                .get(&id)
-                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.clone())))?;
+            let mut open = bridge.require(&id)?;
+            let session = open_session(&mut open);
+            session.titled = file.is_some_and(history::has_prompts);
             notify(
                 &connection,
                 &id,
@@ -273,6 +226,48 @@ impl Bridge {
         }
     }
 
+    fn set_config(
+        self: &Arc<Self>,
+        request: &acp::SetSessionConfigOptionRequest,
+        connection: ConnectionTo<Client>,
+    ) -> impl Future<Output = Result<acp::SetSessionConfigOptionResponse, Error>> + Send + 'static
+    {
+        let id = request.session_id.to_string();
+        let change = (|| {
+            drop(self.require(&id)?);
+            let acp::SessionConfigOptionValue::Id { value } = &request.value else {
+                return Err(invalid("Expected a select value"));
+            };
+            let command = options::command(&request.config_id.to_string(), &value.to_string())
+                .ok_or_else(|| invalid("Unknown configuration option or value"))?;
+            if self.start_pi(&id, &connection)? {
+                self.publish_description(&id, &connection);
+            }
+            let mut open = self.require(&id)?;
+            let pi = open_session(&mut open).pi.as_ref().expect("started pi");
+            // TODO: Pi handles RPC lines concurrently; a following prompt can
+            // start on the previous model while set_model awaits authentication.
+            Ok(pi.request(command))
+        })();
+        let bridge = self.clone();
+        async move {
+            answer(change?).await?;
+            let description = bridge.describe(&id).await?;
+            notify(
+                &connection,
+                &id,
+                SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
+                    description.config_options.clone(),
+                )),
+            );
+            Ok(acp::SetSessionConfigOptionResponse::new(
+                description.config_options,
+            ))
+        }
+    }
+}
+
+impl Bridge {
     /// Sends all description queries before returning, so later requests do
     /// not overtake their submission to Pi.
     fn describe(
@@ -280,11 +275,8 @@ impl Bridge {
         id: &str,
     ) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
         let queries = (|| {
-            let sessions = self.sessions.lock().unwrap();
-            let session = sessions
-                .get(id)
-                .ok_or_else(|| Error::from(acp::Error::session_not_found(id.to_owned())))?;
-            let pi = session.pi.as_ref().expect("started pi");
+            let mut open = self.require(id)?;
+            let pi = open_session(&mut open).pi.as_ref().expect("started pi");
             Ok::<_, Error>([
                 pi.request(json!({"type":"get_state"})),
                 pi.request(json!({"type":"get_available_models"})),
@@ -335,75 +327,33 @@ impl Bridge {
         });
     }
 
-    /// Sends the change before returning its completion future.
-    pub fn set_config(
-        self: &Arc<Self>,
-        request: &acp::SetSessionConfigOptionRequest,
-        connection: ConnectionTo<Client>,
-    ) -> impl Future<Output = Result<acp::SetSessionConfigOptionResponse, Error>> + Send + 'static
-    {
-        let id = request.session_id.to_string();
-        let change = (|| {
-            if !self.sessions.lock().unwrap().contains_key(&id) {
-                return Err(Error::from(acp::Error::session_not_found(id.clone())));
-            }
-            let acp::SessionConfigOptionValue::Id { value } = &request.value else {
-                return Err(invalid("Expected a select value"));
-            };
-            let command = options::command(&request.config_id.to_string(), &value.to_string())
-                .ok_or_else(|| invalid("Unknown configuration option or value"))?;
-            if self.start_pi(&id, &connection)? {
-                self.publish_description(&id, &connection);
-            }
-            let sessions = self.sessions.lock().unwrap();
-            let pi = sessions[&id].pi.as_ref().expect("started pi");
-            // TODO: Pi handles RPC lines concurrently; a following prompt can
-            // start on the previous model while set_model awaits authentication.
-            Ok(pi.request(command))
-        })();
-        let bridge = self.clone();
-        async move {
-            answer(change?).await?;
-            let description = bridge.describe(&id).await?;
-            notify(
-                &connection,
-                &id,
-                SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
-                    description.config_options.clone(),
-                )),
-            );
-            Ok(acp::SetSessionConfigOptionResponse::new(
-                description.config_options,
-            ))
-        }
-    }
-
     /// Starts the session's Pi unless one is running.
     fn start_pi(&self, id: &str, connection: &ConnectionTo<Client>) -> Result<bool, Error> {
-        let mut sessions = self.sessions.lock().unwrap();
-        let session = sessions
-            .get_mut(id)
-            .ok_or_else(|| Error::from(acp::Error::session_not_found(id.to_owned())))?;
+        let mut open = self.require(id)?;
+        let session = open_session(&mut open);
         if session.pi.as_ref().is_some_and(|pi| !pi.has_exited()) {
             return Ok(false);
         }
-        let pi = Pi::start(
-            &session.metadata.cwd,
-            &session.metadata.pi_session_id,
-            Updates::new(connection.clone(), id, self.forms.load(Ordering::Relaxed)),
-        )
-        .map_err(|error| Error::new(-32603, error))?;
+        let pi = Pi::start(&session.cwd, id, Updates::new(connection.clone(), id))
+            .map_err(|error| Error::new(-32603, error))?;
         session.pi = Some(pi);
         Ok(true)
     }
+
+    /// The open session, when its ID is `id`.
+    fn require(&self, id: &str) -> Result<MutexGuard<'_, Option<Session>>, Error> {
+        let open = self.session.lock().unwrap();
+        if open.as_ref().is_some_and(|session| session.id == id) {
+            Ok(open)
+        } else {
+            Err(acp::Error::session_not_found(id.to_owned()).into())
+        }
+    }
 }
 
-fn invalid(message: impl Into<String>) -> Error {
-    Error::new(-32602, message)
-}
-
-fn store_error(error: &std::io::Error) -> Error {
-    Error::new(-32603, error.to_string())
+/// The session `require` found open.
+fn open_session<'a>(open: &'a mut MutexGuard<'_, Option<Session>>) -> &'a mut Session {
+    open.as_mut().expect("require found the session open")
 }
 
 async fn answer(response: oneshot::Receiver<Result<Value, String>>) -> Result<Value, Error> {

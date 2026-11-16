@@ -1,6 +1,5 @@
 use std::{
     collections::HashMap,
-    os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -12,10 +11,9 @@ use agent_client_protocol::v2::schema::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    process::{Child, Command},
     sync::{mpsc, oneshot},
-    task::{AbortHandle, JoinHandle},
+    task::AbortHandle,
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -49,8 +47,6 @@ struct State {
     abort_on_start: bool,
     /// Why Pi exited, once it has.
     exited: Option<String>,
-    /// The session is closing, so Pi's exit is a cancellation.
-    closing: bool,
 }
 
 impl State {
@@ -82,8 +78,6 @@ pub struct Pi {
     input: mpsc::UnboundedSender<Value>,
     updates: Updates,
     state: Arc<Mutex<State>>,
-    /// Closes once Pi has exited.
-    exited: oneshot::Receiver<()>,
 }
 
 impl Pi {
@@ -100,12 +94,11 @@ impl Pi {
             .spawn()
             .map_err(|e| format!("failed to start pi: {e}"))?;
         let (input, commands) = mpsc::unbounded_channel();
-        tokio::spawn(write_input(
+        tokio::spawn(acp_bridge::pipes::write_input(
             child.stdin.take().expect("piped stdin"),
             commands,
         ));
         let state = Arc::new(Mutex::new(State::default()));
-        let (exit, exited) = oneshot::channel();
         let output = Output {
             updates: updates.clone(),
             state: state.clone(),
@@ -115,14 +108,12 @@ impl Pi {
             blocks: HashMap::new(),
             tools: HashMap::new(),
             last_stop: None,
-            _exit: exit,
         };
         tokio::spawn(output.read(child));
         Ok(Self {
             input,
             updates,
             state,
-            exited,
         })
     }
 
@@ -198,28 +189,6 @@ impl Pi {
         state.withdraw_dialogs(Some(&self.input));
         state.send(&self.input, json!({"type": "abort"}), Pending::Abort);
     }
-
-    /// Stops Pi and returns once it has exited. Its turn is cancelled.
-    pub async fn stop(self) {
-        self.state.lock().unwrap().closing = true;
-        self.abort();
-        let Self { input, exited, .. } = self;
-        // Pi exits when its stdin closes.
-        drop(input);
-        let _ = exited.await;
-    }
-}
-
-/// Writes each command to Pi's stdin as a line, until the session drops its
-/// `Pi` or Pi closes its stdin.
-async fn write_input(mut stdin: ChildStdin, mut commands: mpsc::UnboundedReceiver<Value>) {
-    while let Some(command) = commands.recv().await {
-        let mut line = command.to_string().into_bytes();
-        line.push(b'\n');
-        if stdin.write_all(&line).await.is_err() {
-            return;
-        }
-    }
 }
 
 /// A text or thinking block of the assistant message Pi is streaming.
@@ -252,49 +221,24 @@ struct Output {
     tools: HashMap<String, Tool>,
     /// The stop reason and error message of the run's last assistant message.
     last_stop: Option<(String, Option<String>)>,
-    /// Dropped once Pi has exited.
-    _exit: oneshot::Sender<()>,
 }
 
 impl Output {
     /// Translates Pi's output until Pi exits, then ends what it left open.
     async fn read(mut self, mut child: Child) {
-        let mut stderr = Stderr::collect(child.stderr.take().expect("piped stderr"));
-        let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
-        // A line being read; `read_until` keeps a partial line here when the
-        // other branch wins.
-        let mut line = Vec::new();
-        let status = loop {
-            tokio::select! {
-                biased;
-                read = stdout.read_until(b'\n', &mut line) => match read {
-                    Ok(n) if n > 0 => {
-                        self.translate_lines(&line);
-                        line.clear();
-                    }
-                    _ => break child.wait().await,
-                },
-                status = child.wait() => {
-                    // Everything Pi wrote is in the pipe; a process it
-                    // started may hold the pipe open.
-                    drain(&stdout, &mut line);
-                    self.translate_lines(&line);
-                    break status;
-                }
-            }
-        };
-        let error = match status {
-            Ok(status) => format!(
-                "pi exited with {status}: {}",
-                String::from_utf8_lossy(&stderr.finish().await).trim()
-            ),
-            Err(error) => format!("pi process failed: {error}"),
-        };
-        let (pending, closing) = {
+        let error =
+            match acp_bridge::pipes::read_output(&mut child, |line| self.translate(line)).await {
+                Ok((status, stderr)) => format!(
+                    "pi exited with {status}: {}",
+                    String::from_utf8_lossy(&stderr).trim()
+                ),
+                Err(error) => format!("pi process failed: {error}"),
+            };
+        let pending = {
             let mut state = self.state.lock().unwrap();
             state.exited = Some(error.clone());
             state.withdraw_dialogs(None);
-            (std::mem::take(&mut state.pending), state.closing)
+            std::mem::take(&mut state.pending)
         };
         for (_, pending) in pending {
             match pending {
@@ -314,26 +258,12 @@ impl Output {
         }
 
         self.updates.fail_open_tools();
-        self.updates.idle(if closing {
-            StopReason::Cancelled
-        } else {
-            error_stop(error)
-        });
+        self.updates.idle(error_stop(error));
     }
 
     fn send(&self, message: Value) {
         if let Some(input) = self.input.upgrade() {
             let _ = input.send(message);
-        }
-    }
-
-    /// Translates each complete or final line in `bytes`.
-    fn translate_lines(&mut self, bytes: &[u8]) {
-        for line in bytes.split(|&byte| byte == b'\n') {
-            let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if !line.is_empty() {
-                self.translate(&String::from_utf8_lossy(line));
-            }
         }
     }
 
@@ -372,12 +302,7 @@ impl Output {
     }
 
     fn dialog(&self, request: Value) {
-        let form = self
-            .updates
-            .forms()
-            .then(|| dialogs::form(&request))
-            .flatten();
-        let Some((message, schema)) = form else {
+        let Some((message, schema)) = dialogs::form(&request) else {
             self.send(dialogs::response(&request, None));
             return;
         };
@@ -619,76 +544,4 @@ fn error_stop(message: String) -> StopReason {
 
 fn new_id() -> String {
     Uuid::new_v4().to_string()
-}
-
-/// Appends what Pi's stdout holds once Pi has exited: the reader's buffer,
-/// then the pipe's contents, read from the descriptor directly because the
-/// runtime may not yet have seen the pipe become readable.
-fn drain(stdout: &BufReader<ChildStdout>, bytes: &mut Vec<u8>) {
-    bytes.extend_from_slice(stdout.buffer());
-    read_buffered(stdout.get_ref(), bytes);
-}
-
-/// Reads Pi's stderr while Pi runs, so a full pipe never blocks it.
-struct Stderr {
-    finish: Option<oneshot::Sender<()>>,
-    task: JoinHandle<Vec<u8>>,
-}
-
-impl Stderr {
-    fn collect(stderr: ChildStderr) -> Self {
-        let (finish, finished) = oneshot::channel();
-        Self {
-            finish: Some(finish),
-            task: tokio::spawn(read_stderr(stderr, finished)),
-        }
-    }
-
-    /// Everything Pi wrote to stderr. Call it once Pi has exited: what it
-    /// wrote is then in the pipe, and a process it started that still holds
-    /// the pipe open does not delay the result.
-    async fn finish(&mut self) -> Vec<u8> {
-        if let Some(finish) = self.finish.take() {
-            let _ = finish.send(());
-        }
-        (&mut self.task).await.unwrap_or_default()
-    }
-}
-
-impl Drop for Stderr {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-async fn read_stderr(mut stderr: ChildStderr, mut finished: oneshot::Receiver<()>) -> Vec<u8> {
-    let mut buffer = Vec::new();
-    let mut chunk = [0; 8192];
-    loop {
-        tokio::select! {
-            read = stderr.read(&mut chunk) => match read {
-                Ok(n) if n > 0 => buffer.extend_from_slice(&chunk[..n]),
-                _ => return buffer,
-            },
-            _ = &mut finished => {
-                read_buffered(&stderr, &mut buffer);
-                return buffer;
-            }
-        }
-    }
-}
-
-/// Reads what the pipe holds now. Tokio opens child pipes non-blocking, so
-/// `read` fails with `EAGAIN` instead of waiting once the pipe is empty.
-fn read_buffered(pipe: &impl AsRawFd, buffer: &mut Vec<u8>) {
-    let mut chunk = [0u8; 8192];
-    loop {
-        // SAFETY: reads at most `chunk.len()` bytes into `chunk` from a
-        // descriptor `pipe` owns and keeps open for the call.
-        let n = unsafe { libc::read(pipe.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-        if n <= 0 {
-            return;
-        }
-        buffer.extend_from_slice(&chunk[..n.cast_unsigned()]);
-    }
 }
