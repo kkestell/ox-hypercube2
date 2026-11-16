@@ -1,4 +1,10 @@
-import type { Item, RunInfo, SessionInfo, WorktreeInfo } from "../../lib/protocol";
+import {
+  isRequest,
+  type Request,
+  type RunInfo,
+  type SessionInfo,
+  type WorktreeInfo,
+} from "../../lib/protocol";
 import { Elicitation } from "../composer/Elicitation";
 import { Permission } from "../composer/Permission";
 import { Transcript } from "../conversation/Conversation";
@@ -6,14 +12,8 @@ import { useConversations } from "../conversation/useConversations";
 import { RunHeader } from "./RunHeader";
 import { RunStatus, runNotice } from "./RunStatus";
 
-type Request = Extract<Item, { type: "permission" | "elicitation" }>;
-
-function isRequest(item: Item): item is Request {
-  return item.type === "permission" || item.type === "elicitation";
-}
-
 /**
- * A run's header and current step, and below them the oldest open permission
+ * A run's header and steps, and below them the oldest open permission
  * request or form among the children, in step order.
  */
 export function RunView({
@@ -44,7 +44,7 @@ export function RunView({
     <>
       <RunHeader run={run} worktree={worktree} />
       <Transcript viewId={run.id}>
-        <RunStatus run={run} sessions={sessions} conversations={conversations} />
+        <RunStatus run={run} sessions={sessions} conversations={conversations} notice={notice} />
         {notice !== null && notice.index === -1 && (
           <div className="run-notice">
             <p>{notice.text}</p>

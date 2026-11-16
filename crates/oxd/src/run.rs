@@ -228,18 +228,18 @@ impl Run {
         });
     }
 
-    /// Saves and records step `position`'s state and output.
-    fn set_step(&self, position: usize, state: StepState, output: Option<String>) {
-        if let Err(error) = self
-            .store
-            .set_step(&self.id, position, state, output.as_deref())
+    /// Saves and records step `position`'s success and output.
+    fn succeed_step(&self, position: usize, output: String) {
+        if let Err(error) =
+            self.store
+                .set_step(&self.id, position, StepState::Succeeded, Some(&output))
         {
             eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
         }
         self.update(|record| {
             let step = &mut record.steps[position];
-            step.state = state;
-            step.output = output;
+            step.state = StepState::Succeeded;
+            step.output = Some(output);
         });
     }
 
@@ -356,7 +356,7 @@ async fn advance(
         };
         match context.run(step, &input, &mut cancel).await {
             Ok(output) => {
-                run.set_step(position, StepState::Succeeded, Some(output.clone()));
+                run.succeed_step(position, output.clone());
                 input = output;
             }
             Err(Ended::Failed { error, output }) => {

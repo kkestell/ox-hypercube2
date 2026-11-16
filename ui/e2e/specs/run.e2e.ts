@@ -26,9 +26,9 @@ function agentStep(name: string, prompt: string, checks = "") {
   return `  - name: ${name}\n    agent: {harness: pi}\n    prompt: ${yaml(prompt)}\n${checks}`;
 }
 
-/** A row of the workspace in `cwd` whose class list holds `kind`. */
-function rowsOf(cwd: string, kind: "run" | "child") {
-  return workspaceGroup(cwd).$$(`./ul/li[contains(concat(" ", @class, " "), " ${kind} ")]`);
+/** The run children's rows of the workspace in `cwd`. */
+function childRows(cwd: string) {
+  return workspaceGroup(cwd).$$(`./ul/li[contains(concat(" ", @class, " "), " child ")]`);
 }
 
 function runRow(cwd: string) {
@@ -108,8 +108,7 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await startCheckoutSession(workspace);
 
     await expect(runRow(cwd).$(".title")).toHaveText('text "Fix the build"');
-    await expect(childRow(cwd, "First")).toBeExisting();
-    await expect(rowsOf(cwd, "child")).toBeElementsArrayOfSize(3);
+    await expect(childRows(cwd)).toBeElementsArrayOfSize(3);
     await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
     await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
     await expect(runRow(cwd).$('.status[aria-label="Running"]')).toBeExisting();
@@ -246,7 +245,7 @@ ${agentStep(
     await rowAction(runRow(cwd), "Delete Run");
     await $("dialog[open]").$("button=Discard and Delete").click();
     await expect(runRow(cwd)).not.toBeExisting();
-    await expect(rowsOf(cwd, "child")).toBeElementsArrayOfSize(0);
+    await expect(childRows(cwd)).toBeElementsArrayOfSize(0);
   });
 
   it("shows a failed precondition's error under its step", async () => {

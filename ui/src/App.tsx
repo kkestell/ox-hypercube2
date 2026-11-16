@@ -16,7 +16,7 @@ import { MergeButton } from "./features/sessions/MergeButton";
 import { runTitle, SessionList } from "./features/sessions/SessionList";
 import { useSessionActions } from "./features/sessions/useSessionActions";
 import { useWorkspaces } from "./features/sessions/useWorkspaces";
-import type { Item } from "./lib/protocol";
+import { type Item, isRequest } from "./lib/protocol";
 
 const noItems: Item[] = [];
 
@@ -66,14 +66,7 @@ export function App() {
   const { actions, dialogs } = useSessionActions();
   const conversations = useConversations(session ? [session.id] : [], connection);
   const items = (session && conversations.get(session.id)) || noItems;
-  const request = useMemo(
-    () =>
-      items.find(
-        (item): item is Extract<Item, { type: "permission" | "elicitation" }> =>
-          item.type === "permission" || item.type === "elicitation",
-      ),
-    [items],
-  );
+  const request = useMemo(() => items.find(isRequest), [items]);
 
   const renderContent = () => {
     if (run) {
@@ -165,9 +158,7 @@ export function App() {
         renderContent={renderContent()}
         actions={headerActions()}
         title={run ? runTitle(run) : session ? (session.title ?? "New session") : undefined}
-      >
-        {null}
-      </Workbench>
+      />
       {dialogs}
     </>
   );

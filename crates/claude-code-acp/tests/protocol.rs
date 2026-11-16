@@ -3059,11 +3059,9 @@ async fn scheduled_prompts_keep_the_session_listed() {
             r#"{"stop":true}"#,
             r#""tool_use_result":{"stopped":true},"#,
         ),
-        // A call whose result cannot be read lasts until claude exits.
-        scheduling_turn("cron-4", "CronCreate", "{}", ""),
     ]
     .concat();
-    fake_claude(&bin, &format!("{turns}\nexit 0"));
+    fake_claude(&bin, &turns);
     let (mut child, mut reader) = start(&bin, &temp.path().join("store"));
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
@@ -3129,22 +3127,6 @@ async fn scheduled_prompts_keep_the_session_listed() {
             "state_update: idle end_turn",
         ]
     );
-    assert_eq!(
-        turn(8).await,
-        [
-            "state_update: running",
-            "tool_call_update: cron-4 CronCreate pending",
-            "state_update: running [_claude_schedule:cron-4]",
-            "tool_call_update: cron-4 completed [ok]",
-            "state_update: idle end_turn [_claude_schedule:cron-4]",
-        ]
-    );
-    // Claude exits, and nothing is left listed.
-    let mut exit = Vec::new();
-    while !exit.last().is_some_and(|value| is_state(value, "idle")) {
-        exit.push(receive(&mut reader).await);
-    }
-    assert_eq!(describe_updates(&exit), ["state_update: idle"]);
     child.kill().await.unwrap();
 }
 
@@ -3181,10 +3163,7 @@ next_message
     let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(background_items(&idle["background"]), ["wake-1"]);
     let (idle, _) = prompt(&mut child, &mut reader, 4, &session).await;
-    assert_eq!(
-        background_items(&idle["background"]),
-        ["wake-1", "_claude_schedule:wake-2"]
-    );
+    assert_eq!(background_items(&idle["background"]), ["wake-1"]);
     child.kill().await.unwrap();
 }
 

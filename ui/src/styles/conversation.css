@@ -144,20 +144,3 @@
 .agent-exited {
   color: var(--destructive);
 }
-
-/* A run's step: its heading, then its commands and its child's items, spaced
-   as a conversation's items are. */
-.step {
-  display: flex;
-  flex-direction: column;
-  gap: calc(var(--spacing) * 3);
-}
-
-.step-heading {
-  display: flex;
-  align-items: center;
-  gap: var(--tool-call-gap);
-  margin: 0;
-  font-size: inherit;
-  font-weight: 600;
-}

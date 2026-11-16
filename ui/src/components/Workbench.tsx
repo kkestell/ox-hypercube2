@@ -33,7 +33,6 @@ export function Workbench({
   right,
   actions,
   title,
-  children,
   renderContent,
 }: {
   left: ReactNode;
@@ -43,7 +42,6 @@ export function Workbench({
   actions?: ReactNode;
   /** The content's title, in its header before the panel toggles. */
   title?: ReactNode;
-  children: ReactNode;
   renderContent?: (header: ReactNode) => ReactNode;
 }) {
   const workbench = useRef<HTMLDivElement>(null);
@@ -160,7 +158,7 @@ export function Workbench({
         ) : (
           <main className="content">
             {header}
-            <div className="content-body">{children}</div>
+            <div className="content-body" />
           </main>
         )}
         {sash("bottom")}

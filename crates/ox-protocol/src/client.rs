@@ -163,7 +163,6 @@ pub struct Client {
     connection: Arc<Connection>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
-    hello: HelloResult,
 }
 
 /// Ends a stream when dropped: removes its route and sends `unsubscribe`.
@@ -303,16 +302,12 @@ impl Client {
             outgoing,
             routes: Mutex::default(),
         });
-        let mut client = Self {
+        let client = Self {
             reader: tokio::spawn(read_loop(read, connection.clone())),
             writer: tokio::spawn(write_loop(write, outgoing_rx)),
             connection,
-            hello: HelloResult {
-                protocol_version: PROTOCOL_VERSION,
-                daemon_version: String::new(),
-            },
         };
-        client.hello = client
+        let _: HelloResult = client
             .call(Method::Hello {
                 protocol_version: PROTOCOL_VERSION,
             })
@@ -341,10 +336,6 @@ impl Client {
             }
         }
         Self::connect(socket).await
-    }
-
-    pub fn daemon_version(&self) -> &str {
-        &self.hello.daemon_version
     }
 
     /// Whether the connection to the daemon has closed. Every request on a

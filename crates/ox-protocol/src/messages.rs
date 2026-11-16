@@ -160,9 +160,9 @@ pub enum Method {
     /// session as it was, while the worktree has uncommitted changes,
     /// commits on no branch, or submodule commits on no remote branch,
     /// unless `discard` is set. A branch the daemon created is then deleted
-    /// if all its commits are on another branch, tag or remote branch, and
-    /// kept otherwise; a branch that existed before the session is always
-    /// kept. Git runs with `env` over the daemon's environment, as for
+    /// if every commit on it outside the ancestry of the session's starting
+    /// commit is on another branch, tag or remote branch, and kept
+    /// otherwise; a branch that existed before the session is always kept. Git runs with `env` over the daemon's environment, as for
     /// `session.new`. The result is [`Deleted`].
     #[serde(rename = "session.delete")]
     SessionDelete {

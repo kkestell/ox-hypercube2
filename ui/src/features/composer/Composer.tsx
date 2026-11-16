@@ -4,7 +4,7 @@ import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { memo } from "react";
 import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
-import type { ConfigOption, Item, RunInfo, SessionInfo } from "../../lib/protocol";
+import type { ConfigOption, Request, RunInfo, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
 import { Elicitation } from "./Elicitation";
@@ -26,7 +26,7 @@ export const Composer = memo(function Composer({
   /** The run the session is a child of. */
   run: RunInfo | undefined;
   /** The session's oldest unanswered permission request or form. */
-  request: Extract<Item, { type: "permission" | "elicitation" }> | undefined;
+  request: Request | undefined;
   drafts: Drafts;
 }) {
   const draft = drafts.get(session.id);

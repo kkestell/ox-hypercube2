@@ -711,7 +711,7 @@ async fn a_step_s_agent_posts_status_updates_to_its_child_session() {
 steps:
   - name: Read
     agent: {harness: claude}
-    prompt: mcp-status Reading the code
+    prompt: 'mcp-status  Reading the code '
 ",
     );
     let client = daemon.client().await;

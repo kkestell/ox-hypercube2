@@ -148,27 +148,6 @@ export interface StepInfo {
   started_at: number | null;
   /** The step's child session, once an agent step has started. */
   session_id: string | null;
-  /** The final reply of the step's last turn, or a shell step's standard output. */
-  output: string | null;
-  /** The commands the step has started, in order. */
-  commands: CommandInfo[];
-}
-
-export type CommandKind = "precondition" | "shell" | "postcondition";
-
-export type CommandState = "running" | "succeeded" | "failed" | "cancelled" | "interrupted";
-
-/** A check or a shell step's command. */
-export interface CommandInfo {
-  kind: CommandKind;
-  command: string;
-  state: CommandState;
-  /** Unset while running, and when killed by a signal or unable to start. */
-  exit_code: number | null;
-  /** The last 64 KiB of interleaved standard output and standard error, once it ends. */
-  output: string;
-  /** Whether earlier output was dropped. */
-  truncated: boolean;
 }
 
 /** An entry of a directory, as a directory watch lists it. */
@@ -256,6 +235,13 @@ export type Item =
   /** A status update the agent posted, at `posted_at` in milliseconds since the Unix epoch. */
   | { type: "status_update"; key: string; text: string; posted_at: number }
   | { type: "session_closed"; key: string };
+
+/** An open permission request or form. */
+export type Request = Extract<Item, { type: "permission" | "elicitation" }>;
+
+export function isRequest(item: Item): item is Request {
+  return item.type === "permission" || item.type === "elicitation";
+}
 
 export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
 

@@ -27,19 +27,9 @@ pub fn now_ms() -> u64 {
 
 #[derive(Debug, PartialEq)]
 enum Kind {
-    Recurring {
-        created: u64,
-    },
-    OneShot {
-        fire_at: u64,
-    },
-    Wakeup {
-        fire_at: u64,
-        fallback: bool,
-    },
-    /// A scheduling call the bridge could not read; it counts until claude
-    /// exits.
-    Unknown,
+    Recurring { created: u64 },
+    OneShot { fire_at: u64 },
+    Wakeup { fire_at: u64, fallback: bool },
 }
 
 #[derive(Debug)]
@@ -225,7 +215,7 @@ impl Background {
             })(),
             ("CronDelete", Some(_)) => {
                 let Some(key) = call.input["id"].as_str() else {
-                    return self.add_unknown(id);
+                    return false;
                 };
                 let before = self.schedules.len();
                 self.schedules.retain(|s| {
@@ -260,24 +250,14 @@ impl Background {
                 });
                 true
             }
-            None => self.add_unknown(id),
+            None => false,
         }
-    }
-
-    fn add_unknown(&mut self, id: &str) -> bool {
-        self.schedules.push(Schedule {
-            key: id.to_owned(),
-            kind: Kind::Unknown,
-            tool_call: None,
-        });
-        true
     }
 
     /// Drops the schedules that a turn from `started` to `ended` fulfilled.
     /// A wakeup the turn ended without scheduling another leaves the loop an
-    /// implied fallback wakeup. Returns whether the schedules changed.
-    pub fn turn_ended(&mut self, started: u64, ended: u64) -> bool {
-        let before = self.schedules.len();
+    /// implied fallback wakeup.
+    pub fn turn_ended(&mut self, started: u64, ended: u64) {
         let mut wakeup = false;
         self.schedules.retain(|schedule| match schedule.kind {
             Kind::Recurring { created } => started < created + RECURRING_LIFETIME_MS,
@@ -290,9 +270,7 @@ impl Background {
                 wakeup |= due && !implied;
                 !due
             }
-            Kind::Unknown => true,
         });
-        let mut changed = self.schedules.len() != before;
         if wakeup && !self.wakeup_called {
             self.schedules.push(Schedule {
                 key: format!("fallback-{ended}"),
@@ -302,10 +280,8 @@ impl Background {
                 },
                 tool_call: None,
             });
-            changed = true;
         }
         self.wakeup_called = false;
-        changed
     }
 
     /// Seeds the schedules from a transcript's tool calls, keeping what
@@ -324,7 +300,7 @@ impl Background {
         self.schedules.retain(|s| match s.kind {
             Kind::Recurring { created } => now < created + RECURRING_LIFETIME_MS,
             Kind::OneShot { fire_at } => fire_at > now,
-            Kind::Wakeup { .. } | Kind::Unknown => false,
+            Kind::Wakeup { .. } => false,
         });
         self.calls.clear();
         self.wakeup_called = false;
@@ -518,8 +494,7 @@ mod tests {
         );
         background.turn_ended(10_000, 11_000);
         assert_eq!(keys(&background), ["w2"]);
-        // A stop call that failed leaves the wakeup and adds an unknown
-        // schedule.
+        // A stop call that failed leaves the wakeup.
         background.observe(
             &call("ScheduleWakeup", "w3", &json!({"stop": true})),
             12_000,
@@ -533,7 +508,7 @@ mod tests {
             12_000,
             true,
         );
-        assert_eq!(keys(&background), ["w2", "w3"]);
+        assert_eq!(keys(&background), ["w2"]);
         background.clear();
         run(
             &mut background,
@@ -551,23 +526,6 @@ mod tests {
             json!({"stopped": true}),
             2_000,
         );
-        assert!(keys(&background).is_empty());
-    }
-
-    #[test]
-    fn an_unreadable_scheduling_call_lasts_until_exit() {
-        let mut background = Background::default();
-        background.observe(&call("CronCreate", "c1", &json!({})), 1_000, true);
-        background.observe(
-            &json!({"type": "user", "message": {"content": [
-                {"type": "tool_result", "tool_use_id": "c1", "content": "ok"}
-            ]}}),
-            1_000,
-            true,
-        );
-        background.turn_ended(u64::MAX / 2, u64::MAX / 2 + 1);
-        assert_eq!(keys(&background), ["c1"]);
-        background.clear();
         assert!(keys(&background).is_empty());
     }
 

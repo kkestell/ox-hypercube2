@@ -558,42 +558,11 @@ impl Daemon {
         let workspaces =
             (sent.registry_version != Some(registry.version)).then(|| registry.workspaces.clone());
         sent.registry_version = Some(registry.version);
-        let outdated_worktrees: Vec<Arc<Worktree>> = registry
-            .worktrees
-            .values()
-            .filter(|worktree| sent.worktrees.get(&worktree.id) != Some(&worktree.version()))
-            .cloned()
-            .collect();
-        let removed_worktrees: Vec<String> = sent
-            .worktrees
-            .keys()
-            .filter(|id| !registry.worktrees.contains_key(*id))
-            .cloned()
-            .collect();
-        let mut outdated: Vec<Arc<Session>> = registry
-            .sessions
-            .values()
-            .filter(|session| sent.sessions.get(&session.id) != Some(&session.info_version()))
-            .cloned()
-            .collect();
-        let removed: Vec<String> = sent
-            .sessions
-            .keys()
-            .filter(|id| !registry.sessions.contains_key(*id))
-            .cloned()
-            .collect();
-        let mut outdated_runs: Vec<Arc<Run>> = registry
-            .runs
-            .values()
-            .filter(|run| sent.runs.get(&run.id) != Some(&run.version()))
-            .cloned()
-            .collect();
-        let removed_runs: Vec<String> = sent
-            .runs
-            .keys()
-            .filter(|id| !registry.runs.contains_key(*id))
-            .cloned()
-            .collect();
+        let (outdated_worktrees, removed_worktrees) =
+            stale(&registry.worktrees, &sent.worktrees, Worktree::version);
+        let (mut outdated, removed) =
+            stale(&registry.sessions, &sent.sessions, Session::info_version);
+        let (mut outdated_runs, removed_runs) = stale(&registry.runs, &sent.runs, Run::version);
         drop(registry);
 
         let mut changes = Vec::new();
@@ -1385,6 +1354,26 @@ fn refuse_starting(session: &Session) -> Result<(), ErrorBody> {
 }
 
 /// The workspace as clients see it.
+/// The items whose version differs from the one in `sent`, and the IDs in
+/// `sent` with no item.
+fn stale<T>(
+    items: &HashMap<String, Arc<T>>,
+    sent: &HashMap<String, u64>,
+    version: impl Fn(&T) -> u64,
+) -> (Vec<Arc<T>>, Vec<String>) {
+    let outdated = items
+        .iter()
+        .filter(|(id, item)| sent.get(*id) != Some(&version(item)))
+        .map(|(_, item)| item.clone())
+        .collect();
+    let removed = sent
+        .keys()
+        .filter(|id| !items.contains_key(*id))
+        .cloned()
+        .collect();
+    (outdated, removed)
+}
+
 fn workspace_info(workspace: SavedWorkspace) -> WorkspaceInfo {
     WorkspaceInfo {
         git_working_tree: branches::git_working_tree(&workspace.path),

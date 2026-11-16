@@ -38,7 +38,7 @@ function awaiting(session: SessionInfo) {
 }
 
 /** A run's or a step's dot class and its label. */
-export interface Status {
+interface Status {
   className: string;
   label: string;
 }
@@ -52,7 +52,7 @@ const settled: Record<Exclude<StepState, "running">, Status> = {
 };
 
 /** A run's status, from its state and its child sessions'. */
-export function runStatus(run: RunInfo, children: readonly SessionInfo[]): Status {
+function runStatus(run: RunInfo, children: readonly SessionInfo[]): Status {
   const waiting = children.find(awaiting);
   if (waiting) return { className: "attention", label: stateLabels[waiting.state] };
   if (run.state === "running") return { className: "running", label: "Running" };
@@ -207,7 +207,7 @@ export const SessionList = memo(function SessionList({
 
   const sessionRow = (
     session: SessionInfo,
-    child?: { step: StepInfo | undefined; first: boolean; last: boolean },
+    child?: { step: StepInfo; first: boolean; last: boolean },
   ) => (
     <SessionRow
       key={session.id}
@@ -215,7 +215,6 @@ export const SessionList = memo(function SessionList({
       worktree={session.worktree_id === null ? undefined : worktrees.get(session.worktree_id)}
       selected={session.id === selected}
       busy={busy.has(session.id)}
-      child={child !== undefined}
       step={child?.step}
       first={child?.first ?? false}
       last={child?.last ?? false}
@@ -254,7 +253,6 @@ export const SessionList = memo(function SessionList({
             // biome-ignore lint/suspicious/noArrayIndexKey: a run's steps never move
             key={`${run.id}:${index}`}
             step={step}
-            status={childStatus(step, undefined)}
             first={child.first}
             last={child.last}
             onSelect={() => onSelect(run.id)}
@@ -542,19 +540,18 @@ const RunRow = memo(function RunRow({
  * A run's step that has no session yet, or runs no agent: a shell step, or a
  * pending agent step. It follows the run's tree line, and selects the run.
  */
-const StepRow = memo(function StepRow({
+function StepRow({
   step,
-  status,
   first,
   last,
   onSelect,
 }: {
   step: StepInfo;
-  status: Status;
   first: boolean;
   last: boolean;
   onSelect: () => void;
 }) {
+  const status = childStatus(step, undefined);
   return (
     <li className="sidebar-row session child">
       <button type="button" className="select" onClick={onSelect}>
@@ -572,19 +569,17 @@ const StepRow = memo(function StepRow({
       </button>
     </li>
   );
-});
+}
 
 /**
  * A session's row, which renders again only when its props change. A run's
- * child is titled with its step's name, and follows the
- * run's tree line.
+ * child is titled with its step's name, and follows the run's tree line.
  */
 const SessionRow = memo(function SessionRow({
   session,
   worktree,
   selected,
   busy,
-  child,
   step,
   first,
   last,
@@ -598,15 +593,14 @@ const SessionRow = memo(function SessionRow({
   selected: boolean;
   /** Whether an action on the session is in flight. */
   busy: boolean;
-  /** Whether the session is a run's child. */
-  child: boolean;
-  /** A child's step. */
+  /** The step, when the session is a run's child. */
   step: StepInfo | undefined;
   /** Whether a child is its run's first, or its last. */
   first: boolean;
   last: boolean;
   onSelect: (session: SessionInfo) => void;
 } & Pick<SessionActions, "deleteSession" | "archiveSession" | "unarchiveSession">) {
+  const child = step !== undefined;
   const status = step
     ? childStatus(step, session)
     : { className: session.state, label: stateLabels[session.state] };

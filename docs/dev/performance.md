@@ -32,8 +32,7 @@ messages, and a message's streamed text chunks arrive joined.
   objects and callbacks until their data changes, so typing a draft or a
   change to another session renders nothing in the transcript.
 - The run view keeps each child's items apart. A change to one child's
-  conversation leaves the other children's items, and the other steps'
-  sections, unchanged.
+  conversation leaves the other children's items unchanged.
 - A message's Markdown is parsed into top-level blocks, and each block renders
   on its own from that parse. Text appended to a message parses and renders
   only its last block again; the blocks before it keep their identity.

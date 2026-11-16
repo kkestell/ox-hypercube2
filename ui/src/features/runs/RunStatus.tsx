@@ -63,13 +63,15 @@ export function RunStatus({
   run,
   sessions,
   conversations,
+  notice,
 }: {
   run: RunInfo;
   sessions: SessionInfo[];
   /** The child sessions' conversations, by session ID. */
   conversations: Map<string, Item[]>;
+  /** The run's `runNotice`. */
+  notice: { text: string; index: number } | null;
 }) {
-  const notice = runNotice(run);
   return (
     <div className="run-status">
       {run.steps.map((step, index) => {
@@ -85,7 +87,6 @@ export function RunStatus({
                 ? []
                 : (conversations.get(step.session_id)?.filter(isStatusUpdate) ?? [])
             }
-            started={step.started_at}
             notice={notice?.index === index ? notice.text : undefined}
             // The connector below the step, or null for the last step.
             connector={
@@ -106,7 +107,6 @@ function StepStatus({
   step,
   session,
   updates,
-  started,
   notice,
   connector,
 }: {
@@ -114,8 +114,6 @@ function StepStatus({
   session: SessionInfo | undefined;
   /** The status updates of the step's child session, oldest first. */
   updates: StatusUpdate[];
-  /** When the step started, or null while it is pending. */
-  started: number | null;
   /** The run's failure or interruption, shown after the step's updates. */
   notice: string | undefined;
   /** The connector below the step: solid, dashed between two pending steps, or none. */
@@ -142,9 +140,9 @@ function StepStatus({
       className={`run-status-step ${step.state}${connector ? ` connector ${connector}` : ""}`}
       aria-label={step.name}
     >
-      {started !== null && (
-        <time className="run-status-time" dateTime={new Date(started).toISOString()}>
-          {clock(started)}
+      {step.started_at !== null && (
+        <time className="run-status-time" dateTime={new Date(step.started_at).toISOString()}>
+          {clock(step.started_at)}
         </time>
       )}
       <h3 className="run-status-current">

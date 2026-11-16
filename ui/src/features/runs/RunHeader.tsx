@@ -6,7 +6,7 @@ import { branchStatus } from "../sessions/localMerge";
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
 /** A span of milliseconds as `42s`, `3m 12s` or `1h 4m`. */
-export function elapsed(ms: number) {
+function elapsed(ms: number) {
   const seconds = Math.max(0, Math.floor(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
   const minutes = Math.floor(seconds / 60);
@@ -15,7 +15,7 @@ export function elapsed(ms: number) {
 }
 
 /** A past time as `12 minutes ago`, `yesterday` or `3 days ago`. */
-export function ago(time: number, now: number) {
+function ago(time: number, now: number) {
   const seconds = Math.round((time - now) / 1000);
   const units = [
     ["day", 86_400],
