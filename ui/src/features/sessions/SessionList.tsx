@@ -241,13 +241,26 @@ export const SessionList = memo(function SessionList({
         cancelRun={cancelRun}
         deleteRun={deleteRun}
       />,
-      ...runChildren.map((session, index) =>
-        sessionRow(session, {
-          step: run.steps.find((step) => step.session_id === session.id),
+      ...run.steps.map((step, index) => {
+        const child = {
+          step,
           first: index === 0,
-          last: index === runChildren.length - 1,
-        }),
-      ),
+          last: index === run.steps.length - 1,
+        };
+        const session = runChildren.find((session) => session.id === step.session_id);
+        if (session !== undefined) return sessionRow(session, child);
+        return (
+          <StepRow
+            // biome-ignore lint/suspicious/noArrayIndexKey: a run's steps never move
+            key={`${run.id}:${index}`}
+            step={step}
+            status={childStatus(step, undefined)}
+            first={child.first}
+            last={child.last}
+            onSelect={() => onSelect(run.id)}
+          />
+        );
+      }),
     ];
   };
 
@@ -526,8 +539,44 @@ const RunRow = memo(function RunRow({
 });
 
 /**
+ * A run's step that has no session yet, or runs no agent: a shell step, or a
+ * pending agent step. It follows the run's tree line, and selects the run.
+ */
+const StepRow = memo(function StepRow({
+  step,
+  status,
+  first,
+  last,
+  onSelect,
+}: {
+  step: StepInfo;
+  status: Status;
+  first: boolean;
+  last: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <li className="sidebar-row session child">
+      <button type="button" className="select" onClick={onSelect}>
+        <span
+          className={["tree-branch", first && "first", last && "last"].filter(Boolean).join(" ")}
+          aria-hidden="true"
+        />
+        <span
+          className={`status ${status.className}`}
+          role="img"
+          aria-label={status.label}
+          title={status.label}
+        />
+        <span className="title">{step.name}</span>
+      </button>
+    </li>
+  );
+});
+
+/**
  * A session's row, which renders again only when its props change. A run's
- * child is titled with its step's name, shows a hollow dot, and follows the
+ * child is titled with its step's name, and follows the
  * run's tree line.
  */
 const SessionRow = memo(function SessionRow({
@@ -602,7 +651,7 @@ const SessionRow = memo(function SessionRow({
           />
         )}
         <span
-          className={`status${child ? " hollow" : ""} ${status.className}`}
+          className={`status ${status.className}`}
           role="img"
           aria-label={status.label}
           title={status.label}

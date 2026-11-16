@@ -149,7 +149,7 @@ completion. It does not display tool diffs, terminals, or other update types;
 | `session.prompt.image` | ✅ | ✅ | ✅ | |
 | `session.prompt.embeddedContext` | ✅ | ✅ | ❌ | |
 | `session.prompt.audio` | ✅ | ❌ | ❌ | |
-| `session.mcp.stdio` | ✅ | ✅ | ❌ | Ox supplies the [`ox` MCP server](architecture.md#ox-mcp) to Claude, which allows its tools without permission prompts. Pi sessions have no `ox` MCP server. |
+| `session.mcp.stdio` | ✅ | ✅ | ❌ | Ox supplies the [`ox` MCP server](architecture.md#ox-mcp) to Claude, which allows its tools without permission prompts, including the status update tool. Pi sessions have no MCP servers, so they post no status updates. |
 | `session.mcp.http` | ❌ | ❌ | ❌ | |
 | `session.mcp.acp` (unstable) | ❌ | ❌ | ❌ | |
 | `session.delete` | ❌ | ❌ | ❌ | |

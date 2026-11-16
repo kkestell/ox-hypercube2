@@ -2425,6 +2425,30 @@ async fn agent_sets_title_through_ox_mcp_server() {
     );
 }
 
+/// An agent in an ordinary session posts a status update through its `ox`
+/// MCP server, and the session records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_posts_status_update_through_ox_mcp_server() {
+    let daemon = Daemon::start(1000).await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .prompt(&session.id, text("mcp-status  Reading the code "))
+        .await
+        .unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&turn), ["Status update posted."]);
+    let updates: Vec<&str> = turn
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::StatusUpdate { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates, ["Reading the code"]);
+}
+
 /// After a watch's `unsubscribe` is answered, the connection receives no more
 /// listings.
 #[tokio::test(flavor = "multi_thread")]

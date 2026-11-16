@@ -18,7 +18,7 @@ use ox_protocol::{
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::daemon::Daemon;
+use crate::daemon::{Daemon, now};
 use crate::session::Session;
 use crate::shell::{self, Finished, Inputs};
 use crate::store::{SavedRun, Store};
@@ -214,6 +214,20 @@ impl Run {
         self.update(|record| record.steps[position].session_id = Some(session_id.into()));
     }
 
+    /// Saves and records that step `position` is running, and when it
+    /// started.
+    fn start_step(&self, position: usize) {
+        let started_at = now();
+        if let Err(error) = self.store.start_step(&self.id, position, started_at) {
+            eprintln!("oxd: saving step {position} of run {}: {error}", self.id);
+        }
+        self.update(|record| {
+            let step = &mut record.steps[position];
+            step.state = StepState::Running;
+            step.started_at = Some(started_at);
+        });
+    }
+
     /// Saves and records step `position`'s state and output.
     fn set_step(&self, position: usize, state: StepState, output: Option<String>) {
         if let Err(error) = self
@@ -332,7 +346,7 @@ async fn advance(
             run.end(RunState::Cancelled, None, None);
             return;
         }
-        run.set_step(position, StepState::Running, None);
+        run.start_step(position);
         let context = StepContext {
             run: &run,
             daemon: &daemon,

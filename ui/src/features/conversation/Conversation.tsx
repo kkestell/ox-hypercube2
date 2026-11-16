@@ -89,6 +89,10 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
     case "permission":
     case "elicitation":
       return null;
+    // The session view shows the `post_status_update` tool call with its
+    // text.
+    case "status_update":
+      return null;
     case "turn_error":
       return <p className="turn-error">{item.message}</p>;
     case "agent_exited":

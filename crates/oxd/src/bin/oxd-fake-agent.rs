@@ -65,6 +65,7 @@
 //! - `mcp-title <text>`: start the session's stdio MCP server named `ox`,
 //!   call its `set_title` tool with the rest of the line, and send the tool
 //!   result's text, or the error, as one chunk
+//! - `mcp-status <text>`: the same, calling its `post_status_update` tool
 //! - `shell <JSON string>`: run the decoded text with `sh -c` in the
 //!   session's cwd and append its standard output to the turn's message. A
 //!   non-zero exit ends the turn with the stop reason `error` and the
@@ -721,7 +722,11 @@ enum Directive {
     TitleNull,
     Touch,
     Tool(String),
-    McpTitle(String),
+    /// A call to the `ox` MCP server's tool `name` with `arguments`.
+    McpTool {
+        name: &'static str,
+        arguments: serde_json::Value,
+    },
     Shell(String),
     Next(String),
     BackgroundStart(String),
@@ -779,7 +784,14 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["title-null"] => Directive::TitleNull,
             ["touch"] => Directive::Touch,
             ["tool", ..] => Directive::Tool(rest("tool")),
-            ["mcp-title", ..] => Directive::McpTitle(rest("mcp-title")),
+            ["mcp-title", ..] => Directive::McpTool {
+                name: "set_title",
+                arguments: serde_json::json!({"title": rest("mcp-title")}),
+            },
+            ["mcp-status", ..] => Directive::McpTool {
+                name: "post_status_update",
+                arguments: serde_json::json!({"text": rest("mcp-status")}),
+            },
             ["shell", ..] => Directive::Shell(json_after(line, 1)?),
             ["next", ..] => Directive::Next(json_after(line, 1)?),
             ["background-start", name] => Directive::BackgroundStart((*name).to_owned()),
@@ -993,7 +1005,7 @@ async fn run(
                         ]),
                 )?;
             }
-            Directive::McpTitle(title) => {
+            Directive::McpTool { name, arguments } => {
                 let server = state
                     .mcp_servers
                     .lock()
@@ -1006,7 +1018,7 @@ async fn run(
                         _ => None,
                     });
                 let text = match server {
-                    Some(server) => call_set_title(&server, &title)
+                    Some(server) => call_tool(&server, name, arguments)
                         .await
                         .unwrap_or_else(|error| error.to_string()),
                     None => "no ox MCP server".to_owned(),
@@ -1084,10 +1096,14 @@ async fn run(
     }
 }
 
-/// Starts `server`, calls its `set_title` tool with `title`, and returns
-/// the result's text or the error's message. The server exits once its
-/// stdin closes.
-async fn call_set_title(server: &acp::McpServerStdio, title: &str) -> std::io::Result<String> {
+/// Starts `server`, calls its tool `name` with `arguments`, and returns the
+/// result's text or the error's message. The server exits once its stdin
+/// closes.
+async fn call_tool(
+    server: &acp::McpServerStdio,
+    name: &str,
+    arguments: serde_json::Value,
+) -> std::io::Result<String> {
     let mut child = tokio::process::Command::new(&server.command.0)
         .args(&server.args)
         .envs(server.env.iter().map(|var| (&var.name, &var.value)))
@@ -1113,7 +1129,7 @@ async fn call_set_title(server: &acp::McpServerStdio, title: &str) -> std::io::R
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
-            "params": {"name": "set_title", "arguments": {"title": title}},
+            "params": {"name": name, "arguments": arguments},
         }),
     ] {
         stdin.write_all(format!("{message}\n").as_bytes()).await?;

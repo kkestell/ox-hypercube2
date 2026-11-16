@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ox_protocol::schema::{ContentBlock, SessionConfigKind, SessionUpdate, StopReason};
 use ox_protocol::{
@@ -319,6 +320,12 @@ fn config_value(session: &SessionInfo, id: &str) -> String {
         panic!("{id} is not a select option");
     };
     select.current_value.to_string()
+}
+
+/// The current time in milliseconds since the Unix epoch.
+fn now() -> u64 {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from(since_epoch.as_millis()).unwrap()
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -683,7 +690,54 @@ steps:
         assert_eq!(run.steps[0].output, None, "{workflow}");
         assert_eq!(run.steps[1].state, StepState::Pending, "{workflow}");
         assert_eq!(run.steps[1].session_id, None, "{workflow}");
+        let started_at = run.steps[0].started_at.expect("the failed step started");
+        assert!(
+            (run.created_at..=now()).contains(&started_at),
+            "{workflow}: {run:?}"
+        );
+        assert_eq!(run.steps[1].started_at, None, "{workflow}");
     }
+}
+
+/// A step's agent posts a status update through its `ox` MCP server, and
+/// the step's child session records it with the time it was posted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_s_agent_posts_status_updates_to_its_child_session() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    daemon.define(
+        "reports",
+        "name: Reports
+steps:
+  - name: Read
+    agent: {harness: claude}
+    prompt: mcp-status Reading the code
+",
+    );
+    let client = daemon.client().await;
+    let workspace = add_workspace(&client, repo.path()).await;
+    let run = start(&client, &workspace, "reports", "").await;
+    let run = until_ended(&client, &run.id).await;
+    assert_eq!(run.state, RunState::Succeeded, "{run:?}");
+    let step = &run.steps[0];
+    assert_eq!(step.output.as_deref(), Some("Status update posted."));
+    let started_at = step.started_at.expect("the step started");
+
+    let mut events = client
+        .subscribe(step.session_id.as_deref().unwrap(), 0)
+        .await
+        .unwrap();
+    let (text, posted_at) = loop {
+        let event = timeout(TIMEOUT, events.next()).await.unwrap().unwrap();
+        if let EventKind::StatusUpdate { text, posted_at } = event.kind {
+            break (text, posted_at);
+        }
+    };
+    assert_eq!(text, "Reading the code");
+    assert!(
+        (started_at..=now()).contains(&posted_at),
+        "{posted_at} is not between {started_at} and now"
+    );
 }
 
 /// A fake agent directive with a JSON string argument.

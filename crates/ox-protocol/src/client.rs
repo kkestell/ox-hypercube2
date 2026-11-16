@@ -669,6 +669,15 @@ impl Client {
         .await
     }
 
+    /// Records a status update from the session's agent.
+    pub async fn post_status_update(&self, session_id: &str, text: &str) -> Result<(), Error> {
+        self.ack(Method::SessionPostStatusUpdate {
+            session_id: session_id.into(),
+            text: text.into(),
+        })
+        .await
+    }
+
     /// Starts a run of the workflow defined in `<workflow>.yaml` in the
     /// workspace, with `input` for its first step. Git and the steps' agents
     /// run with `env` over the daemon's environment.

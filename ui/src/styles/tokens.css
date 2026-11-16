@@ -33,6 +33,7 @@
   --font-sans: system-ui, sans-serif;
   --font-mono: ui-monospace, monospace;
   --text-xs: 0.75rem;
+  --text-lg: 1.125rem;
   --text-sm: 0.875rem;
   --leading: 1.5;
 
@@ -86,8 +87,8 @@
   --slider-track-height: calc(var(--spacing) * 1.5);
   --slider-thumb-size: calc(var(--spacing) * 4);
   --slider-tick-height: calc(var(--spacing) * 1.5);
-  --composer-margin: calc(var(--spacing) * 4);
-  --composer-padding: calc(var(--spacing) * 3);
+  --composer-margin: calc(var(--spacing) * 2);
+  --composer-padding: calc(var(--spacing) * 2);
   --composer-max-lines: 8;
   --request-panel-max-height: 50vh;
   --choice-gap: calc(var(--spacing) * 2);

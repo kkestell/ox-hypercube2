@@ -13,7 +13,7 @@ import { openFile } from "./features/files/viewerState";
 import { RunView } from "./features/runs/RunView";
 import { localMerge } from "./features/sessions/localMerge";
 import { MergeButton } from "./features/sessions/MergeButton";
-import { SessionList } from "./features/sessions/SessionList";
+import { runTitle, SessionList } from "./features/sessions/SessionList";
 import { useSessionActions } from "./features/sessions/useSessionActions";
 import { useWorkspaces } from "./features/sessions/useWorkspaces";
 import type { Item } from "./lib/protocol";
@@ -79,7 +79,12 @@ export function App() {
     if (run) {
       return (header: ReactNode) => (
         <SessionContent key={run.id} viewId={run.id} header={header}>
-          <RunView run={run} sessions={sessions} connection={connection} />
+          <RunView
+            run={run}
+            sessions={sessions}
+            worktree={worktrees.get(run.worktree_id)}
+            connection={connection}
+          />
         </SessionContent>
       );
     }
@@ -159,6 +164,7 @@ export function App() {
         }
         renderContent={renderContent()}
         actions={headerActions()}
+        title={run ? runTitle(run) : session ? (session.title ?? "New session") : undefined}
       >
         {null}
       </Workbench>

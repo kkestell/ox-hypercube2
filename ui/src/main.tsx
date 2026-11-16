@@ -10,6 +10,7 @@ import "./styles/sidebar.css";
 import "./styles/sessions.css";
 import "./styles/conversation.css";
 import "./styles/composer.css";
+import "./styles/run-view.css";
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

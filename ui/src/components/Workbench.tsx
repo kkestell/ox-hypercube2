@@ -32,6 +32,7 @@ export function Workbench({
   left,
   right,
   actions,
+  title,
   children,
   renderContent,
 }: {
@@ -40,6 +41,8 @@ export function Workbench({
   right?: ReactNode;
   /** Controls for the content, at the start of its header. */
   actions?: ReactNode;
+  /** The content's title, in its header before the panel toggles. */
+  title?: ReactNode;
   children: ReactNode;
   renderContent?: (header: ReactNode) => ReactNode;
 }) {
@@ -123,6 +126,7 @@ export function Workbench({
   const header = (
     <header className="pane-header content-header">
       {actions}
+      {title !== undefined && <h1 className="pane-title">{title}</h1>}
       <div className="toggles">
         {panels.map((panel) => {
           const { icon: Icon, title } = toggles[panel];

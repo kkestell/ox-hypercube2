@@ -477,6 +477,10 @@ impl Daemon {
                 self.session(&session_id)?.set_title(&title)?;
                 Ok(Value::Null)
             }
+            Method::SessionPostStatusUpdate { session_id, text } => {
+                self.session(&session_id)?.post_status_update(&text)?;
+                Ok(Value::Null)
+            }
             Method::RunStart {
                 workspace_id,
                 workflow,
@@ -903,6 +907,7 @@ impl Daemon {
                 .map(|step| StepInfo {
                     name: step.name.clone(),
                     state: StepState::Pending,
+                    started_at: None,
                     session_id: None,
                     output: None,
                     commands: Vec::new(),
@@ -1359,15 +1364,15 @@ impl Daemon {
     }
 }
 
-/// `path` with symbolic links resolved, or as it is when it cannot be.
 /// The current time in milliseconds since the Unix epoch.
-fn now() -> u64 {
+pub fn now() -> u64 {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the Unix epoch");
     u64::try_from(since_epoch.as_millis()).expect("the time fits a u64")
 }
 
+/// `path` with symbolic links resolved, or as it is when it cannot be.
 fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
 }

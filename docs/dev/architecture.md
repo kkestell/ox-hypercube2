@@ -68,7 +68,8 @@ can restart an exited Pi on the same Pi session ID.
 
 `oxd` supplies each compatible agent with a session-scoped `ox-mcp` stdio
 server. The agent launches it. Its tools call back into the daemon for that
-session; the current tool lets the agent set the session title.
+session: `set_title` sets the session title, and `post_status_update`
+records a timestamped status update in the session's history.
 
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
@@ -176,10 +177,11 @@ clients. Its runner adds the worktree, then for each agent step starts a child
 session with the step's harness bridge from beside `oxd`'s executable, sets
 the step's config options, sends the prompt, and advances when the turn
 ends. A step's output is the final reply of its turn, or a shell step's
-standard output. The runner runs shell steps and checks through `shell::run`,
-each in its own process group, and records each command in the step's
-`commands`. When the daemon stops, it aborts the runners, which kills their
-running commands' process groups.
+standard output. A step's `started_at` is set when it leaves `pending`. The
+runner runs shell steps and checks through `shell::run`, each in its own
+process group, and records each command in the step's `commands`. When the
+daemon stops, it aborts the runners, which kills their running commands'
+process groups.
 
 Child sessions are ordinary sessions that refer to the run's worktree: a
 session is a child of the run that owns its worktree. Deleting or archiving one leaves the worktree; removing the run stops the

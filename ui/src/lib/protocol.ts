@@ -144,6 +144,8 @@ export interface RunInfo {
 export interface StepInfo {
   name: string;
   state: StepState;
+  /** When the step left `pending`, in milliseconds since the Unix epoch. */
+  started_at: number | null;
   /** The step's child session, once an agent step has started. */
   session_id: string | null;
   /** The final reply of the step's last turn, or a shell step's standard output. */
@@ -251,6 +253,8 @@ export type Item =
     }
   | { type: "turn_error"; key: string; message: string }
   | { type: "agent_exited"; key: string; error: string | null }
+  /** A status update the agent posted, at `posted_at` in milliseconds since the Unix epoch. */
+  | { type: "status_update"; key: string; text: string; posted_at: number }
   | { type: "session_closed"; key: string };
 
 export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };

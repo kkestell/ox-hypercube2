@@ -161,6 +161,7 @@ impl Store {
                 state      TEXT    NOT NULL,
                 session_id TEXT    REFERENCES sessions(id) ON DELETE SET NULL,
                 output     TEXT,
+                started_at INTEGER,
                 PRIMARY KEY (run_id, position)
             );
             CREATE TABLE IF NOT EXISTS run_commands (
@@ -401,15 +402,18 @@ impl Store {
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
         for (position, step) in run.steps.iter().enumerate() {
             transaction.execute(
-                "INSERT INTO run_steps (run_id, position, name, state, session_id, output)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO run_steps (
+                    run_id, position, name, state, session_id, output, started_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     run.id,
                     position_value(position),
                     step.name,
                     state_name(step.state),
                     step.session_id,
-                    step.output
+                    step.output,
+                    step.started_at.map(time)
                 ],
             )?;
         }
@@ -443,7 +447,7 @@ impl Store {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut steps = connection.prepare(
-            "SELECT name, state, session_id, output FROM run_steps
+            "SELECT name, state, session_id, output, started_at FROM run_steps
             WHERE run_id = ?1 ORDER BY position",
         )?;
         let mut commands = connection.prepare(
@@ -456,6 +460,9 @@ impl Store {
                     Ok(StepInfo {
                         name: row.get(0)?,
                         state: parse_state(row, 1)?,
+                        started_at: row
+                            .get::<_, Option<i64>>(4)?
+                            .map(|millis| u64::try_from(millis).expect("times are positive")),
                         session_id: row.get(2)?,
                         output: row.get(3)?,
                         commands: Vec::new(),
@@ -517,6 +524,25 @@ impl Store {
         self.lock().execute(
             "UPDATE runs SET state = ?2, error = ?3 WHERE id = ?1",
             params![id, state_name(state), error],
+        )?;
+        Ok(())
+    }
+
+    /// Sets the step `running` and saves when it started.
+    pub fn start_step(
+        &self,
+        run_id: &str,
+        position: usize,
+        started_at: u64,
+    ) -> rusqlite::Result<()> {
+        self.lock().execute(
+            "UPDATE run_steps SET state = ?3, started_at = ?4 WHERE run_id = ?1 AND position = ?2",
+            params![
+                run_id,
+                position_value(position),
+                state_name(StepState::Running),
+                time(started_at)
+            ],
         )?;
         Ok(())
     }
@@ -1096,6 +1122,7 @@ mod tests {
         StepInfo {
             name: name.into(),
             state,
+            started_at: None,
             session_id: None,
             output: None,
             commands: Vec::new(),
@@ -1163,9 +1190,12 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         assert!(store.runs().unwrap().is_empty());
-        let first = add_run(&store, "one");
+        let mut first = add_run(&store, "one");
         let mut second = add_run(&store, "two");
         assert!(first.number < second.number);
+        store.start_step("one", 0, 1_700_000_000_500).unwrap();
+        first.steps[0].state = StepState::Running;
+        first.steps[0].started_at = Some(1_700_000_000_500);
         add_step_session(&store, "s", "two", 0);
         store
             .set_step("two", 0, StepState::Succeeded, Some("planned"))
@@ -1180,6 +1210,7 @@ mod tests {
             StepInfo {
                 name: "Plan".into(),
                 state: StepState::Succeeded,
+                started_at: None,
                 session_id: Some("s".into()),
                 output: Some("planned".into()),
                 commands: Vec::new(),

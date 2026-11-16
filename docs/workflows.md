@@ -61,6 +61,10 @@ for Pi. The step's session is set to each value it gives before the prompt is
 sent. A value the harness has no option for, or refuses, fails the run at
 that step with the reason.
 
+A Claude step's agent can post status updates through the `ox` tool
+`post_status_update`: a sentence or two on what it is doing and what it will
+do next, shown under its step in the run view.
+
 ## Shell steps
 
 A shell step runs its `shell` command with `/bin/sh -c` in the run's
@@ -207,21 +211,23 @@ the run's input. Run, or Command-Return, starts the run and opens it.
 
 The run's row is titled with its input, or with the workflow's name when the
 input is blank, and sits among the workspace's sessions in the order they
-were created. Each agent step's child session appears beneath the run's row
-as its step starts, titled with the step's name. The run's status dot is
-filled and each child's is hollow. Each dot is amber while a permission
+were created. Every step is listed beneath the run's row, titled with its
+name; an agent step's row is its child session once the step starts, and
+the other rows select the run. Each status dot is amber while a permission
 request or question awaits an answer, green and breathing while it runs,
-green once it succeeded, red once it failed, and grey once it was cancelled
-or interrupted.
+green once it succeeded, red once it failed, and grey while it is pending
+or once it was cancelled or interrupted.
 
-Selecting a run opens the run view: each step that has started, in order,
-with its preconditions, a shell step's command, its child's first turn, its
-postconditions, any repair turn and the postconditions it reran, and the
-child's later turns. A command's details hold the whole command, its exit
-status, and its output. The oldest permission request or question awaiting
-an answer among the children shows below the steps. Answering it there or in
-the child's own view resolves it in both. The right sidebar shows the run's
-worktree.
+Selecting a run opens the run view. Its header shows how long the run has
+been running, or when it started once it has ended, the worktree's branch
+and how it compares with its base, and the workflow's name. Below it is
+every step, in order, with its start time once it has started and the
+status updates its agent posted, newest last. A completed step is collapsed
+until its heading is opened. A failed or interrupted run's reason shows
+under the step it stopped at. The oldest permission request or question
+awaiting an answer among the children shows below the steps. Answering it
+there or in the child's own view resolves it in both. The right sidebar
+shows the run's worktree.
 
 Selecting a child opens its session view. While the run is running, the
 child's text entry and attachments are disabled, and Stop cancels the run.

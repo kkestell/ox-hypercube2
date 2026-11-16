@@ -30,6 +30,7 @@
 
 .content-header {
   gap: calc(var(--spacing) * 2);
+  padding-inline: var(--conversation-inset);
   border-bottom: var(--border-width) solid var(--border);
 }
 
@@ -47,6 +48,18 @@
 
 .toggles .icon-button[aria-pressed="false"] {
   color: var(--muted-foreground);
+}
+
+/* A pane's title, which takes the header's free width. */
+.pane-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* A text button in a pane header, as tall as the header's icon buttons. */

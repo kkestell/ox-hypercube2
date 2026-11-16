@@ -27,10 +27,11 @@
 }
 
 .sidebar-row {
+  --row-height: var(--sidebar-row-height);
   position: relative;
   display: flex;
   align-items: center;
-  height: var(--sidebar-row-height);
+  height: var(--row-height);
   border-radius: var(--radius-md);
 }
 
@@ -100,7 +101,7 @@
 
 /* The first child's line starts just below the run's dot. */
 .tree-branch.first::before {
-  top: calc((var(--status-dot-size) - var(--sidebar-row-height)) / 2);
+  top: calc((var(--status-dot-size) - var(--row-height)) / 2);
 }
 
 .tree-branch::after {
@@ -119,6 +120,11 @@
 
 .tree-branch.last::after {
   content: none;
+}
+
+/* A run's child rows are shorter than other rows. */
+.sidebar-row.child {
+  --row-height: calc(var(--spacing) * 6);
 }
 
 .child .title {

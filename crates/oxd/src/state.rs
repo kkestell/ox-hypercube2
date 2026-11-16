@@ -51,6 +51,12 @@ pub enum Request {
         request_id: String,
         action: ElicitationAction,
     },
+    /// A status update the agent posted at `posted_at`, in milliseconds
+    /// since the Unix epoch.
+    StatusUpdate {
+        text: String,
+        posted_at: u64,
+    },
 }
 
 /// Something that happened to a session. A change that does not fit the
@@ -812,9 +818,12 @@ impl State {
                 };
                 resolve_elicitation(request_id, answer, action)
             }
+            (Phase::Live(_), Request::StatusUpdate { text, posted_at }) => {
+                EventKind::StatusUpdate { text, posted_at }
+            }
             (
                 phase @ (Phase::Starting { .. } | Phase::Exited(_) | Phase::Closed),
-                Request::Prompt(_),
+                Request::Prompt(_) | Request::StatusUpdate { .. },
             ) => {
                 return Err(invalid_state(phase.state()));
             }
@@ -1224,9 +1233,41 @@ mod tests {
                 EventKind::TurnEnded { .. } => "turn_ended",
                 EventKind::AgentExited { .. } => "agent_exited",
                 EventKind::AgentParked => "agent_parked",
+                EventKind::StatusUpdate { .. } => "status_update",
                 EventKind::SessionClosed => "session_closed",
             })
             .collect()
+    }
+
+    #[test]
+    fn a_live_session_records_status_updates_and_an_exited_one_refuses_them() {
+        let status_update = || Request::StatusUpdate {
+            text: "Reading the code".into(),
+            posted_at: 1_700_000_000_000,
+        };
+        let mut state = started();
+        state.request(status_update()).unwrap();
+        prompt(&mut state).unwrap();
+        state.request(status_update()).unwrap();
+        let updates: Vec<_> = state
+            .events_after(0)
+            .into_iter()
+            .filter(|event| matches!(event.kind, EventKind::StatusUpdate { .. }))
+            .map(|event| event.kind)
+            .collect();
+        let expected = EventKind::StatusUpdate {
+            text: "Reading the code".into(),
+            posted_at: 1_700_000_000_000,
+        };
+        assert_eq!(updates, [expected.clone(), expected]);
+
+        state.record(Change::Exited(None));
+        let last_seq = state.last_seq();
+        assert_eq!(
+            state.request(status_update()).unwrap_err().code,
+            code::INVALID_STATE
+        );
+        assert_eq!(state.last_seq(), last_seq);
     }
 
     #[test]

@@ -288,9 +288,8 @@ textarea.text-field {
   color: var(--destructive);
 }
 
-/* A run's child shows a hollow dot. */
-.status.exited::before,
-.status.hollow::before {
+/* An exited session shows a hollow dot. */
+.status.exited::before {
   background: transparent;
 }
 
