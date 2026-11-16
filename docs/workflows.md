@@ -53,7 +53,7 @@ An agent step has a `prompt` and an `agent`:
 | `harness` | `claude` or `pi` |
 | `model` | The harness's model option |
 | `effort` | The harness's thought-level option: Claude's effort or Pi's thinking |
-| `permission_mode` | The harness's mode option: Claude's permission mode |
+| `permission_mode` | Claude's permission mode: `auto`, `manual`, `acceptEdits` or `plan`. Pi has no mode option, so a Pi step that sets it fails the run |
 
 Each value is the ID the harness's bridge offers, such as `claude-opus-5-5`,
 `xhigh`, and `manual` for Claude, or `openai-codex/gpt-6.1-terra` and `high`
@@ -210,8 +210,8 @@ the workflows below New Task and Session in Checkout. Choosing one asks for
 the run's input. Run, or Command-Return, starts the run and opens it.
 
 The run's row is titled with its input, or with the workflow's name when the
-input is blank, and sits among the workspace's sessions in the order they
-were created. Every step is listed beneath the run's row, titled with its
+input is blank, and sits among the workspace's sessions, newest first by
+creation time. Every step is listed beneath the run's row, titled with its
 name; an agent step's row is its child session once the step starts, and
 the other rows select the run. Each status dot is amber while a permission
 request or question awaits an answer, green and breathing while it runs,
@@ -222,12 +222,11 @@ Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
 and how it compares with its base, and the workflow's name. Below it is
 every step, in order, with its start time once it has started and the
-status updates its agent posted, newest last. A completed step is collapsed
-until its heading is opened. A failed or interrupted run's reason shows
-under the step it stopped at. The oldest permission request or question
-awaiting an answer among the children shows below the steps. Answering it
-there or in the child's own view resolves it in both. The right sidebar
-shows the run's worktree.
+status updates its agent posted, newest last. A failed or interrupted run's
+reason shows under the step it stopped at. The oldest permission request or
+question awaiting an answer among the children shows below the steps.
+Answering it there or in the child's own view resolves it in both. The right
+sidebar shows the run's worktree.
 
 Selecting a child opens its session view. While the run is running, the
 child's text entry and attachments are disabled, and Stop cancels the run.

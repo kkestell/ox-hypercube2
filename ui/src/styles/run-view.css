@@ -31,6 +31,12 @@
   margin-left: auto;
 }
 
+/* The longest elapsed time, `59m 59s` or `12h 59m`, has seven characters. */
+.run-header-elapsed {
+  min-width: 7ch;
+  font-variant-numeric: tabular-nums;
+}
+
 .run-header-branch {
   font-family: var(--font-mono);
 }
@@ -101,29 +107,6 @@
   margin: 0;
   font-size: var(--text-sm);
   font-weight: 600;
-}
-
-.run-status-toggle {
-  display: flex;
-  align-items: center;
-  gap: calc(var(--spacing) * 2);
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  line-height: calc(var(--spacing) * 5);
-  text-align: left;
-}
-
-.run-status-toggle > svg {
-  flex: none;
-  width: calc(var(--spacing) * 3.5);
-  height: calc(var(--spacing) * 3.5);
-  margin-left: calc(var(--spacing) * -1);
-  color: var(--muted-foreground);
 }
 
 .run-status-step.pending {

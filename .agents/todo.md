@@ -56,9 +56,9 @@ the clients.
 - [ ] Align the icons in the run view. The checkbox and hourglass icons sit at
   different x-positions, so the icon column and the text start differ between
   rows.
-- [ ] Give the elapsed time a fixed width (tabular numerals or a reserved
+- [x] Give the elapsed time a fixed width (tabular numerals or a reserved
   width) so a changing value does not shift the content to its right.
-- [ ] List sessions and workflow runs in the left panel newest-created first.
+- [x] List sessions and workflow runs in the left panel newest-created first.
 - [ ] Stop collapsing completed steps on the run dashboard. While the run is
   active, scroll to the active step's most recent status update.
 - [ ] Use different colors for "working" and "success" in the sidebar. Both
@@ -86,7 +86,7 @@ the clients.
 
 ## Workflow definitions
 
-- [ ] Confirm which `permission_mode` values each harness's bridge offers, and
+- [x] Confirm which `permission_mode` values each harness's bridge offers, and
   list them in [Workflows](../docs/workflows.md). The docs show only `manual`.
   Check what a Pi step does when it sets `permission_mode`.
 
@@ -134,7 +134,7 @@ the clients.
 
 ### Unarchive can leave the session stuck after a database write fails
 
-- [ ] Make unarchive recoverable when Git restores the worktree and SQLite
+- [x] Make unarchive recoverable when Git restores the worktree and SQLite
   fails to clear the archived flag. A retry should be able to finish the
   transition safely. [Unarchive](../crates/oxd/src/daemon.rs)
 

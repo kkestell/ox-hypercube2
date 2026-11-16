@@ -60,7 +60,9 @@ export function RunHeader({ run, worktree }: { run: RunInfo; worktree?: Worktree
       <dl className="run-header-meta">
         <div title={started}>
           {running ? <Hourglass /> : <History />}
-          <span>{running ? elapsed(now - run.created_at) : ago(run.created_at, now)}</span>
+          <span className={running ? "run-header-elapsed" : undefined}>
+            {running ? elapsed(now - run.created_at) : ago(run.created_at, now)}
+          </span>
         </div>
         {worktree && (
           <div>

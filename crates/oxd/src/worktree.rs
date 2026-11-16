@@ -629,7 +629,8 @@ pub async fn add(git: &Git, plan: &WorktreePlan) -> Result<(), String> {
     .map_err(|error| error.to_string())
 }
 
-/// Adds the worktree again at its saved path, on its saved branch.
+/// Adds the worktree again at its saved path, on its saved branch. Succeeds
+/// without change when git already has it there.
 async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
     let path = worktree.path.as_path();
     if let Some(dir) = path.parent() {
@@ -640,7 +641,15 @@ async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
                 message: format!("creating {}: {error}", dir.display()),
             })?;
     }
-    Repository::new(git, &worktree.common_dir)
+    let repository = Repository::new(git, &worktree.common_dir);
+    if path.exists()
+        && checked_out_at(&repository, &worktree.branch)
+            .await?
+            .is_some_and(|listed| is_listed_at(Path::new(&listed), path))
+    {
+        return Ok(());
+    }
+    repository
         .run(&[
             &"worktree",
             &"add",
@@ -866,16 +875,22 @@ async fn registered(repository: &Repository<'_>, path: &Path) -> Result<bool, Gi
     let worktrees = repository
         .run(&[&"worktree", &"list", &"--porcelain", &"-z"])
         .await?;
-    let resolved = path
-        .parent()
-        .and_then(|parent| parent.canonicalize().ok())
-        .zip(path.file_name())
-        .map(|(parent, name)| parent.join(name));
     Ok(worktrees
         .split(|&byte| byte == 0)
         .filter_map(|field| field.strip_prefix(b"worktree "))
-        .map(|listed| Path::new(OsStr::from_bytes(listed)))
-        .any(|listed| listed == path || resolved.as_deref() == Some(listed)))
+        .any(|listed| is_listed_at(Path::new(OsStr::from_bytes(listed)), path)))
+}
+
+/// Whether git's listing path `listed` names the worktree at `path`. Git
+/// lists worktrees by their real paths, so `path` is also compared with its
+/// parent resolved.
+fn is_listed_at(listed: &Path, path: &Path) -> bool {
+    listed == path
+        || path
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .zip(path.file_name())
+            .is_some_and(|(parent, name)| parent.join(name) == listed)
 }
 
 /// Applies the branch rule to the worktree's branch, in its repository.

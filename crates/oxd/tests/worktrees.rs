@@ -2401,6 +2401,35 @@ async fn unarchiving_needs_a_branch_git_can_check_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unarchiving_again_finishes_when_the_worktree_is_already_back() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let session = new_session(&client, repo.path(), on_ox_branch())
+        .await
+        .unwrap();
+    let session = started(&client, &session).await;
+    let worktree = worktree_of(&client, &session).await;
+    archive(&client, &session.id, true).await.unwrap();
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            worktree.path.to_str().unwrap(),
+            &worktree.branch,
+        ],
+    );
+
+    let unarchived = unarchive(&client, &session.id).await.unwrap();
+    assert!(!unarchived.archived);
+    assert_eq!(
+        git(&worktree.path, &["branch", "--show-current"]),
+        worktree.branch
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn deleting_an_archived_session_removes_it_and_applies_the_branch_rule() {
     let repo = repo();
     let daemon = Daemon::start().await;

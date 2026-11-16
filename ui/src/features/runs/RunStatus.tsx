@@ -1,6 +1,4 @@
 import {
-  ChevronDown,
-  ChevronRight,
   CircleCheck,
   CircleDashed,
   CircleDot,
@@ -8,7 +6,7 @@ import {
   CircleSlash,
   CircleX,
 } from "lucide-react";
-import { type ComponentType, useState } from "react";
+import type { ComponentType } from "react";
 import type { Item, RunInfo, SessionInfo, StepInfo } from "../../lib/protocol";
 import { childStatus } from "../sessions/SessionList";
 
@@ -56,8 +54,7 @@ function clock(time: number) {
 
 /**
  * Every step of the run, in order, with the status updates its child
- * session's agent posted. A completed step is collapsed until its heading is
- * opened.
+ * session's agent posted.
  */
 export function RunStatus({
   run,
@@ -121,11 +118,6 @@ function StepStatus({
 }) {
   const status = childStatus(step, session);
   const Icon = icons[status.className || step.state] ?? CircleDashed;
-  const completed = step.state === "succeeded";
-  // Set by a click on a completed step's heading; otherwise a completed step
-  // is collapsed and every other step is open.
-  const [expanded, setExpanded] = useState<boolean | null>(null);
-  const open = expanded ?? !completed;
   const name = (
     <>
       <span className={`status ${status.className}`} role="img" aria-label={status.label}>
@@ -145,22 +137,8 @@ function StepStatus({
           {clock(step.started_at)}
         </time>
       )}
-      <h3 className="run-status-current">
-        {completed ? (
-          <button
-            type="button"
-            className="run-status-toggle"
-            aria-expanded={open}
-            onClick={() => setExpanded(!open)}
-          >
-            {name}
-            {open ? <ChevronDown /> : <ChevronRight />}
-          </button>
-        ) : (
-          name
-        )}
-      </h3>
-      {open && (updates.length > 0 || notice !== undefined) && (
+      <h3 className="run-status-current">{name}</h3>
+      {(updates.length > 0 || notice !== undefined) && (
         <ol className="run-status-updates">
           {updates.map((update) => (
             <li key={update.key}>

@@ -101,7 +101,7 @@ async function run(action: () => Promise<unknown>) {
   }
 }
 
-/** A workspace's run or top-level session, in the order they were created. */
+/** A workspace's run or top-level session, newest first by creation time. */
 type Entry = { run: RunInfo; session?: undefined } | { run?: undefined; session: SessionInfo };
 
 export const SessionList = memo(function SessionList({
@@ -288,7 +288,7 @@ export const SessionList = memo(function SessionList({
           ...workspaceRuns.map((run) => ({ run })),
           ...topLevel.filter((session) => !session.archived).map((session) => ({ session })),
         ];
-        entries.sort((a, b) => (a.run ?? a.session).created_at - (b.run ?? b.session).created_at);
+        entries.sort((a, b) => (b.run ?? b.session).created_at - (a.run ?? a.session).created_at);
         const archived = topLevel.filter((session) => session.archived);
         const archiveOpen = openArchives.has(workspace.id);
         const menu = `new-session-${workspace.id}`;
