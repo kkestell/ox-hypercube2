@@ -1,7 +1,8 @@
-import { GitBranch, History, Hourglass, Workflow } from "lucide-react";
+import { History, Hourglass, Square, Workflow } from "lucide-react";
 import { useEffect, useState } from "react";
+import { Subheader } from "../../components/Subheader";
 import type { RunInfo, WorktreeInfo } from "../../lib/protocol";
-import { branchStatus } from "../sessions/localMerge";
+import { WorktreeBranch } from "../sessions/WorktreeBranch";
 
 const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
@@ -44,40 +45,47 @@ function useNow(live: boolean) {
 
 /**
  * A run's workflow and state, when it started and how long it has run, and
- * its worktree's branch and comparison with its base ref.
+ * its worktree's branch and comparison with its base ref, with Cancel Run
+ * while it runs.
  */
-export function RunHeader({ run, worktree }: { run: RunInfo; worktree?: WorktreeInfo }) {
+export function RunHeader({
+  run,
+  worktree,
+  cancelling,
+  onCancel,
+}: {
+  run: RunInfo;
+  worktree?: WorktreeInfo;
+  /** Whether cancelling the run is in flight. */
+  cancelling: boolean;
+  onCancel: () => void;
+}) {
   const running = run.state === "running";
   const now = useNow(running);
   const started = new Date(run.created_at).toLocaleString();
-  const branch =
-    worktree?.compare != null && worktree.comparison != null
-      ? branchStatus(worktree.compare, worktree.comparison)
-      : null;
 
   return (
-    <header className="run-header">
-      <dl className="run-header-meta">
-        <div title={started}>
-          {running ? <Hourglass /> : <History />}
-          <span className={running ? "run-header-elapsed" : undefined}>
-            {running ? elapsed(now - run.created_at) : ago(run.created_at, now)}
-          </span>
-        </div>
-        {worktree && (
-          <div>
-            <GitBranch />
-            <span className="run-header-branch">{worktree.branch}</span>
-            {branch && (
-              <span className={branch.attention ? "attention" : undefined}>{branch.tooltip}</span>
-            )}
-          </div>
-        )}
-        <div className="run-header-workflow">
-          <Workflow />
-          <span>{run.name}</span>
-        </div>
-      </dl>
-    </header>
+    <Subheader
+      action={
+        running && (
+          <button type="button" className="text-button" disabled={cancelling} onClick={onCancel}>
+            <Square />
+            Cancel Run
+          </button>
+        )
+      }
+    >
+      <div title={started}>
+        {running ? <Hourglass /> : <History />}
+        <span className={running ? "run-header-elapsed" : undefined}>
+          {running ? elapsed(now - run.created_at) : ago(run.created_at, now)}
+        </span>
+      </div>
+      {worktree && <WorktreeBranch worktree={worktree} />}
+      <div>
+        <Workflow />
+        <span>{run.name}</span>
+      </div>
+    </Subheader>
   );
 }

@@ -13,7 +13,7 @@ Each workflow is a YAML file in `$XDG_CONFIG_HOME/ox/workflows/`, by default
 `~/.config/ox/workflows/`. Every workspace and every daemon of the user shares
 these definitions. A run is started by the file name without `.yaml`, such as
 `plan-review` for `plan-review.yaml`. The file's `name` is the workflow's
-display name. The desktop lists every definition, each time a New Task menu
+display name. The desktop lists every definition, each time a New Session menu
 opens. A definition that does not parse is listed disabled, with its error as
 its tooltip.
 
@@ -204,8 +204,8 @@ steps:
 
 ## Running a workflow
 
-In the desktop, the New Task menu of a workspace in a Git working tree lists
-the workflows below New Task and Session in Checkout. Choosing one asks for
+In the desktop, the New Session menu of a workspace in a Git working tree lists
+the workflows below Session in Worktree and Session in Checkout. Choosing one asks for
 the run's input. Run, or Command-Return, starts the run and opens it.
 
 The run's row is titled with its input, or with the workflow's name when the
@@ -217,7 +217,8 @@ run's title, shown while the row is hovered, collapses and expands its steps,
 as does double-clicking the row. Each row's status is a blue breathing dot
 while it runs, an amber dot while a permission request or question awaits an
 answer, a green dot once it succeeded, a red dot once it failed, and a
-hollow dot while it is pending or once it was cancelled or interrupted.
+hollow dot while it is pending or once it was cancelled or interrupted. A
+pending step's row is dimmed.
 
 Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
@@ -236,7 +237,7 @@ Once the run has ended, the child takes prompts like any other session.
 
 `oxctl run start --workspace <workspace id> <workflow> <input>` starts a run
 and prints its ID. The run's worktree and branch are created as for
-[New Task](worktrees.md#choosing-a-checkout).
+[Session in Worktree](worktrees.md#choosing-a-checkout).
 `oxctl run wait <run id>` prints the run as JSON once it ends, and unless
 the run succeeded fails with its state and error, such as
 `the run failed: a postcondition exited with status 1 after the repair turn`.

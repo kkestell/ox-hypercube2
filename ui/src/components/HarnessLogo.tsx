@@ -1,9 +1,17 @@
+import type { AgentId } from "../features/sessions/useAgents";
 import type { SessionInfo } from "../lib/protocol";
 
-/** The harness is identified by its bridge, independently of the model it runs. */
-export function HarnessLogo({ command }: { command: SessionInfo["command"] }) {
+/** The agent whose harness a session runs, identified by its bridge, independently of the model. */
+export function sessionAgent(command: SessionInfo["command"]): AgentId | undefined {
   const bridge = command[0]?.split("/").pop();
-  if (bridge === "pi-acp") {
+  if (bridge === "pi-acp") return "pi";
+  if (bridge === "claude-code-acp") return "claude";
+  return undefined;
+}
+
+/** The logo of an agent's harness. */
+export function HarnessLogo({ agent }: { agent: AgentId | undefined }) {
+  if (agent === "pi") {
     // https://developers.cloudflare.com/icons/agents/pi/dark.svg
     return (
       <svg className="harness-logo pi-logo" viewBox="0 0 470 470" role="img" aria-label="Pi">
@@ -14,7 +22,7 @@ export function HarnessLogo({ command }: { command: SessionInfo["command"] }) {
       </svg>
     );
   }
-  if (bridge !== "claude-code-acp") return null;
+  if (agent !== "claude") return null;
 
   // The Claude mark, from the `claude` icon of VS Code's codicons.
   return (

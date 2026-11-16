@@ -11,6 +11,7 @@
   --destructive: oklch(0.577 0.245 27.325);
   --success: oklch(0.627 0.194 149.214);
   --working: oklch(0.623 0.214 259.815);
+  --working-highlight: var(--working);
   --warning: oklch(0.666 0.179 58.318);
   --border: oklch(0.922 0 0);
   --sidebar: oklch(0.985 0 0);
@@ -67,7 +68,6 @@
   --status-dot-size: calc(var(--spacing) * 2);
   --icon-button-size: calc(var(--spacing) * 6);
   /* How far an icon button's icon sits inside its box. */
-  --icon-button-inset: calc((var(--icon-button-size) - var(--icon-size)) / 2);
   --text-control-height: calc(var(--spacing) * 8);
   --select-picker-height: calc(var(--spacing) * 5);
   --pane-header-height: calc(var(--spacing) * 7);
@@ -117,6 +117,7 @@
     --destructive: oklch(0.704 0.191 22.216);
     --success: oklch(0.723 0.219 149.579);
     --working: oklch(0.707 0.165 254.624);
+    --working-highlight: color-mix(in oklab, var(--working) 25%, white);
     --warning: oklch(0.769 0.188 70.08);
     --border: oklch(1 0 0 / 10%);
     --sidebar: oklch(0.205 0 0);

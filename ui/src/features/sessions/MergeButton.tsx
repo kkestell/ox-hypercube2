@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { GitMerge } from "lucide-react";
 import { memo, useState } from "react";
 import { Dialog } from "../../components/Dialog";
 import type { Comparison, SessionInfo, WorktreeInfo } from "../../lib/protocol";
@@ -6,7 +7,7 @@ import { showError } from "../../lib/showError";
 import { mergeBlocker } from "./localMerge";
 
 /**
- * Merge into `compare`: fast-forwards the ref's branch to the branch of the
+ * Merge: fast-forwards the ref's branch to the branch of the
  * session's worktree, then offers to delete the session.
  */
 export const MergeButton = memo(function MergeButton({
@@ -50,11 +51,12 @@ export const MergeButton = memo(function MergeButton({
       <button
         type="button"
         className="text-button"
-        title={blocker ?? undefined}
+        title={blocker ?? `Merge into ${compare}`}
         disabled={blocker !== null || moving}
         onClick={merge}
       >
-        Merge into {compare}
+        <GitMerge />
+        Merge
       </button>
       {merged && (
         <Dialog

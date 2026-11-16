@@ -21,7 +21,7 @@ export function branchStatus(
   return { attention: true, tooltip: `${commits(ahead)} ahead, ${behind} behind ${compare}` };
 }
 
-/** Why Merge into `compare` is disabled, or null when it is enabled. */
+/** Why Merge is disabled, or null when it is enabled. */
 export function mergeBlocker(compare: string, comparison: Comparison): string | null {
   if (comparison.type === "failed") return comparison.error;
   if (comparison.ahead === 0) return "No commits";

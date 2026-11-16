@@ -7,7 +7,7 @@ Sessions let users keep independent agent conversations in their projects, conti
 ### Create a session
 
 1. Open the workspace's + menu and choose the agent. The desktop offers Claude.
-2. Choose Session in Checkout to run in the workspace directory, or New Task to follow the [isolated Git workflow](git.md#start-a-task).
+2. Choose Session in Checkout to run in the workspace directory, or Session in Worktree to follow the [isolated Git workflow](git.md#start-a-task).
 3. The app selects the new session. It starts in Starting and becomes Idle when the agent is ready, unless the agent reports ongoing work.
 4. A failure to start leaves the app's session Exited and reports the failure in its conversation.
 

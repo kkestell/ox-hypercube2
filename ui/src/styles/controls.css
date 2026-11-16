@@ -57,6 +57,20 @@ textarea.text-field {
   resize: vertical;
 }
 
+/* A text button's icon leads its label. */
+.text-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: calc(var(--spacing) * 1.5);
+}
+
+.text-button svg {
+  flex: none;
+  width: var(--icon-size);
+  height: var(--icon-size);
+}
+
 .text-button:hover:enabled {
   background: var(--accent);
 }
@@ -132,6 +146,12 @@ textarea.text-field {
 
 .menu button:disabled {
   opacity: var(--disabled-opacity);
+}
+
+.menu-field {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
 }
 
 .menu-separator {
@@ -274,7 +294,7 @@ textarea.text-field {
   animation: breathe var(--busy-dot-duration) ease-in-out infinite alternate;
 }
 
-/* A running dot glows while it is at full colour. */
+/* A running dot glows while it is brightest. */
 .status.running::before {
   animation: glow var(--busy-dot-duration) ease-in-out infinite alternate;
 }
@@ -302,15 +322,25 @@ textarea.text-field {
   background: transparent;
 }
 
+/* A running dot fades from near white through its blue to faded blue. */
 @keyframes breathe {
+  from {
+    color: var(--working-highlight);
+  }
+  50% {
+    color: var(--working);
+    opacity: 1;
+  }
   to {
+    color: var(--working);
     opacity: var(--busy-dot-opacity);
   }
 }
 
 @keyframes glow {
   from {
-    box-shadow: 0 0 var(--busy-dot-glow) color-mix(in oklab, currentColor 60%, transparent);
+    box-shadow: 0 0 var(--busy-dot-glow)
+      color-mix(in oklab, var(--working-highlight) 60%, transparent);
   }
   to {
     box-shadow: 0 0 0 transparent;

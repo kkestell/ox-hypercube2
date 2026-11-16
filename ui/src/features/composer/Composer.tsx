@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
 import { memo } from "react";
-import { HarnessLogo } from "../../components/HarnessLogo";
+import { HarnessLogo, sessionAgent } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import type { ConfigOption, Request, RunInfo, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -158,7 +158,7 @@ export const Composer = memo(function Composer({
       <div className="settings">
         {model && (
           <div className="model-setting">
-            <HarnessLogo command={session.command} />
+            <HarnessLogo agent={sessionAgent(session.command)} />
             <ModelPicker model={model} effort={effort} onChange={setOption} />
           </div>
         )}

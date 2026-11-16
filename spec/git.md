@@ -6,9 +6,9 @@ Users can isolate a session's work in a separate checkout, compare its branch wi
 
 ### Start a task
 
-1. In a workspace within a Git working tree, choose New Task.
+1. In a workspace within a Git working tree, choose Session in Worktree.
 2. Ox starts a worktree session on a new `ox/<first eight characters of the session ID>` branch from the workspace's current `HEAD`, compared with the branch checked out there.
-3. If the workspace is not on a branch, Ox reports <workspace> is not on a branch and creates no task. Outside Git, New Task is not offered; Session in Checkout remains available.
+3. If the workspace is not on a branch, Ox reports <workspace> is not on a branch and creates no task. Outside Git, Session in Worktree is not offered; Session in Checkout remains available.
 
 Uncommitted changes in the workspace are not copied to a new worktree. If the workspace is a subdirectory of a repository, the session runs in the corresponding subdirectory of the new worktree.
 
@@ -42,7 +42,7 @@ In the desktop, a non-archived session with a comparison shows a branch indicato
 
 ### Merge a completed task locally
 
-1. View a non-archived session with a comparison. The header offers Merge into <ref> once a comparison is available.
+1. View a non-archived session with a comparison. The session's subheader shows its branch and comparison, and offers Merge into <ref> as a Merge button once a comparison is available.
 2. The button is enabled only at exactly one commit ahead and none behind. Otherwise its tooltip explains No commits, asks for a rebase when behind, asks for a squash when multiple commits are ahead, or shows the comparison failure.
 3. Merge fast-forwards the target local branch from the commit used in the comparison to the session branch's compared commit. It does not create a merge commit, squash commits, rebase, or push.
 4. On success, choose Keep Session or Delete Session. Keeping leaves the session and worktree available; deletion follows [session deletion](sessions.md#delete-a-session).

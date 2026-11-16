@@ -258,17 +258,17 @@ export function worktreeEntry() {
   );
 }
 
-/** Opens the New Task menu of the workspace in `cwd`. */
+/** Opens the New Session menu of the workspace in `cwd`. */
 export async function openMenu(cwd: string) {
-  await workspaceGroup(cwd).$('button[aria-label="New Task"]').click();
+  await workspaceGroup(cwd).$('button[aria-label="New Session"]').click();
   const menu = workspaceGroup(cwd).$('[role="menu"]');
   await expect(menu).toBeDisplayed();
   return menu;
 }
 
-/** Starts a New Task in the workspace in `cwd`, and returns its worktree's path. */
-export async function newTask(cwd: string): Promise<string> {
-  await (await openMenu(cwd)).$("button=New Task").click();
+/** Starts a Session in Worktree in the workspace in `cwd`, and returns its worktree's path. */
+export async function newWorktreeSession(cwd: string): Promise<string> {
+  await (await openMenu(cwd)).$("button=Session in Worktree").click();
   const select = worktreeEntry().$("button.select");
   await expect(select).toHaveAttribute("aria-current", "true");
   return (await select.getAttribute("title"))!.replace(/\/$/, "");

@@ -19,7 +19,7 @@ Ox is a desktop app and command-line tool for people who run coding agents on lo
 - **Checkout:** A Git working tree and the files in it. A workspace may also be a directory outside Git.
 - **Worktree:** A separate Git checkout created and managed by Ox for a session.
 - **Session:** A conversation with one selected agent, belonging to one workspace and running in one directory.
-- **Task:** A session started with New Task, in its own worktree and compared with the workspace checkout's branch.
+- **Task:** A session started with Session in Worktree, in its own worktree and compared with the workspace checkout's branch.
 - **Agent:** The coding assistant selected for a session. Its capabilities determine the content and controls available.
 - **Prompt:** One submission of text, attachments, or other supported content to an agent.
 - **Turn:** A period of agent work, started by a prompt or by the agent itself, ending when the agent reports it has finished or stopped.

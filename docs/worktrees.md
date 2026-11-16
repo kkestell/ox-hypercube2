@@ -6,9 +6,9 @@ of the workspace's repository.
 ## Choosing a checkout
 
 In the workspace's **+** menu, **Session in Checkout** runs in the workspace's
-directory. **New Task** creates a worktree on a new branch
+directory. **Session in Worktree** creates a worktree on a new branch
 `ox/<first 8 digits of the worktree's ID>`, starting at the workspace
-checkout's `HEAD`. New Task is offered for
+checkout's `HEAD`. Session in Worktree is offered for
 workspaces in a Git working tree and requires a checked-out branch with a
 commit.
 
@@ -19,20 +19,22 @@ the worktree's ID>` beside the daemon socket. By default that is in Ox's data
 directory. When the workspace is a subdirectory of its checkout, the session
 runs in the same subdirectory of the worktree.
 
-A New Task branch has no upstream. A workspace subdirectory must exist at the
+A Session in Worktree branch has no upstream. A workspace subdirectory must exist at the
 starting commit. The worktree contains committed files only; uncommitted
 changes stay in the workspace's checkout.
 
 ## Comparing a session's branch
 
-New Task compares the session's branch with the branch the workspace's
-checkout was on when the task started. When the session has commits ahead,
+Session in Worktree compares the session's branch with the branch the workspace's
+checkout was on when the session started. When the session has commits ahead,
 the Git branch icon's tooltip shows the counts. A failed comparison shows
-its error in the tooltip.
+its error in the tooltip. The session view's subheader shows the worktree's
+branch and its comparison, and **Merge** at its end. A session in the
+workspace's checkout shows the checkout's directory instead.
 
 ## Moving a branch
 
-**Merge into** fast-forwards the comparison branch to the session's
+**Merge** fast-forwards the comparison branch to the session's
 commit when the session is one commit ahead and none behind. Both branches
 must still be at the commits Ox used for the comparison.
 

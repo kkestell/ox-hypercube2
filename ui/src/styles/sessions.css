@@ -42,12 +42,19 @@
   white-space: nowrap;
 }
 
-/* An exited session dims its contents but not its tree line. */
-.sidebar-row.exited .select > :not(.tree-branch) {
+/* An exited session and a pending step dim their contents but not their
+   tree line. */
+.sidebar-row.exited .select > :not(.tree-branch),
+.sidebar-row.pending .select > :not(.tree-branch) {
   opacity: var(--dimmed-opacity);
 }
 
 .archived-toggle .select {
+  color: var(--muted-foreground);
+}
+
+/* A pending step is as dark as in the run view. */
+.sidebar-row.pending .select {
   color: var(--muted-foreground);
 }
 

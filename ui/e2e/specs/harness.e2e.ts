@@ -2,7 +2,7 @@ import { openMenu, setHarnesses, startSession, workspaceGroup } from "../helpers
 
 const harness = 'select[aria-label="Harness"]';
 
-describe("The New Task menu's harnesses", () => {
+describe("The New Session menu's harnesses", () => {
   afterEach(async () => {
     await setHarnesses("claude");
   });
@@ -18,7 +18,7 @@ describe("The New Task menu's harnesses", () => {
   it("is disabled with no harness installed", async () => {
     const cwd = await startSession();
     await setHarnesses();
-    await expect(workspaceGroup(cwd).$('button[aria-label="New Task"]')).toBeDisabled();
+    await expect(workspaceGroup(cwd).$('button[aria-label="New Session"]')).toBeDisabled();
   });
 
   it("offers Claude and Pi while both are installed", async () => {

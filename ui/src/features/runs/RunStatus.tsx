@@ -1,30 +1,11 @@
-import {
-  CircleCheck,
-  CircleDashed,
-  CircleDot,
-  CirclePause,
-  CircleSlash,
-  CircleX,
-} from "lucide-react";
-import type { ComponentType } from "react";
 import type { Item, RunInfo, SessionInfo, StepInfo } from "../../lib/protocol";
-import { childStatus } from "../sessions/SessionList";
+import { childStatus, StatusIcon } from "../sessions/SessionList";
 
 type StatusUpdate = Extract<Item, { type: "status_update" }>;
 
 function isStatusUpdate(item: Item): item is StatusUpdate {
   return item.type === "status_update";
 }
-
-const icons: Record<string, ComponentType> = {
-  running: CircleDot,
-  attention: CircleDot,
-  succeeded: CircleCheck,
-  failed: CircleX,
-  pending: CircleDashed,
-  cancelled: CircleSlash,
-  interrupted: CirclePause,
-};
 
 /**
  * The run's failure or interruption, and the index of the step it belongs
@@ -124,13 +105,10 @@ function StepStatus({
   connector: "solid" | "dashed" | null;
 }) {
   const status = childStatus(step, session);
-  const Icon = icons[status.className || step.state] ?? CircleDashed;
   const latest = followUpdates ? updates.at(-1) : undefined;
   const name = (
     <>
-      <span className={`status ${status.className}`} role="img" aria-label={status.label}>
-        <Icon />
-      </span>
+      <StatusIcon status={status} />
       <span className="title">{step.name}</span>
     </>
   );

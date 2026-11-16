@@ -1,4 +1,5 @@
 import type {
+  Comparison,
   ConversationUpdate,
   ListingChange,
   RunInfo,
@@ -54,6 +55,21 @@ class Listing {
     };
     this.sessions.push(session);
     return session;
+  }
+
+  /** An idle session in a new worktree, compared with `main` as `comparison` says. */
+  worktreeSession(title: string, comparison: Comparison) {
+    const id = `worktree-${this.worktrees.length}`;
+    this.worktrees.push({
+      id,
+      path: `${this.workspace.path}/.ox/${id}`,
+      branch: `ox/${id}`,
+      base: "main",
+      created_branch: true,
+      compare: "main",
+      comparison,
+    });
+    return this.session(title, "idle", id);
   }
 
   /** A run whose steps each have a session, in `sessionState`, unless pending. */
@@ -187,8 +203,30 @@ function runStatus(): Scenario {
   };
 }
 
+/** Sessions whose Merge button is enabled, and blocked for each reason. */
+function merge(): Scenario {
+  const listing = new Listing();
+  const compared = (ahead: number, behind: number): Comparison => ({
+    type: "compared",
+    tip: "b".repeat(40),
+    compare_tip: "a".repeat(40),
+    ahead,
+    behind,
+  });
+  listing.worktreeSession("Failed comparison", {
+    type: "failed",
+    error: "fatal: bad revision 'main'",
+  });
+  listing.worktreeSession("No commits", compared(0, 0));
+  listing.worktreeSession("Behind main", compared(1, 2));
+  listing.worktreeSession("Unsquashed commits", compared(3, 0));
+  listing.worktreeSession("Ready to merge", compared(1, 0));
+  return { changes: listing.changes() };
+}
+
 export const scenarios: Record<string, Scenario> = {
   sidebar: sidebar(),
   "run-status": runStatus(),
+  merge: merge(),
   empty: { changes: [] },
 };

@@ -1,4 +1,3 @@
-import { Square } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
 import { Workbench } from "./components/Workbench";
 import { Composer } from "./features/composer/Composer";
@@ -11,8 +10,7 @@ import { forgetDeletedTrees } from "./features/files/treeState";
 import { useFileViewers } from "./features/files/useFileViewers";
 import { openFile } from "./features/files/viewerState";
 import { RunView } from "./features/runs/RunView";
-import { localMerge } from "./features/sessions/localMerge";
-import { MergeButton } from "./features/sessions/MergeButton";
+import { SessionHeader } from "./features/sessions/SessionHeader";
 import { runTitle, SessionList } from "./features/sessions/SessionList";
 import { useSessionActions } from "./features/sessions/useSessionActions";
 import { useWorkspaces } from "./features/sessions/useWorkspaces";
@@ -57,7 +55,6 @@ export function App() {
     [viewed],
   );
   const worktree = session?.worktree_id == null ? undefined : worktrees.get(session.worktree_id);
-  const merge = session && localMerge(session, worktree);
   const { actions, dialogs } = useSessionActions();
   const conversations = useConversations(session ? [session.id] : [], connection);
   const items = (session && conversations.get(session.id)) || noItems;
@@ -72,6 +69,8 @@ export function App() {
             sessions={sessions}
             worktree={worktrees.get(run.worktree_id)}
             connection={connection}
+            cancelling={actions.busy.has(run.id)}
+            onCancel={() => actions.cancelRun(run.id)}
           />
         </SessionContent>
       );
@@ -79,6 +78,11 @@ export function App() {
     if (session) {
       return (header: ReactNode) => (
         <SessionContent key={session.id} viewId={session.id} header={header}>
+          <SessionHeader
+            session={session}
+            worktree={worktree}
+            deleteSession={actions.deleteSession}
+          />
           <Conversation sessionId={session.id} items={items} />
           <Composer
             key={session.id}
@@ -91,37 +95,6 @@ export function App() {
       );
     }
     return undefined;
-  };
-
-  const headerActions = () => {
-    if (run?.state === "running") {
-      return (
-        <button
-          type="button"
-          className="icon-button"
-          title="Cancel Run"
-          aria-label="Cancel Run"
-          disabled={actions.busy.has(run.id)}
-          onClick={() => actions.cancelRun(run.id)}
-        >
-          <Square />
-        </button>
-      );
-    }
-    return (
-      session &&
-      worktree &&
-      merge && (
-        <MergeButton
-          key={session.id}
-          session={session}
-          worktree={worktree}
-          compare={merge.compare}
-          comparison={merge.comparison}
-          deleteSession={actions.deleteSession}
-        />
-      )
-    );
   };
 
   return (
@@ -152,7 +125,6 @@ export function App() {
           )
         }
         renderContent={renderContent()}
-        actions={headerActions()}
         title={run ? runTitle(run) : session ? (session.title ?? "New session") : undefined}
       />
       {dialogs}

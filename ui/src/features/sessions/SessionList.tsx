@@ -4,6 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronDown, ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
 import { type MouseEvent, memo, useCallback, useState } from "react";
 import { Dialog } from "../../components/Dialog";
+import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
 import type {
@@ -44,7 +45,7 @@ interface Status {
 }
 
 /** A status's dot. */
-function StatusIcon({ status }: { status: Status }) {
+export function StatusIcon({ status }: { status: Status }) {
   return (
     <span
       className={`status ${status.className}`}
@@ -147,7 +148,7 @@ export const SessionList = memo(function SessionList({
   actions: SessionActions;
 }) {
   const agents = useAgents();
-  // The agent the user chose, and the agent the New Task menus start: the
+  // The agent the user chose, and the agent the New Session menus start: the
   // chosen one while it is installed, otherwise the first installed agent.
   const [chosen, setChosen] = useState<AgentId | null>(null);
   const agent = chosen !== null && agents.includes(chosen) ? chosen : agents[0];
@@ -157,7 +158,7 @@ export const SessionList = memo(function SessionList({
   const [collapsedRuns, setCollapsedRuns] = useState<ReadonlySet<string>>(new Set());
   // The workspaces whose rows are collapsed.
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set());
-  // The definitions the New Task menus list, read each time one opens.
+  // The definitions the New Session menus list, read each time one opens.
   const [workflows, setWorkflows] = useState<WorkflowInfo[]>([]);
   // The workflow whose input the Start Run dialog asks for.
   const [starting, setStarting] = useState<{
@@ -183,7 +184,7 @@ export const SessionList = memo(function SessionList({
   // A session in a new worktree, on a new `ox/<id8>` branch named for the
   // worktree's ID, from `HEAD`, compared with the branch the workspace's
   // checkout is on.
-  const newTask = (workspace: WorkspaceInfo, agent: AgentId) =>
+  const newWorktreeSession = (workspace: WorkspaceInfo, agent: AgentId) =>
     run(async () => {
       const { head } = await invoke<Branches>("workspace_branches", {
         workspaceId: workspace.id,
@@ -357,8 +358,8 @@ export const SessionList = memo(function SessionList({
               <button
                 type="button"
                 className="icon-button"
-                title="New Task"
-                aria-label="New Task"
+                title="New Session"
+                aria-label="New Session"
                 disabled={agent === undefined}
                 popoverTarget={menu}
                 style={{ anchorName: `--${menu}` }}
@@ -380,6 +381,7 @@ export const SessionList = memo(function SessionList({
                 >
                   {agents.length > 1 && (
                     <div className="menu-field">
+                      <HarnessLogo agent={agent} />
                       <SelectPicker
                         label="Harness"
                         value={agent}
@@ -394,9 +396,9 @@ export const SessionList = memo(function SessionList({
                       role="menuitem"
                       popoverTarget={menu}
                       popoverTargetAction="hide"
-                      onClick={() => newTask(workspace, agent)}
+                      onClick={() => newWorktreeSession(workspace, agent)}
                     >
-                      New Task
+                      Session in Worktree
                     </button>
                   )}
                   <button
@@ -620,7 +622,7 @@ function StepRow({
 }) {
   const status = childStatus(step, undefined);
   return (
-    <li className="sidebar-row session child">
+    <li className={`sidebar-row session child${step.state === "pending" ? " pending" : ""}`}>
       <button type="button" className="select" onClick={onSelect}>
         <span
           className={["tree-branch", first && "first", last && "last"].filter(Boolean).join(" ")}

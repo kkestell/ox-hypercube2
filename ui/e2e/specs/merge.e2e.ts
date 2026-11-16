@@ -7,7 +7,7 @@ import {
   composer,
   git,
   gitWorkspace,
-  newTask,
+  newWorktreeSession,
   openMenu,
   openSession,
   send,
@@ -17,9 +17,9 @@ import {
   worktreeEntry,
 } from "../helpers.ts";
 
-/** The Merge button in the content header. */
+/** The Merge button in the session's subheader. */
 function mergeButton() {
-  return $(".content-header").$("button.text-button");
+  return $(".subheader").$("button.text-button");
 }
 
 /** The git status icon of the one worktree session's row. */
@@ -27,9 +27,9 @@ function branchStatus() {
   return worktreeEntry().$(".branch-status");
 }
 
-/** Clicks Merge into main and waits for the dialog that follows the move. */
+/** Clicks Merge and waits for the dialog that follows the move. */
 async function merge() {
-  await expect(mergeButton()).toHaveText("Merge into main");
+  await expect(mergeButton()).toHaveText("Merge");
   await expect(mergeButton()).toBeEnabled();
   await mergeButton().click();
   const dialog = $("dialog[open]");
@@ -48,7 +48,7 @@ describe("Local merge", () => {
     await writeFile(join(cwd, ".gitignore"), "local.env\n");
     await commit(cwd);
     const base = await git(cwd, "rev-parse", "HEAD");
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await writeFile(join(path, "local.env"), "from task\n");
     await git(path, "add", "-f", "local.env");
     await commit(path);
@@ -72,7 +72,7 @@ describe("Local merge", () => {
   it("refuses to merge a task whose branch changed since comparison", async () => {
     const { cwd, workspace } = await gitWorkspace();
     const base = await git(cwd, "rev-parse", "HEAD");
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await commit(path);
     await compareSession(workspace);
     await expect(mergeButton()).toBeEnabled();
@@ -98,7 +98,7 @@ describe("Local merge", () => {
   it("blocks prompts in the destination checkout until the merge finishes", async () => {
     const { cwd, workspace } = await gitWorkspace();
     await startCheckoutSession(workspace);
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await commit(path);
     const tip = await git(path, "rev-parse", "HEAD");
     await compareSession(workspace, path);
@@ -159,8 +159,8 @@ exit 1
 
   it("can't merge a task with no commits", async () => {
     const { cwd } = await gitWorkspace();
-    await newTask(cwd);
-    await expect(mergeButton()).toHaveText("Merge into main");
+    await newWorktreeSession(cwd);
+    await expect(mergeButton()).toHaveText("Merge");
     await expect(mergeButton()).toBeDisabled();
     await expect(mergeButton()).toHaveAttribute("title", "No commits");
     await expect(branchStatus()).not.toBeExisting();
@@ -171,7 +171,7 @@ exit 1
     await writeFile(join(cwd, ".gitignore"), "local.env\n");
     await commit(cwd);
     await writeFile(join(cwd, "local.env"), "keep me\n");
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     const file = await commit(path);
     await compareSession(workspace);
     await expect(branchStatus()).toHaveAttribute("title", "1 commit ahead of main");
@@ -192,7 +192,7 @@ exit 1
 
   it("keeps a merged task, which then has no commits", async () => {
     const { cwd, workspace } = await gitWorkspace();
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await commit(path);
     await compareSession(workspace);
 
@@ -206,7 +206,7 @@ exit 1
 
   it("asks for a squash when the task has two commits", async () => {
     const { cwd, workspace } = await gitWorkspace();
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await commit(path);
     await commit(path);
     await compareSession(workspace);
@@ -218,7 +218,7 @@ exit 1
 
   it("asks for a rebase when main has moved on", async () => {
     const { cwd, workspace } = await gitWorkspace();
-    const path = await newTask(cwd);
+    const path = await newWorktreeSession(cwd);
     await commit(path);
     await commit(cwd);
     await compareSession(workspace);

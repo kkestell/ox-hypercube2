@@ -64,7 +64,7 @@ function requestPanel() {
   return $(".composer .request-panel");
 }
 
-/** Chooses workflow `name` from the New Task menu and runs it with `input`. */
+/** Chooses workflow `name` from the New Session menu and runs it with `input`. */
 async function startRun(cwd: string, name: string, input: string) {
   await (await openMenu(cwd)).$(`button=${name}`).click();
   const dialog = $("dialog[open]");
@@ -98,7 +98,7 @@ afterEach(async () => {
 });
 
 describe("A workflow run", () => {
-  it("starts from the New Task menu and follows its steps", async () => {
+  it("starts from the New Session menu and follows its steps", async () => {
     const { cwd, workspace } = await gitWorkspace();
     await startCheckoutSession(workspace);
     await defineWorkflow(

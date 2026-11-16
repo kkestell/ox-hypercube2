@@ -19,12 +19,17 @@ export function RunView({
   sessions,
   worktree,
   connection,
+  cancelling,
+  onCancel,
 }: {
   run: RunInfo;
   sessions: SessionInfo[];
   /** The worktree the run owns. */
   worktree: WorktreeInfo | undefined;
   connection: number;
+  /** Whether cancelling the run is in flight. */
+  cancelling: boolean;
+  onCancel: () => void;
 }) {
   const notice = runNotice(run);
   const childIds = run.steps.flatMap((step) => (step.session_id === null ? [] : [step.session_id]));
@@ -40,7 +45,7 @@ export function RunView({
 
   return (
     <>
-      <RunHeader run={run} worktree={worktree} />
+      <RunHeader run={run} worktree={worktree} cancelling={cancelling} onCancel={onCancel} />
       <div className="conversation">
         <RunStatus run={run} sessions={sessions} conversations={conversations} notice={notice} />
         {notice !== null && notice.index === -1 && (
