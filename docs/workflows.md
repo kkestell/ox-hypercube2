@@ -61,7 +61,7 @@ for Pi. The step's session is set to each value it gives before the prompt is
 sent. A value the harness has no option for, or refuses, fails the run at
 that step with the reason.
 
-A Claude step's agent can post [status updates](dev/glossary.md) through the
+A step's agent can post [status updates](dev/glossary.md) through the
 `ox` tool `post_status_update`.
 
 ## Shell steps

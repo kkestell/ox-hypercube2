@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use acp_bridge::McpServer;
 use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
     self as acp, ContentBlock, ErrorStopReason, PromptResponse, StopReason, ToolCallContent,
@@ -19,6 +20,22 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{dialogs, tools, updates::Updates};
+
+/// The Pi extension that registers the client's MCP servers.
+const MCP_EXTENSION: &str = include_str!("mcp-servers.js");
+
+/// Writes `MCP_EXTENSION` to `<temp dir>/pi-acp/mcp-servers.js` and returns
+/// the path. The file is replaced through a rename, so a Pi another bridge
+/// starts meanwhile reads a whole file.
+fn write_mcp_extension() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("pi-acp");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join("mcp-servers.js");
+    let staging = dir.join(format!("mcp-servers.js.{}", std::process::id()));
+    std::fs::write(&staging, MCP_EXTENSION).map_err(|e| e.to_string())?;
+    std::fs::rename(&staging, &path).map_err(|e| e.to_string())?;
+    Ok(path)
+}
 
 /// A prompt waiting for Pi's answer to its `prompt` command.
 struct Prompt {
@@ -83,17 +100,35 @@ pub struct Pi {
 impl Pi {
     /// Starts Pi in `cwd` on the Pi session `pi_session_id`, which Pi opens,
     /// or creates when it does not exist, with `instructions` appended to
-    /// Pi's system prompt.
+    /// Pi's system prompt. The extension `MCP_EXTENSION` registers
+    /// `mcp_servers` with Pi, their tools declared to the model directly.
     pub fn start(
         cwd: &Path,
         pi_session_id: &str,
         instructions: Option<&str>,
+        mcp_servers: &[McpServer],
         updates: Updates,
     ) -> Result<Self, String> {
         let mut command = Command::new("pi");
         command.args(["--mode", "rpc", "--approve", "--session-id", pi_session_id]);
         if let Some(instructions) = instructions {
             command.arg("--append-system-prompt").arg(instructions);
+        }
+        if !mcp_servers.is_empty() {
+            let extension = write_mcp_extension()
+                .map_err(|e| format!("failed to write the MCP extension: {e}"))?;
+            let servers: serde_json::Map<_, _> = mcp_servers
+                .iter()
+                .map(|server| {
+                    let mut entry = server.config();
+                    entry["exposure"] = json!("direct");
+                    (server.name.clone(), entry)
+                })
+                .collect();
+            command
+                .arg("-e")
+                .arg(extension)
+                .env("PI_ACP_MCP_SERVERS", Value::Object(servers).to_string());
         }
         let mut child = command
             .current_dir(cwd)

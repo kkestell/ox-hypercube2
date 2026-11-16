@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{commands, updates::Updates};
+use acp_bridge::McpServer;
 use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
     ContentBlock, ErrorStopReason, PromptResponse, StateUpdate, StopReason,
@@ -16,14 +17,6 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::AbortHandle,
 };
-
-#[derive(Clone, Debug)]
-pub struct McpServer {
-    pub name: String,
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: BTreeMap<String, String>,
-}
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -188,12 +181,7 @@ impl Claude {
             let servers: BTreeMap<_, _> = request
                 .mcp_servers
                 .iter()
-                .map(|s| {
-                    (
-                        s.name.clone(),
-                        json!({"command": s.command, "args": s.args, "env": s.env}),
-                    )
-                })
+                .map(|server| (server.name.clone(), server.config()))
                 .collect();
             command
                 .arg("--mcp-config")

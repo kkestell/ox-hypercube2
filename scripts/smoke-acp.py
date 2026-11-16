@@ -653,6 +653,21 @@ class SmokeRun:
                 if self.daemon is not None:
                     stop(self.daemon)
 
+    def check_title_tool(self):
+        """Has the agent retitle the session with the `ox` MCP server's
+        `set_title` tool. A permission request would stall the turn."""
+        title = f"Smoke {self.directory.name}"
+        self.ctl(
+            "prompt",
+            self.session,
+            f"Call the set_title tool of the ox MCP server with the title {title} "
+            "and do nothing else.",
+        )
+        self.finish()
+        row = self.session_row()
+        check(row[5] == title, f"The title tool did not set the title: {row}")
+        self.report("agent_set_title_through_ox_mcp", title=title)
+
 
 class ClaudeRun(SmokeRun):
     harness = "claude"
@@ -927,21 +942,6 @@ class ClaudeRun(SmokeRun):
         )
         self.report("model_verified", models=sorted(models))
 
-    def check_title_tool(self):
-        """Has Claude retitle the session with the `ox` MCP server's
-        `set_title` tool. A permission request would stall the turn."""
-        title = f"Smoke {self.directory.name}"
-        self.ctl(
-            "prompt",
-            self.session,
-            f"Call the set_title tool of the ox MCP server with the title {title} "
-            "and do nothing else.",
-        )
-        self.finish()
-        row = self.session_row()
-        check(row[5] == title, f"The title tool did not set the title: {row}")
-        self.report("agent_set_title_through_ox_mcp", title=title)
-
     def check_parking(self):
         """A session with a background command is not parked while it runs,
         and is parked once Claude has handled it and the session has been idle
@@ -1048,6 +1048,7 @@ class PiRun(SmokeRun):
             self.check_dialog,
             self.check_cancel_generation,
             self.verify_model,
+            self.check_title_tool,
             self.check_load_after_restart,
             self.check_parking,
             self.check_workflow,

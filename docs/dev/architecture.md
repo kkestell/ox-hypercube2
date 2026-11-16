@@ -25,6 +25,7 @@ flowchart TB
     pibridge --> pi
     bridge --> claude
     claude --> oxmcp
+    pi --> oxmcp
     oxmcp -.-> oxd
 ```
 
@@ -67,7 +68,8 @@ Claude authenticates with the user's subscription. The bridge can restart
 an exited Claude process on the same session.
 
 `pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
-project's settings, skills, and extensions. The bridge exchanges JSONL commands
+project's settings, skills, and extensions, and an extension of its own that
+registers the client's MCP servers with Pi. The bridge exchanges JSONL commands
 and events with Pi, using the providers and credentials configured in Pi. It
 can restart an exited Pi on the same session.
 

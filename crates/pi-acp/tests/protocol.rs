@@ -15,12 +15,13 @@ use tokio::{
     time::{Duration, Instant, sleep, timeout},
 };
 
-/// What every fake pi does: it records how it was started, and reads
-/// commands from stdin, which stays open for the session as the real one's
-/// does.
+/// What every fake pi does: it records how it was started and the MCP
+/// servers it was given, and reads commands from stdin, which stays open for
+/// the session as the real one's does.
 const FAKE_PI: &str = r#"
 printf '%s\n' "$*" >> calls
 pwd >> calls
+if [ -n "${PI_ACP_MCP_SERVERS-}" ]; then printf '%s\n' "$PI_ACP_MCP_SERVERS" >> servers; fi
 # Reads the next command into $command. Pi ends when its stdin closes.
 next_command() {
   IFS= read -r command || { : > closed; exit 0; }
@@ -150,6 +151,10 @@ async fn initialize(child: &mut Child, reader: &mut BufReader<ChildStdout>, capa
     assert_eq!(value["result"]["protocolVersion"], 2);
     assert!(
         value["result"]["capabilities"]["session"]["prompt"]["image"].is_object(),
+        "{value}"
+    );
+    assert!(
+        value["result"]["capabilities"]["session"]["mcp"]["stdio"].is_object(),
         "{value}"
     );
 }
@@ -1082,6 +1087,93 @@ async fn replay_empty_and_invalid_history_and_exited_pi() {
         "{result}"
     );
     child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_servers_reach_every_pi_through_the_extension() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi(&bin, "");
+    let servers = json!([{"type":"stdio","name":"ox","command":"/usr/local/bin/ox-mcp",
+        "args":["--session","s1"],"env":[{"name":"KEY","value":"value"}]}]);
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader, json!({})).await;
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":project,"mcpServers":servers}}),
+    )
+    .await;
+    let (new, _) = response(&mut reader, 2).await;
+    let session = new["result"]["sessionId"].clone();
+    assert!(session.is_string(), "{new}");
+    let snapshot = receive(&mut reader).await;
+    assert!(is_state(&snapshot, "idle"), "{snapshot}");
+    startup_catalog(&mut reader).await;
+    child.kill().await.unwrap();
+
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader, json!({})).await;
+    let mut resume = resume_request(3, &session, &project, None);
+    resume["params"]["mcpServers"] = servers;
+    send(&mut child, resume).await;
+    let (resumed, _) = response(&mut reader, 3).await;
+    assert!(resumed["result"].is_object(), "{resumed}");
+    child.kill().await.unwrap();
+
+    let calls = lines(&project, "calls", 4).await;
+    let extension = calls[0]
+        .strip_prefix(&format!(
+            "--mode rpc --approve --session-id {} -e ",
+            session.as_str().unwrap()
+        ))
+        .unwrap_or_else(|| panic!("{calls:?}"));
+    assert_eq!(
+        fs::read_to_string(extension).unwrap(),
+        include_str!("../src/mcp-servers.js")
+    );
+    assert_eq!(calls[0], calls[2]);
+    let given = lines(&project, "servers", 2).await;
+    let expected = json!({"ox":{"command":"/usr/local/bin/ox-mcp","args":["--session","s1"],
+        "env":{"KEY":"value"},"exposure":"direct"}});
+    assert_eq!(serde_json::from_str::<Value>(&given[0]).unwrap(), expected);
+    assert_eq!(given[0], given[1]);
+}
+
+#[tokio::test]
+async fn invalid_mcp_servers_are_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi(&bin, "");
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader, json!({})).await;
+    let stdio = |name: &str, command: &str| json!({"type":"stdio","name":name,"command":command,"args":[],"env":[]});
+    let refused = [
+        json!([{"type":"http","name":"context","url":"https://example.com/mcp","headers":[]}]),
+        json!([stdio("x", "node")]),
+        json!([stdio("o x", "/usr/bin/node")]),
+        json!([stdio("a-b", "/usr/bin/node"), stdio("a_b", "/usr/bin/node")]),
+    ];
+    for (id, servers) in (2..).zip(refused) {
+        send(
+            &mut child,
+            json!({"jsonrpc":"2.0","id":id,"method":"session/new","params":{"cwd":project,"mcpServers":servers}}),
+        )
+        .await;
+        let (answer, _) = response(&mut reader, id).await;
+        assert_eq!(answer["error"]["code"], -32602, "{servers}: {answer}");
+    }
+    let mut resume = resume_request(
+        6,
+        &json!("8a4f2c1e-0b7d-4e5a-9c3f-1d2e3f4a5b6c"),
+        &project,
+        None,
+    );
+    resume["params"]["mcpServers"] = json!([stdio("x", "node")]);
+    send(&mut child, resume).await;
+    let (answer, _) = response(&mut reader, 6).await;
+    assert_eq!(answer["error"]["code"], -32602, "{answer}");
+    child.kill().await.unwrap();
+    assert!(!project.join("calls").exists(), "no Pi starts");
 }
 
 #[tokio::test]

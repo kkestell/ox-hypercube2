@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use acp_bridge::{invalid, notify};
+use acp_bridge::{McpServer, invalid, notify, parse_mcp};
 use agent_client_protocol::v2::schema::{
     self as acp, SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
     SessionUpdate,
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     content,
     history::History,
-    runner::{Claude, McpServer, StartRequest},
+    runner::{Claude, StartRequest},
     updates::{self, Updates},
 };
 
@@ -480,26 +480,4 @@ fn mode_options() -> Vec<SessionConfigSelectOption> {
         SessionConfigSelectOption::new(id, name).description(description)
     })
     .collect()
-}
-
-fn parse_mcp(servers: Vec<acp::McpServer>) -> std::result::Result<Vec<McpServer>, Error> {
-    servers
-        .into_iter()
-        .map(|server| {
-            let acp::McpServer::Stdio(server) = server else {
-                return Err(invalid("only stdio MCP servers are supported"));
-            };
-            acp_bridge::mcp_command(&server.command.0).map_err(invalid)?;
-            Ok(McpServer {
-                name: server.name,
-                command: server.command.0.to_string_lossy().into_owned(),
-                args: server.args,
-                env: server
-                    .env
-                    .into_iter()
-                    .map(|var| (var.name, var.value))
-                    .collect(),
-            })
-        })
-        .collect()
 }

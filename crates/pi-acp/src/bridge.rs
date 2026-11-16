@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use acp_bridge::{invalid, notify};
+use acp_bridge::{McpServer, invalid, notify};
 use agent_client_protocol::v2::schema::{self as acp, SessionUpdate};
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error};
@@ -25,6 +25,8 @@ struct Session {
     cwd: PathBuf,
     /// The client's system prompt, appended to Pi's.
     instructions: Option<String>,
+    /// The client's MCP servers, which every Pi of the session registers.
+    mcp_servers: Vec<McpServer>,
     /// The session has had a prompt, which titled it.
     titled: bool,
     /// The session's Pi, once started.
@@ -63,7 +65,8 @@ impl acp_bridge::Bridge for Bridge {
                     .prompt(
                         acp::PromptCapabilities::new().image(acp::PromptImageCapabilities::new()),
                     )
-                    .system_prompt(acp::SessionSystemPromptCapabilities::new()),
+                    .system_prompt(acp::SessionSystemPromptCapabilities::new())
+                    .mcp(acp::McpCapabilities::new().stdio(acp::McpStdioCapabilities::new())),
             ),
         )
     }
@@ -73,9 +76,8 @@ impl acp_bridge::Bridge for Bridge {
         request: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, Error> {
         let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
-        if !request.mcp_servers.is_empty() {
-            return Err(invalid("MCP servers are not supported"));
-        }
+        let mcp_servers = acp_bridge::parse_mcp(request.mcp_servers)?;
+        check_pi_names(&mcp_servers)?;
         let instructions = acp_bridge::system_prompt(request.system_prompt)?;
         let mut open = self.session.lock().unwrap();
         if open.is_some() {
@@ -86,6 +88,7 @@ impl acp_bridge::Bridge for Bridge {
             id: id.clone(),
             cwd,
             instructions,
+            mcp_servers,
             titled: false,
             pi: None,
         });
@@ -181,9 +184,8 @@ impl acp_bridge::Bridge for Bridge {
                 Some(_) => return Err(invalid("Unsupported replay cursor")),
             };
             let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
-            if !request.mcp_servers.is_empty() {
-                return Err(invalid("MCP servers are not supported"));
-            }
+            let mcp_servers = acp_bridge::parse_mcp(request.mcp_servers)?;
+            check_pi_names(&mcp_servers)?;
             let instructions = acp_bridge::system_prompt(request.system_prompt)?;
             let id = request.session_id.to_string();
             if Uuid::parse_str(&id).is_err() {
@@ -200,6 +202,7 @@ impl acp_bridge::Bridge for Bridge {
                     id: id.clone(),
                     cwd: cwd.clone(),
                     instructions,
+                    mcp_servers,
                     titled: true,
                     pi: None,
                 });
@@ -346,6 +349,7 @@ impl Bridge {
             &session.cwd,
             id,
             session.instructions.as_deref(),
+            &session.mcp_servers,
             Updates::new(connection.clone(), id),
         )
         .map_err(|error| Error::new(-32603, error))?;
@@ -362,6 +366,29 @@ impl Bridge {
             Err(acp::Error::session_not_found(id.to_owned()).into())
         }
     }
+}
+
+/// Refuses MCP server names Pi's `registerMcpServer` rejects: an empty name,
+/// one with a character other than letters, digits, `_` and `-`, and one
+/// matching an earlier name once `-` is read as `_`.
+fn check_pi_names(servers: &[McpServer]) -> Result<(), Error> {
+    let mut seen = Vec::new();
+    for server in servers {
+        let name = &server.name;
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(invalid(format!("invalid MCP server name: {name}")));
+        }
+        let key = name.replace('-', "_");
+        if seen.contains(&key) {
+            return Err(invalid(format!("duplicate MCP server name: {name}")));
+        }
+        seen.push(key);
+    }
+    Ok(())
 }
 
 /// The session `require` found open.

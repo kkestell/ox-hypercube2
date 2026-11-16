@@ -29,7 +29,7 @@ relays the update or acts on it as the protocol requires.
 | `providers/disable` (unstable) | ❌ | ❌ | ❌ | |
 | `session/new` | ✅ | ✅ | ✅ | Both bridges start their harness asynchronously; a successful response does not guarantee the harness has started. A bridge process serves one session and refuses a second `session/new` or `session/resume`. See `session.mcp.stdio` for MCP support. |
 | `session/list` | ❌ | ❌ | ❌ | |
-| `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. Pi rejects MCP servers. See [Resume and replay](#resume-and-replay). |
+| `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |
 | `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude waits to accept the next prompt; Pi queues it as a follow-up. |
 | `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Pi model choices carry a provider display label in `_meta["ox/provider"]`. Ox supports select and boolean options. |
@@ -148,7 +148,7 @@ completion. It does not display tool diffs, terminals, or other update types;
 | `session.prompt.image` | ✅ | ✅ | ✅ | |
 | `session.prompt.embeddedContext` | ✅ | ✅ | ❌ | |
 | `session.prompt.audio` | ✅ | ❌ | ❌ | |
-| `session.mcp.stdio` | ✅ | ✅ | ❌ | Ox supplies the [`ox` MCP server](architecture.md#ox-mcp) to Claude, which allows its tools without permission prompts, including the status update tool. Pi sessions have no MCP servers, so they post no status updates. |
+| `session.mcp.stdio` | ✅ | ✅ | ✅ | Ox supplies the [`ox` MCP server](architecture.md#ox-mcp) to both bridges. Claude allows its tools without permission prompts. `pi-acp` registers the servers through an extension it loads into Pi, with their tools declared to the model directly. |
 | `session.mcp.http` | ❌ | ❌ | ❌ | |
 | `session.mcp.acp` (unstable) | ❌ | ❌ | ❌ | |
 | `session.delete` | ❌ | ❌ | ❌ | |

@@ -6,6 +6,7 @@ pub mod pipes;
 pub mod testing;
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -16,6 +17,7 @@ use agent_client_protocol::v2::{self, ConnectionTo, Responder};
 use agent_client_protocol::{
     Agent, Client, Error, HandleDispatchFrom, JsonRpcResponse, Result, Stdio,
 };
+use serde_json::{Value, json};
 
 /// A bridge's handling of the ACP requests every bridge answers. A bridge
 /// process serves the one session it opens with `session/new` or
@@ -233,14 +235,48 @@ pub fn cwd(path: &Path) -> std::result::Result<PathBuf, String> {
     Ok(resolved)
 }
 
-/// An MCP server command is an absolute path, as ACP v2 types it.
-pub fn mcp_command(command: &Path) -> std::result::Result<(), String> {
-    if command.is_absolute() {
-        Ok(())
-    } else {
-        Err(format!(
-            "MCP server command must be an absolute path: {}",
-            command.display()
-        ))
+/// A stdio MCP server the client gives a session.
+#[derive(Clone, Debug)]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+impl McpServer {
+    /// The server's `mcpServers` entry, which Claude's `--mcp-config` and
+    /// Pi's `mcp.json` both take.
+    pub fn config(&self) -> Value {
+        json!({"command": self.command, "args": self.args, "env": self.env})
     }
+}
+
+/// The client's MCP servers. Bridges support stdio servers whose command is
+/// an absolute path, as ACP v2 types it.
+pub fn parse_mcp(servers: Vec<acp::McpServer>) -> std::result::Result<Vec<McpServer>, Error> {
+    servers
+        .into_iter()
+        .map(|server| {
+            let acp::McpServer::Stdio(server) = server else {
+                return Err(invalid("only stdio MCP servers are supported"));
+            };
+            if !server.command.0.is_absolute() {
+                return Err(invalid(format!(
+                    "MCP server command must be an absolute path: {}",
+                    server.command.0.display()
+                )));
+            }
+            Ok(McpServer {
+                name: server.name,
+                command: server.command.0.to_string_lossy().into_owned(),
+                args: server.args,
+                env: server
+                    .env
+                    .into_iter()
+                    .map(|var| (var.name, var.value))
+                    .collect(),
+            })
+        })
+        .collect()
 }
