@@ -209,12 +209,13 @@ the workflows below Session in Worktree and Session in Checkout. Choosing one as
 the run's input. Run, or Command-Return, starts the run and opens it.
 
 The run's row is titled with its input, or with the workflow's name when the
-input is blank, and sits in the workspace's Workflows group, below its
-sessions, newest first by creation time. Every step is listed beneath the
-run's row, titled with its name; an agent step's row is its child session once
-the step starts, and the other rows select the run. The chevron after the
-run's title, shown while the row is hovered, collapses and expands its steps,
-as does double-clicking the row. Each row's status is a blue breathing dot
+input is blank, and is listed among the workspace's sessions, newest first by
+creation time. The chevron after the run's title, shown while the row is
+hovered, expands and collapses its steps, as does double-clicking the row; a
+run starts collapsed. Each step is listed beneath the run's row, titled with
+its name; an agent step's row is its child session once the step starts, and
+the other rows select the run. The run's row shows its worktree's branch icon
+as a [Session in Worktree](worktrees.md#comparing-a-sessions-branch) row does. Each row's status is a blue breathing dot
 while it runs, an amber dot while a permission request or question awaits an
 answer, a green dot once it succeeded, a red dot once it failed, and a
 hollow dot while it is pending or once it was cancelled or interrupted. A

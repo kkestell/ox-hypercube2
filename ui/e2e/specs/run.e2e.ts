@@ -64,7 +64,10 @@ function requestPanel() {
   return $(".composer .request-panel");
 }
 
-/** Chooses workflow `name` from the New Session menu and runs it with `input`. */
+/**
+ * Chooses workflow `name` from the New Session menu and runs it with `input`,
+ * then expands its row to show its steps.
+ */
 async function startRun(cwd: string, name: string, input: string) {
   await (await openMenu(cwd)).$(`button=${name}`).click();
   const dialog = $("dialog[open]");
@@ -72,7 +75,11 @@ async function startRun(cwd: string, name: string, input: string) {
   await dialog.$("textarea").setValue(input);
   await dialog.$("button=Run").click();
   await expect(dialog).not.toBeExisting();
-  await expect(runRow(cwd).$("button.select")).toHaveAttribute("aria-current", "true");
+  const select = runRow(cwd).$("button.select");
+  await expect(select).toHaveAttribute("aria-current", "true");
+  await expect(select).toHaveAttribute("aria-expanded", "false");
+  await runRow(cwd).$(".disclosure").click();
+  await expect(select).toHaveAttribute("aria-expanded", "true");
 }
 
 async function viewRun(cwd: string) {
@@ -139,10 +146,7 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
         ),
       await workspaceGroup(cwd),
     );
-    expect(kinds).toEqual([
-      ["session", "session"],
-      ["run", "child", "child", "child"],
-    ]);
+    expect(kinds).toEqual([["session", "run", "child", "child", "child", "session"]]);
     await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
     await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
     await expect(runRow(cwd).$(".status")).toHaveAttribute("class", "status succeeded");

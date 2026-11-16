@@ -54,6 +54,9 @@ Submodule checkouts stay at their current commits when the branch moves.
 | Archive | Removed | Kept |
 | Unarchive | Added again, on the session's branch | — |
 
+The sidebar hides archived sessions until **Show Archived** is checked in the
+workspace name's context menu.
+
 Ox creates the branch for every worktree session. Delete removes the branch
 when no worktree has it checked out and every commit on it outside the
 ancestry of the session's starting commit is reachable from another branch, a

@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
 import { open } from "@tauri-apps/plugin-dialog";
-import { ChevronDown, ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
+import { ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
 import { type MouseEvent, memo, useCallback, useState } from "react";
 import { Dialog } from "../../components/Dialog";
 import { HarnessLogo } from "../../components/HarnessLogo";
@@ -94,7 +94,7 @@ export function runTitle(run: RunInfo) {
 /** Opens a native context menu of `items` at the pointer. */
 async function contextMenu(
   event: MouseEvent,
-  items: { text: string; enabled: boolean; action: () => void }[],
+  items: { text: string; enabled: boolean; checked?: boolean; action: () => void }[],
 ) {
   event.preventDefault();
   const menu = await Menu.new({ items });
@@ -152,10 +152,10 @@ export const SessionList = memo(function SessionList({
   // chosen one while it is installed, otherwise the first installed agent.
   const [chosen, setChosen] = useState<AgentId | null>(null);
   const agent = chosen !== null && agents.includes(chosen) ? chosen : agents[0];
-  // The workspaces whose Archived groups are open.
-  const [openArchives, setOpenArchives] = useState<ReadonlySet<string>>(new Set());
-  // The runs whose steps are collapsed.
-  const [collapsedRuns, setCollapsedRuns] = useState<ReadonlySet<string>>(new Set());
+  // The workspaces that list their archived sessions.
+  const [showArchived, setShowArchived] = useState<ReadonlySet<string>>(new Set());
+  // The runs whose steps show.
+  const [expandedRuns, setExpandedRuns] = useState<ReadonlySet<string>>(new Set());
   // The workspaces whose rows are collapsed.
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set());
   // The definitions the New Session menus list, read each time one opens.
@@ -214,11 +214,8 @@ export const SessionList = memo(function SessionList({
     [onSelect],
   );
 
-  const toggleArchive = (workspaceId: string) =>
-    setOpenArchives((open) => toggled(open, workspaceId));
-
   const toggleRun = useCallback(
-    (runId: string) => setCollapsedRuns((collapsed) => toggled(collapsed, runId)),
+    (runId: string) => setExpandedRuns((expanded) => toggled(expanded, runId)),
     [],
   );
 
@@ -255,11 +252,12 @@ export const SessionList = memo(function SessionList({
   const runRows = (run: RunInfo) => {
     const runChildren = children.get(run.id) ?? [];
     const status = runStatus(run, runChildren);
-    const expanded = !collapsedRuns.has(run.id);
+    const expanded = expandedRuns.has(run.id);
     const row = (
       <RunRow
         key={run.id}
         run={run}
+        worktree={worktrees.get(run.worktree_id)}
         status={status.className}
         label={status.label}
         selected={run.id === selected}
@@ -315,10 +313,16 @@ export const SessionList = memo(function SessionList({
           (session) => session.workspace_id === workspace.id,
         );
         const workspaceRuns = runs.filter((run) => run.workspace_id === workspace.id);
-        const topLevel = workspaceSessions.filter((session) => !parents.has(session.id));
-        const active = topLevel.filter((session) => !session.archived).sort(newestFirst);
-        const archived = topLevel.filter((session) => session.archived);
-        const archiveOpen = openArchives.has(workspace.id);
+        const archivedShown = showArchived.has(workspace.id);
+        const rows = [
+          ...workspaceSessions
+            .filter((session) => !parents.has(session.id) && (archivedShown || !session.archived))
+            .map((session) => ({
+              created_at: session.created_at,
+              rows: [sessionRow(session)],
+            })),
+          ...workspaceRuns.map((run) => ({ created_at: run.created_at, rows: runRows(run) })),
+        ].sort(newestFirst);
         const open = !collapsedWorkspaces.has(workspace.id);
         const menu = `new-session-${workspace.id}`;
         return (
@@ -333,6 +337,12 @@ export const SessionList = memo(function SessionList({
                 title={workspace.path}
                 onContextMenu={(event) =>
                   contextMenu(event, [
+                    {
+                      text: "Show Archived",
+                      enabled: true,
+                      checked: archivedShown,
+                      action: () => setShowArchived((shown) => toggled(shown, workspace.id)),
+                    },
                     {
                       text: "Remove Workspace",
                       enabled: workspaceSessions.length === 0 && workspaceRuns.length === 0,
@@ -432,33 +442,7 @@ export const SessionList = memo(function SessionList({
                 </div>
               )}
             </div>
-            {open && (
-              <ul>
-                {active.map((session) => sessionRow(session))}
-                {archived.length > 0 && (
-                  <li className="sidebar-row archived-toggle">
-                    <button
-                      type="button"
-                      className="select"
-                      aria-expanded={archiveOpen}
-                      onClick={() => toggleArchive(workspace.id)}
-                    >
-                      <span className="status">
-                        {archiveOpen ? <ChevronDown /> : <ChevronRight />}
-                      </span>
-                      <span className="title">Archived ({archived.length})</span>
-                    </button>
-                  </li>
-                )}
-                {archiveOpen && archived.map((session) => sessionRow(session))}
-              </ul>
-            )}
-            {open && workspaceRuns.length > 0 && (
-              <>
-                <h3 className="sidebar-group">Workflows</h3>
-                <ul>{[...workspaceRuns].sort(newestFirst).map(runRows)}</ul>
-              </>
-            )}
+            {open && <ul>{rows.flatMap((row) => row.rows)}</ul>}
           </section>
         );
       })}
@@ -541,6 +525,7 @@ function StartRunDialog({
 /** A run's row, which renders again only when its props change. */
 const RunRow = memo(function RunRow({
   run,
+  worktree,
   status,
   label,
   selected,
@@ -552,6 +537,7 @@ const RunRow = memo(function RunRow({
   deleteRun,
 }: {
   run: RunInfo;
+  worktree: WorktreeInfo | undefined;
   /** The status class and its label, from `runStatus`. */
   status: string;
   label: string;
@@ -564,6 +550,10 @@ const RunRow = memo(function RunRow({
   onToggle: (runId: string) => void;
 } & Pick<SessionActions, "cancelRun" | "deleteRun">) {
   const running = run.state === "running";
+  const branch =
+    worktree?.compare != null && worktree.comparison != null
+      ? branchStatus(worktree.compare, worktree.comparison)
+      : null;
   return (
     <li
       className="sidebar-row run"
@@ -600,6 +590,7 @@ const RunRow = memo(function RunRow({
             <ChevronRight />
           </span>
         </span>
+        {branch && <BranchIcon status={branch} />}
       </button>
     </li>
   );
@@ -668,7 +659,8 @@ const SessionRow = memo(function SessionRow({
   const status = step
     ? childStatus(step, session)
     : { className: session.state, label: stateLabels[session.state] };
-  const merge = localMerge(session, worktree);
+  // A run's children share its worktree, whose branch the run's row shows.
+  const merge = child ? null : localMerge(session, worktree);
   const branch = merge && branchStatus(merge.compare, merge.comparison);
   const classes = [
     "sidebar-row",
@@ -710,17 +702,22 @@ const SessionRow = memo(function SessionRow({
         )}
         <StatusIcon status={status} />
         <span className="title">{step?.name ?? session.title ?? "New session"}</span>
-        {branch && (
-          <span
-            className={`status branch-status${branch.attention ? " attention" : ""}`}
-            role="img"
-            aria-label={branch.tooltip}
-            title={branch.tooltip}
-          >
-            <GitBranch />
-          </span>
-        )}
+        {branch && <BranchIcon status={branch} />}
       </button>
     </li>
   );
 });
+
+/** A row's branch status icon, from `branchStatus`. */
+function BranchIcon({ status }: { status: { attention: boolean; tooltip: string } }) {
+  return (
+    <span
+      className={`status branch-status${status.attention ? " attention" : ""}`}
+      role="img"
+      aria-label={status.tooltip}
+      title={status.tooltip}
+    >
+      <GitBranch />
+    </span>
+  );
+}

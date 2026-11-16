@@ -57,8 +57,11 @@ class Listing {
     return session;
   }
 
-  /** An idle session in a new worktree, compared with `main` as `comparison` says. */
-  worktreeSession(title: string, comparison: Comparison) {
+  /**
+   * An idle session in a new worktree, compared with `main` as `comparison`
+   * says, or not yet compared when it is null.
+   */
+  worktreeSession(title: string, comparison: Comparison | null) {
     const id = `worktree-${this.worktrees.length}`;
     this.worktrees.push({
       id,
@@ -72,8 +75,16 @@ class Listing {
     return this.session(title, "idle", id);
   }
 
-  /** A run whose steps each have a session, in `sessionState`, unless pending. */
-  run(input: string, state: RunState, steps: [string, StepState, SessionState?][]) {
+  /**
+   * A run whose steps each have a session, in `sessionState`, unless pending,
+   * and whose worktree compares with `main` as `comparison` says.
+   */
+  run(
+    input: string,
+    state: RunState,
+    steps: [string, StepState, SessionState?][],
+    comparison: Comparison | null = null,
+  ) {
     const id = `run-${this.runs.length}`;
     const worktree: WorktreeInfo = {
       id: `worktree-${id}`,
@@ -82,7 +93,7 @@ class Listing {
       base: "main",
       created_branch: true,
       compare: "main",
-      comparison: null,
+      comparison,
     };
     this.worktrees.push(worktree);
     const created_at = this.tick();
@@ -145,6 +156,9 @@ function sidebar(): Scenario {
     ["Implement", "running", "running"],
     ["Review", "pending"],
   ]);
+  for (const title of ["Try a flat sidebar", "Profile replay", "Draft the README"]) {
+    listing.session(title, "exited").archived = true;
+  }
   listing.session("Old exploration", "exited");
   listing.session("Explain the event store", "idle");
   listing.session("Which bugs next?", "awaiting_input");
@@ -203,16 +217,14 @@ function runStatus(): Scenario {
   };
 }
 
+/** A branch `ahead` and `behind` its comparison ref. */
+function compared(ahead: number, behind: number): Comparison {
+  return { type: "compared", tip: "b".repeat(40), compare_tip: "a".repeat(40), ahead, behind };
+}
+
 /** Sessions whose Merge button is enabled, and blocked for each reason. */
 function merge(): Scenario {
   const listing = new Listing();
-  const compared = (ahead: number, behind: number): Comparison => ({
-    type: "compared",
-    tip: "b".repeat(40),
-    compare_tip: "a".repeat(40),
-    ahead,
-    behind,
-  });
   listing.worktreeSession("Failed comparison", {
     type: "failed",
     error: "fatal: bad revision 'main'",
@@ -224,9 +236,63 @@ function merge(): Scenario {
   return { changes: listing.changes() };
 }
 
+/**
+ * A session in the workspace's checkout, and worktree sessions and runs in
+ * each comparison state.
+ */
+function checkouts(): Scenario {
+  const listing = new Listing();
+  const done: [string, StepState, SessionState?][] = [
+    ["Plan", "succeeded", "exited"],
+    ["Implement", "succeeded", "exited"],
+  ];
+  listing.run("Run: comparison failed", "succeeded", done, {
+    type: "failed",
+    error: "fatal: bad revision 'main'",
+  });
+  listing.run("Run: 1 ahead, 2 behind (rebase)", "succeeded", done, compared(1, 2));
+  listing.run("Run: 3 ahead (squash)", "succeeded", done, compared(3, 0));
+  listing.run("Run: 1 ahead (mergeable)", "succeeded", done, compared(1, 0));
+  listing.run(
+    "Run: no commits",
+    "failed",
+    [
+      ["Plan", "succeeded", "exited"],
+      ["Implement", "failed", "exited"],
+    ],
+    compared(0, 0),
+  );
+  listing.run(
+    "Run: working, no commits yet",
+    "running",
+    [
+      ["Plan", "succeeded", "exited"],
+      ["Implement", "running", "running"],
+    ],
+    compared(0, 0),
+  );
+  listing.run("Run: just started, not compared yet", "running", [
+    ["Plan", "running", "running"],
+    ["Implement", "pending"],
+  ]);
+  listing.worktreeSession("Worktree: comparison failed", {
+    type: "failed",
+    error: "fatal: bad revision 'main'",
+  });
+  listing.worktreeSession("Worktree: 1 ahead, 2 behind (rebase)", compared(1, 2));
+  listing.worktreeSession("Worktree: 3 ahead (squash)", compared(3, 0));
+  listing.worktreeSession("Worktree: 1 ahead (mergeable)", compared(1, 0));
+  listing.worktreeSession("Worktree: no commits, 2 behind", compared(0, 2));
+  listing.worktreeSession("Worktree: no commits", compared(0, 0));
+  listing.worktreeSession("Worktree: not compared yet", null);
+  listing.session("Checkout", "idle");
+  return { changes: listing.changes() };
+}
+
 export const scenarios: Record<string, Scenario> = {
   sidebar: sidebar(),
   "run-status": runStatus(),
   merge: merge(),
+  checkouts: checkouts(),
   empty: { changes: [] },
 };

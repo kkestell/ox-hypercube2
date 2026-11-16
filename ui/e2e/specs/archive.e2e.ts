@@ -26,17 +26,9 @@ function entry(cwd: string) {
   return workspaceGroup(cwd).$('./ul/li[contains(@class, "session")]');
 }
 
-/** The Archived group's toggle in the workspace in `cwd`. */
-function archivedToggle(cwd: string) {
-  return workspaceGroup(cwd).$("li.archived-toggle button.select");
-}
-
-/** Opens the Archived group in the workspace in `cwd`. */
-async function openArchived(cwd: string) {
-  const toggle = archivedToggle(cwd);
-  await expect(toggle).toBeDisplayed();
-  await toggle.click();
-  await expect(toggle).toHaveAttribute("aria-expanded", "true");
+/** Toggles Show Archived in the workspace's context menu. */
+async function toggleArchived(cwd: string) {
+  await rowAction(workspaceGroup(cwd).$("h2"), "Show Archived");
 }
 
 /** A worktree session that has answered a prompt, selected. */
@@ -77,18 +69,16 @@ describe("A session stuck starting", () => {
 });
 
 describe("Archiving a worktree session", () => {
-  it("moves a clean session into the collapsed Archived group and keeps its branch", async () => {
+  it("hides a clean session and keeps its branch", async () => {
     const { cwd, workspace } = await gitWorkspace();
     await startWorktreeSession(workspace);
     await expect(entry(cwd)).toBeExisting();
-    await expect(archivedToggle(cwd)).not.toBeExisting();
     const path = (await entry(cwd).$("button.select").getAttribute("title"))!.replace(/\/$/, "");
     const branch = (await git(path, "branch", "--show-current")).trim();
 
     await expect(entry(cwd).$(".row-actions")).not.toBeExisting();
     await rowAction(entry(cwd), "Archive Session");
     await expect(entry(cwd)).not.toBeExisting();
-    await expect(archivedToggle(cwd)).toHaveAttribute("aria-expanded", "false");
     expect(await exists(path)).toBe(false);
     expect((await git(cwd, "branch", "--list", branch)).trim()).toBe(branch);
   });
@@ -97,7 +87,7 @@ describe("Archiving a worktree session", () => {
     const { cwd, workspace } = await gitWorkspace();
     await conversedWorktree(cwd, workspace);
     await archiveDiscarding(cwd);
-    await openArchived(cwd);
+    await toggleArchived(cwd);
     await expect(entry(cwd)).toBeExisting();
     await entry(cwd).$("button.select").click();
     await expect(agentText()[0]).toHaveText("chunk-1chunk-2");
@@ -122,13 +112,12 @@ describe("Archiving a worktree session", () => {
     dialog = $("dialog[open]");
     await dialog.$("button=Discard and Archive").click();
     await expect(entry(cwd)).not.toBeExisting();
-    await expect(archivedToggle(cwd)).toBeDisplayed();
     expect(await exists(path)).toBe(false);
   });
 });
 
 describe("An archived session", () => {
-  it("returns to the active list on unarchive, and loads when opened", async () => {
+  it("shows with archived sessions hidden once unarchived, and loads when opened", async () => {
     const { cwd, workspace } = await gitWorkspace();
     const path = await conversedWorktree(cwd, workspace);
     const branch = (await git(path, "branch", "--show-current")).trim();
@@ -136,10 +125,11 @@ describe("An archived session", () => {
     // lets the unarchived worktree restore the session.
     await commit(path);
     await rowAction(entry(cwd), "Archive Session");
-    await openArchived(cwd);
+    await expect(entry(cwd)).not.toBeExisting();
+    await toggleArchived(cwd);
 
     await rowAction(entry(cwd), "Unarchive Session");
-    await expect(archivedToggle(cwd)).not.toBeExisting();
+    await toggleArchived(cwd);
     await expect(entry(cwd)).toBeExisting();
     expect((await git(path, "branch", "--show-current")).trim()).toBe(branch);
     await expect(entry(cwd).$('[aria-label="Exited"]')).toBeExisting();
@@ -156,11 +146,10 @@ describe("An archived session", () => {
     await startWorktreeSession(workspace);
     await expect(entry(cwd)).toBeExisting();
     await rowAction(entry(cwd), "Archive Session");
-    await openArchived(cwd);
+    await toggleArchived(cwd);
 
     await expect(entry(cwd)).toBeExisting();
     await deleteSessions(cwd);
     await expect(entry(cwd)).not.toBeExisting();
-    await expect(archivedToggle(cwd)).not.toBeExisting();
   });
 });

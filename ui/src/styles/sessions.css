@@ -20,6 +20,16 @@
   color: var(--muted-foreground);
 }
 
+/* The New Session button shows while its header is hovered or has keyboard focus, or
+   its menu is open. */
+.workspace-header > .icon-button {
+  visibility: hidden;
+}
+
+.workspace-header:is(:hover, :has(:focus-visible, :popover-open)) > .icon-button {
+  visibility: visible;
+}
+
 /* The workspace's name, followed by its chevron; clicking it collapses or
    expands the workspace's rows. */
 .workspace-toggle {
@@ -49,24 +59,8 @@
   opacity: var(--dimmed-opacity);
 }
 
-.archived-toggle .select {
-  color: var(--muted-foreground);
-}
-
 /* A pending step is as dark as in the run view. */
 .sidebar-row.pending .select {
-  color: var(--muted-foreground);
-}
-
-/* A group of a workspace's rows, such as its workflow runs. */
-.sidebar-group {
-  display: flex;
-  align-items: center;
-  height: var(--sidebar-row-height);
-  margin: calc(var(--spacing) * 2) 0 0;
-  padding: 0 var(--sidebar-row-padding);
-  font-size: var(--text-xs);
-  font-weight: 500;
   color: var(--muted-foreground);
 }
 
