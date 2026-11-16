@@ -1252,3 +1252,34 @@ async fn skill_commands_reach_pi_with_their_native_name() {
     assert_eq!(sent["message"], "/skill:review src/main.rs");
     child.kill().await.unwrap();
 }
+
+/// A client's system prompt is appended to Pi's.
+#[tokio::test]
+async fn appends_the_client_system_prompt_to_pi() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi(&bin, "printf '%s\\n' \"$@\" > args.txt");
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader, json!({})).await;
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
+            "cwd":project,"mcpServers":[],
+            "systemPrompt":{"mode":"append","content":[{"type":"text","text":"Be brief."}]}
+        }}),
+    )
+    .await;
+    let (new, _) = response(&mut reader, 2).await;
+    assert!(new["result"]["sessionId"].is_string(), "{new}");
+    let snapshot = receive(&mut reader).await;
+    assert!(is_state(&snapshot, "idle"), "{snapshot}");
+    startup_catalog(&mut reader).await;
+    child.kill().await.unwrap();
+    let args = fs::read_to_string(project.join("args.txt")).unwrap();
+    let args: Vec<&str> = args.lines().collect();
+    let appended = args
+        .iter()
+        .position(|arg| *arg == "--append-system-prompt")
+        .expect("--append-system-prompt");
+    assert_eq!(args[appended + 1], "Be brief.");
+}

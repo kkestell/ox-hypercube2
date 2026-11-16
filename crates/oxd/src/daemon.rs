@@ -12,6 +12,7 @@ use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::branches;
 use crate::directories::Directories;
+use crate::instructions::StepRole;
 use crate::mcp::OxServer;
 use crate::run::Run;
 use crate::session::Session;
@@ -713,7 +714,7 @@ impl Daemon {
                         env,
                     ));
                 }
-                _ => session.start(env),
+                _ => session.start(env, None),
             }
             Ok(session.info())
         })
@@ -792,7 +793,7 @@ impl Daemon {
         env: BTreeMap<String, String>,
     ) {
         let Err(mut message) = worktree::add(&git, &plan).await else {
-            session.start(env);
+            session.start(env, None);
             return;
         };
         if let Err(error) = self.store.remove_worktree(&live_worktree.id) {
@@ -876,12 +877,14 @@ impl Daemon {
     }
 
     /// Saves, registers and starts the child session of step `position` of
-    /// `run`: the bridge of `harness` beside the daemon's executable, in
-    /// `cwd` in the run's worktree, with `env` over the daemon's environment.
+    /// `run`, which runs `role`: the bridge of `harness` beside the daemon's
+    /// executable, in `cwd` in the run's worktree, with `env` over the
+    /// daemon's environment.
     pub fn add_step_session(
         self: &Arc<Self>,
         run: &Run,
         position: usize,
+        role: StepRole,
         harness: Harness,
         cwd: &Path,
         env: BTreeMap<String, String>,
@@ -904,7 +907,7 @@ impl Daemon {
                 SessionWorktree::Run(&run.worktree.id),
                 || Some(run.worktree.clone()),
             )?;
-            session.start(env);
+            session.start(env, Some(role));
             run.set_step_session(position, &session.id);
             Ok(session)
         })

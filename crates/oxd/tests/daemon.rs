@@ -2012,6 +2012,29 @@ async fn agent_sets_title_through_ox_mcp_server() {
     );
 }
 
+/// An agent gets Ox's instructions in its system prompt when it takes one,
+/// and otherwise before its first prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_gets_ox_instructions() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    for args in [&[][..], &["--no-system-prompt"]] {
+        let (session, started) = daemon.new_session_with(&client, args).await;
+        let mut events = client.subscribe(&session.id, started).await.unwrap();
+        client
+            .prompt(&session.id, text("instructions"))
+            .await
+            .unwrap();
+        let turn = until(&mut events, turn_ended).await;
+        let instructions = chunks(&turn).concat();
+        assert!(
+            instructions.starts_with("You are running in Ox")
+                && instructions.contains("`set_title`"),
+            "{args:?}: {instructions}"
+        );
+    }
+}
+
 /// After a watch's `unsubscribe` is answered, the connection receives no more
 /// listings.
 #[tokio::test(flavor = "multi_thread")]

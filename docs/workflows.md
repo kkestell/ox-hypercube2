@@ -61,9 +61,8 @@ for Pi. The step's session is set to each value it gives before the prompt is
 sent. A value the harness has no option for, or refuses, fails the run at
 that step with the reason.
 
-A Claude step's agent can post status updates through the `ox` tool
-`post_status_update`: a sentence or two on what it is doing and what it will
-do next, shown under its step in the run view.
+A Claude step's agent can post [status updates](dev/glossary.md) through the
+`ox` tool `post_status_update`.
 
 ## Shell steps
 
@@ -210,13 +209,15 @@ the workflows below New Task and Session in Checkout. Choosing one asks for
 the run's input. Run, or Command-Return, starts the run and opens it.
 
 The run's row is titled with its input, or with the workflow's name when the
-input is blank, and sits among the workspace's sessions, newest first by
-creation time. Every step is listed beneath the run's row, titled with its
-name; an agent step's row is its child session once the step starts, and
-the other rows select the run. Each status dot is amber while a permission
-request or question awaits an answer, green and breathing while it runs,
-green once it succeeded, red once it failed, and grey while it is pending
-or once it was cancelled or interrupted.
+input is blank, and sits in the workspace's Workflows group, below its
+sessions, newest first by creation time. Every step is listed beneath the
+run's row, titled with its name; an agent step's row is its child session once
+the step starts, and the other rows select the run. The chevron after the
+run's title, shown while the row is hovered, collapses and expands its steps,
+as does double-clicking the row. Each row's status is a blue breathing dot
+while it runs, an amber dot while a permission request or question awaits an
+answer, a green dot once it succeeded, a red dot once it failed, and a
+hollow dot while it is pending or once it was cancelled or interrupted.
 
 Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
@@ -233,9 +234,8 @@ child's text entry and attachments are disabled, and Stop cancels the run.
 Once the run has ended, the child takes prompts like any other session.
 
 `oxctl run start --workspace <workspace id> <workflow> <input>` starts a run
-and prints its ID. The run's worktree is on a new branch
-`ox/<first 8 digits of the worktree's ID>` that starts at the workspace
-checkout's `HEAD`, as for [New Task](worktrees.md#choosing-a-checkout).
+and prints its ID. The run's worktree and branch are created as for
+[New Task](worktrees.md#choosing-a-checkout).
 `oxctl run wait <run id>` prints the run as JSON once it ends, and unless
 the run succeeded fails with its state and error, such as
 `the run failed: a postcondition exited with status 1 after the repair turn`.

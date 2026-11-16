@@ -10,16 +10,36 @@
 }
 
 .workspace-header h2 {
+  display: flex;
   flex: 1;
   min-width: 0;
   margin: 0 calc(var(--spacing) * 2) 0 0;
-  overflow: hidden;
   font-size: var(--text-xs);
   font-weight: normal;
-  text-overflow: ellipsis;
   text-transform: uppercase;
-  white-space: nowrap;
   color: var(--muted-foreground);
+}
+
+/* The workspace's name, followed by its chevron; clicking it collapses or
+   expands the workspace's rows. */
+.workspace-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing);
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+}
+
+.workspace-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* An exited session dims its contents but not its tree line. */
@@ -29,4 +49,64 @@
 
 .archived-toggle .select {
   color: var(--muted-foreground);
+}
+
+/* A group of a workspace's rows, such as its workflow runs. */
+.sidebar-group {
+  display: flex;
+  align-items: center;
+  height: var(--sidebar-row-height);
+  margin: calc(var(--spacing) * 2) 0 0;
+  padding: 0 var(--sidebar-row-padding);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  color: var(--muted-foreground);
+}
+
+/* A run's title, followed by its chevron, which takes the row's end once the
+   title is too long. */
+.title-group {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: var(--spacing);
+  min-width: 0;
+}
+
+.title-group .title {
+  flex: 0 1 auto;
+}
+
+/* The chevron shows while its row or header is hovered or focused, and points
+   down while what it collapses shows. Hidden, it leaves the title the row's width. */
+.disclosure {
+  display: none;
+  flex: none;
+  color: var(--muted-foreground);
+}
+
+.disclosure svg {
+  width: var(--icon-size);
+  height: var(--icon-size);
+  transition: transform var(--disclosure-duration);
+}
+
+.disclosure.open svg {
+  transform: rotate(90deg);
+}
+
+:is(
+    .sidebar-row:hover,
+    .sidebar-row .select:focus-visible,
+    .workspace-header:hover,
+    .workspace-toggle:focus-visible
+  )
+  .disclosure {
+  display: flex;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .disclosure svg {
+    transition: none;
+  }
 }

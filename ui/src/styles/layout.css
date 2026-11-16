@@ -34,6 +34,11 @@
   border-bottom: var(--border-width) solid var(--border);
 }
 
+/* A leading icon button's icon, not its box, starts at the content's edge. */
+.content-header > .icon-button:first-child {
+  margin-inline-start: calc(-1 * var(--icon-button-inset));
+}
+
 .content-body {
   display: flex;
   flex: 1;

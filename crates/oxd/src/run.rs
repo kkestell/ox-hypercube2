@@ -19,6 +19,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::daemon::{Daemon, now};
+use crate::instructions::StepRole;
 use crate::session::Session;
 use crate::shell::{self, Finished, Inputs};
 use crate::store::{SavedRun, Store};
@@ -410,7 +411,7 @@ impl StepContext<'_> {
                 Ok(finished.stdout)
             }
             Action::Agent { agent, prompt } => {
-                let session = self.start_agent(agent, cancel).await?;
+                let session = self.start_agent(&step.name, agent, cancel).await?;
                 let mut blocks = vec![ContentBlock::Text(TextContent::new(prompt.clone()))];
                 if !input.is_empty() {
                     blocks.push(ContentBlock::Text(TextContent::new(input)));
@@ -517,18 +518,24 @@ impl StepContext<'_> {
         }
     }
 
-    /// Starts the step's session, waits for its agent, and sets its config
-    /// options.
+    /// Starts the session of the step named `name`, waits for its agent, and
+    /// sets its config options.
     async fn start_agent(
         &self,
+        name: &str,
         agent: &AgentStep,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<Arc<Session>, Ended> {
+        let role = StepRole {
+            workflow: self.run.name.clone(),
+            step: name.to_owned(),
+        };
         let session = self
             .daemon
             .add_step_session(
                 self.run,
                 self.position,
+                role,
                 agent.harness,
                 self.cwd,
                 self.env.clone(),

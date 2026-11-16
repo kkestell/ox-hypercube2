@@ -6,10 +6,10 @@ replies or thousands.
 
 ## Daemon
 
-A `watch` sends every workspace and session once, then only those added,
-changed or removed. Each session counts the changes to its `SessionInfo`;
-the watch remembers the count it last sent for each session and reads the
-info only of sessions whose count moved. Workspaces are listed again, with
+A `watch` sends every workspace, worktree, session and run once, then only
+those added, changed or removed. Each worktree, session and run counts its
+changes; the watch remembers the count it last sent for each and reads the
+info only of those whose count moved. Workspaces are listed again, with
 their `git_working_tree` worked out from the filesystem, when a workspace or
 session is added or removed or a client connects or disconnects.
 
@@ -39,10 +39,3 @@ messages, and a message's streamed text chunks arrive joined.
 - A chosen model or effort level shows in the same render as the choice. It
   stays shown until the agent reports it, and goes back if the agent refuses
   it.
-
-## Verification
-
-The stress spec, `ui/e2e/specs/stress.e2e.ts`, holds the app to time budgets
-with hundreds of sessions and a transcript of thousands of long Markdown
-replies. [Testing](testing.md#ox-tests-and-fixtures) describes how it
-measures.

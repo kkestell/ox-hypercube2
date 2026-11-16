@@ -82,10 +82,20 @@ pub struct Pi {
 
 impl Pi {
     /// Starts Pi in `cwd` on the Pi session `pi_session_id`, which Pi opens,
-    /// or creates when it does not exist.
-    pub fn start(cwd: &Path, pi_session_id: &str, updates: Updates) -> Result<Self, String> {
-        let mut child = Command::new("pi")
-            .args(["--mode", "rpc", "--approve", "--session-id", pi_session_id])
+    /// or creates when it does not exist, with `instructions` appended to
+    /// Pi's system prompt.
+    pub fn start(
+        cwd: &Path,
+        pi_session_id: &str,
+        instructions: Option<&str>,
+        updates: Updates,
+    ) -> Result<Self, String> {
+        let mut command = Command::new("pi");
+        command.args(["--mode", "rpc", "--approve", "--session-id", pi_session_id]);
+        if let Some(instructions) = instructions {
+            command.arg("--append-system-prompt").arg(instructions);
+        }
+        let mut child = command
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -10,7 +10,6 @@ v2 and what Ox supports of it. It is built from `agent-client-protocol-schema`
 The columns are the feature, `oxd` as the client, `claude-code-acp` and
 `pi-acp` as agents, and caveats. Each cell is ✅ supported, ⚠️ partial, or ❌ unsupported;
 a partial cell says in the caveats what works and what does not.
-`oxd-fake-agent` is a test fixture and has no column.
 
 `oxd` records and relays live session updates unchanged and in order. During
 resume it keeps the existing conversation when it has one and discards the
@@ -154,7 +153,7 @@ completion. It does not display tool diffs, terminals, or other update types;
 | `session.mcp.acp` (unstable) | ❌ | ❌ | ❌ | |
 | `session.delete` | ❌ | ❌ | ❌ | |
 | `session.additionalDirectories` | ❌ | ❌ | ❌ | |
-| `session.systemPrompt` | ❌ | ❌ | ❌ | |
+| `session.systemPrompt` | ✅ | ✅ | ✅ | `oxd` sends [Ox's instructions](architecture.md#instructions) in `append` mode. Both bridges accept `append` mode with text blocks and pass the text to their harness with `--append-system-prompt`. |
 | `session.fork` (unstable) | ❌ | ❌ | ❌ | |
 | `session.archive` (unstable) | ❌ | ❌ | ❌ | |
 | `session.status` (unstable) | ❌ | ❌ | ❌ | |

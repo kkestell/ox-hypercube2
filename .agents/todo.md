@@ -8,33 +8,12 @@
 
 ## Workflow run and session UI
 
-- [ ] Align the icons in the run view. The checkbox and hourglass icons sit at
-  different x-positions, so the icon column and the text start differ between
-  rows.
 - [ ] Stop collapsing completed steps on the run dashboard. While the run is
   active, scroll to the active step's most recent status update.
-- [ ] Use different colors for "working" and "success" in the sidebar. Both
-  are green now.
 - [ ] Show the status of the local checkout in the UI: current branch, staged
   and unstaged changes, and whether the session is in a worktree. Regular
   sessions show none of this. The run dashboard shows some of it for the run's
   worktree only. Nothing shows the base checkout's status.
-
-## Agent instructions
-
-- [ ] Agents post status updates too seldom. Make them post more reliably, by
-  forcing it or by instructing more strongly. The tool description in
-  [ox-mcp](../crates/ox-mcp/src/main.rs) is the only instruction today.
-- [ ] Inject Ox-specific instructions into agent sessions, such as when to use
-  the status update tool. ACP has no supported system prompt field
-  (`session.systemPrompt` is unsupported in
-  [ACP v2 support](../docs/dev/acp-v2.md)). Options:
-  - Claude's `--append-system-prompt` in the
-    [bridge runner](../crates/claude-code-acp/src/runner.rs).
-  - The MCP server `instructions` field in `ox-mcp`.
-  - Text prepended to each workflow step's prompt, which also works for Pi.
-  - Pi has no MCP servers, so it needs the prompt option or a flag in its
-    bridge.
 
 ## Persistence and recovery
 

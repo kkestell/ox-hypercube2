@@ -270,8 +270,13 @@ textarea.text-field {
 }
 
 .status.running {
-  color: var(--success);
+  color: var(--working);
   animation: breathe var(--busy-dot-duration) ease-in-out infinite alternate;
+}
+
+/* A running dot glows while it is at full colour. */
+.status.running::before {
+  animation: glow var(--busy-dot-duration) ease-in-out infinite alternate;
 }
 
 .status.awaiting_permission,
@@ -288,8 +293,12 @@ textarea.text-field {
   color: var(--destructive);
 }
 
-/* An exited session shows a hollow dot. */
-.status.exited::before {
+/* An exited session, and a pending, cancelled or interrupted step or run,
+   shows a hollow dot. */
+.status.exited::before,
+.status.pending::before,
+.status.cancelled::before,
+.status.interrupted::before {
   background: transparent;
 }
 
@@ -299,10 +308,23 @@ textarea.text-field {
   }
 }
 
+@keyframes glow {
+  from {
+    box-shadow: 0 0 var(--busy-dot-glow) color-mix(in oklab, currentColor 60%, transparent);
+  }
+  to {
+    box-shadow: 0 0 0 transparent;
+  }
+}
+
 /* Without motion, a running dot stays faded, unlike a succeeded one. */
 @media (prefers-reduced-motion: reduce) {
-  .status.running {
+  .status.running,
+  .status.running::before {
     animation: none;
+  }
+
+  .status.running {
     opacity: var(--busy-dot-opacity);
   }
 }

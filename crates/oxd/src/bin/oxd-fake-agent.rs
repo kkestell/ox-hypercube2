@@ -69,9 +69,13 @@
 //! - `next <JSON string>`: run the decoded text as the script of the
 //!   session's next prompt, in place of that prompt's text. The prompt is
 //!   still echoed as a `user_message`
+//! - `instructions`: one chunk with the session's instructions, or `none`
 //!
 //! The agent advertises `session.mcp.stdio` and keeps the MCP servers of
-//! `session/new` and `session/resume`. It accepts image and embedded
+//! `session/new` and `session/resume`. It advertises `session.systemPrompt`
+//! and takes a session's system prompt as its instructions; with
+//! `--no-system-prompt` it advertises no system prompt support and takes
+//! the first text block of the session's first prompt as its instructions. It accepts image and embedded
 //! resource prompts, and has three
 //! select config options: `mode`, in the `mode` category, with values `ask`
 //! and `code`; `model`, in
@@ -186,9 +190,23 @@ struct State {
     /// The script of each session's next prompt, set by `next`, by session
     /// ID.
     next: Mutex<HashMap<String, String>>,
+    /// Each session's instructions, by session ID.
+    instructions: Mutex<HashMap<String, String>>,
 }
 
 impl State {
+    /// Keeps the text of session `id`'s system prompt, if it has one, as
+    /// its instructions.
+    fn take_system_prompt(&self, id: &acp::SessionId, prompt: Option<acp::SystemPrompt>) {
+        let Some(prompt) = prompt else {
+            return;
+        };
+        self.instructions
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), script(&prompt.content));
+    }
+
     fn open_log(&self, session_id: &acp::SessionId, cwd: &Path) -> PathBuf {
         let path = cwd.join(format!("fake-agent-{session_id}.jsonl"));
         self.logs
@@ -399,6 +417,7 @@ async fn main() -> agent_client_protocol::Result<()> {
         form_elicitation: AtomicBool::new(false),
         mcp_servers: Mutex::default(),
         next: Mutex::default(),
+        instructions: Mutex::default(),
     });
     agent_client_protocol::Agent
         .v2()
@@ -429,6 +448,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                         let mut session = acp::SessionCapabilities::new().mcp(
                             acp::McpCapabilities::new().stdio(acp::McpStdioCapabilities::new()),
                         );
+                        if !flag("--no-system-prompt") {
+                            session =
+                                session.system_prompt(acp::SessionSystemPromptCapabilities::new());
+                        }
                         if !flag("--text-only") {
                             session =
                                 session.prompt(
@@ -457,6 +480,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             connection: ConnectionTo<Client>| {
                     let id = acp::SessionId::new(format!("fake-{}", uuid::Uuid::new_v4()));
                     state.open_log(&id, &request.cwd.0);
+                    state.take_system_prompt(&id, request.system_prompt);
                     state
                         .mcp_servers
                         .lock()
@@ -524,6 +548,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         .lock()
                         .unwrap()
                         .insert(request.session_id.to_string(), request.mcp_servers);
+                    state.take_system_prompt(&request.session_id, request.system_prompt);
                     let session_id = request.session_id;
                     for line in log.lines().filter(|_| replay) {
                         let entry: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -629,9 +654,19 @@ async fn main() -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let state = state.clone();
-                async move |request: acp::PromptRequest,
+                async move |mut request: acp::PromptRequest,
                             responder: Responder<acp::PromptResponse>,
                             connection: ConnectionTo<Client>| {
+                    if flag("--no-system-prompt") {
+                        let mut instructions = state.instructions.lock().unwrap();
+                        let id = request.session_id.to_string();
+                        if !instructions.contains_key(&id)
+                            && let Some(acp::ContentBlock::Text(first)) = request.prompt.first()
+                        {
+                            instructions.insert(id, first.text.clone());
+                            request.prompt.remove(0);
+                        }
+                    }
                     // A prompt the agent cannot run is answered with an
                     // error: it was not inserted.
                     let text = script(&request.prompt);
@@ -725,6 +760,7 @@ enum Directive {
     },
     Shell(String),
     Next(String),
+    Instructions,
     BackgroundStart(String),
     BackgroundEnd(String),
     Exit(i32),
@@ -780,6 +816,7 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["title-null"] => Directive::TitleNull,
             ["touch"] => Directive::Touch,
             ["tool", ..] => Directive::Tool(rest("tool")),
+            ["instructions"] => Directive::Instructions,
             ["mcp-title", ..] => Directive::McpTool {
                 name: "set_title",
                 arguments: serde_json::json!({"title": rest("mcp-title")}),
@@ -948,6 +985,15 @@ async fn run(
             }
             Directive::LatePermission | Directive::OwnTurn => {}
             Directive::Describe => say(description.clone())?,
+            Directive::Instructions => {
+                let instructions = state
+                    .instructions
+                    .lock()
+                    .unwrap()
+                    .get(&*session_id.0)
+                    .cloned();
+                say(instructions.unwrap_or_else(|| "none".into()))?;
+            }
             Directive::Echo(text) => say(text)?,
             Directive::Commands(commands) => {
                 state.commands.lock().unwrap().clone_from(&commands);

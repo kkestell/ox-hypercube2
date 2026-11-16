@@ -53,8 +53,9 @@ Submodule checkouts stay at their current commits when the branch moves.
 | Unarchive | Added again, on the session's branch | — |
 
 Ox creates the branch for every worktree session. Delete removes the branch
-when no worktree has it checked out and every commit on it outside the ancestry of the session's
-starting commit is reachable from another branch, a remote branch, or a tag.
+when no worktree has it checked out and every commit on it outside the
+ancestry of the session's starting commit is reachable from another branch, a
+remote branch, or a tag.
 If those conditions fail or the repository is missing, Ox keeps the branch
 and reports its name.
 
@@ -63,6 +64,5 @@ uncommitted changes, commits on no branch, remote branch or tag, or submodule
 commits on no remote branch. Ox asks whether to discard the unsaved work
 before removing the worktree.
 
-A [workflow run](workflows.md) owns its worktree. Removing the run removes
-the worktree and its branch under the same rules as Delete. Deleting or
-archiving one of the run's child sessions leaves the run's worktree.
+A [workflow run](workflows.md#cancelling-removing-and-restarting) owns its
+worktree.

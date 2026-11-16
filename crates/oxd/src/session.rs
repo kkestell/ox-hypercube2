@@ -11,7 +11,7 @@ use agent_client_protocol::v2::schema::{
     ElicitationCapabilities, ElicitationFormCapabilities, Implementation, InitializeRequest,
     NewSessionRequest, PromptRequest, ReplayFrom, ReplayFromStart, RequestPermissionRequest,
     RequestPermissionResponse, ResumeSessionRequest, SessionConfigOption, SessionConfigOptionValue,
-    SetSessionConfigOptionRequest, UpdateSessionNotification,
+    SetSessionConfigOptionRequest, SystemPrompt, TextContent, UpdateSessionNotification,
 };
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
@@ -20,12 +20,20 @@ use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::daemon::now;
+use crate::instructions::{self, StepRole};
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, Store};
 use crate::worktree::Worktree;
 
 type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
+
+/// How an agent task opens its ACP session: a new one, for the workflow
+/// step a run's child session runs, or a resumed one.
+enum Launch {
+    New(Option<StepRole>),
+    Resume(Resume),
+}
 
 enum Command {
     /// A prompt, with the seq of the `PromptStarted` event that records it.
@@ -174,16 +182,16 @@ impl Session {
         }
     }
 
-    /// Launches the agent of a session that is still `starting`. The session
-    /// records `AgentStarted` once the ACP session is open, or `AgentExited`
-    /// if it cannot be opened. A session closed before it started stays
-    /// closed.
-    pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>) {
+    /// Launches the agent of a session that is still `starting`, running the
+    /// workflow step `step` when it is a run's child. The session records
+    /// `AgentStarted` once the ACP session is open, or `AgentExited` if it
+    /// cannot be opened. A session closed before it started stays closed.
+    pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>, step: Option<StepRole>) {
         // Holding the task slot keeps a concurrent `close` from missing the
         // agent's task.
         let mut task = self.task.lock().unwrap();
         if self.state() == SessionState::Starting {
-            self.launch(&mut task, env, None);
+            self.launch(&mut task, env, Launch::New(step));
         }
     }
 
@@ -201,11 +209,11 @@ impl Session {
         self: &Arc<Self>,
         task: &mut Option<JoinHandle<()>>,
         env: BTreeMap<String, String>,
-        resume: Option<Resume>,
+        launch: Launch,
     ) {
         let (commands, commands_rx) = mpsc::unbounded_channel();
         *self.commands.lock().unwrap() = commands;
-        *task = Some(tokio::spawn(self.clone().run(commands_rx, env, resume)));
+        *task = Some(tokio::spawn(self.clone().run(commands_rx, env, launch)));
     }
 
     /// Starts a new agent on an exited session that has an agent session ID,
@@ -231,7 +239,7 @@ impl Session {
         // new task.
         let mut task = self.task.lock().unwrap();
         let resume = self.update(State::load)?;
-        self.launch(&mut task, env, Some(resume));
+        self.launch(&mut task, env, Launch::Resume(resume));
         Ok(())
     }
 
@@ -588,7 +596,7 @@ impl Session {
         self: Arc<Self>,
         mut commands: mpsc::UnboundedReceiver<Command>,
         env: BTreeMap<String, String>,
-        resume: Option<Resume>,
+        launch: Launch,
     ) {
         let config = AcpAgentConfig::new(&self.command[0])
             .args(self.command[1..].iter().cloned())
@@ -701,6 +709,26 @@ impl Session {
                     } else {
                         Vec::new()
                     };
+                    // An agent that takes a system prompt gets Ox's
+                    // instructions in it; another gets them before a new
+                    // session's first prompt.
+                    // TODO: A new session whose agent exits before its first
+                    // prompt is resumed without them.
+                    let step = match &launch {
+                        Launch::New(step) => step.as_ref(),
+                        Launch::Resume(_) => None,
+                    };
+                    let instructions = instructions::text(step, !mcp_servers.is_empty());
+                    let takes_system_prompt = capabilities.system_prompt.is_some();
+                    let system_prompt =
+                        instructions
+                            .clone()
+                            .filter(|_| takes_system_prompt)
+                            .map(|text| {
+                                SystemPrompt::new(vec![ContentBlock::Text(TextContent::new(text))])
+                            });
+                    let mut preamble = instructions
+                        .filter(|_| !takes_system_prompt && matches!(launch, Launch::New(_)));
                     let (opened, open) = oneshot::channel();
                     let start = {
                         let session = session.clone();
@@ -714,8 +742,8 @@ impl Session {
                         }
                     };
                     let mut saved_options = Vec::new();
-                    match resume {
-                        Some(Resume {
+                    match launch {
+                        Launch::Resume(Resume {
                             session_id,
                             replay,
                             options,
@@ -730,7 +758,8 @@ impl Session {
                                     .replay_from(
                                         replay.then(|| ReplayFrom::Start(ReplayFromStart::new())),
                                     )
-                                    .mcp_servers(mcp_servers),
+                                    .mcp_servers(mcp_servers)
+                                    .system_prompt(system_prompt),
                                 )
                                 .on_receiving_result(async move |result| {
                                     start(result.map(|resumed| state::Agent {
@@ -742,10 +771,11 @@ impl Session {
                                     Ok(())
                                 })?;
                         }
-                        None => connection
+                        Launch::New(_) => connection
                             .prepare_request(
                                 NewSessionRequest::new(session.cwd.clone())
-                                    .mcp_servers(mcp_servers),
+                                    .mcp_servers(mcp_servers)
+                                    .system_prompt(system_prompt),
                             )
                             .on_receiving_result(async move |result| {
                                 start(result.map(|created| state::Agent {
@@ -798,6 +828,14 @@ impl Session {
                         match command {
                             None => break,
                             Some(Command::Prompt { prompt, seq }) => {
+                                let prompt = match preamble.take() {
+                                    Some(text) => {
+                                        std::iter::once(ContentBlock::Text(TextContent::new(text)))
+                                            .chain(prompt)
+                                            .collect()
+                                    }
+                                    None => prompt,
+                                };
                                 let session = session.clone();
                                 connection
                                     .prepare_request(PromptRequest::new(

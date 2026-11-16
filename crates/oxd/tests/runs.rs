@@ -575,6 +575,36 @@ steps:
     );
 }
 
+/// A step's agent is told which step of which workflow it runs, that its
+/// final reply is the next step's input, and to post status updates.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_s_agent_is_told_its_step() {
+    let repo = repo();
+    let daemon = start_daemon().await;
+    daemon.define(
+        "reports",
+        "name: Reports
+steps:
+  - name: Read
+    agent: {harness: claude}
+    prompt: instructions
+",
+    );
+    let client = daemon.client().await;
+    let workspace = add_workspace(&client, repo.path()).await;
+    let run = start(&client, &workspace, "reports", "").await;
+    let run = until_ended(&client, &run.id).await;
+    assert_eq!(run.state, RunState::Succeeded, "{run:?}");
+    let instructions = run.steps[0].output.as_deref().unwrap_or_default();
+    for expected in [
+        "the step \"Read\" of the workflow \"Reports\"",
+        "Your final reply is handed to the next step as its input.",
+        "`post_status_update`",
+    ] {
+        assert!(instructions.contains(expected), "{instructions}");
+    }
+}
+
 /// A fake agent directive with a JSON string argument.
 fn directive(name: &str, text: &str) -> String {
     format!("{name} {}", yaml_string(text))

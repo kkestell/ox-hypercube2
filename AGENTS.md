@@ -9,6 +9,7 @@ workflow.
 | Document | Owns |
 | --- | --- |
 | [Code style](docs/dev/code-style.md) | Implementation, architecture, scope, and edge-case decisions |
+| [Development](docs/dev/development.md) | Development tools and how to use them |
 | [Testing](docs/dev/testing.md) | Test design, verification procedures, and evidence of completion |
 | [Documentation](docs/dev/documentation.md) | Document ownership, maintenance, writing, and naming rules |
 | [Glossary](docs/dev/glossary.md) | Project vocabulary and distinctions between terms |
@@ -17,7 +18,7 @@ workflow.
 
 | Document | Owns |
 | --- | --- |
-| [README](README.md) | Project overview and development setup |
+| [README](README.md) | What Ox is, its features, and installation |
 | [Architecture](docs/dev/architecture.md) | Process ownership, boundaries, persistence, and session lifecycle |
 | [ACP v2 support](docs/dev/acp-v2.md) | Protocol support and integration caveats |
 | [Where sessions run](docs/worktrees.md) | Checkout selection, branches, comparisons, and worktree cleanup |
@@ -32,8 +33,7 @@ workflow.
   work.
 - Resolve ordinary implementation decisions yourself. Ask when a missing
   decision materially changes the requested outcome or scope.
-- Use a plan when the work needs design decisions or sequencing. Routine work
-  does not require a plan, report, or prescribed sequence of agent sessions.
+- Use a plan when the work needs design decisions or sequencing.
 - Preserve unrelated working-tree changes. Commit or publish only when the user
   requests it.
 - Complete verification according to [Testing](docs/dev/testing.md#running-checks) and
@@ -45,7 +45,7 @@ workflow.
 - Lead with the substantive result. Use plain language and concrete names.
 - Share findings, material uncertainty, blockers, and decisions that need the
   user. Skip opening acknowledgements and routine progress narration.
-- Distinguish observations, conclusions, and assumptions. Do not claim an action
-  succeeded until its result confirms it.
+- Distinguish observations, conclusions, and assumptions. Claim an action
+  succeeded once its result confirms it.
 - When corrected, revisit the underlying judgment and apply the correction to
   the work, rather than patching only the example the user identified.

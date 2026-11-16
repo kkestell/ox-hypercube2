@@ -179,6 +179,32 @@ pub fn invalid(message: impl Into<String>) -> Error {
     Error::new(-32602, message)
 }
 
+/// The text a session's `systemPrompt` appends to its harness's
+/// instructions, its text blocks joined by blank lines. Bridges support the
+/// `append` mode and text blocks.
+pub fn system_prompt(
+    prompt: Option<acp::SystemPrompt>,
+) -> std::result::Result<Option<String>, Error> {
+    let Some(prompt) = prompt else {
+        return Ok(None);
+    };
+    if prompt.mode != acp::SystemPromptMode::Append {
+        return Err(invalid("Unsupported system prompt mode"));
+    }
+    if prompt.content.is_empty() {
+        return Err(invalid("The system prompt is empty"));
+    }
+    let texts = prompt
+        .content
+        .into_iter()
+        .map(|block| match block {
+            acp::ContentBlock::Text(text) => Ok(text.text),
+            _ => Err(invalid("A system prompt holds text blocks only")),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(Some(texts.join("\n\n")))
+}
+
 /// The error of a `session/new` or `session/resume` on a connection that
 /// already has its session.
 pub fn already_open() -> Error {

@@ -84,6 +84,8 @@ pub struct StartRequest<'a> {
     pub effort: &'a str,
     pub mode: &'a str,
     pub mcp_servers: &'a [McpServer],
+    /// The client's system prompt, appended to Claude's.
+    pub instructions: Option<&'a str>,
     /// The resumed conversation's transcript entries, from which the bridge
     /// finds the scheduled prompts Claude restores.
     pub transcript: &'a [Value],
@@ -174,6 +176,9 @@ impl Claude {
             "--permission-prompt-tool",
             "stdio",
         ]);
+        if let Some(instructions) = request.instructions {
+            command.arg("--append-system-prompt").arg(instructions);
+        }
         if request.resume {
             command.arg("--resume").arg(request.session_id);
         } else {

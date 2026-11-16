@@ -29,9 +29,14 @@ flowchart TB
 ```
 
 Solid arrows show process ownership. Dotted arrows show connections to the
-daemon over a Unix socket. Clients start the daemon detached when needed;
-startup and instance locks keep one daemon per socket. The daemon accepts
-connections only from its own user.
+daemon over a Unix socket. Clients start the `oxd` beside their own executable,
+detached, when no daemon answers; startup and instance locks keep one daemon
+per socket. The daemon accepts connections only from its own user.
+
+The socket is `$OX_SOCKET` when set. Otherwise it is `oxd.sock` in
+`$XDG_DATA_HOME/ox` when `XDG_DATA_HOME` is an absolute path, or in
+`~/.local/share/ox`. The database is `<socket>.db`, and the daemon appends its
+stderr to `oxd.log` beside the socket.
 
 ### Desktop and command-line clients
 
@@ -77,6 +82,16 @@ records a timestamped status update in the session's history.
 
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
+
+### Instructions
+
+`oxd` gives each agent instructions about Ox when any apply. An agent with
+the `ox` tools is told to title its session with `set_title`. A run's child
+session is told which step of which workflow it runs and that its final
+reply is the next step's input, and, with the `ox` tools, to post status
+updates. An agent that advertises `session.systemPrompt` gets the
+instructions in its system prompt when its session is opened or resumed.
+Another gets them as a text block before a new session's first prompt.
 
 ## Ownership boundaries
 
@@ -159,15 +174,15 @@ the Ox session ID and subscriptions. Missing history can be recovered through
 the agent's replay support.
 
 An idle session with no subscribers, pending requests, or reported background
-work can have its agent parked. Parking preserves the session's conversation
+work can have its agent parked after an idle delay, 15 minutes unless
+`oxd --park-after-ms` sets it. Parking preserves the session's conversation
 and checkout; loading the session starts its agent again. Agents that do not
 report background-work state are never parked.
 
-Archiving stops the agent and removes its worktree while retaining the
-conversation and branch. An archived session cannot load until unarchived.
-Deleting a session stops the agent and removes its saved history, with
-repository cleanup governed by the
-[worktree deletion and archiving rules](../worktrees.md#deleting-and-archiving).
+Archiving and deleting stop the agent. An archived session loads once it is
+unarchived; deleting a session removes its saved history.
+[Where sessions run](../worktrees.md#deleting-and-archiving) owns what each
+does to the worktree and branch.
 
 Startup, load, parking, and deletion coordinate through a per-session
 lifecycle lock. Shutdown stops agents but preserves saved sessions. The
@@ -190,10 +205,10 @@ daemon stops, it aborts the runners, which kills their running commands'
 process groups.
 
 Child sessions are ordinary sessions that refer to the run's worktree: a
-session is a child of the run that owns its worktree. Deleting or archiving one leaves the worktree; removing the run stops the
-child sessions' agents, removes the worktree, and deletes the child sessions.
-A running run keeps the daemon alive. A restart marks the runs, steps and
-commands that were running `interrupted`, where they stay.
+session is a child of the run that owns its worktree. A running run keeps the
+daemon alive. [Workflows](../workflows.md#cancelling-removing-and-restarting)
+owns what removing a run or a child session does and what a restart does to a
+running run.
 
 ## Repository ownership
 
@@ -224,5 +239,5 @@ checkout, and applies the branch cleanup rule separately.
 Branch moves use Git ref transactions to check the commits the client
 expected, including a source branch when supplied. If updating a checked-out
 branch's files fails, the daemon attempts to restore its previous tip and
-reports the failure. The user guide documents the
-[checks and limitations](../worktrees.md#moving-a-branch).
+reports the failure. [Where sessions run](../worktrees.md#moving-a-branch)
+owns the checks and limitations.

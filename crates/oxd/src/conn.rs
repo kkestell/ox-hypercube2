@@ -244,8 +244,8 @@ async fn forward(
     }
 }
 
-/// Sends watch `subscription` every workspace and session, then the
-/// workspaces and sessions that are added, change, or are removed.
+/// Sends watch `subscription` every workspace, worktree, session and run,
+/// then those that are added, change, or are removed.
 async fn watch(daemon: Arc<Daemon>, subscription: u64, outgoing: mpsc::Sender<ServerMessage>) {
     let mut signal = daemon.changed();
     let mut sent = Sent::default();

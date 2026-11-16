@@ -37,18 +37,30 @@ function awaiting(session: SessionInfo) {
   return session.state === "awaiting_permission" || session.state === "awaiting_input";
 }
 
-/** A run's or a step's dot class and its label. */
+/** A session's, a run's or a step's status class and its label. */
 interface Status {
   className: string;
   label: string;
 }
 
+/** A status's dot. */
+function StatusIcon({ status }: { status: Status }) {
+  return (
+    <span
+      className={`status ${status.className}`}
+      role="img"
+      aria-label={status.label}
+      title={status.label}
+    />
+  );
+}
+
 const settled: Record<Exclude<StepState, "running">, Status> = {
-  pending: { className: "", label: "Pending" },
+  pending: { className: "pending", label: "Pending" },
   succeeded: { className: "succeeded", label: "Succeeded" },
   failed: { className: "failed", label: "Failed" },
-  cancelled: { className: "", label: "Cancelled" },
-  interrupted: { className: "", label: "Interrupted" },
+  cancelled: { className: "cancelled", label: "Cancelled" },
+  interrupted: { className: "interrupted", label: "Interrupted" },
 };
 
 /** A run's status, from its state and its child sessions'. */
@@ -101,8 +113,17 @@ async function run(action: () => Promise<unknown>) {
   }
 }
 
-/** A workspace's run or top-level session, newest first by creation time. */
-type Entry = { run: RunInfo; session?: undefined } | { run?: undefined; session: SessionInfo };
+/** `set` with `id` added, or removed when it holds it. */
+function toggled(set: ReadonlySet<string>, id: string): ReadonlySet<string> {
+  const next = new Set(set);
+  if (!next.delete(id)) next.add(id);
+  return next;
+}
+
+/** Newest first by creation time. */
+function newestFirst(a: { created_at: number }, b: { created_at: number }) {
+  return b.created_at - a.created_at;
+}
 
 export const SessionList = memo(function SessionList({
   workspaces,
@@ -132,6 +153,10 @@ export const SessionList = memo(function SessionList({
   const agent = chosen !== null && agents.includes(chosen) ? chosen : agents[0];
   // The workspaces whose Archived groups are open.
   const [openArchives, setOpenArchives] = useState<ReadonlySet<string>>(new Set());
+  // The runs whose steps are collapsed.
+  const [collapsedRuns, setCollapsedRuns] = useState<ReadonlySet<string>>(new Set());
+  // The workspaces whose rows are collapsed.
+  const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set());
   // The definitions the New Task menus list, read each time one opens.
   const [workflows, setWorkflows] = useState<WorkflowInfo[]>([]);
   // The workflow whose input the Start Run dialog asks for.
@@ -189,11 +214,12 @@ export const SessionList = memo(function SessionList({
   );
 
   const toggleArchive = (workspaceId: string) =>
-    setOpenArchives((open) => {
-      const next = new Set(open);
-      if (!next.delete(workspaceId)) next.add(workspaceId);
-      return next;
-    });
+    setOpenArchives((open) => toggled(open, workspaceId));
+
+  const toggleRun = useCallback(
+    (runId: string) => setCollapsedRuns((collapsed) => toggled(collapsed, runId)),
+    [],
+  );
 
   const children = new Map<string, SessionInfo[]>();
   for (const session of sessions) {
@@ -228,7 +254,8 @@ export const SessionList = memo(function SessionList({
   const runRows = (run: RunInfo) => {
     const runChildren = children.get(run.id) ?? [];
     const status = runStatus(run, runChildren);
-    return [
+    const expanded = !collapsedRuns.has(run.id);
+    const row = (
       <RunRow
         key={run.id}
         run={run}
@@ -236,10 +263,16 @@ export const SessionList = memo(function SessionList({
         label={status.label}
         selected={run.id === selected}
         busy={busy.has(run.id)}
+        expanded={expanded}
         onSelect={onSelect}
+        onToggle={toggleRun}
         cancelRun={cancelRun}
         deleteRun={deleteRun}
-      />,
+      />
+    );
+    if (!expanded) return [row];
+    return [
+      row,
       ...run.steps.map((step, index) => {
         const child = {
           step,
@@ -282,13 +315,10 @@ export const SessionList = memo(function SessionList({
         );
         const workspaceRuns = runs.filter((run) => run.workspace_id === workspace.id);
         const topLevel = workspaceSessions.filter((session) => !parents.has(session.id));
-        const entries: Entry[] = [
-          ...workspaceRuns.map((run) => ({ run })),
-          ...topLevel.filter((session) => !session.archived).map((session) => ({ session })),
-        ];
-        entries.sort((a, b) => (b.run ?? b.session).created_at - (a.run ?? a.session).created_at);
+        const active = topLevel.filter((session) => !session.archived).sort(newestFirst);
         const archived = topLevel.filter((session) => session.archived);
         const archiveOpen = openArchives.has(workspace.id);
+        const open = !collapsedWorkspaces.has(workspace.id);
         const menu = `new-session-${workspace.id}`;
         return (
           <section
@@ -310,7 +340,19 @@ export const SessionList = memo(function SessionList({
                   ])
                 }
               >
-                {directoryName(workspace.path)}
+                <button
+                  type="button"
+                  className="workspace-toggle"
+                  aria-expanded={open}
+                  onClick={() =>
+                    setCollapsedWorkspaces((collapsed) => toggled(collapsed, workspace.id))
+                  }
+                >
+                  <span className="workspace-name">{directoryName(workspace.path)}</span>
+                  <span className={`disclosure${open ? " open" : ""}`} aria-hidden="true">
+                    <ChevronRight />
+                  </span>
+                </button>
               </h2>
               <button
                 type="button"
@@ -388,25 +430,33 @@ export const SessionList = memo(function SessionList({
                 </div>
               )}
             </div>
-            <ul>
-              {entries.map((entry) => (entry.run ? runRows(entry.run) : sessionRow(entry.session)))}
-              {archived.length > 0 && (
-                <li className="sidebar-row archived-toggle">
-                  <button
-                    type="button"
-                    className="select"
-                    aria-expanded={archiveOpen}
-                    onClick={() => toggleArchive(workspace.id)}
-                  >
-                    <span className="status">
-                      {archiveOpen ? <ChevronDown /> : <ChevronRight />}
-                    </span>
-                    <span className="title">Archived ({archived.length})</span>
-                  </button>
-                </li>
-              )}
-              {archiveOpen && archived.map((session) => sessionRow(session))}
-            </ul>
+            {open && (
+              <ul>
+                {active.map((session) => sessionRow(session))}
+                {archived.length > 0 && (
+                  <li className="sidebar-row archived-toggle">
+                    <button
+                      type="button"
+                      className="select"
+                      aria-expanded={archiveOpen}
+                      onClick={() => toggleArchive(workspace.id)}
+                    >
+                      <span className="status">
+                        {archiveOpen ? <ChevronDown /> : <ChevronRight />}
+                      </span>
+                      <span className="title">Archived ({archived.length})</span>
+                    </button>
+                  </li>
+                )}
+                {archiveOpen && archived.map((session) => sessionRow(session))}
+              </ul>
+            )}
+            {open && workspaceRuns.length > 0 && (
+              <>
+                <h3 className="sidebar-group">Workflows</h3>
+                <ul>{[...workspaceRuns].sort(newestFirst).map(runRows)}</ul>
+              </>
+            )}
           </section>
         );
       })}
@@ -493,18 +543,23 @@ const RunRow = memo(function RunRow({
   label,
   selected,
   busy,
+  expanded,
   onSelect,
+  onToggle,
   cancelRun,
   deleteRun,
 }: {
   run: RunInfo;
-  /** The dot's class and its label, from `runStatus`. */
+  /** The status class and its label, from `runStatus`. */
   status: string;
   label: string;
   selected: boolean;
   /** Whether an action on the run is in flight. */
   busy: boolean;
+  /** Whether the run's steps show. */
+  expanded: boolean;
   onSelect: (runId: string) => void;
+  onToggle: (runId: string) => void;
 } & Pick<SessionActions, "cancelRun" | "deleteRun">) {
   const running = run.state === "running";
   return (
@@ -525,10 +580,24 @@ const RunRow = memo(function RunRow({
         type="button"
         className="select"
         aria-current={selected}
+        aria-expanded={expanded}
         onClick={() => onSelect(run.id)}
+        onDoubleClick={() => onToggle(run.id)}
       >
-        <span className={`status ${status}`} role="img" aria-label={label} title={label} />
-        <span className="title">{runTitle(run)}</span>
+        <StatusIcon status={{ className: status, label }} />
+        <span className="title-group">
+          <span className="title">{runTitle(run)}</span>
+          <span
+            className={`disclosure${expanded ? " open" : ""}`}
+            aria-hidden="true"
+            onClick={(event) => {
+              event.stopPropagation();
+              onToggle(run.id);
+            }}
+          >
+            <ChevronRight />
+          </span>
+        </span>
       </button>
     </li>
   );
@@ -557,12 +626,7 @@ function StepRow({
           className={["tree-branch", first && "first", last && "last"].filter(Boolean).join(" ")}
           aria-hidden="true"
         />
-        <span
-          className={`status ${status.className}`}
-          role="img"
-          aria-label={status.label}
-          title={status.label}
-        />
+        <StatusIcon status={status} />
         <span className="title">{step.name}</span>
       </button>
     </li>
@@ -642,12 +706,7 @@ const SessionRow = memo(function SessionRow({
             aria-hidden="true"
           />
         )}
-        <span
-          className={`status ${status.className}`}
-          role="img"
-          aria-label={status.label}
-          title={status.label}
-        />
+        <StatusIcon status={status} />
         <span className="title">{step?.name ?? session.title ?? "New session"}</span>
         {branch && (
           <span

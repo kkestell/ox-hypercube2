@@ -1050,6 +1050,60 @@ next_message
     assert_eq!(claude_args[allowed + 2], "--permission-mode");
 }
 
+/// A client's system prompt in `append` mode is appended to Claude's; one
+/// in another mode is refused.
+#[tokio::test]
+async fn appends_the_client_system_prompt_to_claude() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_claude(
+        &bin,
+        &format!(
+            r#"
+printf '%s\n' "$@" > args.txt
+next_prompt
+printf '%s\n' '{{"type":"result","session_id":"{HISTORY_ID}"}}'
+next_message
+"#
+        ),
+    );
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    let system_prompt =
+        |mode: &str| json!({"mode":mode,"content":[{"type":"text","text":"Be brief."}]});
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{
+            "cwd":project,"mcpServers":[],"systemPrompt":system_prompt("override")
+        }}),
+    )
+    .await;
+    let (refused, _) = response(&mut reader, 2).await;
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{
+            "cwd":project,"mcpServers":[],"systemPrompt":system_prompt("append")
+        }}),
+    )
+    .await;
+    let (new, _) = response(&mut reader, 3).await;
+    let id = new["result"]["sessionId"]
+        .as_str()
+        .expect("a session ID")
+        .to_owned();
+    let (idle, _) = prompt(&mut child, &mut reader, 4, &json!(id)).await;
+    child.kill().await.unwrap();
+    assert_eq!(idle["stopReason"], "end_turn");
+    let claude_args = fs::read_to_string(project.join("args.txt")).unwrap();
+    let claude_args: Vec<&str> = claude_args.lines().collect();
+    let appended = claude_args
+        .iter()
+        .position(|arg| *arg == "--append-system-prompt")
+        .expect("--append-system-prompt");
+    assert_eq!(claude_args[appended + 1], "Be brief.");
+}
+
 #[tokio::test]
 async fn new_sessions_are_fresh_and_resume_is_explicit() {
     let temp = tempfile::tempdir().unwrap();

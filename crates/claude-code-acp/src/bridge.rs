@@ -38,12 +38,14 @@ struct ConfigChange {
 
 /// The session a bridge process serves. Its ID is also its Claude session
 /// ID, and Claude keeps its transcript. The client sends its working
-/// directory and MCP servers whenever it opens the session, and sets its
-/// options after.
+/// directory, MCP servers and system prompt whenever it opens the session,
+/// and sets its options after.
 struct Session {
     id: String,
     cwd: PathBuf,
     mcp_servers: Vec<McpServer>,
+    /// The client's system prompt, appended to Claude's.
+    instructions: Option<String>,
     mode: String,
     model: String,
     effort: String,
@@ -53,11 +55,18 @@ struct Session {
 }
 
 impl Session {
-    fn new(id: String, cwd: PathBuf, mcp_servers: Vec<McpServer>, titled: bool) -> Self {
+    fn new(
+        id: String,
+        cwd: PathBuf,
+        mcp_servers: Vec<McpServer>,
+        instructions: Option<String>,
+        titled: bool,
+    ) -> Self {
         Self {
             id,
             cwd,
             mcp_servers,
+            instructions,
             mode: "manual".into(),
             model: "claude-opus-5-5".into(),
             effort: "high".into(),
@@ -100,7 +109,8 @@ impl acp_bridge::Bridge for Bridge {
                             .image(acp::PromptImageCapabilities::new())
                             .embedded_context(acp::PromptEmbeddedContextCapabilities::new()),
                     )
-                    .mcp(acp::McpCapabilities::new().stdio(acp::McpStdioCapabilities::new())),
+                    .mcp(acp::McpCapabilities::new().stdio(acp::McpStdioCapabilities::new()))
+                    .system_prompt(acp::SessionSystemPromptCapabilities::new()),
             ),
         )
     }
@@ -114,11 +124,18 @@ impl acp_bridge::Bridge for Bridge {
     ) -> std::result::Result<acp::NewSessionResponse, Error> {
         let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
         let servers = parse_mcp(request.mcp_servers)?;
+        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
         let mut open = self.session.lock().unwrap();
         if open.is_some() {
             return Err(acp_bridge::already_open());
         }
-        let session = Session::new(Uuid::new_v4().to_string(), cwd, servers, false);
+        let session = Session::new(
+            Uuid::new_v4().to_string(),
+            cwd,
+            servers,
+            instructions,
+            false,
+        );
         let response =
             acp::NewSessionResponse::new(session.id.clone()).config_options(session.options());
         *open = Some(session);
@@ -159,6 +176,7 @@ impl acp_bridge::Bridge for Bridge {
             let id = request.session_id.to_string();
             let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
             let servers = parse_mcp(request.mcp_servers)?;
+            let instructions = acp_bridge::system_prompt(request.system_prompt)?;
             if Uuid::parse_str(&id).is_err() {
                 return Err(acp::Error::session_not_found(id).into());
             }
@@ -167,7 +185,13 @@ impl acp_bridge::Bridge for Bridge {
                 return Err(acp_bridge::already_open());
             }
             let titled = self.history.find(&id, &cwd);
-            let session = open.insert(Session::new(id.clone(), cwd.clone(), servers, titled));
+            let session = open.insert(Session::new(
+                id.clone(),
+                cwd.clone(),
+                servers,
+                instructions,
+                titled,
+            ));
             self.start_claude(session, connection)?;
             Ok((id, cwd, replay))
         })();
@@ -372,6 +396,7 @@ impl Bridge {
                 effort: &session.effort,
                 mode: &session.mode,
                 mcp_servers: &session.mcp_servers,
+                instructions: session.instructions.as_deref(),
                 transcript: &transcript,
             },
             Updates::new(connection.clone(), &session.id),

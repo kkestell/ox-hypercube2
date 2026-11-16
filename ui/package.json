@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "mock": "vite --port 1430 --open /mock/",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "check": "biome check --error-on-warnings . && tsc && tsc -p e2e",

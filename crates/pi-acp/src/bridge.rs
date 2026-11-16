@@ -23,6 +23,8 @@ use crate::{
 struct Session {
     id: String,
     cwd: PathBuf,
+    /// The client's system prompt, appended to Pi's.
+    instructions: Option<String>,
     /// The session has had a prompt, which titled it.
     titled: bool,
     /// The session's Pi, once started.
@@ -57,9 +59,11 @@ impl acp_bridge::Bridge for Bridge {
         )
         .capabilities(
             acp::AgentCapabilities::new().session(
-                acp::SessionCapabilities::new().prompt(
-                    acp::PromptCapabilities::new().image(acp::PromptImageCapabilities::new()),
-                ),
+                acp::SessionCapabilities::new()
+                    .prompt(
+                        acp::PromptCapabilities::new().image(acp::PromptImageCapabilities::new()),
+                    )
+                    .system_prompt(acp::SessionSystemPromptCapabilities::new()),
             ),
         )
     }
@@ -72,6 +76,7 @@ impl acp_bridge::Bridge for Bridge {
         if !request.mcp_servers.is_empty() {
             return Err(invalid("MCP servers are not supported"));
         }
+        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
         let mut open = self.session.lock().unwrap();
         if open.is_some() {
             return Err(acp_bridge::already_open());
@@ -80,6 +85,7 @@ impl acp_bridge::Bridge for Bridge {
         *open = Some(Session {
             id: id.clone(),
             cwd,
+            instructions,
             titled: false,
             pi: None,
         });
@@ -178,6 +184,7 @@ impl acp_bridge::Bridge for Bridge {
             if !request.mcp_servers.is_empty() {
                 return Err(invalid("MCP servers are not supported"));
             }
+            let instructions = acp_bridge::system_prompt(request.system_prompt)?;
             let id = request.session_id.to_string();
             if Uuid::parse_str(&id).is_err() {
                 return Err(acp::Error::session_not_found(id).into());
@@ -192,6 +199,7 @@ impl acp_bridge::Bridge for Bridge {
                 *open = Some(Session {
                     id: id.clone(),
                     cwd: cwd.clone(),
+                    instructions,
                     titled: true,
                     pi: None,
                 });
@@ -334,8 +342,13 @@ impl Bridge {
         if session.pi.as_ref().is_some_and(|pi| !pi.has_exited()) {
             return Ok(false);
         }
-        let pi = Pi::start(&session.cwd, id, Updates::new(connection.clone(), id))
-            .map_err(|error| Error::new(-32603, error))?;
+        let pi = Pi::start(
+            &session.cwd,
+            id,
+            session.instructions.as_deref(),
+            Updates::new(connection.clone(), id),
+        )
+        .map_err(|error| Error::new(-32603, error))?;
         session.pi = Some(pi);
         Ok(true)
     }

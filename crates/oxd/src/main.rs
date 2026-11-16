@@ -14,6 +14,7 @@ mod conn;
 mod daemon;
 mod directories;
 mod files;
+mod instructions;
 mod mcp;
 mod run;
 mod session;
