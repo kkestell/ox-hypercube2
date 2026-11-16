@@ -18,6 +18,19 @@
   padding-inline: calc(var(--sidebar-padding) + var(--row-action-inset));
 }
 
+.panel-tabs {
+  display: flex;
+  gap: var(--spacing);
+}
+
+.panel-tabs [role="tab"][aria-selected="false"] {
+  color: var(--muted-foreground);
+}
+
+.panel-tabs [role="tab"][aria-selected="true"] {
+  background: var(--selected);
+}
+
 .sidebar-body ul {
   display: flex;
   flex-direction: column;

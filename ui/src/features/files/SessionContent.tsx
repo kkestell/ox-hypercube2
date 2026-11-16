@@ -1,14 +1,22 @@
 import { type ReactNode, useCallback, useRef, useSyncExternalStore } from "react";
+import { ContentHeader } from "../../components/Workbench";
 import { FileViewer } from "./FileViewer";
 import { subscribeViewer, updateViewer, viewerState } from "./viewerState";
 
+/**
+ * A session's or run's content, beside its open file. `toggles` end the
+ * rightmost header: the file viewer's while a file is open, otherwise the
+ * content's.
+ */
 export function SessionContent({
   viewId,
-  header,
+  title,
+  toggles,
   children,
 }: {
   viewId: string;
-  header: ReactNode;
+  title: ReactNode;
+  toggles: ReactNode;
   children: ReactNode;
 }) {
   const subscribe = useCallback(
@@ -24,7 +32,7 @@ export function SessionContent({
         className="content chat-pane"
         style={state.path ? { flex: `${state.ratio} 1 0` } : undefined}
       >
-        {header}
+        <ContentHeader title={title}>{state.path ? null : toggles}</ContentHeader>
         <div className="content-body">{children}</div>
       </main>
       {state.path && (
@@ -53,7 +61,7 @@ export function SessionContent({
             }}
           />
           <div className="file-pane" style={{ flex: `${1 - state.ratio} 1 0` }}>
-            <FileViewer key={state.path} viewId={viewId} state={state} />
+            <FileViewer key={state.path} viewId={viewId} state={state} toggles={toggles} />
           </div>
         </>
       )}

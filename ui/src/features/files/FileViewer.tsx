@@ -1,8 +1,17 @@
 import { FileTextIcon, X } from "lucide-react";
-import { useLayoutEffect, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useRef } from "react";
 import { openFile, updateViewer, type ViewerState } from "./viewerState";
 
-export function FileViewer({ viewId, state }: { viewId: string; state: ViewerState }) {
+export function FileViewer({
+  viewId,
+  state,
+  toggles,
+}: {
+  viewId: string;
+  state: ViewerState;
+  /** The panel toggles, at the header's end, or null. */
+  toggles: ReactNode;
+}) {
   const body = useRef<HTMLDivElement>(null);
   const path = state.path!;
   useLayoutEffect(() => {
@@ -26,6 +35,7 @@ export function FileViewer({ viewId, state }: { viewId: string; state: ViewerSta
             <X />
           </button>
         </div>
+        {toggles}
       </header>
       <div
         className="file-body"

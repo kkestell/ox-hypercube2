@@ -45,6 +45,53 @@ describe("The file tree", () => {
   });
 });
 
+describe("The right sidebar's tabs", () => {
+  it("shows Files first, and Changes in its place", async () => {
+    const cwd = await startSession();
+    await writeFile(join(cwd, "a.txt"), "a\n");
+    await openSession(cwd);
+    const files = $('aside.right [role="tab"][aria-label="Files"]');
+    const changes = $('aside.right [role="tab"][aria-label="Changes"]');
+    await expect(files).toHaveAttribute("aria-selected", "true");
+    await expect(treeRow("a.txt")).toBeDisplayed();
+
+    await changes.click();
+    await expect(changes).toHaveAttribute("aria-selected", "true");
+    await expect(files).toHaveAttribute("aria-selected", "false");
+    await expect($('aside.right [role="tabpanel"][aria-label="Changes"]')).toBeExisting();
+    await expect(treeRow("a.txt")).not.toBeExisting();
+
+    await files.click();
+    await expect(treeRow("a.txt")).toBeDisplayed();
+  });
+});
+
+describe("The panel toggles", () => {
+  it("end the rightmost header", async () => {
+    const cwd = await startSession();
+    await writeFile(join(cwd, "a.txt"), "a\n");
+    await openSession(cwd);
+    const toggleRight = () => $('button[aria-label="Toggle Secondary Side Bar"]').click();
+    await expect($("aside.right .toggles")).toBeExisting();
+    await expect($(".content-header .toggles")).not.toBeExisting();
+
+    await treeRow("a.txt").$("button.select").click();
+    await expect($(".file-header")).toBeDisplayed();
+    await expect($(".file-header .toggles")).not.toBeExisting();
+
+    await toggleRight();
+    await expect($(".file-header .toggles")).toBeExisting();
+    await expect($(".content-header .toggles")).not.toBeExisting();
+
+    await $('button[aria-label="Close file"]').click();
+    await expect($(".content-header .toggles")).toBeExisting();
+
+    await toggleRight();
+    await expect($("aside.right .toggles")).toBeExisting();
+    await expect($(".content-header .toggles")).not.toBeExisting();
+  });
+});
+
 describe("The file viewer", () => {
   it("opens nested plain text, follows disk edits, and restores each session before paint", async () => {
     const cwd = await startSession();

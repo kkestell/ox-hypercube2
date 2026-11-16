@@ -4,7 +4,7 @@ import { Composer } from "./features/composer/Composer";
 import { useDrafts } from "./features/composer/useDrafts";
 import { Conversation } from "./features/conversation/Conversation";
 import { useConversations } from "./features/conversation/useConversations";
-import { FileTree } from "./features/files/FileTree";
+import { RightPanel, type RightPanelTab } from "./features/files/RightPanel";
 import { SessionContent } from "./features/files/SessionContent";
 import { forgetDeletedTrees } from "./features/files/treeState";
 import { useFileViewers } from "./features/files/useFileViewers";
@@ -45,6 +45,7 @@ export function App() {
   useEffect(() => {
     if (connection > 0) forgetDeletedTrees(views);
   }, [views, connection]);
+  const [rightTab, setRightTab] = useState<RightPanelTab>("files");
   const run = runs.find((run) => run.id === viewed);
   const session = run ? undefined : sessions.find((session) => session.id === viewed);
   const root = run ? worktrees.get(run.worktree_id)?.path : session?.cwd;
@@ -62,8 +63,8 @@ export function App() {
 
   const renderContent = () => {
     if (run) {
-      return (header: ReactNode) => (
-        <SessionContent key={run.id} viewId={run.id} header={header}>
+      return (toggles: ReactNode) => (
+        <SessionContent key={run.id} viewId={run.id} title={runTitle(run)} toggles={toggles}>
           <RunView
             run={run}
             sessions={sessions}
@@ -76,8 +77,13 @@ export function App() {
       );
     }
     if (session) {
-      return (header: ReactNode) => (
-        <SessionContent key={session.id} viewId={session.id} header={header}>
+      return (toggles: ReactNode) => (
+        <SessionContent
+          key={session.id}
+          viewId={session.id}
+          title={session.title ?? "New session"}
+          toggles={toggles}
+        >
           <SessionHeader
             session={session}
             worktree={worktree}
@@ -113,19 +119,21 @@ export function App() {
           />
         }
         right={
-          viewed !== null &&
-          root !== undefined && (
-            <FileTree
-              key={viewed}
-              viewId={viewed}
-              root={root}
-              connection={connection}
-              onOpenFile={onOpenFile}
-            />
-          )
+          viewed !== null && root !== undefined
+            ? (toggles: ReactNode) => (
+                <RightPanel
+                  tab={rightTab}
+                  onTab={setRightTab}
+                  toggles={toggles}
+                  viewId={viewed}
+                  root={root}
+                  connection={connection}
+                  onOpenFile={onOpenFile}
+                />
+              )
+            : undefined
         }
         renderContent={renderContent()}
-        title={run ? runTitle(run) : session ? (session.title ?? "New session") : undefined}
       />
       {dialogs}
     </>

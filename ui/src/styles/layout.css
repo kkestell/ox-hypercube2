@@ -92,9 +92,17 @@
   min-height: 0;
 }
 
+/* The panel toggles end the header they are in. */
 .toggles {
   display: flex;
   align-items: center;
+  margin-left: auto;
+}
+
+/* The toggles keep one place whichever header holds them: the right
+   sidebar's header's inset from the window's edge. */
+.pane-header:has(> .toggles) {
+  padding-right: calc(var(--sidebar-padding) + var(--row-action-inset));
 }
 
 .toggles .icon-button[aria-pressed="false"] {

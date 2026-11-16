@@ -16,7 +16,7 @@ const minSizes: Record<Panel, number> = { left: 200, bottom: 200, right: 200 };
 const minContentWidth = 200;
 const minContentHeight = 100;
 
-const toggles: Record<Panel, { icon: LucideIcon; title: string }> = {
+const panelToggles: Record<Panel, { icon: LucideIcon; title: string }> = {
   left: { icon: PanelLeft, title: "Toggle Primary Side Bar" },
   bottom: { icon: PanelBottom, title: "Toggle Panel" },
   right: { icon: PanelRight, title: "Toggle Secondary Side Bar" },
@@ -28,18 +28,32 @@ interface Drag {
   startSize: number;
 }
 
+/** The content's pane header: its title, then `children`. */
+export function ContentHeader({ title, children }: { title?: ReactNode; children?: ReactNode }) {
+  return (
+    <header className="pane-header content-header">
+      {title !== undefined && <h1 className="pane-title">{title}</h1>}
+      {children}
+    </header>
+  );
+}
+
+/**
+ * The panels around the content. The panel toggles sit at the right end of
+ * the window's top row: in the right sidebar's header while it shows, and
+ * otherwise passed to the content, which ends its rightmost header with
+ * them.
+ */
 export function Workbench({
   left,
   right,
-  title,
   renderContent,
 }: {
   left: ReactNode;
-  /** The right sidebar's content, rendered only while the sidebar shows. */
-  right?: ReactNode;
-  /** The content's title, in its header before the panel toggles. */
-  title?: ReactNode;
-  renderContent?: (header: ReactNode) => ReactNode;
+  /** The right sidebar's content, given the toggles, rendered only while the sidebar shows. */
+  right?: (toggles: ReactNode) => ReactNode;
+  /** The content, given the toggles, or null while the right sidebar shows. */
+  renderContent?: (toggles: ReactNode) => ReactNode;
 }) {
   const workbench = useRef<HTMLDivElement>(null);
   const center = useRef<HTMLDivElement>(null);
@@ -118,29 +132,27 @@ export function Workbench({
     panels.map((panel) => [`--${panel}-size`, `${sizes[panel]}px`]),
   ) as CSSProperties;
 
-  const header = (
-    <header className="pane-header content-header">
-      {title !== undefined && <h1 className="pane-title">{title}</h1>}
-      <div className="toggles">
-        {panels.map((panel) => {
-          const { icon: Icon, title } = toggles[panel];
-          return (
-            <button
-              key={panel}
-              type="button"
-              className="icon-button"
-              title={title}
-              aria-label={title}
-              aria-pressed={visible[panel]}
-              onClick={() => setVisible((shown) => ({ ...shown, [panel]: !shown[panel] }))}
-            >
-              <Icon />
-            </button>
-          );
-        })}
-      </div>
-    </header>
+  const toggles = (
+    <div className="toggles">
+      {panels.map((panel) => {
+        const { icon: Icon, title } = panelToggles[panel];
+        return (
+          <button
+            key={panel}
+            type="button"
+            className="icon-button"
+            title={title}
+            aria-label={title}
+            aria-pressed={visible[panel]}
+            onClick={() => setVisible((shown) => ({ ...shown, [panel]: !shown[panel] }))}
+          >
+            <Icon />
+          </button>
+        );
+      })}
+    </div>
   );
+  const contentToggles = visible.right ? null : toggles;
 
   return (
     <div className="workbench" ref={workbench} style={style}>
@@ -150,10 +162,10 @@ export function Workbench({
       {sash("left")}
       <div className="center" ref={center}>
         {renderContent ? (
-          renderContent(header)
+          renderContent(contentToggles)
         ) : (
           <main className="content">
-            {header}
+            <ContentHeader>{contentToggles}</ContentHeader>
             <div className="content-body" />
           </main>
         )}
@@ -162,7 +174,8 @@ export function Workbench({
       </div>
       {sash("right")}
       <aside className="panel right" hidden={!visible.right}>
-        {visible.right && right}
+        {visible.right &&
+          (right ? right(toggles) : <header className="pane-header">{toggles}</header>)}
       </aside>
     </div>
   );

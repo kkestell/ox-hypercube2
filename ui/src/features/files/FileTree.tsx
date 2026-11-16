@@ -1,6 +1,5 @@
 import { FileIcon, FolderIcon, FolderOpenIcon } from "lucide-react";
 import { type CSSProperties, memo, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Sidebar } from "../../components/Sidebar";
 import type { DirEntry } from "../../lib/protocol";
 import { loadTreeState, saveTreeState } from "./treeState";
 import { useDirectory } from "./useDirectory";
@@ -80,7 +79,10 @@ export const FileTree = memo(function FileTree({
     });
 
   return (
-    <Sidebar
+    <div
+      className="sidebar-body"
+      role="tabpanel"
+      aria-label="Files"
       ref={body}
       onScroll={(event) => {
         if (restoring.current) return;
@@ -99,7 +101,7 @@ export const FileTree = memo(function FileTree({
           toggle={toggle}
         />
       </ul>
-    </Sidebar>
+    </div>
   );
 });
 
