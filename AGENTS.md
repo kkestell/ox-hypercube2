@@ -34,6 +34,7 @@ workflow.
 - Resolve ordinary implementation decisions yourself. Ask when a missing
   decision materially changes the requested outcome or scope.
 - Use a plan when the work needs design decisions or sequencing.
+- Work and commit directly on `main`. Do not create branches.
 - Preserve unrelated working-tree changes. Commit or publish only when the user
   requests it.
 - Complete verification according to [Testing](docs/dev/testing.md#running-checks) and
