@@ -120,7 +120,7 @@
 .tree-branch::after {
   bottom: 50%;
   left: calc(var(--line) + var(--border-width));
-  width: calc(var(--end) - var(--line) - var(--border-width));
+  width: var(--tree-branch-length);
   border-bottom-width: var(--border-width);
 }
 

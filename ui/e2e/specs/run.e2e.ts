@@ -163,7 +163,7 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
   });
 
-  it("follows the active step's latest agent message and keeps completed messages visible", async () => {
+  it("follows the active step's latest agent message and collapses the step once it succeeds", async () => {
     const { cwd } = await gitWorkspace();
     const report = [
       directive("messages 1", "Reading the code"),
@@ -182,10 +182,6 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
       "Reading the code",
     );
     const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
-    await browser.execute(() => {
-      const view = document.querySelector(".conversation")!;
-      view.scrollTop = view.scrollHeight;
-    });
     await writeFile(join(worktree, "report"), "");
 
     const messages = ["Reading the code", "Writing the fix"];
@@ -197,13 +193,17 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     expect(
       await browser.execute((element) => {
         const message = element.getBoundingClientRect();
-        const view = element.closest(".conversation")!.getBoundingClientRect();
+        const view = element.closest(".run-status-messages")!.getBoundingClientRect();
         return message.top >= view.top && message.bottom <= view.bottom;
       }, latest),
     ).toBe(true);
 
     await writeFile(join(worktree, "go"), "");
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
+    const toggle = statusStep("Report").$(".run-status-toggle");
+    await expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await expect(statusStep("Report").$(".run-status-messages")).not.toBeExisting();
+    await toggle.click();
     await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
   });
 
@@ -229,13 +229,65 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     expect(
       await browser.execute((element) => {
         const end = element.getBoundingClientRect().bottom;
-        const view = element.closest(".conversation")!.getBoundingClientRect();
+        const view = element.closest(".run-status-messages")!.getBoundingClientRect();
         return end > view.top && end <= view.bottom + 1;
       }, message),
     ).toBe(true);
 
     await writeFile(join(worktree, "go"), "");
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
+  });
+
+  it("fits its steps in the view, sharing the height among expanded steps", async () => {
+    const { cwd } = await gitWorkspace();
+    // The shell step between the agent steps gives the second an empty input.
+    const steps = ["First", "Second"]
+      .map((name) => agentStep(name, directive("messages 30", `${name} message`)))
+      .join('  - name: Between\n    shell: "true"\n');
+    await defineWorkflow("share", `name: Share\nsteps:\n${steps}`);
+    await startRun(cwd, "Share", "");
+    await expect(stepStatus("Second", "Succeeded")).toBeExisting();
+    await expect($$(".run-status-messages")).toBeElementsArrayOfSize(0);
+
+    /** Whether the view scrolls, and each expanded list's height and scrolling. */
+    const layout = () =>
+      browser.execute(() => {
+        const view = document.querySelector(".conversation")!;
+        return {
+          viewScrolls: view.scrollHeight > view.clientHeight + 1,
+          lists: [...document.querySelectorAll(".run-status-messages")].map((list) => ({
+            height: list.clientHeight,
+            scrolls: list.scrollHeight > list.clientHeight,
+            atEnd: list.scrollHeight - list.scrollTop - list.clientHeight < 1,
+          })),
+        };
+      });
+    const expand = async (name: string) => {
+      await statusStep(name).$(".run-status-toggle").click();
+      await expect(statusStep(name).$$(".run-status-messages > li")).toBeElementsArrayOfSize(30);
+    };
+
+    await expand("Second");
+    const one = await layout();
+    expect(one.viewScrolls).toBe(false);
+    expect(one.lists).toHaveLength(1);
+    expect(one.lists[0]!.scrolls && one.lists[0]!.atEnd).toBe(true);
+
+    await expand("First");
+    const both = await layout();
+    expect(both.viewScrolls).toBe(false);
+    expect(both.lists).toHaveLength(2);
+    expect(both.lists.every((list) => list.scrolls && list.atEnd)).toBe(true);
+    expect(Math.abs(both.lists[0]!.height - both.lists[1]!.height)).toBeLessThanOrEqual(1);
+    expect(one.lists[0]!.height).toBeGreaterThan(both.lists[1]!.height);
+
+    await statusStep("First").$(".run-status-toggle").click();
+    await expect(statusStep("First").$(".run-status-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    await expect(statusStep("First").$(".run-status-messages")).not.toBeExisting();
+    expect((await layout()).lists[0]!.height).toBe(one.lists[0]!.height);
   });
 
   it("takes an answer to a child's request from the run view or the child's view", async () => {

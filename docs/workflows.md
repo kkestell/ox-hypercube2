@@ -231,13 +231,17 @@ view shows each step's outcome. A pending step's row is dimmed.
 
 Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
-and how it compares with its base, and the workflow's name. Below it is
-every step, in order, with its start time once it has started and the
-messages its agent wrote, oldest first. A step's dot there is green once it
-succeeded and red once it failed. While the run is active, the view keeps the
-end of the active step's latest message in view as it grows, until you scroll
-it out of view; a new message is followed again. A failed or interrupted run's
-reason shows under the step it stopped at. The oldest
+and how it compares with its base, and the workflow's name when it fits.
+Below it is every step, in order, with its start time once it has started and
+the messages its agent wrote, oldest first. A step's dot there is green once it
+succeeded and red once it failed. A failed or interrupted run's reason shows
+under the step it stopped at. The steps fill the view's height. Clicking the
+name of a step with messages collapses or expands them; a step shows its
+messages until it succeeds, unless you have expanded or collapsed it.
+Expanded steps share the height the collapsed steps leave, each taking no more
+than its messages need, and a step whose messages do not fit scrolls them. Each
+step's messages stay scrolled to their end as they grow, until you scroll away
+from the end. A view too short for every step scrolls. The oldest
 permission request or question awaiting an answer among the children shows
 below the steps. Answering it there or in the child's own view resolves it in
 both. The right sidebar shows the run's worktree.

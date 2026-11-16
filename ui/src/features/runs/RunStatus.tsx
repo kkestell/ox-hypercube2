@@ -1,5 +1,7 @@
-import { useEffect, useLayoutEffect, useRef } from "react";
+import { ChevronRight } from "lucide-react";
+import { type CSSProperties, useState } from "react";
 import type { Item, RunInfo, SessionInfo, StepInfo } from "../../lib/protocol";
+import { useFollowEnd } from "../conversation/Conversation";
 import { Markdown } from "../conversation/Markdown";
 import {
   awaiting,
@@ -61,7 +63,10 @@ function clock(time: number) {
 
 /**
  * Every step of the run, in order, with the agent messages of its child
- * session.
+ * session. The steps fill the view's height: a step with messages or the
+ * run's notice expands and collapses, is expanded until it succeeds unless
+ * the user toggles it, and shares the height left by the collapsed steps with
+ * the other expanded steps.
  */
 export function RunStatus({
   run,
@@ -76,9 +81,35 @@ export function RunStatus({
   /** The run's `runNotice`. */
   notice: { text: string; index: number } | null;
 }) {
+  // Whether each step the user toggled is expanded, by index.
+  const [toggled, setToggled] = useState<ReadonlyMap<number, boolean>>(new Map());
+  const steps = run.steps.map((step, index) => {
+    const messages =
+      step.session_id === null
+        ? []
+        : (conversations.get(step.session_id)?.filter(isAgentMessage) ?? []);
+    const stepNotice = notice?.index === index ? notice.text : undefined;
+    const expandable = messages.length > 0 || stepNotice !== undefined;
+    return {
+      step,
+      messages,
+      notice: stepNotice,
+      expandable,
+      expanded: expandable && (toggled.get(index) ?? step.state !== "succeeded"),
+    };
+  });
+  const expanded = steps.filter((step) => step.expanded).length;
+  const style = {
+    gridTemplateRows: steps
+      .map((step) => (step.expanded ? "minmax(0, max-content)" : "max-content"))
+      .join(" "),
+    "--run-status-collapsed": steps.length - expanded,
+    "--run-status-expanded": expanded,
+  } as CSSProperties;
+
   return (
-    <div className="run-status">
-      {run.steps.map((step, index) => {
+    <div className="run-status" style={style}>
+      {steps.map(({ step, messages, notice, expandable, expanded }, index) => {
         const next = run.steps[index + 1];
         return (
           <StepStatus
@@ -86,13 +117,10 @@ export function RunStatus({
             key={index}
             step={step}
             session={sessions.find((session) => session.id === step.session_id)}
-            followMessages={run.state === "running" && step.state === "running"}
-            messages={
-              step.session_id === null
-                ? []
-                : (conversations.get(step.session_id)?.filter(isAgentMessage) ?? [])
-            }
-            notice={notice?.index === index ? notice.text : undefined}
+            messages={messages}
+            notice={notice}
+            expanded={expandable ? expanded : null}
+            onToggle={() => setToggled((current) => new Map(current).set(index, !expanded))}
             // The connector below the step, or null for the last step.
             connector={
               next === undefined
@@ -108,77 +136,29 @@ export function RunStatus({
   );
 }
 
-/**
- * How far the end of `message` is below the bottom of `view`. It is negative
- * when the end is above the bottom, and below `-view.clientHeight` when the
- * end is above the view.
- */
-function endBelow(message: Element, view: Element) {
-  return message.getBoundingClientRect().bottom - view.getBoundingClientRect().bottom;
-}
-
-/**
- * A ref for the active step's latest message that keeps the message's end in
- * the run view's scrolling view as the message grows, until the user scrolls
- * the end out of view. A new latest message is followed again.
- */
-function useFollow(latest: AgentMessage | undefined) {
-  const element = useRef<HTMLLIElement>(null);
-  // Whether the view follows the end of the latest message.
-  const following = useRef(true);
-  const key = latest?.key;
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new latest message is followed
-  useLayoutEffect(() => {
-    following.current = true;
-  }, [key]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: each change to the latest message scrolls a followed view
-  useLayoutEffect(() => {
-    const node = element.current;
-    if (node === null || !following.current) return;
-    const view = node.closest(".conversation")!;
-    const below = endBelow(node, view);
-    if (below > 0 || below < -view.clientHeight) view.scrollTop += below;
-  }, [latest]);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: each latest message is a new element
-  useEffect(() => {
-    const node = element.current;
-    if (node === null) return;
-    const view = node.closest(".conversation")!;
-    const onScroll = () => {
-      const below = endBelow(node, view);
-      following.current = below < 1 && below >= -view.clientHeight;
-    };
-    view.addEventListener("scroll", onScroll);
-    return () => view.removeEventListener("scroll", onScroll);
-  }, [key]);
-
-  return element;
-}
-
 function StepStatus({
   step,
   session,
-  followMessages,
   messages,
   notice,
+  expanded,
+  onToggle,
   connector,
 }: {
   step: StepInfo;
   session: SessionInfo | undefined;
-  followMessages: boolean;
   /** The agent messages of the step's child session, oldest first. */
   messages: AgentMessage[];
   /** The run's failure or interruption, shown after the step's messages. */
   notice: string | undefined;
+  /** Whether the step shows its messages, or null when it has none to show. */
+  expanded: boolean | null;
+  onToggle: () => void;
   /** The connector below the step: solid, dashed between two pending steps, or none. */
   connector: "solid" | "dashed" | null;
 }) {
   const status = stepOutcome(step, session);
-  const latest = followMessages ? messages.at(-1) : undefined;
-  const follow = useFollow(latest);
+  const follow = useFollowEnd<HTMLOListElement>(expanded);
   const name = (
     <>
       <StatusIcon status={status} />
@@ -196,11 +176,25 @@ function StepStatus({
           {clock(step.started_at)}
         </time>
       )}
-      <h3 className="run-status-current">{name}</h3>
-      {(messages.length > 0 || notice !== undefined) && (
-        <ol className="run-status-messages">
+      <h3 className="run-status-current">
+        {expanded === null ? (
+          name
+        ) : (
+          <button
+            type="button"
+            className="run-status-toggle"
+            aria-expanded={expanded}
+            onClick={onToggle}
+          >
+            {name}
+            <ChevronRight />
+          </button>
+        )}
+      </h3>
+      {expanded && (
+        <ol className="run-status-messages" ref={follow.ref} onScroll={follow.onScroll}>
           {messages.map((message) => (
-            <li key={message.key} ref={message === latest ? follow : undefined}>
+            <li key={message.key}>
               <Markdown text={message.text} />
             </li>
           ))}

@@ -93,6 +93,16 @@
   --row-action-inset: var(--spacing);
   /* VS Code's explorer indent. */
   --tree-indent: calc(var(--spacing) * 2);
+  /* A tree branch's length, from its line to the dot it ends at. */
+  --tree-branch-length: calc(
+    var(--icon-size) /
+    2 +
+    var(--sidebar-row-gap) +
+    (var(--icon-size) - var(--status-dot-size)) /
+    2 -
+    var(--border-width) /
+    2
+  );
   --workspace-header-height: calc(var(--spacing) * 7);
   --menu-min-width: calc(var(--spacing) * 32);
   --menu-padding: calc(var(--spacing) * 2);

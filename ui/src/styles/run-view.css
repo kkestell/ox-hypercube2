@@ -28,8 +28,22 @@
   /* The connector runs through the step dots' centres. */
   --run-status-line: calc(var(--spacing) * 14);
   --run-status-indent: calc(var(--spacing) * 12);
-  display: flex;
-  flex-direction: column;
+  /* A collapsed step's height: its name and the gap below it. */
+  --run-status-step-height: calc(var(--spacing) * 9);
+  /* The least height an expanded step gets when the view is too short. */
+  --run-status-expanded-height: calc(var(--spacing) * 40);
+  /* The steps fill the view's height. Each expanded step's row starts empty
+     and the rows share the height left, each up to its content's height. A
+     view too short for every step scrolls. */
+  display: grid;
+  flex: 1 1 0;
+  align-content: start;
+  min-height: calc(
+    var(--run-status-collapsed) *
+    var(--run-status-step-height) +
+    var(--run-status-expanded) *
+    var(--run-status-expanded-height)
+  );
   margin-top: calc(var(--spacing) * 2);
 }
 
@@ -37,6 +51,9 @@
    step's dot, on the dot's centre line. */
 .run-status-step {
   position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   padding: 0 0 calc(var(--spacing) * 4) var(--run-status-indent);
 }
 
@@ -98,39 +115,80 @@
   opacity: var(--dimmed-opacity);
 }
 
+/* The name of a step with messages, which expands and collapses them. */
+.run-status-toggle {
+  display: flex;
+  align-items: center;
+  gap: inherit;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+}
+
+.run-status-toggle > svg:last-child {
+  flex: none;
+  width: var(--icon-size);
+  height: var(--icon-size);
+  color: var(--muted-foreground);
+  transition: rotate 150ms;
+}
+
+.run-status-toggle[aria-expanded="true"] > svg:last-child {
+  rotate: 90deg;
+}
+
+/* An expanded step's messages scroll within its share of the view. The
+   messages' dots and ticks sit in the list's left padding. */
 .run-status-messages {
+  --message-dot: calc(var(--spacing) * 1.5);
+  /* The space between a message's dot and its text. */
+  --message-gap: calc(var(--spacing) * 3.25);
   display: flex;
   flex-direction: column;
   gap: calc(var(--spacing) * 3);
-  margin: calc(var(--spacing) * 3) 0 0 calc(var(--spacing) * 10);
-  padding: 0;
+  min-height: 0;
+  margin: calc(var(--spacing) * 3) 0 0;
+  padding: 0 0 0
+    calc(
+      var(--run-status-line) -
+      var(--run-status-indent) +
+      var(--border-width) /
+      2 +
+      var(--tree-branch-length) +
+      var(--message-dot) +
+      var(--message-gap)
+    );
+  overflow-y: auto;
   list-style: none;
 }
 
-/* Each message is a block of the step's text, with a dot on the connector's
-   centre line. */
-.run-status-messages li {
+/* Each message is a block of the step's text, with a dot branching from the
+   connector. */
+.run-status-messages > li {
   position: relative;
 }
 
-.run-status-messages li::before {
+.run-status-messages > li::before {
   content: "";
   position: absolute;
   top: calc(var(--spacing) * 2.25);
-  left: calc(var(--spacing) * -4.75);
-  width: calc(var(--spacing) * 1.5);
-  height: calc(var(--spacing) * 1.5);
+  left: calc(-1 * (var(--message-gap) + var(--message-dot)));
+  width: var(--message-dot);
+  height: var(--message-dot);
   border-radius: var(--radius-full);
   background: var(--muted-foreground);
 }
 
-/* A tick from the dot to the message's first line. */
-.run-status-messages li::after {
+/* A branch from the connector to the message's dot, as long as the sidebar's. */
+.run-status-messages > li::after {
   content: "";
   position: absolute;
   top: calc(var(--spacing) * 3 - var(--border-width) / 2);
-  left: calc(var(--spacing) * -8);
-  width: calc(var(--spacing) * 3.25);
+  left: calc(-1 * (var(--message-gap) + var(--message-dot) + var(--tree-branch-length)));
+  width: var(--tree-branch-length);
   height: var(--border-width);
   background: var(--border);
 }
@@ -143,6 +201,6 @@
   color: var(--destructive);
 }
 
-.run-status-messages li.run-status-error::before {
+.run-status-messages > li.run-status-error::before {
   background: var(--destructive);
 }
