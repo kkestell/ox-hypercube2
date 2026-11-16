@@ -64,3 +64,7 @@ export function subscribeOpenViewers(listener: () => void) {
     watchers.delete(listener);
   };
 }
+
+// In development, a change to this module reloads the page, so every viewer
+// and subscription shares one copy of the state above.
+if (import.meta.hot) import.meta.hot.accept(() => location.reload());
