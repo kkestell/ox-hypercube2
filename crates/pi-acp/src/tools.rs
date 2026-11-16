@@ -19,14 +19,30 @@ pub fn kind(name: &str) -> ToolKind {
     }
 }
 
+/// The tool of MCP tool `name`, which Pi names `mcp__<server>__<tool>`.
+fn mcp_tool(name: &str) -> Option<&str> {
+    Some(name.strip_prefix("mcp__")?.split_once("__")?.1)
+}
+
 /// The title of a call of tool `name`: the tool's name capitalized, followed
-/// by the first line of its main argument as Markdown inline code.
+/// by the first line of its main argument as Markdown inline code. An MCP
+/// tool shows as its tool's name in capitalized words, so
+/// `mcp__ox__set_title` shows as `SetTitle`, and its main argument is its
+/// first string argument.
 pub fn title(name: &str, args: &Value) -> String {
-    let mut chars = name.chars();
-    let display: String = chars
-        .next()
-        .map(|first| first.to_uppercase().chain(chars).collect())
-        .unwrap_or_default();
+    let mcp = mcp_tool(name);
+    let words: Vec<&str> = match mcp {
+        Some(tool) => tool.split(['_', '-']).collect(),
+        None => vec![name],
+    };
+    let display: String = words
+        .into_iter()
+        .filter_map(|word| {
+            let mut chars = word.chars();
+            chars.next().map(|first| first.to_uppercase().chain(chars))
+        })
+        .flatten()
+        .collect();
     let key = match name {
         "bash" => "command",
         "grep" | "find" => "pattern",
@@ -34,6 +50,10 @@ pub fn title(name: &str, args: &Value) -> String {
     };
     let argument = args[key]
         .as_str()
+        .or_else(|| {
+            mcp?;
+            args.as_object()?.values().find_map(Value::as_str)
+        })
         .and_then(|text| text.trim().lines().next())
         .map(|first_line| {
             let mut argument: String = first_line.chars().take(160).collect();
@@ -160,4 +180,20 @@ fn code_span(text: &str) -> String {
         ""
     };
     format!("{fence}{pad}{text}{pad}{fence}")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::title;
+
+    #[test]
+    fn mcp_tool_title() {
+        assert_eq!(
+            title("mcp__ox__set_title", &json!({"title": "Fix the parser"})),
+            "SetTitle `Fix the parser`"
+        );
+        assert_eq!(title("bash", &json!({"command": "ls"})), "Bash `ls`");
+    }
 }
