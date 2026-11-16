@@ -30,8 +30,8 @@
   min-width: 0;
   max-width: 100%;
   padding-left: var(--file-pill-padding);
-  padding-right: var(--spacing);
-  height: var(--pane-header-button-height);
+  padding-right: calc(var(--file-pill-padding) - var(--spacing));
+  height: var(--text-control-height);
   border-radius: var(--file-pill-radius);
   background: var(--muted);
   font-size: var(--text-sm);
@@ -68,7 +68,7 @@
   margin: 0;
   width: max-content;
   font-family: var(--font-mono);
-  font-size: var(--text-sm);
+  font-size: var(--text-xs);
   line-height: var(--leading);
   white-space: pre;
   user-select: text;
