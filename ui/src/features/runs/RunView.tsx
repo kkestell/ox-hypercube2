@@ -6,7 +6,6 @@ import {
   type WorktreeInfo,
 } from "../../lib/protocol";
 import { OpenRequest } from "../composer/OpenRequest";
-import { Transcript } from "../conversation/Conversation";
 import { useConversations } from "../conversation/useConversations";
 import { RunHeader } from "./RunHeader";
 import { RunStatus, runNotice } from "./RunStatus";
@@ -42,14 +41,14 @@ export function RunView({
   return (
     <>
       <RunHeader run={run} worktree={worktree} />
-      <Transcript viewId={run.id}>
+      <div className="conversation">
         <RunStatus run={run} sessions={sessions} conversations={conversations} notice={notice} />
         {notice !== null && notice.index === -1 && (
           <div className="run-notice">
             <p>{notice.text}</p>
           </div>
         )}
-      </Transcript>
+      </div>
       {request && (
         <div className="composer">
           <div className="stack">

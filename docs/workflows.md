@@ -223,11 +223,12 @@ Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
 and how it compares with its base, and the workflow's name. Below it is
 every step, in order, with its start time once it has started and the
-status updates its agent posted, newest last. A failed or interrupted run's
-reason shows under the step it stopped at. The oldest permission request or
-question awaiting an answer among the children shows below the steps.
-Answering it there or in the child's own view resolves it in both. The right
-sidebar shows the run's worktree.
+status updates its agent posted, newest last. While the run is active, the
+view scrolls as needed to show the active step's latest status update. A failed
+or interrupted run's reason shows under the step it stopped at. The oldest
+permission request or question awaiting an answer among the children shows
+below the steps. Answering it there or in the child's own view resolves it in
+both. The right sidebar shows the run's worktree.
 
 Selecting a child opens its session view. While the run is running, the
 child's text entry and attachments are disabled, and Stop cancels the run.

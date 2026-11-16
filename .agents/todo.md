@@ -2,8 +2,6 @@
 
 ## Workflow run and session UI
 
-- [ ] Stop collapsing completed steps on the run dashboard. While the run is
-  active, scroll to the active step's most recent status update.
 - [ ] Show the status of the local checkout in the UI: current branch, staged
   and unstaged changes, and whether the session is in a worktree. Regular
   sessions show none of this. The run dashboard shows some of it for the run's

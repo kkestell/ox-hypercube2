@@ -70,7 +70,7 @@ class Listing {
     };
     this.worktrees.push(worktree);
     const created_at = this.tick();
-    this.runs.push({
+    const run: RunInfo = {
       id,
       workspace_id: this.workspace.id,
       workflow: "implement",
@@ -87,7 +87,9 @@ class Listing {
           sessionState === undefined ? null : this.session(name, sessionState, worktree.id).id,
       })),
       created_at,
-    });
+    };
+    this.runs.push(run);
+    return run;
   }
 
   changes(): ListingChange[] {
@@ -156,7 +158,37 @@ function sidebar(): Scenario {
   };
 }
 
+function runStatus(): Scenario {
+  const listing = new Listing();
+  const run = listing.run("Follow workflow status updates", "running", [
+    ["Plan", "succeeded", "exited"],
+    ["Implement", "running", "running"],
+    ...Array.from({ length: 30 }, (_, index): [string, StepState] => [
+      `Verify fixture ${index + 1}`,
+      "pending",
+    ]),
+  ]);
+  return {
+    changes: listing.changes(),
+    conversations: {
+      [run.steps[0]!.session_id!]: [
+        { type: "status_update", key: "1", text: "Read the run view", posted_at: run.created_at },
+      ],
+      [run.steps[1]!.session_id!]: [
+        {
+          type: "status_update",
+          key: "1",
+          text: "Updated the run view",
+          posted_at: run.created_at,
+        },
+        { type: "status_update", key: "2", text: "Running checks", posted_at: run.created_at },
+      ],
+    },
+  };
+}
+
 export const scenarios: Record<string, Scenario> = {
   sidebar: sidebar(),
+  "run-status": runStatus(),
   empty: { changes: [] },
 };

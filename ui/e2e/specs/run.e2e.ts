@@ -117,17 +117,22 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
 
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
     const kinds = await browser.execute(
-      (list) =>
-        [...list.children].map((row) =>
-          row.classList.contains("run")
-            ? "run"
-            : row.classList.contains("child")
-              ? "child"
-              : "session",
+      (group) =>
+        [...group.querySelectorAll(":scope > ul")].map((list) =>
+          [...list.children].map((row) =>
+            row.classList.contains("run")
+              ? "run"
+              : row.classList.contains("child")
+                ? "child"
+                : "session",
+          ),
         ),
-      await workspaceGroup(cwd).$("ul"),
+      await workspaceGroup(cwd),
     );
-    expect(kinds).toEqual(["session", "run", "child", "child", "child", "session"]);
+    expect(kinds).toEqual([
+      ["session", "session"],
+      ["run", "child", "child", "child"],
+    ]);
     await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
     await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
     await expect(runRow(cwd).$(".status")).toHaveAttribute("class", "status succeeded");
@@ -143,22 +148,28 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
   });
 
-  it("shows each started step's start time and its agent's status updates", async () => {
+  it("follows the active step's latest status update and keeps completed updates visible", async () => {
     const { cwd } = await gitWorkspace();
     const report = [
       "mcp-status Reading the code",
+      directive("shell", "while [ ! -f report ]; do sleep 0.1; done"),
       "mcp-status Writing the fix",
       directive("shell", "while [ ! -f go ]; do sleep 0.1; done"),
     ].join("\n");
-    await defineWorkflow(
-      "report",
-      `name: Report
-steps:
-${agentStep("Report", report)}  - name: Later
-    shell: "true"
-`,
-    );
+    const later = Array.from(
+      { length: 40 },
+      (_, index) => `  - name: Later ${index + 1}\n    shell: "true"\n`,
+    ).join("");
+    await defineWorkflow("report", `name: Report\nsteps:\n${agentStep("Report", report)}${later}`);
     await startRun(cwd, "Report", "");
+
+    await expect(statusStep("Report").$(".run-status-updates li p")).toHaveText("Reading the code");
+    const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
+    await browser.execute(() => {
+      const view = document.querySelector(".conversation")!;
+      view.scrollTop = view.scrollHeight;
+    });
+    await writeFile(join(worktree, "report"), "");
 
     const updates = ["Reading the code", "Writing the fix"];
     await expect(statusStep("Report").$$(".run-status-updates li")).toBeElementsArrayOfSize(2);
@@ -168,13 +179,18 @@ ${agentStep("Report", report)}  - name: Later
       clockText,
     ]);
     await expect(statusStep("Report").$(".run-status-time")).toHaveText(clockText);
-    await expect(statusStep("Later").$(".run-status-time")).not.toBeExisting();
+    await expect(statusStep("Later 1").$(".run-status-time")).not.toBeExisting();
+    const latest = await statusStep("Report").$(".run-status-updates li:last-child");
+    expect(
+      await browser.execute((element) => {
+        const update = element.getBoundingClientRect();
+        const view = element.closest(".conversation")!.getBoundingClientRect();
+        return update.top >= view.top && update.bottom <= view.bottom;
+      }, latest),
+    ).toBe(true);
 
-    const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
-    await writeFile(join(worktree.replace(/\/$/, ""), "go"), "");
+    await writeFile(join(worktree, "go"), "");
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-    await expect(statusStep("Report").$(".run-status-updates")).not.toBeExisting();
-    await statusStep("Report").$(".run-status-toggle").click();
     await expect(statusStep("Report").$$(".run-status-updates li p")).toHaveText(updates);
   });
 

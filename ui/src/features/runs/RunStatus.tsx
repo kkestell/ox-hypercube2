@@ -79,6 +79,7 @@ export function RunStatus({
             key={index}
             step={step}
             session={sessions.find((session) => session.id === step.session_id)}
+            followUpdates={run.state === "running" && step.state === "running"}
             updates={
               step.session_id === null
                 ? []
@@ -100,15 +101,21 @@ export function RunStatus({
   );
 }
 
+function revealUpdate(element: HTMLLIElement | null) {
+  element?.scrollIntoView({ block: "nearest" });
+}
+
 function StepStatus({
   step,
   session,
+  followUpdates,
   updates,
   notice,
   connector,
 }: {
   step: StepInfo;
   session: SessionInfo | undefined;
+  followUpdates: boolean;
   /** The status updates of the step's child session, oldest first. */
   updates: StatusUpdate[];
   /** The run's failure or interruption, shown after the step's updates. */
@@ -118,6 +125,7 @@ function StepStatus({
 }) {
   const status = childStatus(step, session);
   const Icon = icons[status.className || step.state] ?? CircleDashed;
+  const latest = followUpdates ? updates.at(-1) : undefined;
   const name = (
     <>
       <span className={`status ${status.className}`} role="img" aria-label={status.label}>
@@ -141,7 +149,7 @@ function StepStatus({
       {(updates.length > 0 || notice !== undefined) && (
         <ol className="run-status-updates">
           {updates.map((update) => (
-            <li key={update.key}>
+            <li key={update.key} ref={update === latest ? revealUpdate : undefined}>
               <time dateTime={new Date(update.posted_at).toISOString()}>
                 {clock(update.posted_at)}
               </time>
