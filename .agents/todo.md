@@ -49,6 +49,36 @@
      final stored sequence if it differs. The subscription waits even though
      event 7 is already in the database.
 
+## Open questions
+
+The functional spec describes current behavior. Investigate these before
+changing behavior, and update the affected spec alongside any change.
+
+- [ ] **Embed desktop image and PDF attachments?** Desktop attachments
+  currently send local file references, including for images and PDFs.
+  Decide whether supported images and PDFs should instead be embedded, and
+  what should happen for agents that do not support that content. See
+  [Conversations](../spec/conversations.md#compose-and-send).
+- [ ] **Investigate withdrawn permission requests (suspected bug).** An agent
+  can withdraw a permission request, but Ox leaves it pending until answered,
+  the turn is cancelled, or the agent or session is stopped. Forms are
+  removed when withdrawn. Determine whether permission withdrawals should
+  likewise cancel and remove the request, including what happens when an
+  answer arrives at the same time. See
+  [Permissions and questions](../spec/requests.md#answer-a-permission-request).
+- [ ] **Align form validation across clients (low priority).** The desktop
+  enforces text patterns and formats; command-line answers do not. Shared
+  checks already cover field names, required fields, value types, choices,
+  lengths, ranges, and choice counts. Investigate consistent validation
+  across clients, including invalid patterns and supported formats. See
+  [Permissions and questions](../spec/requests.md#rules).
+- [ ] **Decide what an empty MCP server list means on resume.** The Claude
+  Code bridge replaces the previous servers when given a nonempty list but
+  retains them when given an empty list, so an empty list cannot clear the
+  configuration. Check the ACP contract and decide whether empty should clear
+  the servers or whether retaining them is intended. See
+  [Claude Code bridge](../spec/claude.md#mcp-servers).
+
 ## Future work
 
 - The pull request and review workflows, as the spec describes them.
