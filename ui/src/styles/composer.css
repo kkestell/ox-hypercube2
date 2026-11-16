@@ -128,7 +128,7 @@
   flex: none;
   flex-direction: column;
   gap: calc(var(--spacing) * 2);
-  margin: var(--composer-margin);
+  margin: var(--composer-margin) var(--conversation-gutter) var(--conversation-gutter);
 }
 
 .composer .stack {

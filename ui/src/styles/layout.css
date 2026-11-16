@@ -30,7 +30,7 @@
 
 .content-header {
   gap: calc(var(--spacing) * 2);
-  padding-inline: var(--conversation-inset);
+  padding-inline: var(--header-inset);
   border-bottom: var(--border-width) solid var(--border);
 }
 
@@ -44,7 +44,7 @@
   gap: calc(var(--spacing) * 5);
   box-sizing: border-box;
   min-height: calc(var(--text-control-height) + var(--spacing) * 4 + var(--border-width));
-  padding: calc(var(--spacing) * 2) var(--conversation-inset);
+  padding: calc(var(--spacing) * 2) var(--header-inset);
   border-bottom: var(--border-width) solid var(--border);
 }
 
