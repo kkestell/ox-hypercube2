@@ -45,8 +45,8 @@ function useNow(live: boolean) {
 
 /**
  * A run's workflow and state, when it started and how long it has run, and
- * its worktree's branch and comparison with its base ref, with Cancel Run
- * while it runs.
+ * its worktree's branch and comparison with its base ref, with Cancel while
+ * it runs. The workflow's name shows only where it fits whole.
  */
 export function RunHeader({
   run,
@@ -70,7 +70,7 @@ export function RunHeader({
         running && (
           <button type="button" className="text-button" disabled={cancelling} onClick={onCancel}>
             <Square />
-            Cancel Run
+            Cancel
           </button>
         )
       }
@@ -82,9 +82,11 @@ export function RunHeader({
         </span>
       </div>
       {worktree && <WorktreeBranch worktree={worktree} />}
-      <div>
-        <Workflow />
-        <span>{run.name}</span>
+      <div className="run-header-workflow">
+        <div>
+          <Workflow />
+          <span>{run.name}</span>
+        </div>
       </div>
     </Subheader>
   );

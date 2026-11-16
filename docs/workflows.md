@@ -271,8 +271,8 @@ stop reason, and the later steps stay pending.
 
 ## Cancelling, removing, and restarting
 
-In the desktop, Cancel Run, in a running run's context menu and in the run
-view's header, cancels the run. Delete Run, in the context menu of a run that
+In the desktop, Cancel Run in a running run's context menu, or Cancel in the
+run view's header, cancels the run. Delete Run, in the context menu of a run that
 has ended, removes it, and asks before discarding unsaved work.
 
 `oxctl run cancel <run id>` cancels the active step's turn, or stops its

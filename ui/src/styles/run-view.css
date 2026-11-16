@@ -2,6 +2,28 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The workflow takes the subheader's leftover width, one line tall. Its name
+   wraps below the empty first item when it does not fit, out of sight. */
+.run-header-workflow {
+  flex: 1 1 0;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  height: 1lh;
+  overflow: hidden;
+}
+
+.run-header-workflow::before {
+  content: "";
+  height: 1lh;
+}
+
+.run-header-workflow > div {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: calc(var(--spacing) * 1.5);
+}
+
 .run-status {
   /* The connector runs through the step dots' centres. */
   --run-status-line: calc(var(--spacing) * 14);

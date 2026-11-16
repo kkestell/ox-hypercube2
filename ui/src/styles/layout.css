@@ -48,6 +48,12 @@
   border-bottom: var(--border-width) solid var(--border);
 }
 
+/* A subheader's action keeps its label on one line. */
+.subheader > .text-button {
+  flex: none;
+  white-space: nowrap;
+}
+
 .subheader-meta {
   display: flex;
   flex-wrap: wrap;
