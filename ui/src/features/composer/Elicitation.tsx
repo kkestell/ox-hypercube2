@@ -28,7 +28,34 @@ function selectionError(field: Extract<Field, { type: "array" }>, count: number)
   return "";
 }
 
-/** A form the agent asks the user to fill in, with its fields. */
+/** Whether the form has a control to show for a field: a choice or a
+ * multiple choice needs options, and items or fields of a type the app does
+ * not know have none. */
+function shown(field: Field) {
+  switch (field.type) {
+    case "string":
+      return !field.oneOf || field.oneOf.length > 0;
+    case "array":
+      return (field.items.anyOf ?? []).length > 0;
+    default:
+      return false;
+  }
+}
+
+/** The form's questions, asked one per page. A field with a description asks
+ * a question and starts a page; a field without one, such as a question's
+ * "Other" answer, joins the page before it. */
+function pages(fields: Field[]) {
+  const pages: Field[][] = [];
+  for (const field of fields.filter(shown)) {
+    const page = pages.at(-1);
+    if (page && !field.description) page.push(field);
+    else pages.push([field]);
+  }
+  return pages;
+}
+
+/** A form the agent asks the user to fill in, one question at a time. */
 export function Elicitation({
   item,
   sessionId,
@@ -40,13 +67,18 @@ export function Elicitation({
     Object.fromEntries(item.fields.map((field) => [field.name, initial(field)])),
   );
   const [pending, setPending] = useState(false);
+  const [page, setPage] = useState(0);
   const form = useRef<HTMLFormElement>(null);
+  const questions = pages(item.fields);
+  const last = page >= questions.length - 1;
 
   const set = (name: string, value: Value) =>
     setValues((current) => ({ ...current, [name]: value }));
 
   // A multiple choice's bounds are checked with the browser's own
-  // validation, on the group's first checkbox.
+  // validation, on the group's first checkbox. The browser checks the
+  // shown page's fields before the form moves to the next page.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new page shows new checkboxes.
   useEffect(() => {
     for (const field of item.fields) {
       if (field.type !== "array") continue;
@@ -56,7 +88,7 @@ export function Elicitation({
         first.setCustomValidity(selectionError(field, (values[field.name] as string[]).length));
       }
     }
-  }, [item.fields, values]);
+  }, [item.fields, values, page]);
 
   const respond = async (action: object) => {
     setPending(true);
@@ -83,7 +115,6 @@ export function Elicitation({
     switch (field.type) {
       case "string": {
         if (field.oneOf) {
-          if (field.oneOf.length === 0) return null;
           return field.oneOf.map((option, index) => (
             <Choice
               key={option.const}
@@ -108,9 +139,7 @@ export function Elicitation({
         );
       }
       case "array": {
-        // Items of a type the app does not know have no choices to show.
         const options = field.items.anyOf ?? [];
-        if (options.length === 0) return null;
         const selected = value as string[];
         return options.map((option) => (
           <Choice
@@ -144,14 +173,14 @@ export function Elicitation({
       className="request-panel"
       onSubmit={(event) => {
         event.preventDefault();
-        submit();
+        if (last) submit();
+        else setPage(page + 1);
       }}
     >
-      <div className="scroll">
+      <div key={page} className="scroll">
         <p className="title">{item.message}</p>
-        {item.fields.map((field) => {
+        {questions[page]?.map((field) => {
           const input = control(field);
-          if (input === null) return null;
           return (
             <fieldset key={field.name} disabled={pending}>
               <legend>{field.title ?? field.name}</legend>
@@ -170,9 +199,24 @@ export function Elicitation({
         >
           Decline
         </button>
+        {page > 0 && (
+          <button
+            type="button"
+            className="text-button"
+            disabled={pending}
+            onClick={() => setPage(page - 1)}
+          >
+            Back
+          </button>
+        )}
         <button type="submit" className="text-button" disabled={pending}>
-          Submit
+          {last ? "Submit" : "Next"}
         </button>
+        {questions.length > 1 && (
+          <span className="step">
+            {page + 1} of {questions.length}
+          </span>
+        )}
       </div>
     </form>
   );

@@ -20,7 +20,7 @@
 //! - `elicit`: `requires_action` and a form `elicitation/create` with the
 //!   message `Order` and the fields `color` (required, one of `red` "Red"
 //!   and `blue` "Blue"), `extras` (at most two of `sprinkles`, `nuts` and
-//!   `cherries`), and `note` (text, by default `first\nsecond`). Then
+//!   `cherries`, described "Pick up to two"), and `note` (text, by default `first\nsecond`). Then
 //!   `running` and a chunk `accepted <content as compact JSON>`, `declined`,
 //!   or `cancelled`. When the turn is cancelled first, the agent withdraws
 //!   the elicitation with `$/cancel_request`, waits for its answer, sends
@@ -1294,6 +1294,7 @@ fn order(session_id: acp::SessionId) -> acp::CreateElicitationRequest {
                 option("cherries", "Cherries"),
             ])
             .title("Extras")
+            .description("Pick up to two")
             .max_items(2),
             false,
         )

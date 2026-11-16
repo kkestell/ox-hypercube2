@@ -108,18 +108,32 @@ describe("A session", () => {
     await expect(form.$("p=Pick a color")).toBeDisplayed();
     await expect(form.$("label*=Blue").$(".description")).toHaveText("Cool");
     await expect(awaiting).toBeDisplayed();
-    // The colour is required, so the form stays up and sends nothing.
-    await form.$("button=Submit").click();
-    await expect(form).toBeDisplayed();
-    await expect(awaiting).toBeDisplayed();
+    // Each question has its own page; a field without a description stays
+    // with the question before it.
+    await expect(form.$(".step")).toHaveText("1 of 2");
+    await expect(form.$("legend=Extras")).not.toBeExisting();
+    await expect(form.$("button=Back")).not.toBeExisting();
+    // The colour is required, so the form stays on its page.
+    await form.$("button=Next").click();
+    await expect(form.$(".step")).toHaveText("1 of 2");
     await form.$("label*=Blue").click();
+    await form.$("button=Next").click();
+    await expect(form.$(".step")).toHaveText("2 of 2");
+    await expect(form.$("legend=Color")).not.toBeExisting();
+    await expect(form.$("p=Pick up to two")).toBeDisplayed();
     await form.$("label*=Nuts").click();
     const note = form.$('textarea[aria-label="Note"]');
     await expect(note).toHaveValue("first\nsecond");
     await note.setValue("edited\nsecond");
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "elicitation-text-fields.png"));
+    // Going back keeps the answers.
+    await form.$("button=Back").click();
+    await expect(form.$('input[value="blue"]')).toBeSelected();
+    await form.$("button=Next").click();
+    await expect(form.$('input[value="nuts"]')).toBeSelected();
+    await expect(awaiting).toBeDisplayed();
     await form.$("button=Submit").click();
-    // Had the first Submit gone out, the agent would have answered it alone.
+    // Had an earlier page gone out, the agent would have answered it alone.
     await expect(agentText()[0]).toHaveText(
       'accepted {"color":"blue","extras":["nuts"],"note":"edited\\nsecond"}',
     );
@@ -131,6 +145,7 @@ describe("A session", () => {
     await send("elicit");
     const form = $(".composer .request-panel");
     await form.$("label*=Blue").click();
+    await form.$("button=Next").click();
     await form.$('textarea[aria-label="Note"]').clearValue();
     await form.$("label*=Sprinkles").click();
     await form.$("label*=Nuts").click();

@@ -352,6 +352,7 @@ textarea.text-field {
 .tool-call .label,
 .session-closed,
 .request-panel legend,
+.request-panel .step,
 .choice .description,
 .menu-detail {
   font-size: var(--text-xs);

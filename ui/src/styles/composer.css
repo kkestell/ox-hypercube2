@@ -229,13 +229,14 @@
 }
 
 /* A request rises from behind the composer's box, inset from its sides, its
-   lower edge hidden under the box. */
+   lower edge hidden under the box. Its border has the colour of the dot of a
+   session awaiting the user. */
 .request-panel {
   max-height: var(--request-panel-max-height);
   margin: 0 var(--composer-padding) calc(var(--radius-2xl) * -1);
   padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4)
     calc(var(--spacing) * 4 + var(--radius-2xl));
-  border: var(--border-width) solid var(--border);
+  border: var(--border-width) solid var(--warning);
   border-radius: var(--radius-2xl) var(--radius-2xl) 0 0;
   background: var(--card);
   color: var(--foreground);
@@ -259,6 +260,12 @@
 .request-panel .scroll {
   min-height: 0;
   overflow: auto;
+}
+
+/* Which of a form's questions the panel shows, at the end of its actions. */
+.request-panel .step {
+  margin-left: auto;
+  align-self: center;
 }
 
 .request-panel .actions {
