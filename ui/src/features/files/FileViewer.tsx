@@ -54,9 +54,7 @@ export function FileViewer({
         }
       >
         {state.content?.type === "text" ? (
-          <pre>
-            <code>{highlighted}</code>
-          </pre>
+          <pre>{highlighted}</pre>
         ) : (
           <p className="file-message">
             {state.content?.type === "error" ? state.content.message : "Loading…"}
