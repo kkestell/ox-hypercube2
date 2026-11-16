@@ -35,6 +35,4 @@ ownership and lifecycle.
 - **Child session**: The session a run starts for one of its agent steps, in the
   run's worktree.
 - **Run view**: The desktop view of a run: each step with its start time and
-  its agent's status updates.
-- **Status update**: A sentence or two a child session's agent posts on what
-  it is doing and will do next, shown under its step in the run view.
+  its agent's messages.

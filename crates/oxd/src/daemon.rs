@@ -430,10 +430,6 @@ impl Daemon {
                 self.session(&session_id)?.set_title(&title)?;
                 Ok(Value::Null)
             }
-            Method::SessionPostStatusUpdate { session_id, text } => {
-                self.session(&session_id)?.post_status_update(&text)?;
-                Ok(Value::Null)
-            }
             Method::RunStart {
                 workspace_id,
                 workflow,

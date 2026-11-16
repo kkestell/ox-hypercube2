@@ -550,49 +550,8 @@ steps:
     }
 }
 
-/// A step's agent posts a status update through its `ox` MCP server, and
-/// the step's child session records it with the time it was posted.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_step_s_agent_posts_status_updates_to_its_child_session() {
-    let repo = repo();
-    let daemon = start_daemon().await;
-    daemon.define(
-        "reports",
-        "name: Reports
-steps:
-  - name: Read
-    agent: {harness: claude}
-    prompt: 'mcp-status  Reading the code '
-",
-    );
-    let client = daemon.client().await;
-    let workspace = add_workspace(&client, repo.path()).await;
-    let run = start(&client, &workspace, "reports", "").await;
-    let run = until_ended(&client, &run.id).await;
-    assert_eq!(run.state, RunState::Succeeded, "{run:?}");
-    let step = &run.steps[0];
-    assert_eq!(step.output.as_deref(), Some("Status update posted."));
-    let started_at = step.started_at.expect("the step started");
-
-    let mut events = client
-        .subscribe(step.session_id.as_deref().unwrap(), 0)
-        .await
-        .unwrap();
-    let (text, posted_at) = loop {
-        let event = timeout(TIMEOUT, events.next()).await.unwrap().unwrap();
-        if let EventKind::StatusUpdate { text, posted_at } = event.kind {
-            break (text, posted_at);
-        }
-    };
-    assert_eq!(text, "Reading the code");
-    assert!(
-        started_at <= posted_at,
-        "{posted_at} is before the step started at {started_at}"
-    );
-}
-
-/// A step's agent is told which step of which workflow it runs, that its
-/// final reply is the next step's input, and to post status updates.
+/// A step's agent is told which step of which workflow it runs, and that its
+/// final reply is the next step's input.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_s_agent_is_told_its_step() {
     let repo = repo();
@@ -615,7 +574,6 @@ steps:
     for expected in [
         "the step \"Read\" of the workflow \"Reports\"",
         "Your final reply is handed to the next step as its input.",
-        "`post_status_update`",
     ] {
         assert!(instructions.contains(expected), "{instructions}");
     }

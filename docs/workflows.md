@@ -61,9 +61,6 @@ for Pi. The step's session is set to each value it gives before the prompt is
 sent. A value the harness has no option for, or refuses, fails the run at
 that step with the reason.
 
-A step's agent can post [status updates](dev/glossary.md) through the
-`ox` tool `post_status_update`.
-
 ## Shell steps
 
 A shell step runs its `shell` command with `/bin/sh -c` in the run's
@@ -225,9 +222,10 @@ Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
 and how it compares with its base, and the workflow's name. Below it is
 every step, in order, with its start time once it has started and the
-status updates its agent posted, newest last. While the run is active, the
-view scrolls as needed to show the active step's latest status update. A failed
-or interrupted run's reason shows under the step it stopped at. The oldest
+messages its agent wrote, oldest first. While the run is active, the view
+keeps the end of the active step's latest message in view as it grows, until
+you scroll it out of view; a new message is followed again. A failed or
+interrupted run's reason shows under the step it stopped at. The oldest
 permission request or question awaiting an answer among the children shows
 below the steps. Answering it there or in the child's own view resolves it in
 both. The right sidebar shows the run's worktree.

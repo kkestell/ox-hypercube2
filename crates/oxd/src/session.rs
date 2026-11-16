@@ -19,7 +19,6 @@ use ox_protocol::{ConfigValue, ErrorBody, Event, EventKind, SessionInfo, Session
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::daemon::now;
 use crate::instructions::{self, StepRole};
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
@@ -320,24 +319,6 @@ impl Session {
         }
         self.update(|state| state.set_title(title));
         Ok(())
-    }
-
-    /// Records a status update from the session's agent, timestamped now.
-    /// Refused for empty text, and unless the agent is running.
-    pub fn post_status_update(&self, text: &str) -> Result<(), ErrorBody> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Err(ErrorBody {
-                code: code::INVALID_REQUEST,
-                message: "the status update is empty".into(),
-            });
-        }
-        self.update(|state| {
-            state.request(Request::StatusUpdate {
-                text: text.into(),
-                posted_at: now(),
-            })
-        })
     }
 
     /// Marks the session archived, or not, and signals the change.

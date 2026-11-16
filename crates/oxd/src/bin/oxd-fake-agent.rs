@@ -61,7 +61,6 @@
 //! - `mcp-title <text>`: start the session's stdio MCP server named `ox`,
 //!   call its `set_title` tool with the rest of the line, and send the tool
 //!   result's text, or the error, as one chunk
-//! - `mcp-status <text>`: the same, calling its `post_status_update` tool
 //! - `shell <JSON string>`: run the decoded text with `sh -c` in the
 //!   session's cwd and append its standard output to the turn's message. A
 //!   non-zero exit ends the turn with the stop reason `error` and the
@@ -848,10 +847,6 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["mcp-title", ..] => Directive::McpTool {
                 name: "set_title",
                 arguments: serde_json::json!({"title": rest("mcp-title")}),
-            },
-            ["mcp-status", ..] => Directive::McpTool {
-                name: "post_status_update",
-                arguments: serde_json::json!({"text": rest("mcp-status")}),
             },
             ["shell", ..] => Directive::Shell(json_after(line, 1)?),
             ["next", ..] => Directive::Next(json_after(line, 1)?),

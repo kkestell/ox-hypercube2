@@ -26,13 +26,6 @@ pub fn text(step: Option<&StepRole>, ox_tools: bool) -> Option<String> {
             "You are running the step \"{step}\" of the workflow \"{workflow}\". Your final \
              reply is handed to the next step as its input."
         ));
-        if ox_tools {
-            paragraphs.push(
-                "Call the `ox` tool `post_status_update` when you start the step and each \
-                 time you move on to a new part of it."
-                    .into(),
-            );
-        }
     }
     Some(paragraphs.join("\n\n"))
 }

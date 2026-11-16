@@ -212,13 +212,6 @@ pub enum Method {
     /// empty is refused with `invalid_request`. Answers `null`.
     #[serde(rename = "session.set_title")]
     SessionSetTitle { session_id: String, title: String },
-    /// Records a status update from the session's agent: what it is doing
-    /// and what it will do next. The text is trimmed, and an empty one is
-    /// refused with `invalid_request`. Refused with `invalid_state` unless
-    /// the agent is running. The update is saved in the session's history
-    /// as a `status_update` event. Answers `null`.
-    #[serde(rename = "session.post_status_update")]
-    SessionPostStatusUpdate { session_id: String, text: String },
     /// Starts a run of the workflow defined in `<workflow>.yaml` in the
     /// daemon's workflows directory, in a new worktree of the workspace's
     /// repository on a new branch `ox/<first 8 digits of the worktree ID>`
@@ -690,12 +683,6 @@ pub enum EventKind {
     /// background work, and unviewed, or because the session was archived. The session is `exited`;
     /// `session.load` resumes it.
     AgentParked,
-    /// The agent posted a status update through `session.post_status_update`.
-    /// `posted_at` is in milliseconds since the Unix epoch.
-    StatusUpdate {
-        text: String,
-        posted_at: u64,
-    },
     /// The session was closed. It is the last event of a session.
     SessionClosed,
 }
@@ -1119,29 +1106,6 @@ mod tests {
         );
 
         let value = serde_json::to_value(Request {
-            id: 31,
-            method: Method::SessionPostStatusUpdate {
-                session_id: "s".into(),
-                text: "Reading the code".into(),
-            },
-        })
-        .unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "id": 31,
-                "method": "session.post_status_update",
-                "params": {"session_id": "s", "text": "Reading the code"}
-            })
-        );
-        let request: Request = serde_json::from_value(value).unwrap();
-        assert!(matches!(
-            request.method,
-            Method::SessionPostStatusUpdate { ref session_id, ref text }
-                if session_id == "s" && text == "Reading the code"
-        ));
-
-        let value = serde_json::to_value(Request {
             id: 30,
             method: Method::WorkflowList,
         })
@@ -1268,22 +1232,6 @@ mod tests {
                 ],
             },
         ];
-        let status_update = EventKind::StatusUpdate {
-            text: "Reading the code".into(),
-            posted_at: 1_700_000_000_000,
-        };
-        let value = serde_json::to_value(&status_update).unwrap();
-        assert_eq!(
-            value,
-            json!({
-                "type": "status_update",
-                "data": {"text": "Reading the code", "posted_at": 1_700_000_000_000_u64}
-            })
-        );
-        assert_eq!(
-            serde_json::from_value::<EventKind>(value).unwrap(),
-            status_update
-        );
         for message in messages.into_iter().chain(elicitation_events()) {
             let line = serde_json::to_string(&message).unwrap();
             let parsed: ServerMessage = serde_json::from_str(&line).unwrap();

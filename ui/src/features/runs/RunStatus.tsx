@@ -1,10 +1,13 @@
+import { useEffect, useLayoutEffect, useRef } from "react";
 import type { Item, RunInfo, SessionInfo, StepInfo } from "../../lib/protocol";
+import { Markdown } from "../conversation/Markdown";
 import { childStatus, StatusIcon } from "../sessions/SessionList";
 
-type StatusUpdate = Extract<Item, { type: "status_update" }>;
+type AgentMessage = Extract<Item, { type: "text" }>;
 
-function isStatusUpdate(item: Item): item is StatusUpdate {
-  return item.type === "status_update";
+/** Whether `item` is an agent message with text. */
+function isAgentMessage(item: Item): item is AgentMessage {
+  return item.type === "text" && item.text.trim() !== "";
 }
 
 /**
@@ -34,8 +37,8 @@ function clock(time: number) {
 }
 
 /**
- * Every step of the run, in order, with the status updates its child
- * session's agent posted.
+ * Every step of the run, in order, with the agent messages of its child
+ * session.
  */
 export function RunStatus({
   run,
@@ -60,11 +63,11 @@ export function RunStatus({
             key={index}
             step={step}
             session={sessions.find((session) => session.id === step.session_id)}
-            followUpdates={run.state === "running" && step.state === "running"}
-            updates={
+            followMessages={run.state === "running" && step.state === "running"}
+            messages={
               step.session_id === null
                 ? []
-                : (conversations.get(step.session_id)?.filter(isStatusUpdate) ?? [])
+                : (conversations.get(step.session_id)?.filter(isAgentMessage) ?? [])
             }
             notice={notice?.index === index ? notice.text : undefined}
             // The connector below the step, or null for the last step.
@@ -82,30 +85,77 @@ export function RunStatus({
   );
 }
 
-function revealUpdate(element: HTMLLIElement | null) {
-  element?.scrollIntoView({ block: "nearest" });
+/**
+ * How far the end of `message` is below the bottom of `view`. It is negative
+ * when the end is above the bottom, and below `-view.clientHeight` when the
+ * end is above the view.
+ */
+function endBelow(message: Element, view: Element) {
+  return message.getBoundingClientRect().bottom - view.getBoundingClientRect().bottom;
+}
+
+/**
+ * A ref for the active step's latest message that keeps the message's end in
+ * the run view's scrolling view as the message grows, until the user scrolls
+ * the end out of view. A new latest message is followed again.
+ */
+function useFollow(latest: AgentMessage | undefined) {
+  const element = useRef<HTMLLIElement>(null);
+  // Whether the view follows the end of the latest message.
+  const following = useRef(true);
+  const key = latest?.key;
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new latest message is followed
+  useLayoutEffect(() => {
+    following.current = true;
+  }, [key]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: each change to the latest message scrolls a followed view
+  useLayoutEffect(() => {
+    const node = element.current;
+    if (node === null || !following.current) return;
+    const view = node.closest(".conversation")!;
+    const below = endBelow(node, view);
+    if (below > 0 || below < -view.clientHeight) view.scrollTop += below;
+  }, [latest]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: each latest message is a new element
+  useEffect(() => {
+    const node = element.current;
+    if (node === null) return;
+    const view = node.closest(".conversation")!;
+    const onScroll = () => {
+      const below = endBelow(node, view);
+      following.current = below < 1 && below >= -view.clientHeight;
+    };
+    view.addEventListener("scroll", onScroll);
+    return () => view.removeEventListener("scroll", onScroll);
+  }, [key]);
+
+  return element;
 }
 
 function StepStatus({
   step,
   session,
-  followUpdates,
-  updates,
+  followMessages,
+  messages,
   notice,
   connector,
 }: {
   step: StepInfo;
   session: SessionInfo | undefined;
-  followUpdates: boolean;
-  /** The status updates of the step's child session, oldest first. */
-  updates: StatusUpdate[];
-  /** The run's failure or interruption, shown after the step's updates. */
+  followMessages: boolean;
+  /** The agent messages of the step's child session, oldest first. */
+  messages: AgentMessage[];
+  /** The run's failure or interruption, shown after the step's messages. */
   notice: string | undefined;
   /** The connector below the step: solid, dashed between two pending steps, or none. */
   connector: "solid" | "dashed" | null;
 }) {
   const status = childStatus(step, session);
-  const latest = followUpdates ? updates.at(-1) : undefined;
+  const latest = followMessages ? messages.at(-1) : undefined;
+  const follow = useFollow(latest);
   const name = (
     <>
       <StatusIcon status={status} />
@@ -124,14 +174,11 @@ function StepStatus({
         </time>
       )}
       <h3 className="run-status-current">{name}</h3>
-      {(updates.length > 0 || notice !== undefined) && (
-        <ol className="run-status-updates">
-          {updates.map((update) => (
-            <li key={update.key} ref={update === latest ? revealUpdate : undefined}>
-              <time dateTime={new Date(update.posted_at).toISOString()}>
-                {clock(update.posted_at)}
-              </time>
-              <p>{update.text}</p>
+      {(messages.length > 0 || notice !== undefined) && (
+        <ol className="run-status-messages">
+          {messages.map((message) => (
+            <li key={message.key} ref={message === latest ? follow : undefined}>
+              <Markdown text={message.text} />
             </li>
           ))}
           {notice !== undefined && (

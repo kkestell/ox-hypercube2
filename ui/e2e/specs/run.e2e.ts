@@ -162,12 +162,12 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
   });
 
-  it("follows the active step's latest status update and keeps completed updates visible", async () => {
+  it("follows the active step's latest agent message and keeps completed messages visible", async () => {
     const { cwd } = await gitWorkspace();
     const report = [
-      "mcp-status Reading the code",
+      directive("messages 1", "Reading the code"),
       directive("shell", "while [ ! -f report ]; do sleep 0.1; done"),
-      "mcp-status Writing the fix",
+      directive("messages 1", "Writing the fix"),
       directive("shell", "while [ ! -f go ]; do sleep 0.1; done"),
     ].join("\n");
     const later = Array.from(
@@ -177,7 +177,9 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await defineWorkflow("report", `name: Report\nsteps:\n${agentStep("Report", report)}${later}`);
     await startRun(cwd, "Report", "");
 
-    await expect(statusStep("Report").$(".run-status-updates li p")).toHaveText("Reading the code");
+    await expect(statusStep("Report").$(".run-status-messages li p")).toHaveText(
+      "Reading the code",
+    );
     const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
     await browser.execute(() => {
       const view = document.querySelector(".conversation")!;
@@ -185,27 +187,54 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     });
     await writeFile(join(worktree, "report"), "");
 
-    const updates = ["Reading the code", "Writing the fix"];
-    await expect(statusStep("Report").$$(".run-status-updates li")).toBeElementsArrayOfSize(2);
-    await expect(statusStep("Report").$$(".run-status-updates li p")).toHaveText(updates);
-    await expect(statusStep("Report").$$(".run-status-updates li time")).toHaveText([
-      clockText,
-      clockText,
-    ]);
+    const messages = ["Reading the code", "Writing the fix"];
+    await expect(statusStep("Report").$$(".run-status-messages li")).toBeElementsArrayOfSize(2);
+    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
     await expect(statusStep("Report").$(".run-status-time")).toHaveText(clockText);
     await expect(statusStep("Later 1").$(".run-status-time")).not.toBeExisting();
-    const latest = await statusStep("Report").$(".run-status-updates li:last-child");
+    const latest = await statusStep("Report").$(".run-status-messages li:last-child");
     expect(
       await browser.execute((element) => {
-        const update = element.getBoundingClientRect();
+        const message = element.getBoundingClientRect();
         const view = element.closest(".conversation")!.getBoundingClientRect();
-        return update.top >= view.top && update.bottom <= view.bottom;
+        return message.top >= view.top && message.bottom <= view.bottom;
       }, latest),
     ).toBe(true);
 
     await writeFile(join(worktree, "go"), "");
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-    await expect(statusStep("Report").$$(".run-status-updates li p")).toHaveText(updates);
+    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
+  });
+
+  it("keeps the end of the active step's growing message in view", async () => {
+    const { cwd } = await gitWorkspace();
+    const lines = "for i in $(seq 60); do printf '\\n\\nLine %s' $i; done";
+    const report = [
+      directive("text", "Reading the code"),
+      directive("shell", `while [ ! -f grow ]; do sleep 0.1; done; ${lines}`),
+      directive("shell", "while [ ! -f go ]; do sleep 0.1; done"),
+    ].join("\n");
+    await defineWorkflow("grow", `name: Grow\nsteps:\n${agentStep("Report", report)}`);
+    await startRun(cwd, "Grow", "");
+
+    await expect(statusStep("Report").$(".run-status-messages li p")).toHaveText(
+      "Reading the code",
+    );
+    const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
+    await writeFile(join(worktree, "grow"), "");
+
+    const message = await statusStep("Report").$(".run-status-messages li");
+    await expect(message).toHaveText(expect.stringContaining("Line 60"));
+    expect(
+      await browser.execute((element) => {
+        const end = element.getBoundingClientRect().bottom;
+        const view = element.closest(".conversation")!.getBoundingClientRect();
+        return end > view.top && end <= view.bottom + 1;
+      }, message),
+    ).toBe(true);
+
+    await writeFile(join(worktree, "go"), "");
+    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
   });
 
   it("takes an answer to a child's request from the run view or the child's view", async () => {

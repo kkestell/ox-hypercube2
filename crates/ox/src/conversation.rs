@@ -69,13 +69,6 @@ pub enum Item {
         key: String,
         error: Option<String>,
     },
-    /// A status update the agent posted, at `posted_at` in milliseconds
-    /// since the Unix epoch.
-    StatusUpdate {
-        key: String,
-        text: String,
-        posted_at: u64,
-    },
     SessionClosed {
         key: String,
     },
@@ -279,11 +272,6 @@ impl Conversation {
                     error: error.clone(),
                 }]
             }
-            EventKind::StatusUpdate { text, posted_at } => vec![Item::StatusUpdate {
-                key,
-                text: text.clone(),
-                posted_at: *posted_at,
-            }],
             EventKind::SessionClosed => vec![Item::SessionClosed { key }],
         }
     }
@@ -444,7 +432,6 @@ impl Item {
             | Self::Elicitation { key, .. }
             | Self::TurnError { key, .. }
             | Self::AgentExited { key, .. }
-            | Self::StatusUpdate { key, .. }
             | Self::SessionClosed { key } => Some(key),
             Self::RequestResolved { .. } => None,
         }

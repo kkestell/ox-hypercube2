@@ -221,8 +221,6 @@ export type Item =
     }
   | { type: "turn_error"; key: string; message: string }
   | { type: "agent_exited"; key: string; error: string | null }
-  /** A status update the agent posted, at `posted_at` in milliseconds since the Unix epoch. */
-  | { type: "status_update"; key: string; text: string; posted_at: number }
   | { type: "session_closed"; key: string };
 
 /** An open permission request or form. */

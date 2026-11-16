@@ -79,8 +79,7 @@ can restart an exited Pi on the same session.
 
 `oxd` supplies each compatible agent with a session-scoped `ox-mcp` stdio
 server. The agent launches it. Its tools call back into the daemon for that
-session: `set_title` sets the session title, and `post_status_update`
-records a timestamped status update in the session's history.
+session: `set_title` sets the session title.
 
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
@@ -90,10 +89,10 @@ does not keep the daemon alive between calls.
 `oxd` gives each agent instructions about Ox when any apply. An agent with
 the `ox` tools is told to title its session with `set_title`. A run's child
 session is told which step of which workflow it runs and that its final
-reply is the next step's input, and, with the `ox` tools, to post status
-updates. An agent that advertises `session.systemPrompt` gets the
-instructions in its system prompt when its session is opened or resumed.
-Another gets them as a text block before a new session's first prompt.
+reply is the next step's input. An agent that advertises
+`session.systemPrompt` gets the instructions in its system prompt when its
+session is opened or resumed. Another gets them as a text block before a new
+session's first prompt.
 
 ## Ownership boundaries
 
