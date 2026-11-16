@@ -163,6 +163,31 @@ describe("The file viewer", () => {
     ).toBe(true);
   });
 
+  it("opens Markdown as a preview and flips to source and back", async () => {
+    const cwd = await startSession();
+    const text = "# Title\n\nSome *text*\n";
+    await writeFile(join(cwd, "notes.md"), text);
+    await writeFile(join(cwd, "main.rs"), "fn main() {}\n");
+    await openSession(cwd);
+    await treeRow("main.rs").$("button.select").click();
+    await expect($(".file-pill")).toHaveText("main.rs");
+    await expect($(".preview-toggle")).not.toBeExisting();
+    await treeRow("notes.md").$("button.select").click();
+    await expect($(".file-body .markdown h1")).toHaveText("Title");
+    await expect($(".file-body .markdown em")).toHaveText("text");
+    await expect($(".file-body > pre")).not.toBeExisting();
+    await $(".preview-toggle").click();
+    await browser.waitUntil(() =>
+      browser.execute(
+        (text) => document.querySelector(".file-body > pre")?.textContent === text,
+        text,
+      ),
+    );
+    await expect($(".file-body .markdown")).not.toBeExisting();
+    await $(".preview-toggle").click();
+    await expect($(".file-body .markdown h1")).toHaveText("Title");
+  });
+
   it("opens nested plain text, follows disk edits, and restores each session before paint", async () => {
     const cwd = await startSession();
     const text = Array.from(
@@ -170,21 +195,21 @@ describe("The file viewer", () => {
       (_, index) => `${index} ${"long line ".repeat(40)}`,
     ).join("\n");
     await mkdir(join(cwd, "sub"));
-    await writeFile(join(cwd, "sub", "README.md"), text);
+    await writeFile(join(cwd, "sub", "notes.txt"), text);
     await writeFile(join(cwd, "second.txt"), "second");
     const other = await startSession();
     await writeFile(join(other, "other.txt"), text.replaceAll("long line", "other text"));
     const empty = await startSession();
     await openSession(cwd);
     await treeRow("sub").$("button.select").click();
-    await treeRow("README.md").$("button.select").click();
+    await treeRow("notes.txt").$("button.select").click();
     await browser.waitUntil(async () =>
       browser.execute(
         (expected) => document.querySelector(".file-body pre")?.textContent === expected,
         text,
       ),
     );
-    await expect($(".file-pill")).toHaveText("README.md");
+    await expect($(".file-pill")).toHaveText("notes.txt");
     expect(
       await browser.execute(
         () => getComputedStyle(document.querySelector(".file-body pre")!).whiteSpace,
@@ -250,7 +275,7 @@ describe("The file viewer", () => {
       body.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
     const updated = `updated\n${text}`;
-    await writeFile(join(cwd, "sub", "README.md"), updated);
+    await writeFile(join(cwd, "sub", "notes.txt"), updated);
     // Observe a live filesystem notification while the target viewer is inactive.
     await writeFile(join(other, "other.txt"), `active update\n${text}`);
     await browser.waitUntil(async () =>
@@ -342,7 +367,7 @@ describe("The file viewer", () => {
     await browser.setWindowSize(windowSize.width, windowSize.height);
     await treeRow("second.txt").$("button.select").click();
     await expect($(".file-body pre")).toHaveText("second");
-    await writeFile(join(cwd, "sub", "README.md"), "old file changed");
+    await writeFile(join(cwd, "sub", "notes.txt"), "old file changed");
     await writeFile(join(cwd, "second.txt"), "new file changed");
     await expect($(".file-body pre")).toHaveText("new file changed");
     await browser.saveScreenshot("/tmp/ox-file-viewer.png");

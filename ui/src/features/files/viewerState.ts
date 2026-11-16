@@ -6,9 +6,18 @@ export interface ViewerState {
   scrollTop: number;
   scrollLeft: number;
   content: FileContent | null;
+  /** Whether a Markdown file shows rendered rather than as source. */
+  preview: boolean;
 }
 
-const empty: ViewerState = { path: null, ratio: 0.5, scrollTop: 0, scrollLeft: 0, content: null };
+const empty: ViewerState = {
+  path: null,
+  ratio: 0.5,
+  scrollTop: 0,
+  scrollLeft: 0,
+  content: null,
+  preview: true,
+};
 const states = new Map<string, ViewerState>();
 const listeners = new Map<string, Set<() => void>>();
 const watchers = new Set<() => void>();

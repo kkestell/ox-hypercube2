@@ -123,8 +123,8 @@ they need; the daemon shares one non-recursive watch per directory across
 consumers and releases it when the last consumer stops watching. The file tree
 subscribes only for open folders. File content subscriptions share these watches
 on the file’s parent directory and send changed text or read errors. The viewer
-keeps each session’s open file, split ratio, scroll position, and current content
-in browser memory. Open viewers stay subscribed while their session is inactive,
+keeps each session’s open file, split ratio, scroll position, current content,
+and whether Markdown shows as source or preview in browser memory. Open viewers stay subscribed while their session is inactive,
 so switching sessions can restore the viewer before paint. Closing a viewer or
 deleting its session releases its subscription.
 

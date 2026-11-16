@@ -25,6 +25,7 @@
 
 .file-pill {
   display: flex;
+  margin-right: auto;
   align-items: center;
   gap: calc(var(--spacing) * 2);
   min-width: 0;
@@ -53,8 +54,14 @@
   white-space: nowrap;
 }
 
-.file-pill .icon-button {
+.file-pill .icon-button,
+.preview-toggle[aria-pressed="false"] {
   color: var(--muted-foreground);
+}
+
+/* The tab's margin holds the header's actions at its end. */
+.file-header > .toggles {
+  margin-left: 0;
 }
 
 .file-body {
@@ -64,7 +71,7 @@
   padding: var(--file-content-padding);
 }
 
-.file-body pre {
+.file-body > pre {
   margin: 0;
   width: max-content;
   font-family: var(--font-mono);

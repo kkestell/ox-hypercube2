@@ -1,5 +1,6 @@
-import { FileTextIcon, X } from "lucide-react";
+import { EyeIcon, FileTextIcon, X } from "lucide-react";
 import { type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
+import { Markdown } from "../conversation/Markdown";
 import { highlightFile } from "./highlight";
 import { openFile, updateViewer, type ViewerState } from "./viewerState";
 
@@ -16,9 +17,11 @@ export function FileViewer({
   const body = useRef<HTMLDivElement>(null);
   const path = state.path!;
   const text = state.content?.type === "text" ? state.content.text : null;
+  const markdown = /\.(md|markdown)$/i.test(path);
+  const preview = markdown && state.preview;
   const highlighted = useMemo(
-    () => (text === null ? null : highlightFile(path, text)),
-    [path, text],
+    () => (text === null || preview ? null : highlightFile(path, text)),
+    [path, text, preview],
   );
   useLayoutEffect(() => {
     const element = body.current!;
@@ -41,6 +44,18 @@ export function FileViewer({
             <X />
           </button>
         </div>
+        {markdown && (
+          <button
+            type="button"
+            className="icon-button preview-toggle"
+            aria-label="Preview"
+            title="Preview"
+            aria-pressed={preview}
+            onClick={() => updateViewer(viewId, { preview: !preview, scrollTop: 0, scrollLeft: 0 })}
+          >
+            <EyeIcon />
+          </button>
+        )}
         {toggles}
       </header>
       <div
@@ -53,7 +68,9 @@ export function FileViewer({
           })
         }
       >
-        {state.content?.type === "text" ? (
+        {text !== null && preview ? (
+          <Markdown text={text} />
+        ) : text !== null ? (
           <pre>{highlighted}</pre>
         ) : (
           <p className="file-message">
