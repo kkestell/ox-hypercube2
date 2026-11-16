@@ -1,11 +1,5 @@
 # To do
 
-## Desktop workflow bugs
-
-- [ ] The bundled content policy may block tool output images. The tool image
-  decoded in the macOS desktop test. Other platforms have not been checked.
-  [Image decoding check](../ui/e2e/specs/session.e2e.ts)
-
 ## Workflow run and session UI
 
 - [ ] Stop collapsing completed steps on the run dashboard. While the run is
