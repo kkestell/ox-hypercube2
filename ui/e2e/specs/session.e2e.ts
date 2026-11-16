@@ -180,6 +180,43 @@ describe("A session", () => {
     await expect(image).toHaveProperty("naturalWidth", 1);
   });
 
+  it("folds a completed turn's work under Worked", async () => {
+    await send('thought "Planning"\nmessages 1 "Checking the tests"\ntool listed\ntext "Done"');
+    const group = $(".conversation > .worked");
+    const toggle = group.$(".worked-toggle");
+    const closed = async () => {
+      await expect(toggle).toHaveText("Worked");
+      await expect(toggle).toHaveAttribute("aria-expanded", "false");
+      const children = await browser.execute(() =>
+        [...document.querySelectorAll(".conversation > *")].map((child) => child.className),
+      );
+      expect(children).toEqual(["prompt", "worked", "text markdown"]);
+      await expect(agentText()).toBeElementsArrayOfSize(1);
+      await expect(agentText()[0]).toHaveText("Done");
+      await expect($(".conversation .tool-call")).not.toBeExisting();
+      await expect($(".conversation .thought")).not.toBeExisting();
+    };
+    await toggle.waitForExist();
+    await closed();
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(group.$(".thought")).toBeDisplayed();
+    await expect(group.$(".worked-items > .text")).toHaveText("Checking the tests");
+    await expect(group.$(".tool-call .title")).toHaveText("Fake tool listed");
+
+    await reload();
+    await toggle.waitForExist();
+    await closed();
+  });
+
+  it("keeps a turn that ends in an error expanded", async () => {
+    await send('thought "Planning"\ntool listed\nfail broken');
+    await expect($(".conversation .turn-error")).toHaveText("broken");
+    await expect($(".conversation .worked")).not.toBeExisting();
+    await expect($(".conversation > .tool-call")).toBeDisplayed();
+  });
+
   it("stops a turn the agent started", async () => {
     await send("own-turn");
     await expect(agentText()[0]).toHaveText("own-turn");

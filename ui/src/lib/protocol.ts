@@ -229,6 +229,7 @@ export type Item =
       message: string;
       fields: Field[];
     }
+  | { type: "turn_completed"; key: string }
   | { type: "turn_error"; key: string; message: string }
   | { type: "agent_exited"; key: string; error: string | null }
   | { type: "session_closed"; key: string };

@@ -91,6 +91,40 @@
   margin-top: calc(var(--spacing) * 2);
 }
 
+/* A completed turn's work: a muted toggle over a rule, with the work below
+   the rule while open. */
+.worked-toggle {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  width: 100%;
+  padding: 0 0 var(--spacing);
+  border: none;
+  border-bottom: var(--border-width) solid var(--border);
+  background: none;
+  color: var(--muted-foreground);
+  font: inherit;
+  cursor: default;
+}
+
+.worked-toggle > svg {
+  flex: none;
+  width: var(--icon-size);
+  height: var(--icon-size);
+  transition: rotate 150ms;
+}
+
+.worked-toggle[aria-expanded="true"] > svg {
+  rotate: 90deg;
+}
+
+.worked-items {
+  display: flex;
+  flex-direction: column;
+  gap: calc(var(--spacing) * 3);
+  padding-top: calc(var(--spacing) * 4);
+}
+
 .tool-call .heading {
   display: flex;
   align-items: center;

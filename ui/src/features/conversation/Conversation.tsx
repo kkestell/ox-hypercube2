@@ -1,5 +1,13 @@
-import { Check, X } from "lucide-react";
-import { memo, type ReactNode, type UIEvent, useLayoutEffect, useRef } from "react";
+import { Check, ChevronRight, X } from "lucide-react";
+import {
+  memo,
+  type ReactNode,
+  type UIEvent,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { CodeSpans } from "../../components/CodeSpans";
 import type { Item, ToolCallStatus } from "../../lib/protocol";
 import { Markdown } from "./Markdown";
@@ -45,9 +53,73 @@ export function Transcript({ viewId, children }: { viewId: string; children: Rea
   );
 }
 
+/** Whether `ItemView` renders anything for `item`. */
+function shown(item: Item): boolean {
+  switch (item.type) {
+    case "text":
+    case "thought":
+      return item.text.trim() !== "";
+    // Permission requests and forms show in the composer while they await
+    // an answer.
+    case "permission":
+    case "elicitation":
+    case "turn_completed":
+      return false;
+    default:
+      return true;
+  }
+}
+
+/** A row of the transcript: one item, or a completed turn's work before its reply. */
+type Row = { type: "item"; item: Item } | { type: "worked"; key: string; items: Item[] };
+
 /**
- * A session's items. An item renders again only when it changes, so
- * appending to the conversation leaves the rest of it alone.
+ * The transcript's rows. A turn's work is the items after the previous
+ * prompt or turn end. When the turn completes and its last shown item is a
+ * text reply with shown work before it, that work becomes one `worked` row;
+ * otherwise each item is its own row.
+ */
+function rows(items: Item[]): Row[] {
+  const rows: Row[] = [];
+  let turn: Item[] = [];
+  const flush = (from: number) => {
+    for (const item of turn.slice(from)) rows.push({ type: "item", item });
+    turn = [];
+  };
+  for (const item of items) {
+    switch (item.type) {
+      case "turn_completed": {
+        let reply = turn.length - 1;
+        while (reply >= 0 && !shown(turn[reply]!)) reply--;
+        const work = turn.slice(0, Math.max(reply, 0));
+        if (turn[reply]?.type === "text" && work.some(shown)) {
+          rows.push({ type: "worked", key: `worked:${work[0]!.key}`, items: work });
+          flush(reply);
+        } else {
+          flush(0);
+        }
+        rows.push({ type: "item", item });
+        break;
+      }
+      case "prompt":
+      case "turn_error":
+      case "agent_exited":
+      case "session_closed":
+        flush(0);
+        rows.push({ type: "item", item });
+        break;
+      default:
+        turn.push(item);
+    }
+  }
+  flush(0);
+  return rows;
+}
+
+/**
+ * A session's items, with each completed turn's work under a Worked group.
+ * An item or group renders again only when it changes, so appending to the
+ * conversation leaves the rest of it alone.
  */
 export const Conversation = memo(function Conversation({
   sessionId,
@@ -56,16 +128,52 @@ export const Conversation = memo(function Conversation({
   sessionId: string;
   items: Item[];
 }) {
+  const transcript = useMemo(() => rows(items), [items]);
   return (
     <Transcript viewId={sessionId}>
-      {items.map((item) => (
-        <ItemView key={item.key} item={item} />
-      ))}
+      {transcript.map((row) =>
+        row.type === "item" ? (
+          <ItemView key={row.item.key} item={row.item} />
+        ) : (
+          <WorkedGroup key={row.key} items={row.items} />
+        ),
+      )}
     </Transcript>
   );
 });
 
+/** A completed turn's work, closed until the user opens it. */
+const WorkedGroup = memo(
+  function WorkedGroup({ items }: { items: Item[] }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <div className="worked">
+        <button
+          type="button"
+          className="worked-toggle"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          Worked
+          <ChevronRight />
+        </button>
+        {open && (
+          <div className="worked-items">
+            {items.map((item) => (
+              <ItemView key={item.key} item={item} />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  },
+  (previous, next) =>
+    previous.items.length === next.items.length &&
+    previous.items.every((item, index) => item === next.items[index]),
+);
+
 export const ItemView = memo(function ItemView({ item }: { item: Item }) {
+  if (!shown(item)) return null;
   switch (item.type) {
     case "prompt":
       return (
@@ -82,7 +190,6 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
     case "text":
       return <Markdown text={item.text} />;
     case "thought":
-      if (item.text.trim() === "") return null;
       return (
         <details className="thought">
           <summary>Thinking</summary>
@@ -91,10 +198,9 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
       );
     case "tool_call":
       return <ToolCall item={item} />;
-    // Permission requests and forms show in the composer while they await
-    // an answer.
     case "permission":
     case "elicitation":
+    case "turn_completed":
       return null;
     case "turn_error":
       return <p className="turn-error">{item.message}</p>;

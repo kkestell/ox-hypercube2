@@ -77,6 +77,8 @@ async function waitForSession(session: string, state: string, title?: string) {
 /**
  * A workspace with `SESSIONS` exited sessions and one live session whose
  * transcript has `MESSAGES` replies, and the live session's ID and folder.
+ * The long turn ends on a tool call, without a reply, so its replies stay in
+ * the transcript rather than under a Worked group.
  */
 async function bigWorkspace(): Promise<{ workspace: string; session: string; cwd: string }> {
   const cwd = await realpath(await mkdtemp(join(process.env.OX_E2E_DIR!, "stress-")));
@@ -92,7 +94,11 @@ async function bigWorkspace(): Promise<{ workspace: string; session: string; cwd
     },
   );
   const session = await oxctl("new", "--workspace", workspace, "--", agent);
-  await oxctl("prompt", session, `title Long\nmessages ${MESSAGES} ${JSON.stringify(reply)}`);
+  await oxctl(
+    "prompt",
+    session,
+    `title Long\nmessages ${MESSAGES} ${JSON.stringify(reply)}\ntool end`,
+  );
   // The title arrives once the turn is running, so idle after it ends the turn.
   await waitForSession(session, "idle", "Long");
   return { workspace, session, cwd };

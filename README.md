@@ -12,7 +12,8 @@ keep working when the app closes.
   worktree and branch.
 - Workflows that run a task through a sequence of agent and shell steps in one
   worktree.
-- Streaming responses, thinking, tool calls, and background-task updates.
+- Streaming responses, thinking, tool calls, and background-task updates. A
+  completed turn's work folds under Worked, leaving its prompt and reply.
 - File attachments on prompts.
 - Conversations and tool output saved by the daemon, so sessions survive app
   and daemon restarts.

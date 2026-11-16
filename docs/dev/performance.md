@@ -31,6 +31,8 @@ messages, and a message's streamed text chunks arrive joined.
   when their own props change. The hooks that feed them return the same
   objects and callbacks until their data changes, so typing a draft or a
   change to another session renders nothing in the transcript.
+- A completed turn's work renders only while its Worked group is open, and a
+  group renders again only when its own items change.
 - The run view keeps each child's items apart. A change to one child's
   conversation leaves the other children's items unchanged.
 - A message's Markdown is parsed into top-level blocks, and each block renders

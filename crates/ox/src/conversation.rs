@@ -60,6 +60,10 @@ pub enum Item {
     RequestResolved {
         request_id: String,
     },
+    /// A turn the agent ended on its own without an error.
+    TurnCompleted {
+        key: String,
+    },
     /// A turn that ended with an error, or stopped short of its end.
     TurnError {
         key: String,
@@ -258,9 +262,10 @@ impl Conversation {
                         "The agent reached its limit of requests in a turn".into()
                     }
                     (None, Some(StopReason::Refusal)) => "The agent refused".into(),
-                    (None, Some(StopReason::EndTurn | StopReason::Cancelled) | None) => {
-                        return Vec::new();
+                    (None, Some(StopReason::EndTurn) | None) => {
+                        return vec![Item::TurnCompleted { key }];
                     }
+                    (None, Some(StopReason::Cancelled)) => return Vec::new(),
                     (None, Some(_)) => "The agent stopped".into(),
                 };
                 vec![Item::TurnError { key, message }]
@@ -430,6 +435,7 @@ impl Item {
             | Self::ToolCall { key, .. }
             | Self::Permission { key, .. }
             | Self::Elicitation { key, .. }
+            | Self::TurnCompleted { key }
             | Self::TurnError { key, .. }
             | Self::AgentExited { key, .. }
             | Self::SessionClosed { key } => Some(key),
@@ -598,6 +604,7 @@ mod tests {
                 item_thought("thought:m2", "c"),
                 item_thought("thought:m2", "d"),
                 item_text("text:m3", "e", false),
+                Item::TurnCompleted { key: "7".into() },
             ]
         );
     }
@@ -731,8 +738,50 @@ mod tests {
                     text: "live".into(),
                     attachments: vec!["a.rs".into()],
                 },
+                Item::TurnCompleted { key: "8".into() },
             ]
         );
+    }
+
+    #[test]
+    fn a_completed_turn_is_marked() {
+        let cases = [
+            (
+                "an ended turn",
+                Some(StopReason::EndTurn),
+                None,
+                "turn_completed",
+            ),
+            ("a turn without a stop reason", None, None, "turn_completed"),
+            (
+                "a cancelled turn",
+                Some(StopReason::Cancelled),
+                None,
+                "none",
+            ),
+            (
+                "an error stop reason",
+                Some(StopReason::Error(ErrorStopReason::new())),
+                None,
+                "turn_error",
+            ),
+            (
+                "an error",
+                Some(StopReason::EndTurn),
+                Some("agent exited".to_owned()),
+                "turn_error",
+            ),
+        ];
+        for (name, stop_reason, error, expected) in cases {
+            let items = fold(vec![EventKind::TurnEnded { stop_reason, error }]);
+            let kind = match &items[..] {
+                [] => "none",
+                [Item::TurnCompleted { key }] if key == "1" => "turn_completed",
+                [Item::TurnError { .. }] => "turn_error",
+                other => panic!("{name}: {other:?}"),
+            };
+            assert_eq!(kind, expected, "{name}");
+        }
     }
 
     #[test]
