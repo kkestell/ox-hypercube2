@@ -163,7 +163,7 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
   });
 
-  it("follows the active step's latest agent message and collapses the step once it succeeds", async () => {
+  it("follows the active step's latest agent message and collapses the step once a later step reports", async () => {
     const { cwd } = await gitWorkspace();
     const report = [
       directive("messages 1", "Reading the code"),
@@ -175,7 +175,15 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
       { length: 40 },
       (_, index) => `  - name: Later ${index + 1}\n    shell: "true"\n`,
     ).join("");
-    await defineWorkflow("report", `name: Report\nsteps:\n${agentStep("Report", report)}${later}`);
+    const check = [
+      directive("shell", "while [ ! -f check ]; do sleep 0.1; done"),
+      directive("messages 1", "Checking the fix"),
+    ].join("\n");
+    // The shell step between the agent steps gives the second an empty input.
+    await defineWorkflow(
+      "report",
+      `name: Report\nsteps:\n${agentStep("Report", report)}  - name: Between\n    shell: "true"\n${agentStep("Check", check)}${later}`,
+    );
     await startRun(cwd, "Report", "");
 
     await expect(statusStep("Report").$(".run-status-messages li p")).toHaveText(
@@ -199,10 +207,23 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     ).toBe(true);
 
     await writeFile(join(worktree, "go"), "");
-    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
+    // The step stays expanded after it succeeds, until a later step reports.
+    await expect(stepStatus("Check", "Running")).toBeExisting();
+    await expect(stepStatus("Report", "Succeeded")).toBeExisting();
     const toggle = statusStep("Report").$(".run-status-toggle");
+    await expect(toggle).toHaveAttribute("aria-expanded", "true");
+    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
+
+    await writeFile(join(worktree, "check"), "");
+    await expect(statusStep("Check").$(".run-status-messages li p")).toHaveText("Checking the fix");
     await expect(toggle).toHaveAttribute("aria-expanded", "false");
     await expect(statusStep("Report").$(".run-status-messages")).not.toBeExisting();
+    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
+    // The last step to report stays expanded once the run ends.
+    await expect(statusStep("Check").$(".run-status-toggle")).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
     await toggle.click();
     await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
   });
@@ -247,7 +268,9 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await defineWorkflow("share", `name: Share\nsteps:\n${steps}`);
     await startRun(cwd, "Share", "");
     await expect(stepStatus("Second", "Succeeded")).toBeExisting();
-    await expect($$(".run-status-messages")).toBeElementsArrayOfSize(0);
+    // Only the last step to report stays expanded once the run ends.
+    await expect(statusStep("Second").$$(".run-status-messages > li")).toBeElementsArrayOfSize(30);
+    await expect($$(".run-status-messages")).toBeElementsArrayOfSize(1);
 
     /** Whether the view scrolls, and each expanded list's height and scrolling. */
     const layout = () =>
@@ -267,7 +290,6 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
       await expect(statusStep(name).$$(".run-status-messages > li")).toBeElementsArrayOfSize(30);
     };
 
-    await expand("Second");
     const one = await layout();
     expect(one.viewScrolls).toBe(false);
     expect(one.lists).toHaveLength(1);

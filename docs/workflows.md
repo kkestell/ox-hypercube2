@@ -237,7 +237,8 @@ the messages its agent wrote, oldest first. A step's dot there is green once it
 succeeded and red once it failed. A failed or interrupted run's reason shows
 under the step it stopped at. The steps fill the view's height. Clicking the
 name of a step with messages collapses or expands them; a step shows its
-messages until it succeeds, unless you have expanded or collapsed it.
+messages until it has succeeded and a later step shows its first message or
+the run's failure, unless you have expanded or collapsed it.
 Expanded steps share the height the collapsed steps leave, each taking no more
 than its messages need, and a step whose messages do not fit scrolls them. Each
 step's messages stay scrolled to their end as they grow, until you scroll away

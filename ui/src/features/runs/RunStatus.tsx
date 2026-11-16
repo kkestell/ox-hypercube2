@@ -64,9 +64,9 @@ function clock(time: number) {
 /**
  * Every step of the run, in order, with the agent messages of its child
  * session. The steps fill the view's height: a step with messages or the
- * run's notice expands and collapses, is expanded until it succeeds unless
- * the user toggles it, and shares the height left by the collapsed steps with
- * the other expanded steps.
+ * run's notice expands and collapses, is expanded until it has succeeded and
+ * a later step has messages or the notice, unless the user toggles it, and
+ * shares the height left by the collapsed steps with the other expanded steps.
  */
 export function RunStatus({
   run,
@@ -83,19 +83,27 @@ export function RunStatus({
 }) {
   // Whether each step the user toggled is expanded, by index.
   const [toggled, setToggled] = useState<ReadonlyMap<number, boolean>>(new Map());
-  const steps = run.steps.map((step, index) => {
+  const shown = run.steps.map((step, index) => {
     const messages =
       step.session_id === null
         ? []
         : (conversations.get(step.session_id)?.filter(isAgentMessage) ?? []);
     const stepNotice = notice?.index === index ? notice.text : undefined;
-    const expandable = messages.length > 0 || stepNotice !== undefined;
     return {
       step,
       messages,
       notice: stepNotice,
-      expandable,
-      expanded: expandable && (toggled.get(index) ?? step.state !== "succeeded"),
+      expandable: messages.length > 0 || stepNotice !== undefined,
+    };
+  });
+  const steps = shown.map((shownStep, index) => {
+    // A succeeded step stays expanded until a later step has something to show.
+    const done =
+      shownStep.step.state === "succeeded" &&
+      shown.slice(index + 1).some((later) => later.expandable);
+    return {
+      ...shownStep,
+      expanded: shownStep.expandable && (toggled.get(index) ?? !done),
     };
   });
   const expanded = steps.filter((step) => step.expanded).length;
