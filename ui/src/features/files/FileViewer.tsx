@@ -1,5 +1,6 @@
 import { FileTextIcon, X } from "lucide-react";
-import { type ReactNode, useLayoutEffect, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useMemo, useRef } from "react";
+import { highlightFile } from "./highlight";
 import { openFile, updateViewer, type ViewerState } from "./viewerState";
 
 export function FileViewer({
@@ -14,6 +15,11 @@ export function FileViewer({
 }) {
   const body = useRef<HTMLDivElement>(null);
   const path = state.path!;
+  const text = state.content?.type === "text" ? state.content.text : null;
+  const highlighted = useMemo(
+    () => (text === null ? null : highlightFile(path, text)),
+    [path, text],
+  );
   useLayoutEffect(() => {
     const element = body.current!;
     element.scrollTop = state.scrollTop;
@@ -48,7 +54,9 @@ export function FileViewer({
         }
       >
         {state.content?.type === "text" ? (
-          <pre>{state.content.text}</pre>
+          <pre>
+            <code>{highlighted}</code>
+          </pre>
         ) : (
           <p className="file-message">
             {state.content?.type === "error" ? state.content.message : "Loading…"}

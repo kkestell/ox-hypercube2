@@ -74,6 +74,42 @@
   user-select: text;
 }
 
+.file-body :is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag) {
+  color: var(--syntax-keyword);
+}
+
+.file-body :is(.hljs-string, .hljs-regexp, .hljs-char.escape_, .hljs-addition) {
+  color: var(--syntax-string);
+}
+
+.file-body :is(.hljs-number, .hljs-literal, .hljs-symbol, .hljs-bullet, .hljs-link) {
+  color: var(--syntax-constant);
+}
+
+.file-body
+  :is(
+    .hljs-title,
+    .hljs-title.function_,
+    .hljs-section,
+    .hljs-attr,
+    .hljs-attribute,
+    .hljs-property
+  ) {
+  color: var(--syntax-function);
+}
+
+.file-body :is(.hljs-type, .hljs-built_in, .hljs-title.class_, .hljs-name, .hljs-tag) {
+  color: var(--syntax-type);
+}
+
+.file-body :is(.hljs-comment, .hljs-quote, .hljs-meta) {
+  color: var(--syntax-comment);
+}
+
+.file-body .hljs-deletion {
+  color: var(--destructive);
+}
+
 .file-message {
   margin: 0;
   color: var(--muted-foreground);

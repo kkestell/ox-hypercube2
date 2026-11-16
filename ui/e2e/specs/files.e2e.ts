@@ -93,6 +93,76 @@ describe("The panel toggles", () => {
 });
 
 describe("The file viewer", () => {
+  it("highlights recognised filenames and follows edits without changing text", async () => {
+    const cwd = await startSession();
+    const cases = [
+      { name: "main.rs", text: "fn main() {}\n", selector: ".hljs-keyword", token: "fn" },
+      { name: "App.tsx", text: "const x = 1;\n", selector: ".hljs-keyword", token: "const" },
+      {
+        name: "Makefile",
+        text: "all: build\n\techo hi\n",
+        selector: ".hljs-section",
+        token: "all: build",
+      },
+      { name: "notes.txt", text: "const fn plain text\n", selector: null, token: null },
+    ];
+    for (const file of cases) await writeFile(join(cwd, file.name), file.text);
+    await openSession(cwd);
+    for (const file of cases) {
+      await expect(treeRow(file.name)).toBeDisplayed();
+      await treeRow(file.name).$("button.select").click();
+      await browser.waitUntil(() =>
+        browser.execute(
+          (text) => document.querySelector(".file-body pre")?.textContent === text,
+          file.text,
+        ),
+      );
+      if (file.selector) {
+        expect(
+          await browser.execute(
+            (selector, token) => {
+              const pre = document.querySelector(".file-body pre")!;
+              const span = pre.querySelector(selector);
+              return (
+                span?.textContent === token &&
+                getComputedStyle(span).color !== getComputedStyle(pre).color
+              );
+            },
+            file.selector,
+            file.token,
+          ),
+        ).toBe(true);
+      } else {
+        expect(
+          await browser.execute(
+            () => document.querySelectorAll('.file-body pre [class*="hljs-"]').length,
+          ),
+        ).toBe(0);
+      }
+    }
+    await treeRow("main.rs").$("button.select").click();
+    await browser.waitUntil(() =>
+      browser.execute(
+        () => document.querySelector(".file-body pre")?.textContent === "fn main() {}\n",
+      ),
+    );
+    const updated = "fn main() { let value = 1; }\n";
+    await writeFile(join(cwd, "main.rs"), updated);
+    await browser.waitUntil(() =>
+      browser.execute(
+        (text) => document.querySelector(".file-body pre")?.textContent === text,
+        updated,
+      ),
+    );
+    expect(
+      await browser.execute(() =>
+        [...document.querySelectorAll(".file-body .hljs-keyword")].some(
+          (span) => span.textContent === "let",
+        ),
+      ),
+    ).toBe(true);
+  });
+
   it("opens nested plain text, follows disk edits, and restores each session before paint", async () => {
     const cwd = await startSession();
     const text = Array.from(

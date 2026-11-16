@@ -36,6 +36,7 @@
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-opener": "^2.7.3",
     "hast-util-to-jsx-runtime": "^2.3.7",
+    "lowlight": "^3.3.0",
     "lucide-react": "^1.72.0",
     "mdast-util-from-markdown": "^2.1.0",
     "mdast-util-gfm": "^3.1.0",

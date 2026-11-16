@@ -24,6 +24,12 @@
   --hover: var(--accent);
   --selected: var(--muted);
   --surface: color-mix(in oklab, var(--background), var(--card));
+  --syntax-keyword: var(--working);
+  --syntax-string: var(--success);
+  --syntax-constant: var(--warning);
+  --syntax-type: var(--claude);
+  --syntax-function: var(--foreground);
+  --syntax-comment: var(--muted-foreground);
   --disabled-opacity: 0.5;
   --dimmed-opacity: 0.6;
   --busy-dot-opacity: 0.4;
