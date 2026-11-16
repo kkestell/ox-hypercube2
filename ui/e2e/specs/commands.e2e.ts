@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { agentText, composer, openSession, send, startSession } from "../helpers.ts";
+import { agentText, composer, openSession, reload, send, startSession } from "../helpers.ts";
 
 const menu = () => $('.command-menu [role="listbox"]');
 const firstOption = () => menu().$('[role="option"]');
@@ -38,6 +38,7 @@ describe("Slash command completion", () => {
     await browser.keys("Enter");
     await expect(agentText()[0]).toHaveText("src/main.rs");
     await expect($(".conversation .prompt .text")).toHaveText("/review src/main.rs");
+    await expect($$(".conversation .prompt")).toBeElementsArrayOfSize(1);
     await $("button.model-picker").click();
     await $("#model-menu").waitForDisplayed();
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "model-menu.png"));
@@ -85,6 +86,9 @@ describe("Slash command completion", () => {
     await browser.keys(["Shift", "Enter"]);
     await expect(composer()).toHaveValue("/\n", { trim: false });
     await expect($(".conversation .prompt")).not.toBeExisting();
+    await send("say 1 0");
+    await expect($(".conversation .prompt .text")).toHaveText("say 1 0");
+    await expect($$(".conversation .prompt")).toBeElementsArrayOfSize(1);
   });
 
   it("replaces and clears catalogs, restores a current snapshot and isolates sessions", async () => {
@@ -95,9 +99,7 @@ describe("Slash command completion", () => {
     await expect(options()).toBeElementsArrayOfSize(1);
     await expect(firstOption().$(".menu-item-text > span:first-child")).toHaveText("/echo");
     await expect(firstOption().$(".menu-item-text > .menu-detail")).toHaveText("Changed");
-    await browser.refresh();
-    // The old editor still holds `/` while the webview reloads.
-    await expect(composer()).toHaveValue("");
+    await reload();
     await composer().setValue("/");
     await expect(options()).toBeElementsArrayOfSize(1);
     await expect(firstOption().$(".menu-item-text > span:first-child")).toHaveText("/echo");

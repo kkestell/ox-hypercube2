@@ -39,6 +39,7 @@ describe("The New Task menu", () => {
     expect(branches).toHaveLength(1);
     expect((await git(path, "branch", "--show-current")).trim()).toMatch(/^ox\//);
     expect(await git(path, "rev-parse", "HEAD")).toBe(await git(cwd, "rev-parse", "main"));
+    await expect($(".content-header button.text-button")).toHaveAttribute("title", "No commits");
     await expect(worktreeEntry().$(".branch-status")).not.toBeExisting();
     expect((await compareSession(workspace)).split("\t")[0]).toBe("main");
   });

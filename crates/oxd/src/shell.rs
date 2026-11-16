@@ -265,9 +265,17 @@ impl Output {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    use tokio::io::AsyncWriteExt;
 
     use super::*;
+
+    /// How long a test waits for something that must happen.
+    const TIMEOUT: Duration = Duration::from_secs(10);
 
     const INPUTS: Inputs<'static> = Inputs {
         run: "the run",
@@ -276,24 +284,60 @@ mod tests {
 
     async fn finish(command: &str) -> Finished {
         let dir = tempfile::tempdir().unwrap();
-        run(
-            command,
-            dir.path(),
-            &BTreeMap::new(),
-            INPUTS,
-            std::future::pending(),
+        tokio::time::timeout(
+            TIMEOUT,
+            run(
+                command,
+                dir.path(),
+                &BTreeMap::new(),
+                INPUTS,
+                std::future::pending(),
+            ),
         )
         .await
+        .expect("the command did not finish")
         .ok()
         .expect("the command was not stopped")
     }
 
+    /// Polls `reading` once, so it reads everything already written, and
+    /// checks that it is still waiting for more.
+    async fn read_written(mut reading: Pin<&mut impl Future<Output = ()>>) {
+        let pending =
+            std::future::poll_fn(|cx| Poll::Ready(reading.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "the streams ended early");
+    }
+
     #[tokio::test]
-    async fn stdout_is_kept_apart_and_interleaved_with_stderr() {
-        let finished =
-            finish("printf a; sleep 0.1; printf b >&2; sleep 0.1; printf c; exit 3").await;
-        assert_eq!(finished.stdout, "ac");
-        assert_eq!(finished.output, "abc");
+    async fn output_interleaves_the_streams_in_the_order_they_are_read() {
+        let (mut stdout, stdout_end) = tokio::io::duplex(64);
+        let (mut stderr, stderr_end) = tokio::io::duplex(64);
+        let mut output = Output::default();
+        {
+            let mut reading = std::pin::pin!(output.read(stdout_end, stderr_end));
+            stdout.write_all(b"a").await.unwrap();
+            read_written(reading.as_mut()).await;
+            stderr.write_all(b"b").await.unwrap();
+            read_written(reading.as_mut()).await;
+            stdout.write_all(b"c").await.unwrap();
+            read_written(reading.as_mut()).await;
+            drop((stdout, stderr));
+            reading.await;
+        }
+        assert_eq!(output.stdout, b"ac");
+        assert_eq!(output.tail(), ("abc".to_owned(), false));
+    }
+
+    #[tokio::test]
+    async fn stdout_is_kept_apart_and_the_exit_status_is_reported() {
+        let finished = finish("printf out; printf err >&2; exit 3").await;
+        assert_eq!(finished.stdout, "out");
+        // The two pipes are read concurrently, so either may come first.
+        assert!(
+            ["outerr", "errout"].contains(&finished.output.as_str()),
+            "{:?}",
+            finished.output
+        );
         assert!(!finished.truncated);
         assert_eq!(finished.exit_code(), Some(3));
         assert_eq!(finished.result(), "exited with status 3");
@@ -320,9 +364,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_background_process_holding_stdout_does_not_hold_the_command() {
-        let started = Instant::now();
-        let finished = finish("sleep 30 & echo done").await;
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // `tail -f` never ends on its own, so the command finishes only if
+        // the shell's exit ends it.
+        let finished = finish("tail -f /dev/null & echo done").await;
         assert_eq!(finished.stdout, "done\n");
     }
 
@@ -343,23 +387,40 @@ mod tests {
         assert!(!finished.output.is_empty());
     }
 
-    #[tokio::test]
-    async fn stop_kills_a_command_that_ignores_sigterm() {
+    fn mkfifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is a NUL-terminated string that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+
+    /// The clock is paused: it moves only when the runtime has nothing to do
+    /// but wait for a timer, and then straight to that timer. The stop fires
+    /// once the shell has set its trap, so `STOP_GRACE` is the only timer.
+    #[tokio::test(start_paused = true)]
+    async fn stop_kills_a_command_that_ignores_sigterm_after_the_grace() {
         let dir = tempfile::tempdir().unwrap();
-        let started = Instant::now();
+        let trapped = dir.path().join("trapped");
+        mkfifo(&trapped);
+        let env = BTreeMap::from([("TRAPPED".to_owned(), trapped.display().to_string())]);
+        // Opening the FIFO waits for the shell to open it, and reading it
+        // ends when the shell closes it.
+        let reader = tokio::task::spawn_blocking(move || std::fs::read(trapped).unwrap());
+        let started = tokio::time::Instant::now();
         let stopped = run(
-            "trap '' TERM; echo ready; sleep 30",
+            r#"trap '' TERM; echo ready; : > "$TRAPPED"; sleep 30; echo slept"#,
             dir.path(),
-            &BTreeMap::new(),
+            &env,
             INPUTS,
-            tokio::time::sleep(Duration::from_millis(200)),
+            async {
+                reader.await.unwrap();
+            },
         )
         .await
         .err()
         .expect("the command was stopped");
         let elapsed = started.elapsed();
         assert!(elapsed >= STOP_GRACE, "{elapsed:?}");
-        assert!(elapsed < STOP_GRACE + Duration::from_secs(5), "{elapsed:?}");
+        assert!(elapsed < STOP_GRACE + Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(stopped.output, "ready\n");
     }
 }

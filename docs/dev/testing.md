@@ -31,13 +31,57 @@ in [Code style](code-style.md#implementation) applies to tests too.
   clarify repeated setup.
 - Use realistic local data and real components where practical. Substitute
   external systems at their boundary and use real internals.
-- Control time, randomness, and concurrency when they affect the result. Wait
-  for observable conditions with bounded waits instead of guessing sleep times.
+- Control time, randomness, and concurrency when they affect the result, as
+  [Time and concurrency](#time-and-concurrency) describes.
 - Give tests their own temporary files, configuration, and state. Clean up the
   resources they create without interfering with the user's running processes
   or other tests.
 - Capture enough output to explain failures. Each test runs independently of
   execution order and of other tests' state.
+
+## Time and concurrency
+
+A test passes or fails on the behavior under test alone, at any machine speed
+and load. A test whose result depends on timing is a failing test, whether or
+not it failed today.
+
+- Synchronize every step on the observable event that proves the previous
+  action took effect: a response, a session event, a listing change, a log
+  line, or a file or FIFO a fixture writes. A bounded wait (`TIMEOUT` in Rust
+  tests, `waitforTimeout` in end-to-end tests) is only the limit on waiting
+  for something that must happen.
+- Hold a fixture open on something the test releases when the test acts while
+  the fixture runs: a permission request, `wait`, background work
+  (`--background-running`), or the `blocked` and `release` FIFOs of
+  `mkfifos`. Fixture delays (`say` and `stream`) and shell `sleep` serve only
+  to generate load.
+- Use a process that never ends on its own, such as `tail -f /dev/null`, for
+  work the test expects to be stopped, so a missing stop fails the test.
+- Test durations (delays, timeouts, grace periods) in process on tokio's
+  paused clock, `#[tokio::test(start_paused = true)]`, with the timing in a
+  function that takes its delay and the channels it watches. Integration
+  tests set the duration to zero or out of reach and test the wiring through
+  events: test daemons run without an idle exit unless the test is about
+  idle exit, and parking tests use `park_after_ms: Some(0)`.
+- Prove that something did not happen with a later event it would have
+  preceded: the turn's end, or the answer to a later request on the same
+  connection, which the daemon reads in order. Where the system offers no
+  such event, test the decision as a unit and keep the integration test to
+  what does happen.
+- Assert an order only where the system orders it. Output from independent
+  tasks, processes, pipes, or file watchers arrives in either order, so a test
+  checks each item's presence, or orders them through an event.
+- In end-to-end tests, read state after the element or attribute that shows
+  it, and after a reload wait for the new document (`reload` in
+  `ui/e2e/helpers.ts`).
+- Before delivering a test change, name the event behind each wait in it.
+
+Clippy rejects `tokio::time::sleep`, `sleep_until`, and `std::thread::sleep`
+(`clippy.toml`), and Biome rejects `browser.pause`, `setTimeout`, and
+`setInterval` in `ui/e2e` (`ui/biome.json`). A delay that is itself the
+behavior, such as the park delay or the stall probe in `stress.e2e.ts`, sits
+in a small function or line marked with an `expect` or `biome-ignore` that
+gives the reason.
 
 ## Maintaining the suite
 

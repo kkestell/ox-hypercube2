@@ -100,6 +100,9 @@
 //! - `--background`: report the background work on every state update, `[]`
 //!   when none is running, starting after `session/new`, and accept the
 //!   `background-start` and `background-end` directives
+//! - `--background-running <name>`: with `--background`, start a new
+//!   session with the background work `<name>` running, as
+//!   `background-start <name>` does
 //! - `--no-commands`: omit commands from setup responses
 //! - `--model-providers`: include provider labels in the model choices
 //! - `--silent-config`: send no `config_option_update` when an option is set
@@ -355,6 +358,28 @@ fn with_background(state: acp::StateUpdate) -> acp::StateUpdate {
     }
 }
 
+/// Starts the background work `name`: its tool call `bg-<name>`, left
+/// `in_progress`, and its listing.
+fn start_background(
+    connection: &ConnectionTo<Client>,
+    session_id: &acp::SessionId,
+    name: &str,
+) -> agent_client_protocol::Result<()> {
+    let tool = format!("bg-{name}");
+    notify(
+        connection,
+        session_id,
+        acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(tool.as_str())
+                .name("fake_background")
+                .title(format!("Background {name}"))
+                .status(acp::ToolCallStatus::InProgress),
+        ),
+    )?;
+    BACKGROUND.lock().unwrap().push(tool);
+    Ok(())
+}
+
 fn state_update(
     connection: &ConnectionTo<Client>,
     session_id: &acp::SessionId,
@@ -492,6 +517,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                             .available_commands(state.commands.lock().unwrap().clone()),
                     )?;
                     if flag("--background") {
+                        if let Some(name) = value("--background-running") {
+                            start_background(&connection, &id, &name)?;
+                        }
                         state_update(
                             &connection,
                             &id,
@@ -875,6 +903,15 @@ async fn turn(
     Ok(())
 }
 
+/// Waits `delay` between the chunks of `say` and `stream`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the delay paces the chunks a test asks for"
+)]
+async fn pace(delay: Duration) {
+    tokio::time::sleep(delay).await;
+}
+
 async fn run(
     state: &State,
     connection: &ConnectionTo<Client>,
@@ -905,7 +942,7 @@ async fn run(
                     }
                     say(text.clone().unwrap_or_else(|| format!("chunk-{i}")))?;
                     if i < count {
-                        tokio::time::sleep(delay).await;
+                        pace(delay).await;
                     }
                 }
             }
@@ -1096,18 +1133,7 @@ async fn run(
                     .insert(session_id.to_string(), script);
             }
             Directive::BackgroundStart(name) => {
-                let tool = format!("bg-{name}");
-                notify(
-                    connection,
-                    &session_id,
-                    acp::SessionUpdate::ToolCallUpdate(
-                        acp::ToolCallUpdate::new(tool.as_str())
-                            .name("fake_background")
-                            .title(format!("Background {name}"))
-                            .status(acp::ToolCallStatus::InProgress),
-                    ),
-                )?;
-                BACKGROUND.lock().unwrap().push(tool);
+                start_background(connection, &session_id, &name)?;
                 state_update(connection, &session_id, running())?;
             }
             Directive::BackgroundEnd(name) => {

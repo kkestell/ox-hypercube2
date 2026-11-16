@@ -162,7 +162,9 @@ client connection and of the agent process currently serving it. A workspace
 cannot be removed while sessions or runs still belong to it.
 
 The daemon owns turn state, including turns the agent starts without a
-client prompt. Agent state updates drive the turn lifecycle; the prompt
+client prompt. A session's requests reach its agent in the order a
+connection sends them, so a prompt sent after a config option change runs
+with the new value. Agent state updates drive the turn lifecycle; the prompt
 response acknowledges insertion rather than turn completion. Permission
 requests and form elicitations are recorded with the session and can be
 answered by clients.
@@ -187,9 +189,12 @@ unarchived; deleting a session removes its saved history.
 does to the worktree and branch.
 
 Startup, load, parking, and deletion coordinate through a per-session
-lifecycle lock. Shutdown stops agents but preserves saved sessions. The
-daemon can exit when it has no clients, running agents, or running workflow
-runs; exited sessions do not keep it alive.
+lifecycle lock. Shutdown stops agents but preserves saved sessions. Each
+connected client then receives the rest of every session it follows, up to
+the session's close, before the daemon exits; a client that has not read
+it within five seconds is disconnected. The daemon can exit when it has no
+clients, running agents, or running workflow runs; exited sessions do not
+keep it alive.
 
 ## Workflow runs
 

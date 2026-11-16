@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { agentText, composer, openSession, send, startSession } from "../helpers.ts";
+import { agentText, composer, openSession, reload, send, startSession } from "../helpers.ts";
 
 const text = (value: string) => `text ${JSON.stringify(value)}`;
 const thought = (value: string) => `thought ${JSON.stringify(value)}`;
@@ -17,7 +17,7 @@ describe("Transcript Markdown", () => {
     await expect(reply().$("strong")).toHaveText("User");
     await expect(reply().$("code")).toHaveText("code");
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "markdown-messages.png"));
-    await browser.refresh();
+    await reload();
     await expect($(".prompt .markdown strong")).toHaveText("User");
     await expect(reply().$("strong")).toHaveText("User");
   });
@@ -62,7 +62,7 @@ describe("Transcript Markdown", () => {
     await expect(thinking.$("strong")).toHaveText("Reasoning");
     await expect(composer()).toBeEnabled();
     await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "markdown-thinking.png"));
-    await browser.refresh();
+    await reload();
     await expect(thinking).not.toHaveAttribute("open");
     await thinking.$("summary").click();
     await expect(thinking.$("strong")).toHaveText("Reasoning");
@@ -77,11 +77,11 @@ describe("Transcript Markdown", () => {
           "[web](https://example.com) [email](mailto:a@example.com)",
       ),
     );
-    await expect(reply().$("script")).not.toBeExisting();
     await expect(reply()).toHaveText(expect.stringContaining("<script>"));
     await expect(reply().$$("a")).toBeElementsArrayOfSize(2);
     await expect(reply().$("a=web")).toHaveAttribute("href", "https://example.com");
     await expect(reply().$("a=email")).toHaveAttribute("href", "mailto:a@example.com");
+    await expect(reply().$("script")).not.toBeExisting();
   });
 
   it("opens web links through the native opener without navigating the transcript", async () => {
@@ -140,6 +140,8 @@ describe("Transcript Markdown", () => {
       ].join("\n"),
     );
     await expect(reply().$("pre")).toBeExisting();
+    const tool = $(".conversation .tool-call");
+    await expect(tool.$('.status[aria-label="Completed"]')).toBeExisting();
     const layout = await browser.execute(() => {
       const conversation = document.querySelector<HTMLElement>(".conversation")!;
       const code = conversation.querySelector<HTMLElement>(".markdown pre")!;
@@ -165,7 +167,6 @@ describe("Transcript Markdown", () => {
       tableHeightFits: true,
       tableWordsFit: true,
     });
-    const tool = $(".conversation .tool-call");
     await tool.$("summary").click();
     await expect(tool.$("section:last-child pre")).toHaveText("**literal** `code`");
     await expect(tool.$("section:last-child strong")).not.toBeExisting();

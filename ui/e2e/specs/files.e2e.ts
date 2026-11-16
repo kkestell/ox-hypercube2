@@ -164,7 +164,17 @@ describe("The file viewer", () => {
           });
         });
       }, target) as Promise<{ text: string | null; ratio: number; top: number; left: number }>;
-    const restored = await firstFrame(cwd);
+    // Each file's watcher notifies on its own, so the README's edit can reach
+    // its inactive viewer after the active viewer's edit. Each try selects
+    // `cwd` from `other`, and so observes the first frame of a selection.
+    let restored = await firstFrame(cwd);
+    await browser.waitUntil(async () => {
+      if (restored.text !== updated) {
+        await firstFrame(other);
+        restored = await firstFrame(cwd);
+      }
+      return restored.text === updated;
+    });
     expect(restored.text).toBe(updated);
     expect(restored.ratio).toBeCloseTo(savedRatio, 2);
     expect(restored.top).toBe(400);
@@ -182,7 +192,20 @@ describe("The file viewer", () => {
     expect(await ratio()).toBeCloseTo(savedRatio, 2);
     await $('button[aria-label="Toggle Secondary Side Bar"]').click();
     const windowSize = await browser.getWindowSize();
+    const inner = await browser.execute(() => ({
+      width: window.innerWidth,
+      height: window.innerHeight,
+    }));
     await browser.setWindowSize(900, 650);
+    // The webview takes the window's new size, less the window's frame, after
+    // the window has it.
+    await browser.waitUntil(() =>
+      browser.execute(
+        (width, height) => window.innerWidth === width && window.innerHeight === height,
+        inner.width - (windowSize.width - 900),
+        inner.height - (windowSize.height - 650),
+      ),
+    );
     expect(await ratio()).toBeCloseTo(savedRatio, 2);
     expect(
       await browser.execute(() => {

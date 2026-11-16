@@ -7,6 +7,9 @@ use tokio::{
     time::{Duration, timeout},
 };
 
+/// How long a test waits for a message that must arrive.
+pub const TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn send(child: &mut Child, message: Value) {
     let stdin = child.stdin.as_mut().unwrap();
     stdin
@@ -18,7 +21,7 @@ pub async fn send(child: &mut Child, message: Value) {
 
 pub async fn receive(reader: &mut BufReader<ChildStdout>) -> Value {
     let mut line = String::new();
-    timeout(Duration::from_secs(5), reader.read_line(&mut line))
+    timeout(TIMEOUT, reader.read_line(&mut line))
         .await
         .expect("timed out waiting for ACP response")
         .unwrap();

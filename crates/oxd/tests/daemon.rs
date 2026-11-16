@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::time::{Duration, timeout};
+use tokio::time::timeout;
 
 mod common;
 
@@ -270,14 +270,17 @@ fn remote_code(error: Error) -> i32 {
     }
 }
 
+/// A client that reconnects during a turn receives the rest of it after the
+/// last event it saw.
 #[tokio::test(flavor = "multi_thread")]
 async fn reattach_mid_turn() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
+    // The permission request holds the turn open until it is answered.
     client
-        .prompt(&session.id, text("pid\nsay 20 50"))
+        .prompt(&session.id, text("pid\nsay 20 0\npermission"))
         .await
         .unwrap();
     let mut seen = Vec::new();
@@ -292,10 +295,21 @@ async fn reattach_mid_turn() {
         .subscribe(&session.id, seen.last().unwrap().seq)
         .await
         .unwrap();
+    seen.extend(
+        until(&mut events, |kind| {
+            matches!(kind, EventKind::PermissionRequested { .. })
+        })
+        .await,
+    );
+    let EventKind::PermissionRequested { request_id, .. } = &seen.last().unwrap().kind else {
+        unreachable!()
+    };
+    client
+        .permit(&session.id, &request_id.clone(), "allow")
+        .await
+        .unwrap();
     seen.extend(until(&mut events, turn_ended).await);
     assert_contiguous(&seen, started + 1);
-    // The prompt, its echo, `running`, the chunks, `idle`, and the turn's end.
-    assert_eq!(seen.len(), 26);
     assert!(matches!(
         seen.last().unwrap().kind,
         EventKind::TurnEnded {
@@ -304,10 +318,11 @@ async fn reattach_mid_turn() {
         }
     ));
     let pid = chunk(&seen[3]).unwrap().to_owned();
-    assert_eq!(
-        chunks(&seen[4..]),
-        (1..=20).map(|i| format!("chunk-{i}")).collect::<Vec<_>>()
-    );
+    let expected: Vec<String> = (1..=20)
+        .map(|i| format!("chunk-{i}"))
+        .chain(["allowed".to_owned()])
+        .collect();
+    assert_eq!(chunks(&seen[4..]), expected);
 
     client.prompt(&session.id, text("pid")).await.unwrap();
     let turn = until(&mut events, turn_ended).await;
@@ -515,19 +530,39 @@ async fn vanished_client() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
 
     let mut raw = Raw::connect(&daemon).await;
     raw.send("session.subscribe", json!({"session_id": session.id}))
         .await;
-    client.prompt(&session.id, text("say 20 50")).await.unwrap();
+    // The turn streams its chunks and stays open until it is cancelled.
+    client
+        .prompt(&session.id, text("say 200 0\nwait"))
+        .await
+        .unwrap();
     raw.events_until(|message| message["event"]["seq"] == 3)
         .await;
+    let mut turn = until(&mut events, |kind| {
+        matches!(
+            kind,
+            EventKind::Update(SessionUpdate::AgentMessageChunk(update))
+                if matches!(&update.content, ContentBlock::Text(text) if text.text == "chunk-200")
+        )
+    })
+    .await;
     drop(raw);
 
-    let mut events = client.subscribe(&session.id, started).await.unwrap();
-    let turn = until(&mut events, turn_ended).await;
+    client.cancel(&session.id).await.unwrap();
+    turn.extend(until(&mut events, turn_ended).await);
     assert_contiguous(&turn, started + 1);
-    assert_eq!(chunks(&turn).len(), 20);
+    assert_eq!(chunks(&turn).len(), 200);
+    assert!(matches!(
+        turn.last().unwrap().kind,
+        EventKind::TurnEnded {
+            stop_reason: Some(StopReason::Cancelled),
+            ..
+        }
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -563,21 +598,15 @@ async fn agent_exit() {
 #[tokio::test(flavor = "multi_thread")]
 async fn lifetime() {
     let mut daemon = Daemon::start_with(Options {
-        idle_exit_ms: 300,
+        idle_exit_ms: Some(IDLE_EXIT_MS),
         ..Options::default()
     })
     .await;
     let client = daemon.client().await;
     let (session, _) = daemon.new_session(&client).await;
+    // The live session keeps the daemon running without a client, which the
+    // daemon's unit tests establish for every state.
     drop(client);
-    assert!(
-        timeout(Duration::from_secs(1), daemon.child.wait())
-            .await
-            .is_err(),
-        "oxd exited with a live session"
-    );
-    assert!(daemon.socket.exists());
-
     let client = daemon.client().await;
     client
         .delete(&session.id, false, BTreeMap::new())
@@ -723,10 +752,45 @@ async fn slow_subscriber_receives_every_event() {
     assert_eq!(seqs, turn.iter().map(|event| event.seq).collect::<Vec<_>>());
 }
 
+/// A stopping daemon sends a client that has fallen behind the rest of each
+/// session it follows, up to the session's close, before it exits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopping_daemon_sends_the_rest_of_each_subscription() {
+    let mut daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut raw = Raw::connect(&daemon).await;
+    raw.send(
+        "session.subscribe",
+        json!({"session_id": session.id, "after_seq": started}),
+    )
+    .await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .prompt(&session.id, text("say 1000 0"))
+        .await
+        .unwrap();
+    until(&mut events, turn_ended).await;
+
+    // The raw client has read nothing, so most of the turn is still to be
+    // sent to it.
+    daemon.stop_signal();
+    let rest = raw
+        .events_until(|message| message["event"]["kind"]["type"] == "session_closed")
+        .await;
+    assert_eq!(
+        rest.iter()
+            .filter(|message| raw_turn_ended(message))
+            .count(),
+        1
+    );
+    assert!(daemon.wait_for_exit().await.success());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn delete_while_starting() {
     let mut daemon = Daemon::start_with(Options {
-        idle_exit_ms: 300,
+        idle_exit_ms: Some(IDLE_EXIT_MS),
         ..Options::default()
     })
     .await;
@@ -1195,6 +1259,25 @@ async fn config_options_are_listed_and_set() {
     }
 }
 
+/// A prompt sent after a config option change, without waiting for the
+/// change's answer, reaches the agent after the change.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_sent_after_a_config_change_runs_with_the_new_value() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    // The connection sends its requests in the order they are first polled.
+    let (set, prompted) = tokio::join!(
+        client.set_config_option(&session.id, "mode", ConfigValue::Id("code".into())),
+        client.prompt(&session.id, text("config mode")),
+    );
+    set.unwrap();
+    prompted.unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&turn), ["code"]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn prompt_content_reaches_the_agent() {
     let daemon = Daemon::start().await;
@@ -1539,12 +1622,14 @@ async fn a_stopped_daemon_stores_the_end_of_the_turn_it_interrupted() {
         matches!(kind, EventKind::PermissionRequested { .. })
     })
     .await;
-    let ended = {
-        // The daemon records the end of the turn as it closes, and the
-        // subscription sees it before the daemon exits.
-        first.stop_signal();
-        until(&mut events, turn_ended).await.pop().unwrap()
-    };
+    first.stop_signal();
+    // The daemon records the end of the turn as it closes the session, and
+    // the subscriber receives it and the session's close before oxd exits.
+    let ended = until(&mut events, turn_ended).await.pop().unwrap();
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::SessionClosed
+    ));
     assert!(first.wait_for_exit().await.success());
     drop(events);
     drop(client);
@@ -1553,7 +1638,27 @@ async fn a_stopped_daemon_stores_the_end_of_the_turn_it_interrupted() {
     let client = second.client().await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     let history = until(&mut events, turn_ended).await;
-    assert_eq!(history.last().unwrap(), &ended);
+    let [.., resolved, stored] = history.as_slice() else {
+        panic!("{history:?}");
+    };
+    assert_eq!(stored, &ended);
+    assert!(
+        matches!(
+            &resolved.kind,
+            EventKind::PermissionResolved {
+                outcome: RequestPermissionOutcome::Cancelled(_),
+                ..
+            }
+        ),
+        "{resolved:?}"
+    );
+    assert!(
+        matches!(
+            &stored.kind,
+            EventKind::TurnEnded { error: Some(error), .. } if error == "the session was closed"
+        ),
+        "{stored:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1894,7 +1999,7 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
 #[tokio::test(flavor = "multi_thread")]
 async fn exited_sessions_do_not_keep_the_daemon_alive() {
     let mut daemon = Daemon::start_with(Options {
-        idle_exit_ms: 300,
+        idle_exit_ms: Some(IDLE_EXIT_MS),
         ..Options::default()
     })
     .await;
@@ -2111,38 +2216,73 @@ async fn parked_seq(client: &Client, id: &str) -> u64 {
         .seq
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn an_idle_unviewed_session_is_parked_and_its_agent_exits() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(300),
+/// A daemon that parks a session as soon as it is quiet and unviewed. The
+/// park delay itself is established by the daemon's unit tests.
+async fn parking_daemon(idle_exit_ms: Option<u64>) -> Daemon {
+    Daemon::start_with(Options {
+        idle_exit_ms,
+        park_after_ms: Some(0),
         ..Options::default()
     })
-    .await;
+    .await
+}
+
+/// Creates a session whose fake agent reports background work, with `args`,
+/// and waits until the daemon has parked it. Nothing views the session, so
+/// it is parked as soon as its agent reports that no work is running.
+async fn parked_session(
+    daemon: &Daemon,
+    client: &Client,
+    watch: &mut Listings,
+    args: &[&str],
+) -> SessionInfo {
+    let workspace = daemon.workspace(client).await;
+    let args: Vec<&str> = ["--background"]
+        .into_iter()
+        .chain(args.iter().copied())
+        .collect();
+    let session = client
+        .new_session(
+            &workspace.id,
+            fake_agent(&args),
+            BTreeMap::new(),
+            Checkout::Workspace,
+        )
+        .await
+        .unwrap();
+    parked(watch, &session.id).await;
+    parked_seq(client, &session.id).await;
+    session
+}
+
+/// The fake agent's arguments for a session whose background work `job`
+/// runs until a prompt of `background-end job`, which keeps it from being
+/// parked until then.
+const BUSY: [&str; 2] = ["--background-running", "job"];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_unviewed_session_is_parked_and_its_agent_exits() {
+    let daemon = parking_daemon(None).await;
     let client = daemon.client().await;
-    let agent = ExitWatch::new(daemon.dir.path());
-    let (session, _) = parking_session(&daemon, &client, &agent.arg()).await;
     let mut watch = listings(&client).await;
-    parked(&mut watch, &session.id).await;
+    let agent = ExitWatch::new(daemon.dir.path());
+    parked_session(&daemon, &client, &mut watch, &agent.arg()).await;
     agent.exited().await;
-    parked_seq(&client, &session.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_parked_session_loads_again() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(300),
-        ..Options::default()
-    })
-    .await;
+    let daemon = parking_daemon(None).await;
     let client = daemon.client().await;
-    let (session, started) = parking_session(&daemon, &client, &[]).await;
+    let mut watch = listings(&client).await;
+    let (session, started) = parking_session(&daemon, &client, &BUSY).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
-    client.prompt(&session.id, text("say 1 0")).await.unwrap();
+    client
+        .prompt(&session.id, text("say 1 0\nbackground-end job"))
+        .await
+        .unwrap();
     until(&mut events, turn_ended).await;
     drop(events);
-    let mut watch = listings(&client).await;
     parked(&mut watch, &session.id).await;
     let seq = parked_seq(&client, &session.id).await;
 
@@ -2161,23 +2301,25 @@ async fn a_parked_session_loads_again() {
     assert_eq!(chunks(&turn), ["chunk-1"]);
 }
 
+/// The sessions a test expects to stay unparked become quiet before a
+/// control session does, so a wrongful park of one comes before the
+/// control's park.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_viewed_session_is_not_parked() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(300),
-        ..Options::default()
-    })
-    .await;
+    let daemon = parking_daemon(None).await;
     let client = daemon.client().await;
-    let (viewed, started) = parking_session(&daemon, &client, &[]).await;
-    let view = client.subscribe(&viewed.id, started).await.unwrap();
-    let (control, _) = parking_session(&daemon, &client, &[]).await;
     let mut watch = listings(&client).await;
-    parked(&mut watch, &control.id).await;
-    assert_ne!(
-        info(&client, &viewed.id).await.unwrap().state,
-        SessionState::Exited
+    let (viewed, started) = parking_session(&daemon, &client, &BUSY).await;
+    let mut view = client.subscribe(&viewed.id, started).await.unwrap();
+    client
+        .prompt(&viewed.id, text("background-end job"))
+        .await
+        .unwrap();
+    until(&mut view, turn_ended).await;
+    parked_session(&daemon, &client, &mut watch, &[]).await;
+    assert_eq!(
+        state_in(&watch.current.sessions, &viewed.id),
+        Some(SessionState::Idle)
     );
 
     drop(view);
@@ -2186,27 +2328,14 @@ async fn a_viewed_session_is_not_parked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_background_work_is_not_parked() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(300),
-        ..Options::default()
-    })
-    .await;
+    let daemon = parking_daemon(None).await;
     let client = daemon.client().await;
-    let (busy, started) = parking_session(&daemon, &client, &[]).await;
-    let mut events = client.subscribe(&busy.id, started).await.unwrap();
-    client
-        .prompt(&busy.id, text("background-start job"))
-        .await
-        .unwrap();
-    until(&mut events, turn_ended).await;
-    drop(events);
-    let (control, _) = parking_session(&daemon, &client, &[]).await;
     let mut watch = listings(&client).await;
-    parked(&mut watch, &control.id).await;
+    let (busy, _) = parking_session(&daemon, &client, &BUSY).await;
+    parked_session(&daemon, &client, &mut watch, &[]).await;
     assert_eq!(
-        info(&client, &busy.id).await.unwrap().state,
-        SessionState::Idle
+        state_in(&watch.current.sessions, &busy.id),
+        Some(SessionState::Idle)
     );
 
     let mut events = client.subscribe(&busy.id, 0).await.unwrap();
@@ -2221,60 +2350,24 @@ async fn a_session_with_background_work_is_not_parked() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_whose_agent_reports_no_background_work_is_not_parked() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(300),
-        ..Options::default()
-    })
-    .await;
+    let daemon = parking_daemon(None).await;
     let client = daemon.client().await;
+    let mut watch = listings(&client).await;
     let (silent, _) = daemon.new_session(&client).await;
-    let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = listings(&client).await;
-    parked(&mut watch, &control.id).await;
+    parked_session(&daemon, &client, &mut watch, &[]).await;
     assert_eq!(
-        info(&client, &silent.id).await.unwrap().state,
-        SessionState::Idle
+        state_in(&watch.current.sessions, &silent.id),
+        Some(SessionState::Idle)
     );
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn becoming_busy_restarts_the_park_delay() {
-    let daemon = Daemon::start_with(Options {
-        idle_exit_ms: 5000,
-        park_after_ms: Some(800),
-        ..Options::default()
-    })
-    .await;
-    let client = daemon.client().await;
-    let (restarted, _) = parking_session(&daemon, &client, &[]).await;
-    let (control, _) = parking_session(&daemon, &client, &[]).await;
-    let mut watch = listings(&client).await;
-    // The delay is the behavior under test: prompt the session part-way
-    // through it.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let mut events = client.subscribe(&restarted.id, 0).await.unwrap();
-    client.prompt(&restarted.id, text("say 1 0")).await.unwrap();
-    until(&mut events, turn_ended).await;
-    drop(events);
-    parked(&mut watch, &control.id).await;
-    assert_eq!(
-        info(&client, &restarted.id).await.unwrap().state,
-        SessionState::Idle
-    );
-    parked(&mut watch, &restarted.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_whose_sessions_are_parked_exits() {
-    let mut daemon = Daemon::start_with(Options {
-        idle_exit_ms: 300,
-        park_after_ms: Some(300),
-        ..Options::default()
-    })
-    .await;
+    let mut daemon = parking_daemon(Some(IDLE_EXIT_MS)).await;
     let client = daemon.client().await;
-    parking_session(&daemon, &client, &[]).await;
+    let mut watch = listings(&client).await;
+    parked_session(&daemon, &client, &mut watch, &[]).await;
+    drop(watch);
     drop(client);
     assert!(daemon.wait_for_exit().await.success());
     assert!(!daemon.socket.exists());
@@ -2403,7 +2496,10 @@ async fn file_watch_follows_edits_replacement_and_recreation() {
     std::fs::write(&path, "recreated").unwrap();
     text(&mut watch, "recreated").await;
     for bytes in [vec![0xff], vec![0]] {
-        std::fs::write(&path, bytes).unwrap();
+        // A whole replacement leaves no empty file between the two contents
+        // for the watch to read.
+        std::fs::write(&replacement, bytes).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
         assert!(matches!(
             timeout(TIMEOUT, watch.next()).await.unwrap().unwrap(),
             FileContent::Error { .. }

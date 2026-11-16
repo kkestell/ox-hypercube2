@@ -173,8 +173,10 @@ async function longestStall(action: () => Promise<unknown>): Promise<number> {
       const now = performance.now();
       probe.longest = Math.max(probe.longest, now - last);
       last = now;
+      // biome-ignore lint/style/noRestrictedGlobals: the timer measures the webview's stalls.
       if (probe.running) setTimeout(tick, 4);
     };
+    // biome-ignore lint/style/noRestrictedGlobals: the timer measures the webview's stalls.
     setTimeout(tick, 4);
   });
   await action();

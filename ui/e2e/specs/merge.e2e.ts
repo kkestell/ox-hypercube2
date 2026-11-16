@@ -105,6 +105,7 @@ describe("Local merge", () => {
     await expect(mergeButton()).toBeEnabled();
 
     // Pause Git after Ox has checked the destination, while it updates main.
+    // The pause outlasts the test's timeout, so only a hung test fails the move.
     const ready = join(cwd, ".git", "move-ready");
     const release = join(cwd, ".git", "move-release");
     await writeFile(
@@ -114,8 +115,10 @@ describe("Local merge", () => {
 grep -q ' refs/heads/main$' || exit 0
 dir="$(dirname "$0")/.."
 touch "$dir/move-ready"
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
+attempt=0
+while [ "$attempt" -lt 90 ]; do
   [ ! -f "$dir/move-release" ] || exit 0
+  attempt=$((attempt + 1))
   sleep 1
 done
 exit 1

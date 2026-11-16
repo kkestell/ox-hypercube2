@@ -92,23 +92,26 @@ impl Updates {
         self.publish(&mut state, Some(stop_reason));
     }
 
+    /// Sends the client the form now and returns a future of its answer, so
+    /// a time limit on the answer starts after the form is on its way.
     pub fn ask(
         &self,
         message: String,
         schema: acp::ElicitationSchema,
     ) -> impl Future<Output = Option<acp::ElicitationAction>> + Send + 'static {
-        let updates = self.clone();
+        let asking = Asking::new(self.clone());
+        let answer = self
+            .connection
+            .send_request(acp::CreateElicitationRequest::new(
+                acp::ElicitationFormMode::new(
+                    acp::ElicitationSessionScope::new(self.session_id.clone()),
+                    schema,
+                ),
+                message,
+            ));
         async move {
-            let _asking = Asking::new(updates.clone());
-            updates
-                .connection
-                .send_request(acp::CreateElicitationRequest::new(
-                    acp::ElicitationFormMode::new(
-                        acp::ElicitationSessionScope::new(updates.session_id.clone()),
-                        schema,
-                    ),
-                    message,
-                ))
+            let _asking = asking;
+            answer
                 .block_task()
                 .await
                 .ok()

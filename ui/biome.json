@@ -39,5 +39,26 @@
         "organizeImports": "on"
       }
     }
-  }
+  },
+  "plugins": ["./e2e/wait-for-conditions.grit"],
+  "overrides": [
+    {
+      "includes": ["e2e/**"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noRestrictedGlobals": {
+              "level": "error",
+              "options": {
+                "deniedGlobals": {
+                  "setTimeout": "Wait for the condition that shows the change, with waitUntil or an expect, as docs/dev/testing.md#time-and-concurrency describes.",
+                  "setInterval": "Wait for the condition that shows the change, with waitUntil or an expect, as docs/dev/testing.md#time-and-concurrency describes."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

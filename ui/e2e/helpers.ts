@@ -91,7 +91,9 @@ export async function startStuckSession(): Promise<string> {
         .map((request) => `${JSON.stringify(request)}\n`)
         .join(""),
     );
-    socket.setTimeout(5000, () => socket.destroy(new Error("timed out starting the fake agent")));
+    socket.setTimeout(browser.options.waitforTimeout!, () =>
+      socket.destroy(new Error("timed out starting the fake agent")),
+    );
     let pending = "";
     for await (const chunk of socket.setEncoding("utf8")) {
       pending += chunk;
@@ -292,6 +294,21 @@ export async function send(text?: string) {
   if (text !== undefined) await composer().setValue(text);
   await expect(sendButton()).toBeEnabled();
   await sendButton().click();
+}
+
+/**
+ * Reloads the webview and waits for the new document, which has none of the
+ * old document's globals. `browser.refresh()` can return while the old
+ * document is still loaded.
+ */
+export async function reload() {
+  await browser.execute(() => {
+    (window as unknown as { previous?: boolean }).previous = true;
+  });
+  await browser.refresh();
+  await browser.waitUntil(() =>
+    browser.execute(() => !(window as unknown as { previous?: boolean }).previous),
+  );
 }
 
 /** Answers one native file picker or message box at the Tauri IPC boundary. */

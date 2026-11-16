@@ -9,7 +9,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
@@ -34,23 +34,34 @@ impl Drop for Task {
     }
 }
 
-/// Serves one client until it disconnects or stops reading.
-pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard) {
+/// Serves one client until it disconnects or stops reading, or until oxd
+/// stops. When `stopping` turns true, every session has recorded its end:
+/// the client receives each subscribed session's events up to its
+/// `SessionClosed` and everything else already queued for it, and then the
+/// connection ends.
+pub async fn serve(
+    daemon: Arc<Daemon>,
+    stream: UnixStream,
+    _client: ClientGuard,
+    mut stopping: watch::Receiver<bool>,
+) {
     let (read, write) = stream.into_split();
     let (outgoing, outgoing_rx) = mpsc::channel(OUTGOING_CAPACITY);
     let mut writer = Task(tokio::spawn(write_loop(write, outgoing_rx)));
-    // Event subscriptions and watches, by the id of the
-    // request that started each.
-    let mut subscriptions: HashMap<u64, Task> = HashMap::new();
+    // Event subscriptions, which end with their session's `SessionClosed`,
+    // and watches, by the id of the request that started each.
+    let mut forwards: HashMap<u64, Task> = HashMap::new();
+    let mut watches: HashMap<u64, Task> = HashMap::new();
     let mut lines = BufReader::new(read).lines();
     let mut greeted = false;
 
-    loop {
+    let stopped = loop {
         let line = tokio::select! {
             line = lines.next_line() => line,
-            _ = &mut writer.0 => break,
+            _ = &mut writer.0 => break false,
+            _ = stopping.wait_for(|stopping| *stopping) => break true,
         };
-        let Ok(Some(line)) = line else { break };
+        let Ok(Some(line)) = line else { break false };
         let request: Request = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
@@ -58,7 +69,7 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     .ok()
                     .and_then(|value| value.get("id").and_then(Value::as_u64))
                 else {
-                    break;
+                    break false;
                 };
                 let error = ErrorBody {
                     code: code::INVALID_REQUEST,
@@ -69,7 +80,7 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     .await
                     .is_err()
                 {
-                    break;
+                    break false;
                 }
                 continue;
             }
@@ -104,10 +115,10 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                         result: Value::Null,
                     };
                     if outgoing.send(ack).await.is_err() {
-                        break;
+                        break false;
                     }
                     let task = tokio::spawn(forward(session, id, after_seq, outgoing.clone()));
-                    subscriptions.insert(id, Task(task));
+                    forwards.insert(id, Task(task));
                     continue;
                 }
                 Err(error) => Err(error),
@@ -118,10 +129,10 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     result: Value::Null,
                 };
                 if outgoing.send(ack).await.is_err() {
-                    break;
+                    break false;
                 }
                 let task = tokio::spawn(watch(daemon.clone(), id, outgoing.clone()));
-                subscriptions.insert(id, Task(task));
+                watches.insert(id, Task(task));
                 continue;
             }
             Method::FileWatch { path } | Method::DirectoryWatch { path } if !path.is_absolute() => {
@@ -139,7 +150,7 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     .await
                     .is_err()
                 {
-                    break;
+                    break false;
                 }
                 let task = tokio::spawn(crate::files::stream(
                     daemon.directories().clone(),
@@ -147,7 +158,7 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     id,
                     outgoing.clone(),
                 ));
-                subscriptions.insert(id, Task(task));
+                watches.insert(id, Task(task));
                 continue;
             }
             Method::DirectoryWatch { path } => {
@@ -156,24 +167,37 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
                     result: Value::Null,
                 };
                 if outgoing.send(ack).await.is_err() {
-                    break;
+                    break false;
                 }
                 let task = tokio::spawn(directory(daemon.clone(), path, id, outgoing.clone()));
-                subscriptions.insert(id, Task(task));
+                watches.insert(id, Task(task));
                 continue;
             }
             Method::Unsubscribe { subscription } => {
-                subscriptions.remove(&subscription);
+                forwards.remove(&subscription);
+                watches.remove(&subscription);
                 Ok(Value::Null)
             }
-            // Setting a config option waits on the agent, and creating a
-            // session in a worktree, starting a run, deleting a session or a
-            // run, listing or moving branches and comparing a worktree's
-            // branch wait on git, so each runs in its own task and the
-            // connection keeps serving other requests. A client that
-            // disconnects does not cancel it.
-            method @ (Method::SessionSetConfigOption { .. }
-            | Method::SessionNew { .. }
+            // A config option change goes to the agent here, in the order of
+            // the connection's requests, so a prompt sent after it reaches the
+            // agent after it. Its answer waits on the agent in its own task.
+            Method::SessionSetConfigOption {
+                session_id,
+                config_id,
+                value,
+            } => match daemon.set_config_option(&session_id, config_id, value) {
+                Ok(options) => {
+                    answer_later(id, options, outgoing.clone(), stopping.clone());
+                    continue;
+                }
+                Err(error) => Err(error),
+            },
+            // Creating a session in a worktree, starting a run, deleting a
+            // session or a run, listing or moving branches and comparing a
+            // worktree's branch wait on git, so each runs in its own task and
+            // the connection keeps serving other requests. A client that
+            // disconnects does not cancel it; oxd stopping does.
+            method @ (Method::SessionNew { .. }
             | Method::SessionDelete { .. }
             | Method::RunStart { .. }
             | Method::RunDelete { .. }
@@ -183,14 +207,8 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
             | Method::BranchMove { .. }
             | Method::WorktreeRefresh { .. }) => {
                 let daemon = daemon.clone();
-                let outgoing = outgoing.clone();
-                tokio::spawn(async move {
-                    let message = match daemon.handle(method).await {
-                        Ok(result) => ServerMessage::Result { id, result },
-                        Err(error) => ServerMessage::Error { id, error },
-                    };
-                    let _ = outgoing.send(message).await;
-                });
+                let answer = async move { daemon.handle(method).await };
+                answer_later(id, answer, outgoing.clone(), stopping.clone());
                 continue;
             }
             method => daemon.handle(method).await,
@@ -200,9 +218,39 @@ pub async fn serve(daemon: Arc<Daemon>, stream: UnixStream, _client: ClientGuard
             Err(error) => ServerMessage::Error { id, error },
         };
         if outgoing.send(message).await.is_err() {
-            break;
+            break false;
         }
+    };
+    if stopped {
+        drop(watches);
+        for (_, mut forward) in forwards.drain() {
+            let _ = (&mut forward.0).await;
+        }
+        // The writer ends once it has sent everything queued and every
+        // sender is gone.
+        drop(outgoing);
+        let _ = (&mut writer.0).await;
     }
+}
+
+/// Answers request `id` with `answer` in a task of its own, unless oxd stops
+/// first.
+fn answer_later(
+    id: u64,
+    answer: impl Future<Output = Result<Value, ErrorBody>> + Send + 'static,
+    outgoing: mpsc::Sender<ServerMessage>,
+    mut stopping: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let message = tokio::select! {
+            answer = answer => match answer {
+                Ok(result) => ServerMessage::Result { id, result },
+                Err(error) => ServerMessage::Error { id, error },
+            },
+            _ = stopping.wait_for(|stopping| *stopping) => return,
+        };
+        let _ = outgoing.send(message).await;
+    });
 }
 
 /// The session, once its history is loaded, if it has events after

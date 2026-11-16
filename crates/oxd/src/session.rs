@@ -86,9 +86,8 @@ pub struct Session {
     task: Mutex<Option<JoinHandle<()>>>,
     /// The subscriptions to the session's events. Locked after the state.
     viewers: Mutex<usize>,
-    /// Whether the session may be parked, and how many times it has stopped
-    /// being parkable.
-    parkable: watch::Sender<Parkable>,
+    /// Whether the session may be parked.
+    parkable: Parkability,
     /// Stops the agent of a session that stays parkable for the park delay.
     parker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -96,10 +95,68 @@ pub struct Session {
 /// Whether a session is quiet and unviewed. `lapses` counts the times it
 /// stopped being so, which a change that reverts before the park task looks
 /// still counts.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
 struct Parkable {
     parkable: bool,
     lapses: u64,
+}
+
+/// Whether a session may be parked, published to its park task.
+#[derive(Default)]
+struct Parkability(watch::Sender<Parkable>);
+
+impl Parkability {
+    /// Records whether the session is parkable now. Stopping being parkable
+    /// is a lapse.
+    fn set(&self, parkable: bool) {
+        self.0.send_if_modified(|p| {
+            if p.parkable == parkable {
+                return false;
+            }
+            p.parkable = parkable;
+            if !parkable {
+                p.lapses += 1;
+            }
+            true
+        });
+    }
+
+    /// Whether the session is parkable with no lapse since it had `lapses`.
+    fn holds(&self, lapses: u64) -> bool {
+        let p = *self.0.borrow();
+        p.parkable && p.lapses == lapses
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Parkable> {
+        self.0.subscribe()
+    }
+}
+
+/// Calls `park` each time `parkable` stays parkable for `delay`, with the
+/// lapse count the delay started from. A lapse, even one that reverted
+/// before this task looked, restarts the delay. Returns once the sender is
+/// gone.
+#[expect(clippy::disallowed_methods, reason = "the park delay is the behavior")]
+async fn park_after<F: Future<Output = ()>>(
+    mut parkable: watch::Receiver<Parkable>,
+    delay: Duration,
+    mut park: impl FnMut(u64) -> F,
+) {
+    loop {
+        let Ok(seen) = parkable.wait_for(|p| p.parkable).await.map(|p| p.lapses) else {
+            return;
+        };
+        tokio::select! {
+            () = tokio::time::sleep(delay) => {}
+            lapsed = parkable.wait_for(|p| !p.parkable || p.lapses != seen) => {
+                if lapsed.is_err() {
+                    return;
+                }
+                continue;
+            }
+        }
+        park(seen).await;
+    }
 }
 
 /// A subscription to a session's events. A session with one is not parked.
@@ -145,10 +202,7 @@ impl Session {
             commands: Mutex::new(mpsc::unbounded_channel().0),
             task: Mutex::new(None),
             viewers: Mutex::new(0),
-            parkable: watch::Sender::new(Parkable {
-                parkable: false,
-                lapses: 0,
-            }),
+            parkable: Parkability::default(),
             parker: Mutex::new(None),
         });
         *session.parker.lock().unwrap() =
@@ -156,30 +210,21 @@ impl Session {
         session
     }
 
-    /// Parks the session each time it stays parkable for `park_after`. Any
-    /// change that makes it not parkable restarts the delay.
-    async fn park_when_idle(self: Arc<Self>, park_after: Duration) {
-        let mut parkable = self.parkable.subscribe();
-        loop {
-            let Ok(seen) = parkable.wait_for(|p| p.parkable).await.map(|p| p.lapses) else {
-                return;
-            };
-            tokio::select! {
-                () = tokio::time::sleep(park_after) => {}
-                lapsed = parkable.wait_for(|p| !p.parkable || p.lapses != seen) => {
-                    if lapsed.is_err() {
-                        return;
-                    }
-                    continue;
+    /// Parks the session each time it stays parkable for `delay`. Any change
+    /// that makes it not parkable restarts the delay.
+    async fn park_when_idle(self: Arc<Self>, delay: Duration) {
+        park_after(self.parkable.subscribe(), delay, |seen| {
+            let session = self.clone();
+            async move {
+                // A load, startup or delete in progress finishes first, and
+                // the session is checked again after.
+                let _lifecycle = session.lifecycle().await;
+                if session.parkable.holds(seen) {
+                    session.stop(Change::Parked).await;
                 }
             }
-            // A load, startup or delete in progress finishes first, and the
-            // session is checked again after.
-            let _lifecycle = self.lifecycle().await;
-            if self.parkable.borrow().parkable {
-                self.stop(Change::Parked).await;
-            }
-        }
+        })
+        .await;
     }
 
     /// Launches the agent of a session that is still `starting`, running the
@@ -416,13 +461,15 @@ impl Session {
         })
     }
 
-    /// Asks the agent to change a config option and returns its resulting
-    /// options.
-    pub async fn set_config_option(
+    /// Asks the agent to change a config option. The request goes to the
+    /// agent ahead of every command sent after this returns, such as a
+    /// prompt. The returned future resolves to the agent's resulting options.
+    pub fn set_config_option(
         &self,
         config_id: String,
         value: ConfigValue,
-    ) -> Result<Vec<SessionConfigOption>, ErrorBody> {
+    ) -> Result<impl Future<Output = Result<Vec<SessionConfigOption>, ErrorBody>> + use<>, ErrorBody>
+    {
         let state = self.lock().state();
         if matches!(state, SessionState::Starting | SessionState::Exited) {
             return Err(invalid_state(state));
@@ -437,13 +484,15 @@ impl Session {
             value,
             reply,
         });
-        result
-            .await
-            .unwrap_or_else(|_| Err("the session ended".into()))
-            .map_err(|message| ErrorBody {
-                code: code::AGENT,
-                message,
-            })
+        Ok(async move {
+            result
+                .await
+                .unwrap_or_else(|_| Err("the session ended".into()))
+                .map_err(|message| ErrorBody {
+                    code: code::AGENT,
+                    message,
+                })
+        })
     }
 
     /// Cancels the running turn and every pending permission request.
@@ -549,17 +598,8 @@ impl Session {
         if !events.is_empty() {
             self.store.log(events);
         }
-        let parkable = state.quiet() && *self.viewers.lock().unwrap() == 0;
-        self.parkable.send_if_modified(|p| {
-            if p.parkable == parkable {
-                return false;
-            }
-            p.parkable = parkable;
-            if !parkable {
-                p.lapses += 1;
-            }
-            true
-        });
+        self.parkable
+            .set(state.quiet() && *self.viewers.lock().unwrap() == 0);
         let after = self.info_of(&state);
         if after != before {
             self.save(&before, &after);
@@ -893,5 +933,127 @@ impl Session {
             )
             .await;
         self.record(Change::Exited(result.err().map(|error| error.to_string())));
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tests move the paused clock by sleeping"
+)]
+mod tests {
+    use tokio::sync::{Notify, mpsc};
+    use tokio::time::Instant;
+
+    use super::*;
+
+    const DELAY: Duration = Duration::from_mins(1);
+    const TICK: Duration = Duration::from_millis(1);
+
+    /// A park task over `parkability` that parks as a session does: once
+    /// `lifecycle` lets it, if no lapse came since its delay started, after
+    /// which the session is not parkable. It sends the time of each park.
+    fn parker(
+        parkability: &Arc<Parkability>,
+        lifecycle: Option<Arc<Notify>>,
+    ) -> mpsc::UnboundedReceiver<Instant> {
+        let (parked, parks) = mpsc::unbounded_channel();
+        let parkability = parkability.clone();
+        tokio::spawn(async move {
+            park_after(parkability.subscribe(), DELAY, |seen| {
+                let (parkability, lifecycle, parked) =
+                    (parkability.clone(), lifecycle.clone(), parked.clone());
+                async move {
+                    if let Some(lifecycle) = lifecycle {
+                        lifecycle.notified().await;
+                    }
+                    if parkability.holds(seen) {
+                        parkability.set(false);
+                        let _ = parked.send(Instant::now());
+                    }
+                }
+            })
+            .await;
+        });
+        parks
+    }
+
+    // These tests run on a paused clock: it moves only when every task waits
+    // on a timer, and then straight to the earliest one.
+
+    #[tokio::test(start_paused = true)]
+    async fn a_parkable_session_is_parked_once_the_delay_passes() {
+        let parkability = Arc::new(Parkability::default());
+        let mut parks = parker(&parkability, None);
+        let start = Instant::now();
+        parkability.set(true);
+        tokio::time::sleep(DELAY.saturating_sub(TICK)).await;
+        assert!(parks.try_recv().is_err());
+        assert_eq!(parks.recv().await.unwrap() - start, DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lapse_that_reverts_before_the_park_task_looks_restarts_the_delay() {
+        let parkability = Arc::new(Parkability::default());
+        let mut parks = parker(&parkability, None);
+        parkability.set(true);
+        tokio::time::sleep(DELAY / 2).await;
+        parkability.set(false);
+        parkability.set(true);
+        let restarted = Instant::now();
+        tokio::time::sleep(DELAY / 2 + TICK).await;
+        assert!(parks.try_recv().is_err(), "parked by the first delay");
+        assert_eq!(parks.recv().await.unwrap() - restarted, DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_session_is_parked_only_while_it_stays_parkable() {
+        let parkability = Arc::new(Parkability::default());
+        let mut parks = parker(&parkability, None);
+        parkability.set(true);
+        tokio::time::sleep(DELAY / 2).await;
+        parkability.set(false);
+        tokio::time::sleep(DELAY * 10).await;
+        assert!(parks.try_recv().is_err());
+
+        parkability.set(true);
+        let parkable = Instant::now();
+        assert_eq!(parks.recv().await.unwrap() - parkable, DELAY);
+        // Parked again each time it becomes parkable.
+        parkability.set(true);
+        let again = Instant::now();
+        assert_eq!(parks.recv().await.unwrap() - again, DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lapse_while_the_park_waits_for_the_lifecycle_restarts_the_delay() {
+        let parkability = Arc::new(Parkability::default());
+        let lifecycle = Arc::new(Notify::new());
+        let mut parks = parker(&parkability, Some(lifecycle.clone()));
+        parkability.set(true);
+        // The delay passes and the park waits for the lifecycle.
+        tokio::time::sleep(DELAY + TICK).await;
+        parkability.set(false);
+        parkability.set(true);
+        let restarted = Instant::now();
+        lifecycle.notify_one();
+        tokio::time::sleep(DELAY.saturating_sub(TICK)).await;
+        assert!(parks.try_recv().is_err(), "parked after a lapse");
+        lifecycle.notify_one();
+        assert_eq!(parks.recv().await.unwrap() - restarted, DELAY);
+    }
+
+    #[test]
+    fn parkability_holds_until_a_lapse() {
+        let parkability = Parkability::default();
+        assert!(!parkability.holds(0));
+        parkability.set(true);
+        assert!(parkability.holds(0));
+        parkability.set(true);
+        assert!(parkability.holds(0), "setting it again is not a lapse");
+        parkability.set(false);
+        parkability.set(true);
+        assert!(!parkability.holds(0));
+        assert!(parkability.holds(1));
     }
 }

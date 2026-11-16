@@ -660,11 +660,14 @@ async fn configure(
         if current == *value {
             continue;
         }
+        let setting =
+            |error: ErrorBody| failed(format!("setting the {label} to {value}: {}", error.message));
+        let set = session
+            .set_config_option(config_id, ConfigValue::Id(value.clone()))
+            .map_err(setting)?;
         tokio::select! {
-            set = session.set_config_option(config_id, ConfigValue::Id(value.clone())) => {
-                set.map_err(|error| {
-                    failed(format!("setting the {label} to {value}: {}", error.message))
-                })?;
+            set = set => {
+                set.map_err(setting)?;
             }
             _ = cancel.wait_for(|cancelled| *cancelled) => return Err(Ended::Cancelled),
         }

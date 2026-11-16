@@ -1,0 +1,5 @@
+disallowed-methods = [
+    { path = "tokio::time::sleep", reason = "wait for the event that shows the change (docs/dev/testing.md#time-and-concurrency); a delay that is the behavior itself states why with an `expect`" },
+    { path = "tokio::time::sleep_until", reason = "wait for the event that shows the change (docs/dev/testing.md#time-and-concurrency); a delay that is the behavior itself states why with an `expect`" },
+    { path = "std::thread::sleep", reason = "wait for the event that shows the change (docs/dev/testing.md#time-and-concurrency); a delay that is the behavior itself states why with an `expect`" },
+]

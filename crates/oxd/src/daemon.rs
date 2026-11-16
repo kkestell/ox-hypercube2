@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ox_protocol::{
-    Branches, Checkout, CommandState, Deleted, ErrorBody, Harness, ListingChange, Method, RunInfo,
-    RunState, SessionInfo, SessionState, StepInfo, StepState, WorkspaceInfo, code,
+    Branches, Checkout, CommandState, ConfigValue, Deleted, ErrorBody, Harness, ListingChange,
+    Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo, StepState, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -229,30 +229,16 @@ impl Daemon {
     /// running runs for `idle_exit`. A session whose agent is not running,
     /// `exited`, is saved and does not keep the daemon alive.
     pub async fn idle(&self, idle_exit: Duration) {
-        let mut changed = self.changed.subscribe();
-        loop {
-            // Marking the change seen before reading the registry means a
-            // change made while it is read wakes this again.
-            changed.borrow_and_update();
-            if self.is_idle() {
-                tokio::select! {
-                    () = tokio::time::sleep(idle_exit) => return,
-                    _ = changed.changed() => {}
-                }
-            } else {
-                let _ = changed.changed().await;
-            }
-        }
+        idle_for(self.changed.subscribe(), idle_exit, || self.is_idle()).await;
     }
 
     fn is_idle(&self) -> bool {
         let registry = self.lock();
-        registry.clients == 0
-            && registry
-                .sessions
-                .values()
-                .all(|session| session.state() == SessionState::Exited)
-            && !registry.runs.values().any(|run| run.running())
+        nothing_running(
+            registry.clients,
+            registry.sessions.values().map(|session| session.state()),
+            registry.runs.values().any(|run| run.running()),
+        )
     }
 
     /// Stops every runner, every agent and every comparison. The runs and
@@ -316,6 +302,21 @@ impl Daemon {
             .ok_or_else(|| not_found("worktree", id))
     }
 
+    /// Sends session `session_id`'s agent a config option change, ahead of
+    /// every later command to the session. The returned future resolves to
+    /// the agent's resulting options.
+    pub fn set_config_option(
+        &self,
+        session_id: &str,
+        config_id: String,
+        value: ConfigValue,
+    ) -> Result<impl Future<Output = Result<Value, ErrorBody>> + use<>, ErrorBody> {
+        let options = self
+            .session(session_id)?
+            .set_config_option(config_id, value)?;
+        Ok(async move { Ok(to_value(options.await?)) })
+    }
+
     /// Handles every method except `hello`, `session.subscribe`, `watch`, and
     /// `unsubscribe`, which belong to the connection.
     pub async fn handle(self: &Arc<Self>, method: Method) -> Result<Value, ErrorBody> {
@@ -360,10 +361,7 @@ impl Daemon {
                 session_id,
                 config_id,
                 value,
-            } => {
-                let session = self.session(&session_id)?;
-                Ok(to_value(session.set_config_option(config_id, value).await?))
-            }
+            } => self.set_config_option(&session_id, config_id, value)?.await,
             Method::SessionCancel { session_id } => {
                 self.session(&session_id)?.cancel();
                 Ok(Value::Null)
@@ -1264,4 +1262,130 @@ fn storage(error: &rusqlite::Error) -> ErrorBody {
 
 fn to_value(value: impl serde::Serialize) -> Value {
     serde_json::to_value(value).expect("protocol types serialize")
+}
+
+/// Whether nothing keeps the daemon running: no client, no session whose
+/// agent is running, and no running run.
+fn nothing_running(
+    clients: usize,
+    mut sessions: impl Iterator<Item = SessionState>,
+    run_running: bool,
+) -> bool {
+    clients == 0 && sessions.all(|state| state == SessionState::Exited) && !run_running
+}
+
+/// Resolves once `is_idle` has held for `delay` with no change signalled on
+/// `changed`. Each change restarts the delay.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the idle exit delay is the behavior"
+)]
+async fn idle_for(mut changed: watch::Receiver<()>, delay: Duration, is_idle: impl Fn() -> bool) {
+    loop {
+        // Marking the change seen before reading the state means a change
+        // made while it is read wakes this again.
+        changed.borrow_and_update();
+        if is_idle() {
+            tokio::select! {
+                () = tokio::time::sleep(delay) => return,
+                _ = changed.changed() => {}
+            }
+        } else {
+            let _ = changed.changed().await;
+        }
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tests move the paused clock by sleeping"
+)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use tokio::time::Instant;
+
+    use super::*;
+
+    #[test]
+    fn only_clients_live_sessions_and_running_runs_keep_the_daemon_running() {
+        use SessionState::*;
+        for (clients, sessions, run_running, expected) in [
+            (0, vec![], false, true),
+            (0, vec![Exited, Exited], false, true),
+            (1, vec![], false, false),
+            (0, vec![], true, false),
+            (0, vec![Exited, Starting], false, false),
+            (0, vec![Idle], false, false),
+            (0, vec![Running], false, false),
+            (0, vec![AwaitingPermission], false, false),
+            (0, vec![AwaitingInput], false, false),
+        ] {
+            assert_eq!(
+                nothing_running(clients, sessions.iter().copied(), run_running),
+                expected,
+                "{clients} clients, sessions {sessions:?}, run running {run_running}"
+            );
+        }
+    }
+
+    const DELAY: Duration = Duration::from_secs(5);
+    const TICK: Duration = Duration::from_millis(1);
+
+    /// Waits on `idle_for` in a task, which sends the time it resolved.
+    fn idle_task(
+        changed: &watch::Sender<()>,
+        idle: &Arc<AtomicBool>,
+    ) -> tokio::sync::oneshot::Receiver<Instant> {
+        let (resolved, resolution) = tokio::sync::oneshot::channel();
+        let changed = changed.subscribe();
+        let idle = idle.clone();
+        tokio::spawn(async move {
+            idle_for(changed, DELAY, || idle.load(Ordering::SeqCst)).await;
+            let _ = resolved.send(Instant::now());
+        });
+        resolution
+    }
+
+    // These tests run on a paused clock: it moves only when every task waits
+    // on a timer, and then straight to the earliest one.
+
+    #[tokio::test(start_paused = true)]
+    async fn idling_for_the_delay_resolves() {
+        let changed = watch::Sender::new(());
+        let idle = Arc::new(AtomicBool::new(true));
+        let start = Instant::now();
+        let mut resolution = idle_task(&changed, &idle);
+        tokio::time::sleep(DELAY.saturating_sub(TICK)).await;
+        assert!(resolution.try_recv().is_err());
+        assert_eq!(resolution.await.unwrap() - start, DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_restarts_the_delay_and_busy_time_does_not_count() {
+        let changed = watch::Sender::new(());
+        let idle = Arc::new(AtomicBool::new(true));
+        let mut resolution = idle_task(&changed, &idle);
+        tokio::time::sleep(DELAY / 2).await;
+        idle.store(false, Ordering::SeqCst);
+        changed.send_replace(());
+        tokio::time::sleep(DELAY * 10).await;
+        assert!(resolution.try_recv().is_err(), "resolved while busy");
+
+        idle.store(true, Ordering::SeqCst);
+        changed.send_replace(());
+        let idle_since = Instant::now();
+        tokio::time::sleep(DELAY / 2).await;
+        // A change that leaves it idle restarts the delay too.
+        changed.send_replace(());
+        let restarted = Instant::now();
+        tokio::time::sleep(DELAY / 2 + TICK).await;
+        assert!(Instant::now() - idle_since > DELAY);
+        assert!(
+            resolution.try_recv().is_err(),
+            "resolved by the first delay"
+        );
+        assert_eq!(resolution.await.unwrap() - restarted, DELAY);
+    }
 }

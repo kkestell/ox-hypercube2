@@ -1,0 +1,3 @@
+`browser.pause($duration)` where {
+  register_diagnostic(span=$duration, message="Wait for the condition that shows the change, with waitUntil or an expect, as docs/dev/testing.md#time-and-concurrency describes.")
+}

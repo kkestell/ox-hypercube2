@@ -7,6 +7,7 @@ import {
   composer,
   deleteSessions,
   openSession,
+  reload,
   send,
   sendButton,
   sessionEntry,
@@ -44,8 +45,8 @@ describe("A session", () => {
   it("shows the prompt and the agent's reply", async () => {
     await send("say 3 0");
     await expect($(".conversation .prompt .text")).toHaveText("say 3 0");
-    await expect(agentText()).toBeElementsArrayOfSize(1);
     await expect(agentText()[0]).toHaveText("chunk-1chunk-2chunk-3");
+    await expect(agentText()).toBeElementsArrayOfSize(1);
     await expect(composer()).toHaveValue("");
   });
 
@@ -93,7 +94,7 @@ describe("A session", () => {
     await expect($(".conversation .request-panel")).not.toBeExisting();
     await expect(sessionEntry(cwd).$('[aria-label="Awaiting permission"]')).not.toBeExisting();
 
-    await browser.refresh();
+    await reload();
     await expect(agentText()[0]).toHaveText("allowed");
     await expect(permission).not.toBeExisting();
   });
@@ -200,7 +201,7 @@ describe("A session", () => {
   it("replays the conversation after the webview reloads", async () => {
     await send("say 2 0");
     await expect(agentText()[0]).toHaveText("chunk-1chunk-2");
-    await browser.refresh();
+    await reload();
     await expect(sessionEntry(cwd).$("button.select")).toHaveAttribute("aria-current", "true");
     await expect($(".conversation .prompt .text")).toHaveText("say 2 0");
     await expect(agentText()[0]).toHaveText("chunk-1chunk-2");

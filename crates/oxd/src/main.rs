@@ -47,6 +47,10 @@ const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(5);
 /// before its agent is parked.
 const DEFAULT_PARK_AFTER: Duration = Duration::from_mins(15);
 
+/// How long a stopping daemon waits for its clients to receive what is
+/// queued for them.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Pause after a failed `accept`. Accepting fails while the process or the
 /// system is out of file descriptors, and descriptors other processes free
 /// produce no event here.
@@ -178,20 +182,28 @@ async fn run(args: Args) -> io::Result<()> {
     let uid = unsafe { libc::geteuid() };
     let idle = daemon.idle(args.idle_exit);
     tokio::pin!(idle);
+    let (stopping, stopping_rx) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     if stream.peer_cred().is_ok_and(|cred| cred.uid() == uid) {
                         let client = daemon.client();
-                        tokio::spawn(conn::serve(daemon.clone(), stream, client));
+                        connections.spawn(conn::serve(
+                            daemon.clone(),
+                            stream,
+                            client,
+                            stopping_rx.clone(),
+                        ));
                     }
                 }
                 Err(error) => {
                     eprintln!("oxd: accept failed: {error}");
-                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    pause_after_failed_accept().await;
                 }
             },
+            Some(_) = connections.join_next() => {}
             () = &mut idle => break,
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
@@ -208,7 +220,23 @@ async fn run(args: Args) -> io::Result<()> {
     daemon.close_all();
     // The next daemon reads the log once every queued event is committed.
     daemon.flush().await;
+    // Each client receives the end of every session it follows. One that
+    // stops reading is given up on.
+    let _ = stopping.send(true);
+    let _ = tokio::time::timeout(DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
     Ok(())
+}
+
+/// Waits [`ACCEPT_RETRY_DELAY`] before accepting again.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "nothing signals that descriptors were freed"
+)]
+async fn pause_after_failed_accept() {
+    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
 }
 
 /// Tells whoever started the daemon that a daemon is listening. Nothing

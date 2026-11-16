@@ -15,7 +15,7 @@ use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot},
     task::AbortHandle,
-    time::{Duration, sleep},
+    time::sleep,
 };
 use uuid::Uuid;
 
@@ -346,6 +346,10 @@ impl Output {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "Pi's dialog timeout is the behavior"
+    )]
     fn dialog(&self, request: Value) {
         let Some((message, schema)) = dialogs::form(&request) else {
             self.send(dialogs::response(&request, None));
@@ -363,10 +367,10 @@ impl Output {
             let ask = updates.ask(message, schema);
             // Pi silently forgets timed-out dialogs; it sends no withdrawal record.
             // An extension's private AbortSignal cannot be observed over RPC.
-            let action = if let Some(timeout) = request["timeout"].as_u64().filter(|ms| *ms > 0) {
+            let action = if let Some(timeout) = dialogs::timeout(&request) {
                 tokio::select! {
                     action = ask => action,
-                    () = sleep(Duration::from_millis(timeout)) => None,
+                    () = sleep(timeout) => None,
                 }
             } else {
                 ask.await

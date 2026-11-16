@@ -83,39 +83,6 @@ impl BlockedGit {
     }
 }
 
-/// Makes the FIFOs `blocked` and `release` in `dir`, through which a script
-/// says it has stopped and the test lets it go on.
-fn mkfifos(dir: &Path) {
-    for fifo in ["blocked", "release"] {
-        let status = std::process::Command::new("mkfifo")
-            .arg(dir.join(fifo))
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-}
-
-/// Waits until the script using the FIFOs in `dir` has stopped.
-async fn blocked(dir: &Path) {
-    let fifo = dir.join("blocked");
-    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(fifo));
-    let read = timeout(TIMEOUT, read)
-        .await
-        .expect("the script never stopped");
-    assert_eq!(read.unwrap().unwrap(), "blocked\n");
-}
-
-/// Lets the script using the FIFOs in `dir` go on.
-async fn release(dir: &Path) {
-    let fifo = dir.join("release");
-    let write = tokio::task::spawn_blocking(move || std::fs::write(fifo, "go\n"));
-    timeout(TIMEOUT, write)
-        .await
-        .expect("the script was not waiting")
-        .unwrap()
-        .unwrap();
-}
-
 /// The branches of the workspace for `path`.
 async fn branches(client: &Client, path: &Path) -> Result<Branches, Error> {
     let workspace = workspace_id(client, path).await;
@@ -1133,7 +1100,13 @@ async fn a_delete_during_startup_waits_for_the_worktree() {
     let worktree = worktree_of(&client, &session).await;
     blocked.blocked().await;
 
-    let releasing = async { blocked.release().await };
+    // The daemon reads a connection's requests in order and answers a watch
+    // at once, so a watch answered after the delete was sent shows that the
+    // delete arrived while the startup was stopped.
+    let releasing = async {
+        sessions(&client).await;
+        blocked.release().await;
+    };
     let (deleted, ()) = tokio::join!(delete(&client, &session.id, false), releasing);
     assert_eq!(deleted.unwrap().kept_branch, None);
     assert_removed(repo.path(), &worktree);
@@ -1718,6 +1691,9 @@ async fn a_move_compares_the_repositorys_sessions_again() {
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
+    // The session's startup runs git in the repository too, so it finishes
+    // before the test changes the repository.
+    let session = started(&client, &session).await;
     until_compared(&client, &session, counts(0, 0)).await;
 
     move_branch(&client, repo.path(), "main", &topic, &first)
@@ -1739,6 +1715,7 @@ async fn a_delete_compares_the_repositorys_sessions_again() {
     let second = new_session(&client, repo.path(), compared_with(&branch))
         .await
         .unwrap();
+    let second = started(&client, &second).await;
     until_compared(&client, &second, counts(0, 0)).await;
 
     let deleted = delete(&client, &first.id, false).await.unwrap();
@@ -1763,6 +1740,7 @@ async fn a_comparison_is_refreshed_on_request() {
     let session = new_session(&client, repo.path(), compared_with("main"))
         .await
         .unwrap();
+    let session = started(&client, &session).await;
     let worktree_id = until_compared(&client, &session, counts(0, 0)).await.id;
 
     commit_file(repo.path(), "outside");

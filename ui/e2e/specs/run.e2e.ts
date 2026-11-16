@@ -81,8 +81,13 @@ async function viewRun(cwd: string) {
   await expect(select).toHaveAttribute("aria-current", "true");
 }
 
+/**
+ * Views the session of `step`. Until the session exists, the step's row has
+ * no title and selects the run.
+ */
 async function viewChild(cwd: string, step: string) {
   const select = childRow(cwd, step).$("button.select");
+  await expect(select).toHaveAttribute("title");
   await select.click();
   await expect(select).toHaveAttribute("aria-current", "true");
 }
@@ -112,10 +117,15 @@ ${agentStep("Second", directive("text", "second"), '    postconditions:\n      -
     await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
     await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
     await expect(runRow(cwd).$('.status[aria-label="Running"]')).toBeExisting();
-    const worktree = (await childRow(cwd, "First").$("button.select").getAttribute("title"))!;
+    const first = childRow(cwd, "First").$("button.select");
+    await expect(first).toHaveAttribute("title");
+    const worktree = (await first.getAttribute("title"))!;
     await writeFile(join(worktree.replace(/\/$/, ""), "go"), "");
 
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
+    await expect(
+      workspaceGroup(cwd).$$(`./ul/li[button[@class="select"][@title="${cwd}"]]`),
+    ).toBeElementsArrayOfSize(2);
     const kinds = await browser.execute(
       (group) =>
         [...group.querySelectorAll(":scope > ul")].map((list) =>

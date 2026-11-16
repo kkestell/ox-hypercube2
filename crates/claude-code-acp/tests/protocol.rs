@@ -1,6 +1,11 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Stdio};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
 use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
 use serde_json::{Value, json};
@@ -253,14 +258,16 @@ next_message
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"sessionId":session,"cwd":project,"replayFrom":{"type":"start"}}})).await;
-    response(&mut reader, 2).await;
-    let discovered = loop {
-        let message = receive(&mut reader).await;
-        if update(&message)["sessionUpdate"] == "available_commands_update" {
-            break message;
-        }
-    };
-    assert_eq!(update(&discovered)["availableCommands"], initial);
+    // Claude reports its commands from its own output, on either side of the
+    // response.
+    let (_, mut seen) = response(&mut reader, 2).await;
+    let is_commands =
+        |message: &Value| update(message)["sessionUpdate"] == "available_commands_update";
+    while !seen.iter().any(is_commands) {
+        seen.push(receive(&mut reader).await);
+    }
+    let discovered = seen.iter().find(|message| is_commands(message)).unwrap();
+    assert_eq!(update(discovered)["availableCommands"], initial);
     assert_eq!(calls(&project).len(), 2);
     child.kill().await.unwrap();
 }
@@ -1605,17 +1612,20 @@ done
 async fn failed_exit_reports_claude_stderr() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
-    // The background process keeps stdout and stderr open after claude exits.
+    // The background process keeps stdout and stderr open after claude exits,
+    // until the test ends it.
     fake_claude(
         &bin,
         r#"
 next_prompt
 state running
 echo "unknown option --bogus" >&2
-sleep 10 &
+tail -f /dev/null &
+printf '%s\n' "$!" > holder
 exit 1
 "#,
     );
+    let _holder = KillOnDrop(project.join("holder"));
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader).await;
     let session = new_session(&mut child, &mut reader, 2, &project).await;
@@ -1635,6 +1645,17 @@ exit 1
         ]
     );
     child.kill().await.unwrap();
+}
+
+/// Kills, when dropped, the process whose ID a fake claude wrote to the file.
+struct KillOnDrop(PathBuf);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(&self.0) {
+            let _ = std::process::Command::new("kill").arg(pid.trim()).status();
+        }
+    }
 }
 
 /// Writes a transcript that mixes conversation entries with entries the
@@ -1791,6 +1812,14 @@ const REPLAY: [&str; 11] = [
     "tool_call_update: toolu_2 failed",
 ];
 
+/// `describe_updates` without the command updates claude's output sends.
+fn without_commands(notifications: &[Value]) -> Vec<String> {
+    describe_updates(notifications)
+        .into_iter()
+        .filter(|update| !update.starts_with("available_commands_update"))
+        .collect()
+}
+
 /// The replay of `write_conversation`, then the idle state a resume sends.
 fn replay_and_state() -> Vec<String> {
     REPLAY
@@ -1834,13 +1863,14 @@ next_message
     let (loaded, notifications) = response(&mut reader, 2).await;
     assert!(loaded["result"].is_object(), "{loaded}");
     // The replay comes first, then the session's state, then the response.
+    // Claude reports its commands from its own output, unordered with them.
     assert!(
         notifications
             .iter()
             .all(|n| n["params"]["sessionId"] == session),
         "{notifications:?}"
     );
-    assert_eq!(describe_updates(&notifications), replay_and_state());
+    assert_eq!(without_commands(&notifications), replay_and_state());
     let (result, _) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(result["stopReason"], "end_turn", "{result}");
     let args = fs::read_to_string(project.join("args")).unwrap();
@@ -1856,7 +1886,7 @@ next_message
     send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/resume","params":{"sessionId":session,"cwd":project,"mcpServers":[]}})).await;
     let (resumed, notifications) = response(&mut reader, 4).await;
     assert!(resumed["result"].is_object(), "{resumed}");
-    assert_eq!(describe_updates(&notifications), ["state_update: idle"]);
+    assert_eq!(without_commands(&notifications), ["state_update: idle"]);
     child.kill().await.unwrap();
 }
 
@@ -2109,12 +2139,18 @@ next_message
     let (result, updates) = prompt(&mut child, &mut reader, 3, &session).await;
     assert_eq!(result["stopReason"], "end_turn", "{result}");
     assert_eq!(
-        describe_updates(&updates)[3..7],
+        describe_updates(&updates)
+            .into_iter()
+            .filter(|update| !update.starts_with("session_info_update"))
+            .collect::<Vec<_>>(),
         [
+            "user_message: hello",
+            "state_update: running",
             "tool_call_update: tool-1 Bash `ls` pending",
             "tool_call_update: tool-2 Read `/a.png` pending",
             "tool_call_update: tool-1 failed [a.png\nb.rs]",
             "tool_call_update: tool-2 completed [Read an image | image | {type:tool_reference,tool_name:WebSearch}]",
+            "state_update: idle end_turn",
         ]
     );
     let image = updates
@@ -2241,20 +2277,26 @@ next_message
     let session = new_session(&mut child, &mut reader, 2, &project).await;
     send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"hello"}]}})).await;
     // Only the prompt's own message comes before its response; the turn's
-    // state and output follow it.
+    // state and output follow it. The session's title is sent with the
+    // prompt, apart from the turn, so it may arrive on either side.
     let (answer, before) = response(&mut reader, 3).await;
-    let kinds: Vec<&str> = before
-        .iter()
-        .map(|v| update(v)["sessionUpdate"].as_str().unwrap())
-        .collect();
-    assert_eq!(kinds, ["session_info_update", "user_message"], "{before:?}");
+    let is_title = |v: &Value| update(v)["sessionUpdate"] == "session_info_update";
+    let message: Vec<&Value> = before.iter().filter(|v| !is_title(v)).collect();
+    assert_eq!(message.len(), 1, "{before:?}");
+    assert_eq!(update(message[0])["sessionUpdate"], "user_message");
     assert_eq!(
-        update(&before[1])["messageId"],
+        update(message[0])["messageId"],
         answer["result"]["messageId"]
     );
-    assert_eq!(update(&before[1])["content"][0]["text"], "hello");
-    let after = until_text(&mut reader, "working").await;
-    assert_eq!(describe_updates(&after[..1]), ["state_update: running"]);
+    assert_eq!(update(message[0])["content"][0]["text"], "hello");
+    let mut after = until_text(&mut reader, "working").await;
+    while !before.iter().chain(&after).any(is_title) {
+        after.push(receive(&mut reader).await);
+    }
+    let title = before.iter().chain(&after).find(|v| is_title(v)).unwrap();
+    assert_eq!(update(title)["title"], "hello", "{title}");
+    let turn: Vec<Value> = after.iter().filter(|v| !is_title(v)).cloned().collect();
+    assert_eq!(describe_updates(&turn[..1]), ["state_update: running"]);
 
     send(
         &mut child,

@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use ox_protocol::schema::{ContentBlock, SessionConfigKind, SessionUpdate, StopReason};
 use ox_protocol::{
@@ -178,12 +177,6 @@ fn config_value(session: &SessionInfo, id: &str) -> String {
     select.current_value.to_string()
 }
 
-/// The current time in milliseconds since the Unix epoch.
-fn now() -> u64 {
-    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    u64::try_from(since_epoch.as_millis()).unwrap()
-}
-
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     !git(repo, &["branch", "--list", branch]).is_empty()
 }
@@ -297,23 +290,49 @@ async fn a_cancelled_run_stops_at_its_active_step() {
     );
 }
 
-/// A run keeps going after the client that started it disconnects, for
-/// longer than the daemon's idle exit.
+/// A run keeps going after the client that started it disconnects, and the
+/// daemon exits once the run has ended. The daemon's unit tests establish
+/// that a running run keeps it from being idle.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_continues_without_clients() {
     let repo = repo();
-    let daemon = start_daemon().await;
-    // The first step streams empty chunks, so it hands the second nothing.
-    daemon.define_two("slow", r#"stream 5 700 """#, "pid");
+    let mut daemon = Daemon::start_with(Options {
+        bridges: true,
+        idle_exit_ms: Some(IDLE_EXIT_MS),
+        ..Options::default()
+    })
+    .await;
+    // A shell step has no child session, so only the run is running.
+    let gate = tempfile::tempdir().unwrap();
+    mkfifos(gate.path());
+    let command = r#"echo blocked > "$OX_RUN_INPUT/blocked"; read _ < "$OX_RUN_INPUT/release""#;
+    daemon.define(
+        "gated",
+        &format!(
+            "name: Gated
+steps:
+  - name: Gate
+    shell: {}
+",
+            yaml_string(command)
+        ),
+    );
     let client = daemon.client().await;
     let workspace = add_workspace(&client, repo.path()).await;
-    let run = start(&client, &workspace, "slow", "").await;
+    let run = start(&client, &workspace, "gated", gate.path().to_str().unwrap()).await;
+    blocked(gate.path()).await;
     drop(client);
 
-    // No client is connected for longer than the idle exit.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    release(gate.path()).await;
+    assert!(daemon.wait_for_exit().await.success());
+    let daemon = daemon
+        .again(Options {
+            bridges: true,
+            ..Options::default()
+        })
+        .await;
     let client = daemon.client().await;
-    let run = until_ended(&client, &run.id).await;
+    let run = until_run(&client, &run.id, |_| true).await;
     assert_eq!(run.state, RunState::Succeeded, "{run:?}");
 }
 
@@ -526,10 +545,7 @@ steps:
         assert_eq!(run.steps[1].state, StepState::Pending, "{workflow}");
         assert_eq!(run.steps[1].session_id, None, "{workflow}");
         let started_at = run.steps[0].started_at.expect("the failed step started");
-        assert!(
-            (run.created_at..=now()).contains(&started_at),
-            "{workflow}: {run:?}"
-        );
+        assert!(run.created_at <= started_at, "{workflow}: {run:?}");
         assert_eq!(run.steps[1].started_at, None, "{workflow}");
     }
 }
@@ -570,8 +586,8 @@ steps:
     };
     assert_eq!(text, "Reading the code");
     assert!(
-        (started_at..=now()).contains(&posted_at),
-        "{posted_at} is not between {started_at} and now"
+        started_at <= posted_at,
+        "{posted_at} is before the step started at {started_at}"
     );
 }
 
@@ -1064,13 +1080,14 @@ fn process_exists(pid: libc::pid_t) -> bool {
 async fn cancelling_a_run_stops_its_command() {
     let repo = repo();
     let daemon = start_daemon().await;
-    let command = r#"sleep 30 & echo $! > "$OX_RUN_INPUT"; wait"#;
+    // `tail -f` never ends on its own, so only the cancel ends it.
+    let command = r#"tail -f /dev/null & echo $! > "$OX_RUN_INPUT/blocked"; wait"#;
     daemon.define(
-        "sleeps",
+        "holds",
         &format!(
-            "name: Sleeps
+            "name: Holds
 steps:
-  - name: Sleep
+  - name: Hold
     shell: {}
 ",
             yaml_string(command)
@@ -1078,21 +1095,19 @@ steps:
     );
     let client = daemon.client().await;
     let workspace = add_workspace(&client, repo.path()).await;
-    let scratch = tempfile::tempdir().unwrap();
-    let pid_file = scratch.path().join("pid");
-    let run = start(&client, &workspace, "sleeps", pid_file.to_str().unwrap()).await;
-    let pid: libc::pid_t = timeout(TIMEOUT, async {
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&pid_file)
-                && let Some(pid) = text.strip_suffix('\n')
-            {
-                return pid.parse().unwrap();
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
+    let gate = tempfile::tempdir().unwrap();
+    mkfifos(gate.path());
+    let run = start(&client, &workspace, "holds", gate.path().to_str().unwrap()).await;
+    let fifo = gate.path().join("blocked");
+    let pid = timeout(
+        TIMEOUT,
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(fifo)),
+    )
     .await
-    .expect("the command did not start");
+    .expect("the command did not start")
+    .unwrap()
+    .unwrap();
+    let pid: libc::pid_t = pid.trim_end().parse().unwrap();
     assert!(process_exists(pid));
 
     client.cancel_run(&run.id).await.unwrap();
@@ -1102,11 +1117,20 @@ steps:
     assert_eq!(run.steps[0].commands.len(), 1);
     assert_eq!(run.steps[0].commands[0].state, CommandState::Cancelled);
     assert_eq!(run.steps[0].commands[0].exit_code, None);
+    until_gone(pid).await;
+}
+
+/// Waits until process `pid` no longer exists.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "nothing reports another process's end, so this polls for it"
+)]
+async fn until_gone(pid: libc::pid_t) {
     timeout(TIMEOUT, async {
         while process_exists(pid) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the background process is still running");
+    .expect("the process is still running");
 }

@@ -34,6 +34,9 @@ workflow.
 - Resolve ordinary implementation decisions yourself. Ask when a missing
   decision materially changes the requested outcome or scope.
 - Use a plan when the work needs design decisions or sequencing.
+- Write every test to pass or fail on behavior alone, at any machine speed:
+  it synchronizes on events and controls time as
+  [Testing](docs/dev/testing.md#time-and-concurrency) describes.
 - Work and commit directly on `main`. Do not create branches.
 - Preserve unrelated working-tree changes. Commit or publish only when the user
   requests it.

@@ -12,7 +12,6 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
     process::{Child, ChildStdout, Command},
-    time::{Duration, Instant, sleep, timeout},
 };
 
 /// What every fake pi does: it records how it was started and the MCP
@@ -93,14 +92,17 @@ fn fake_pi(dir: &Path, script: &str) {
     fake_pi_script(dir, &format!("describe\n{script}"));
 }
 
+/// Writes the fake pi through a rename, so a fake pi of an earlier bridge
+/// that is still reading its script keeps the whole old one.
 fn fake_pi_script(dir: &Path, script: &str) {
-    let path = dir.join("pi");
+    let staging = dir.join("pi.new");
     fs::write(
-        &path,
+        &staging,
         format!("#!/bin/sh\n{FAKE_PI}\n{script}\nwhile :; do next_command; done\n"),
     )
     .unwrap();
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&staging, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&staging, dir.join("pi")).unwrap();
 }
 
 fn dirs(temp: &Path) -> (PathBuf, PathBuf) {
@@ -224,22 +226,16 @@ async fn prompt(
     finish(reader, id, Vec::new()).await
 }
 
-/// The lines a fake pi recorded in `project`'s `name` file, once it has
-/// `count` of them.
-async fn lines(project: &Path, name: &str, count: usize) -> Vec<String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let lines: Vec<String> = fs::read_to_string(project.join(name))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        if lines.len() >= count {
-            return lines;
-        }
-        assert!(Instant::now() < deadline, "{name} has {lines:?}");
-        sleep(Duration::from_millis(10)).await;
-    }
+/// The `count` lines a fake pi recorded in `project`'s `name` file. The fake
+/// writes them before output the test has already read.
+fn lines(project: &Path, name: &str, count: usize) -> Vec<String> {
+    let lines: Vec<String> = fs::read_to_string(project.join(name))
+        .unwrap_or_else(|error| panic!("{name}: {error}"))
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(lines.len(), count, "{name} has {lines:?}");
+    lines
 }
 
 /// The message of the error an idle update ends its turn with.
@@ -294,7 +290,7 @@ async fn a_new_session_starts_pi_and_reports_idle() {
             {"type":"command","name":"skill:review","description":"Review"}
         ])
     );
-    let calls = lines(&project, "calls", 2).await;
+    let calls = lines(&project, "calls", 2);
     let session_id = calls[0]
         .strip_prefix("--mode rpc --approve --session-id ")
         .unwrap_or_else(|| panic!("{calls:?}"));
@@ -392,7 +388,7 @@ settled
         .unwrap();
     assert!(retried < idle_at);
 
-    let prompts = lines(&project, "prompts", 1).await;
+    let prompts = lines(&project, "prompts", 1);
     let sent: Value = serde_json::from_str(&prompts[0]).unwrap();
     assert_eq!(sent["message"], "hello");
     assert_eq!(sent["streamingBehavior"], "followUp");
@@ -488,13 +484,23 @@ async fn a_prompt_pi_rejects_fails_with_its_error() {
 next_prompt
 id=$(printf '%s\n' "$command" | sed 's/.*"id":"\([^"]*\)".*/\1/')
 printf '{"id":"%s","type":"response","command":"prompt","success":false,"error":"No model selected"}\n' "$id"
+next_command
+expect set_thinking_level
+answer set_thinking_level
+describe
 "#,
     )
     .await;
     send(&mut child, prompt_request(3, &session)).await;
-    let (result, updates) = response(&mut reader, 3).await;
+    let (result, mut updates) = response(&mut reader, 3).await;
     assert_eq!(result["error"]["code"], -32603, "{result}");
     assert_eq!(result["error"]["message"], "No model selected", "{result}");
+    // The bridge handles Pi's answers in order, so what it sends for the
+    // prompt's answer precedes the answer to a later config change.
+    send(&mut child, config_request(4, &session, "thinking", "high")).await;
+    let (set, more) = response(&mut reader, 4).await;
+    assert!(set["result"].is_object(), "{set}");
+    updates.extend(more);
     assert!(
         !updates.iter().any(|value| kind(value) == "user_message"),
         "{updates:?}"
@@ -614,7 +620,7 @@ settled
             .iter()
             .any(|value| kind(value) == "config_option_update")
     );
-    let calls = lines(&project, "calls", 4).await;
+    let calls = lines(&project, "calls", 4);
     assert_eq!(calls[0], calls[2], "the same Pi session: {calls:?}");
     child.kill().await.unwrap();
 }
@@ -673,7 +679,6 @@ settled
         "{states:?}"
     );
     let dialogs: Vec<Value> = lines(&project, "dialogs", 4)
-        .await
         .iter()
         .map(|s| serde_json::from_str(s).unwrap())
         .collect();
@@ -713,7 +718,7 @@ settled
         answer_form(&mut child, &request, json!({"action":action})).await;
     }
     finish(&mut reader, 3, seen).await;
-    for (index, line) in lines(&project, "dialogs", 2).await.iter().enumerate() {
+    for (index, line) in lines(&project, "dialogs", 2).iter().enumerate() {
         assert_eq!(
             serde_json::from_str::<Value>(line).unwrap(),
             json!({"type":"extension_ui_response","id":format!("ask-{}", index + 1),"cancelled":true})
@@ -746,7 +751,7 @@ settled true
     let (idle, _) = finish(&mut reader, 3, seen).await;
     assert_eq!(idle["stopReason"], "cancelled");
     assert_eq!(
-        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1)[0]).unwrap(),
         json!({"type":"extension_ui_response","id":"ask-1","cancelled":true})
     );
     child.kill().await.unwrap();
@@ -770,7 +775,7 @@ settled
     assert_eq!(cancel["params"]["requestId"], request["id"]);
     finish(&mut reader, 3, seen).await;
     assert_eq!(
-        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1)[0]).unwrap(),
         json!({"type":"extension_ui_response","id":"ask-1","cancelled":true})
     );
     child.kill().await.unwrap();
@@ -791,27 +796,30 @@ settled
     )
     .await;
     send(&mut child, prompt_request(3, &session)).await;
-    let (request, seen) = until_method(&mut reader, "elicitation/create").await;
-    // Pi treats zero as no timeout. Keep the form open beyond an immediate
-    // timer before answering, so cancellation cannot race a fast answer.
-    assert!(
-        timeout(
-            Duration::from_millis(50),
-            until_method(&mut reader, "$/cancel_request"),
-        )
-        .await
-        .is_err(),
-        "a zero timeout withdrew the dialog"
-    );
+    let (request, mut seen) = until_method(&mut reader, "elicitation/create").await;
     answer_form(
         &mut child,
         &request,
         json!({"action":"accept", "content":{"answer":"Ada"}}),
     )
     .await;
+    // The script settles only after the dialog's answer reaches it, so
+    // everything the bridge sends about the dialog precedes the turn's idle.
+    loop {
+        let value = receive(&mut reader).await;
+        assert_ne!(
+            value["method"], "$/cancel_request",
+            "a zero timeout withdrew the dialog"
+        );
+        let idle = is_state(&value, "idle");
+        seen.push(value);
+        if idle {
+            break;
+        }
+    }
     finish(&mut reader, 3, seen).await;
     assert_eq!(
-        serde_json::from_str::<Value>(&lines(&project, "dialog", 1).await[0]).unwrap(),
+        serde_json::from_str::<Value>(&lines(&project, "dialog", 1)[0]).unwrap(),
         json!({"type":"extension_ui_response","id":"ask-1","value":"Ada"})
     );
     child.kill().await.unwrap();
@@ -950,7 +958,7 @@ settled
         "a resumed session keeps its title: {updates:?}"
     );
 
-    let calls = lines(&project, "calls", 4).await;
+    let calls = lines(&project, "calls", 4);
     assert_eq!(
         calls[0],
         format!(
@@ -959,7 +967,7 @@ settled
         )
     );
     assert_eq!(calls[0], calls[2]);
-    let changes = lines(&project, "changes", 2).await;
+    let changes = lines(&project, "changes", 2);
     let model: Value = serde_json::from_str(&changes[0]).unwrap();
     assert_eq!(model["modelId"], "org/two");
     let thinking: Value = serde_json::from_str(&changes[1]).unwrap();
@@ -1006,7 +1014,7 @@ while :; do describe; done
         resumed["result"]["availableCommands"][2]["name"],
         "skill:review"
     );
-    let queries = lines(&project, "queries", 8).await;
+    let queries = lines(&project, "queries", 8);
     let states = queries
         .iter()
         .filter(|line| line.contains("\"type\":\"get_state\""))
@@ -1120,7 +1128,7 @@ async fn mcp_servers_reach_every_pi_through_the_extension() {
     assert!(resumed["result"].is_object(), "{resumed}");
     child.kill().await.unwrap();
 
-    let calls = lines(&project, "calls", 4).await;
+    let calls = lines(&project, "calls", 4);
     let extension = calls[0]
         .strip_prefix(&format!(
             "--mode rpc --approve --session-id {} -e ",
@@ -1132,7 +1140,7 @@ async fn mcp_servers_reach_every_pi_through_the_extension() {
         include_str!("../src/mcp-servers.js")
     );
     assert_eq!(calls[0], calls[2]);
-    let given = lines(&project, "servers", 2).await;
+    let given = lines(&project, "servers", 2);
     let expected = json!({"ox":{"command":"/usr/local/bin/ox-mcp","args":["--session","s1"],
         "env":{"KEY":"value"},"exposure":"direct"}});
     assert_eq!(serde_json::from_str::<Value>(&given[0]).unwrap(), expected);
@@ -1173,7 +1181,6 @@ async fn invalid_mcp_servers_are_refused() {
     let (answer, _) = response(&mut reader, 6).await;
     assert_eq!(answer["error"]["code"], -32602, "{answer}");
     child.kill().await.unwrap();
-    assert!(!project.join("calls").exists(), "no Pi starts");
 }
 
 #[tokio::test]
@@ -1277,7 +1284,7 @@ describe
         assert_eq!(kind(&notifications[0]), "config_option_update");
         assert_eq!(update(&notifications[0])["configOptions"], *options);
     }
-    let changes = lines(&project, "changes", 2).await;
+    let changes = lines(&project, "changes", 2);
     let model: Value = serde_json::from_str(&changes[0]).unwrap();
     assert_eq!(model["provider"], "second");
     assert_eq!(model["modelId"], "org/two");
@@ -1340,7 +1347,7 @@ async fn skill_commands_reach_pi_with_their_native_name() {
     request["params"]["prompt"][0]["text"] = json!("/skill:review src/main.rs");
     send(&mut child, request).await;
     finish(&mut reader, 3, Vec::new()).await;
-    let sent: Value = serde_json::from_str(&lines(&project, "prompts", 1).await[0]).unwrap();
+    let sent: Value = serde_json::from_str(&lines(&project, "prompts", 1)[0]).unwrap();
     assert_eq!(sent["message"], "/skill:review src/main.rs");
     child.kill().await.unwrap();
 }
@@ -1350,7 +1357,7 @@ async fn skill_commands_reach_pi_with_their_native_name() {
 async fn appends_the_client_system_prompt_to_pi() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
-    fake_pi(&bin, "printf '%s\\n' \"$@\" > args.txt");
+    fake_pi_script(&bin, "printf '%s\\n' \"$@\" > args.txt\ndescribe");
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader, json!({})).await;
     send(

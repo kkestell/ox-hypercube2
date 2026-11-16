@@ -25,6 +25,8 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
 pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// The idle exit of a daemon whose test is about it: the daemon's default.
+pub const IDLE_EXIT_MS: u64 = 5000;
 pub const OXD: &str = env!("CARGO_BIN_EXE_oxd");
 pub const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_oxd-fake-agent");
 
@@ -64,9 +66,11 @@ fn bin_dir() -> &'static Path {
 }
 
 /// How a test daemon runs.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Options {
-    pub idle_exit_ms: u64,
+    /// How long the daemon stays idle before it exits. Unset, it runs until
+    /// it is stopped.
+    pub idle_exit_ms: Option<u64>,
     /// A limit on the daemon's open file descriptors.
     pub fd_limit: Option<u32>,
     pub park_after_ms: Option<u64>,
@@ -77,19 +81,6 @@ pub struct Options {
     pub env: BTreeMap<String, String>,
     /// Pipes the daemon's standard error for `Daemon::wait_for_log`.
     pub log: bool,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Self {
-            idle_exit_ms: 1000,
-            fd_limit: None,
-            park_after_ms: None,
-            bridges: false,
-            env: BTreeMap::new(),
-            log: false,
-        }
-    }
 }
 
 /// An oxd on a socket in its own directory, with that directory as its
@@ -137,8 +128,10 @@ impl Daemon {
         command
             .arg("--socket")
             .arg(&socket)
+            // The daemon caps its timers, so the longest delay outlasts any
+            // test.
             .arg("--idle-exit-ms")
-            .arg(options.idle_exit_ms.to_string())
+            .arg(options.idle_exit_ms.unwrap_or(u64::MAX).to_string())
             .args(
                 options
                     .park_after_ms
@@ -208,8 +201,10 @@ impl Daemon {
         Self::start_in(self.dir, options).await
     }
 
+    /// Waits for the daemon to exit, allowing for its idle exit.
     pub async fn wait_for_exit(&mut self) -> std::process::ExitStatus {
-        timeout(TIMEOUT, self.child.wait())
+        let idle_exit = Duration::from_millis(self.options.idle_exit_ms.unwrap_or(0));
+        timeout(TIMEOUT + idle_exit, self.child.wait())
             .await
             .expect("oxd did not exit")
             .unwrap()
@@ -496,4 +491,37 @@ pub fn apply(listing: &mut Listing, change: ListingChange) {
             listing.runs.retain(|r| r.id != run_id);
         }
     }
+}
+
+/// Makes the FIFOs `blocked` and `release` in `dir`, through which a script
+/// says it has stopped and the test lets it go on.
+pub fn mkfifos(dir: &Path) {
+    for fifo in ["blocked", "release"] {
+        let status = std::process::Command::new("mkfifo")
+            .arg(dir.join(fifo))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
+/// Waits until the script using the FIFOs in `dir` has stopped.
+pub async fn blocked(dir: &Path) {
+    let fifo = dir.join("blocked");
+    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(fifo));
+    let read = timeout(TIMEOUT, read)
+        .await
+        .expect("the script never stopped");
+    assert_eq!(read.unwrap().unwrap(), "blocked\n");
+}
+
+/// Lets the script using the FIFOs in `dir` go on.
+pub async fn release(dir: &Path) {
+    let fifo = dir.join("release");
+    let write = tokio::task::spawn_blocking(move || std::fs::write(fifo, "go\n"));
+    timeout(TIMEOUT, write)
+        .await
+        .expect("the script was not waiting")
+        .unwrap()
+        .unwrap();
 }

@@ -1,5 +1,7 @@
 //! Pi extension dialogs as session-scoped forms and their answers as RPC responses.
 
+use std::time::Duration;
+
 use agent_client_protocol::v2::schema::{
     ElicitationAction, ElicitationContentValue, ElicitationSchema, EnumOption, StringPropertySchema,
 };
@@ -53,6 +55,15 @@ pub fn form(request: &Value) -> Option<(String, ElicitationSchema)> {
         "Pi has a question".to_owned(),
         ElicitationSchema::new().property("answer", field, required),
     ))
+}
+
+/// How long the dialog stays open: its `timeout` in milliseconds. Pi treats
+/// zero as no timeout.
+pub fn timeout(request: &Value) -> Option<Duration> {
+    request["timeout"]
+        .as_u64()
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
 }
 
 fn nonempty(request: &Value, key: &str) -> Option<String> {
@@ -134,6 +145,19 @@ mod tests {
         }
         assert!(form(&json!({"method":"select", "options":[3]})).is_none());
         assert!(form(&json!({"method":"notify"})).is_none());
+    }
+
+    #[test]
+    fn a_positive_timeout_limits_the_dialog_and_zero_or_none_leaves_it_open() {
+        for (request, expected) in [
+            (json!({"timeout": 50}), Some(Duration::from_millis(50))),
+            (json!({"timeout": 0}), None),
+            (json!({}), None),
+            (json!({"timeout": -5}), None),
+            (json!({"timeout": "50"}), None),
+        ] {
+            assert_eq!(timeout(&request), expected, "{request}");
+        }
     }
 
     #[test]
