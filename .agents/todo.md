@@ -1,64 +1,16 @@
 # To do
 
-## Local merge workflow
-
-Spec: [git-workflows](specs/git-workflows.md). Two `/kplan` → `/kwork` →
-`/kreview` cycles. Sizes are rough estimates of lines changed, tests included.
-
-- [x] **Daemon and CLI** (~1,800). Tested through `oxctl`.
-  - Move a branch: fast-forward or forced, the expected-commit check,
-    updating a checkout that has the branch, refusing unsaved work or a
-    running agent.
-  - Compare: a comparison ref on worktree sessions, published with the
-    session, recomputed on turn end, on moves, deletes and fetches in the
-    repository, and on a refresh request.
-- [x] **App** (~1,000, about 260 of them deletions).
-  - The New Task menu: New Task starts a local merge session; Session in
-    Checkout stays.
-  - The right-aligned status icon on session rows.
-  - The Merge into main button in the conversation header.
-  - Removes the existing-branch and new-branch dialogs and `useBranches.ts`.
-
-## Git correctness
-
-Fix branch moves and source validation for local merge before adding the PR
-and review workflows. Review rounds will reuse `branch.move` to update the
-review checkout. Keep Git and session state in `oxd` and workflow choices in
-the clients.
-
-### Branch moves can overwrite local files or run alongside an agent
-
-- [x] Preserve ignored, untracked files that a branch move would overwrite.
-- [x] Keep a checkout from starting agent work during a branch move.
-  [Desktop merge regressions](../ui/e2e/specs/merge.e2e.ts)
-
-### Local merge can land an obsolete task commit
-
-- [x] Validate the source branch and its expected tip as part of the merge
-  request.
-  [Desktop merge regressions](../ui/e2e/specs/merge.e2e.ts)
-
 ## Desktop workflow bugs
 
-- [x] Keep unsent prompt text and attachments when switching sessions. Store
-  drafts in memory by session, and clear them after a successful send or
-  session deletion.
-  [Desktop draft regression](../ui/e2e/specs/session.e2e.ts)
 - [ ] The bundled content policy may block tool output images. The tool image
   decoded in the macOS desktop test. Other platforms have not been checked.
   [Image decoding check](../ui/e2e/specs/session.e2e.ts)
-- [x] Keep Delete available while an agent is stuck starting. Disable
-  Archive during startup and refuse requests to archive during startup.
-  [Desktop startup regression](../ui/e2e/specs/archive.e2e.ts)
 
 ## Workflow run and session UI
 
 - [ ] Align the icons in the run view. The checkbox and hourglass icons sit at
   different x-positions, so the icon column and the text start differ between
   rows.
-- [x] Give the elapsed time a fixed width (tabular numerals or a reserved
-  width) so a changing value does not shift the content to its right.
-- [x] List sessions and workflow runs in the left panel newest-created first.
 - [ ] Stop collapsing completed steps on the run dashboard. While the run is
   active, scroll to the active step's most recent status update.
 - [ ] Use different colors for "working" and "success" in the sidebar. Both
@@ -83,12 +35,6 @@ the clients.
   - Text prepended to each workflow step's prompt, which also works for Pi.
   - Pi has no MCP servers, so it needs the prompt option or a flag in its
     bridge.
-
-## Workflow definitions
-
-- [x] Confirm which `permission_mode` values each harness's bridge offers, and
-  list them in [Workflows](../docs/workflows.md). The docs show only `manual`.
-  Check what a Pi step does when it sets `permission_mode`.
 
 ## Persistence and recovery
 
@@ -131,45 +77,6 @@ the clients.
      `oxctl attach "$session" --after 6`, using one less than the
      final stored sequence if it differs. The subscription waits even though
      event 7 is already in the database.
-
-### Unarchive can leave the session stuck after a database write fails
-
-- [x] Make unarchive recoverable when Git restores the worktree and SQLite
-  fails to clear the archived flag. A retry should be able to finish the
-  transition safely. [Unarchive](../crates/oxd/src/daemon.rs)
-
-  1. Start a session with `oxctl new --workspace "$workspace" --worktree --
-     "$bin/oxd-fake-agent"` and save its ID as `session`. Record its checkout
-     from `oxctl ls`, archive it with `oxctl archive "$session"`, and confirm
-     the worktree is gone.
-  2. Install this trigger in `"$OX_SOCKET.db"` using SQLite.
-
-     ```sql
-     CREATE TRIGGER injected BEFORE DELETE ON archived
-     BEGIN
-       SELECT RAISE(ABORT, 'injected archive-row write failure');
-     END;
-     ```
-
-  3. Run `oxctl unarchive "$session"`. It reports the database error. The
-     worktree exists again, and `oxctl ls` still reports `archived`.
-  4. Run `DROP TRIGGER injected;` and retry unarchive. Git refuses because
-     the checkout already exists, and the session remains archived.
-
-## Simplifications
-
-- [x] Request ACP conversation replay only when the saved history needs it.
-  Use the existing `AgentStarted` check when choosing whether to send a
-  replay cursor. Preserve the fallback for missing history and the live
-  state, settings, and command updates on resume.
-  [History check](../crates/oxd/src/state.rs) ·
-  [Resume request](../crates/oxd/src/session.rs)
-- [x] Resolve desktop questions and permissions by request ID. Send the ID
-  when a request is resolved so React can remove its existing item. Drop
-  the duplicate request map from the Rust transcript fold and keep the
-  saved events and CLI stream as they are.
-  [Transcript fold](../crates/ox/src/conversation.rs) ·
-  [React reducer](../ui/src/features/conversation/useConversation.ts)
 
 ## Future work
 
