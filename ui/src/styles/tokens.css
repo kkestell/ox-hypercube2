@@ -41,7 +41,7 @@
   --disabled-opacity: 0.5;
   --dimmed-opacity: 0.6;
   --busy-dot-opacity: 0.4;
-  --busy-dot-glow: calc(var(--spacing) * 1.5);
+  --busy-dot-glow: var(--spacing);
 
   /* Spacing: every padding, margin, gap, and size is a multiple of this. */
   --spacing: 0.25rem;

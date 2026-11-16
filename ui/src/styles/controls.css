@@ -329,7 +329,7 @@ textarea.text-field {
 @keyframes glow {
   from {
     box-shadow: 0 0 var(--busy-dot-glow)
-      color-mix(in oklab, var(--working-highlight) 60%, transparent);
+      color-mix(in oklab, var(--working-highlight) 30%, transparent);
   }
   to {
     box-shadow: 0 0 0 transparent;

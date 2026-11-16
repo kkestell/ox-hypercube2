@@ -56,6 +56,33 @@ describe("Status dots", () => {
     await expect(sessionDot(first)).toHaveAttribute("class", "status");
   });
 
+  it("breathe in step while running, however far apart their turns started", async () => {
+    const first = await startSession();
+    const second = await startSession();
+    await openSession(first);
+    await send(held);
+    await expect(sessionDot(first)).toHaveAttribute("class", "status running");
+    await oxctl("prompt", await sessionId(second), held);
+    await expect(sessionDot(second)).toHaveAttribute("class", "status running");
+
+    // Each dot has two animations: its colour and its glow.
+    const dots = [await sessionDot(first), await sessionDot(second)];
+    await browser.waitUntil(() =>
+      browser.execute((dots) => {
+        const times = dots.flatMap((dot) =>
+          dot.getAnimations({ subtree: true }).map((animation) => animation.currentTime),
+        );
+        return times.length === 4 && times.every((time) => time === times[0]);
+      }, dots),
+    );
+
+    await writeFile(join(first, "go"), "");
+    await writeFile(join(second, "go"), "");
+    // The first session is in view, so its turn ends without a finish.
+    await expect(sessionDot(first)).toHaveAttribute("class", "status");
+    await expect(sessionDot(second)).toHaveAttribute("class", "status finished");
+  });
+
   it("show a turn that ended while the window was in the background", async () => {
     const cwd = await startSession();
     await openSession(cwd);
