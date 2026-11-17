@@ -18,7 +18,8 @@ const empty: Conversation = { items: new Map(), list: [] };
 
 // Viewing a session starts it empty. Each batch of updates inserts or
 // replaces items by key, appends text chunks, or removes resolved requests,
-// in that session's conversation only.
+// in that session's conversation only. An item keeps the time its key first
+// appeared.
 function reduce(state: Map<string, Conversation>, action: Action): Map<string, Conversation> {
   const next = new Map(state);
   if (action.type === "view") {
@@ -38,14 +39,18 @@ function reduce(state: Map<string, Conversation>, action: Action): Map<string, C
       continue;
     }
     const existing = items.get(update.key);
+    if (existing === undefined) {
+      items.set(update.key, update);
+      continue;
+    }
+    const recorded_at = existing.recorded_at;
     items.set(
       update.key,
-      existing !== undefined &&
-        (update.type === "text" || update.type === "thought") &&
+      (update.type === "text" || update.type === "thought") &&
         !update.replace &&
         existing.type === update.type
-        ? { ...update, text: existing.text + update.text }
-        : update,
+        ? { ...update, recorded_at, text: existing.text + update.text }
+        : { ...update, recorded_at },
     );
   }
   next.set(action.sessionId, { items, list: [...items.values()] });

@@ -20,6 +20,7 @@ async function conversation(...updates: ConversationUpdate[]) {
 
 const text = (key: string, value: string, replace = false): ConversationUpdate => ({
   type: "text",
+  recorded_at: 0,
   key,
   text: value,
   replace,
@@ -78,6 +79,7 @@ describe("Transcript Markdown", () => {
   it("completes Markdown split across streamed chunks", async () => {
     const { core, task, transcript } = await conversation(text("reply", "**"), {
       type: "thought",
+      recorded_at: 0,
       key: "thought",
       text: "**Reason",
       replace: false,
@@ -85,6 +87,7 @@ describe("Transcript Markdown", () => {
     expect(transcript.querySelector(".markdown")).toHaveTextContent("**");
     core.update(task.id, text("reply", "done**"), {
       type: "thought",
+      recorded_at: 0,
       key: "thought",
       text: "ing**",
       replace: false,
@@ -109,11 +112,12 @@ describe("A conversation", () => {
 
 describe("A turn", () => {
   const work: ConversationUpdate[] = [
-    { type: "prompt", key: "prompt", text: "Fix it", attachments: [] },
-    { type: "thought", key: "thought", text: "Planning", replace: false },
+    { type: "prompt", recorded_at: 0, key: "prompt", text: "Fix it", attachments: [] },
+    { type: "thought", recorded_at: 0, key: "thought", text: "Planning", replace: false },
     text("progress", "Checking the tests"),
     {
       type: "tool_call",
+      recorded_at: 0,
       key: "tool",
       title: "Read `a.rs`",
       status: "completed",
@@ -130,6 +134,7 @@ describe("A turn", () => {
   it("folds its work under Worked once it completes with a reply", async () => {
     const { transcript } = await conversation(...work, text("reply", "Done"), {
       type: "turn_completed",
+      recorded_at: 0,
       key: "end",
     });
     expect(children(transcript)).toEqual(["prompt", "worked", "text markdown"]);
@@ -147,6 +152,7 @@ describe("A turn", () => {
   it("keeps its work in view when it ends in an error", async () => {
     const { transcript } = await conversation(...work, {
       type: "turn_error",
+      recorded_at: 0,
       key: "error",
       message: "broken",
     });
@@ -172,7 +178,7 @@ describe("A turn", () => {
   });
 
   it("reports that the agent exited", async () => {
-    await conversation({ type: "agent_exited", key: "exit", error: "status 3" });
+    await conversation({ type: "agent_exited", recorded_at: 0, key: "exit", error: "status 3" });
     expect(screen.getByText("The agent exited: status 3")).toBeInTheDocument();
   });
 });

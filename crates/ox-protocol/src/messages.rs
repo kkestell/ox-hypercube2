@@ -519,6 +519,9 @@ pub struct RunInfo {
     pub steps: Vec<StepInfo>,
     /// When the run was started, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// When the run succeeded, failed or was cancelled, in milliseconds
+    /// since the Unix epoch. Unset while it runs and for an interrupted run.
+    pub ended_at: Option<u64>,
     /// How the run ended, while no client has focused it since: `finished`
     /// when it succeeded, `error` when it failed or was interrupted.
     pub unseen: Option<Unseen>,
@@ -648,6 +651,8 @@ pub struct SessionInfo {
 pub struct Event {
     pub session_id: String,
     pub seq: u64,
+    /// When `oxd` recorded the event, in milliseconds since the Unix epoch.
+    pub recorded_at: u64,
     pub kind: EventKind,
 }
 
@@ -1215,6 +1220,7 @@ mod tests {
                 event: Box::new(Event {
                     session_id: "s".into(),
                     seq,
+                    recorded_at: 1_700_000_000_000 + seq,
                     kind,
                 }),
             })
@@ -1226,6 +1232,7 @@ mod tests {
         let event = Event {
             session_id: "s".into(),
             seq: 2,
+            recorded_at: 1_700_000_000_000,
             kind: EventKind::TurnEnded {
                 stop_reason: Some(StopReason::EndTurn),
                 error: None,
@@ -1344,6 +1351,7 @@ mod tests {
                          "commands": []}
                     ],
                     "created_at": 1_700_000_000_001_u64,
+                    "ended_at": 1_700_000_000_004_u64,
                     "unseen": "error"
                 }},
                 {"type": "run_removed", "run_id": "q"}
@@ -1437,6 +1445,7 @@ mod tests {
                     },
                 ],
                 created_at: 1_700_000_000_001,
+                ended_at: Some(1_700_000_000_004),
                 unseen: Some(Unseen::Error),
             }
         );

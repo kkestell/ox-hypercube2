@@ -139,9 +139,8 @@ database holds workspace and session metadata, worktrees with their
 comparison refs, archive state, conversation events, and workflow runs. A
 run's steps, with their commands, are saved as one JSON column of its row,
 rewritten whenever the run changes.
-The database schema has no migrations; data added later goes in tables of
-its own, such as `archived` and the `session_unseen` and `run_unseen` tables
-of unseen outcomes, so older databases keep working.
+Each conversation event is saved with the time `oxd` recorded it, and a run
+with the time it ended.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence

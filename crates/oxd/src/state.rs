@@ -878,6 +878,7 @@ impl State {
         let event = Event {
             session_id: self.session_id.clone(),
             seq: self.last_seq,
+            recorded_at: crate::daemon::now(),
             kind,
         };
         if !matches!(event.kind, EventKind::SessionClosed) {
@@ -1487,6 +1488,7 @@ mod tests {
             .map(|(kind, seq)| Event {
                 session_id: "s".into(),
                 seq,
+                recorded_at: 0,
                 kind,
             })
             .collect()
@@ -1509,6 +1511,16 @@ mod tests {
             subject: None,
             options: Vec::new(),
         }
+    }
+
+    #[test]
+    fn an_appended_event_carries_the_time_it_was_recorded() {
+        let mut state = started();
+        let before = crate::daemon::now();
+        state.record(Change::Closed);
+        let after = crate::daemon::now();
+        let recorded_at = state.events_after(state.last_seq() - 1)[0].recorded_at;
+        assert!((before..=after).contains(&recorded_at));
     }
 
     #[test]
@@ -2110,6 +2122,7 @@ mod tests {
         let event = |kind| Event {
             session_id: "s".into(),
             seq: 1,
+            recorded_at: 0,
             kind,
         };
         let turn = |stop_reason, error: Option<&str>| {

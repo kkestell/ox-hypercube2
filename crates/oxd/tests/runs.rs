@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ox_protocol::schema::{ContentBlock, SessionConfigKind, SessionUpdate, StopReason};
 use ox_protocol::{
@@ -178,6 +179,12 @@ fn config_value(session: &SessionInfo, id: &str) -> String {
     select.current_value.to_string()
 }
 
+/// The time now, in milliseconds since the Unix epoch.
+fn now() -> u64 {
+    let since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from(since_epoch.as_millis()).unwrap()
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     !git(repo, &["branch", "--list", branch]).is_empty()
 }
@@ -219,7 +226,19 @@ steps:
     assert_eq!(started.state, RunState::Running);
 
     let run = until_ended(&client, &started.id).await;
+    let ended_by = now();
     assert_eq!(run.state, RunState::Succeeded, "{run:?}");
+    let ended_at = run.ended_at.expect("the run ended");
+    assert!(run.steps[1].started_at.unwrap() <= ended_at && ended_at <= ended_by);
+    let first = run.steps[0].session_id.as_deref().unwrap();
+    let times: Vec<_> = until_turn_ended(&client, first, 0)
+        .await
+        .into_iter()
+        .map(|event| event.recorded_at)
+        .collect();
+    assert!(times.is_sorted(), "{times:?}");
+    assert!(run.steps[0].started_at.unwrap() <= times[0], "{times:?}");
+    assert!(*times.last().unwrap() <= ended_by, "{times:?}");
     let outputs: Vec<_> = run
         .steps
         .iter()
@@ -273,6 +292,7 @@ async fn a_cancelled_run_stops_at_its_active_step() {
     let run = until_ended(&client, &run.id).await;
     assert_eq!(run.state, RunState::Cancelled);
     assert_eq!(run.error, None);
+    assert!(run.ended_at.is_some());
     assert_eq!(run.steps[0].state, StepState::Cancelled);
     assert_eq!(run.steps[0].session_id.as_deref(), Some(session.as_str()));
     assert_eq!(run.steps[1].state, StepState::Pending);
@@ -360,6 +380,7 @@ async fn runs_survive_a_restart_and_running_ones_are_interrupted() {
     let client = daemon.client().await;
     let runs = until_run(&client, &waiting.id, |_| true).await;
     assert_eq!(runs.state, RunState::Interrupted);
+    assert_eq!(runs.ended_at, None);
     assert_eq!(runs.unseen, Some(Unseen::Error));
     assert_eq!(runs.steps[0].state, StepState::Interrupted);
     assert_eq!(runs.steps[1].state, StepState::Pending);
@@ -541,6 +562,7 @@ steps:
     for (workflow, expected) in [("fails", "boom"), ("refused", "unknown option or value")] {
         let run = start(&client, &workspace, workflow, "").await;
         let run = until_ended(&client, &run.id).await;
+        let ended_by = now();
         assert_eq!(run.state, RunState::Failed, "{workflow}: {run:?}");
         let error = run.error.as_deref().unwrap_or_default();
         assert!(error.contains(expected), "{workflow}: {error}");
@@ -550,6 +572,11 @@ steps:
         assert_eq!(run.steps[1].session_id, None, "{workflow}");
         let started_at = run.steps[0].started_at.expect("the failed step started");
         assert!(run.created_at <= started_at, "{workflow}: {run:?}");
+        let ended_at = run.ended_at.expect("the run ended");
+        assert!(
+            started_at <= ended_at && ended_at <= ended_by,
+            "{workflow}: {run:?}"
+        );
         assert_eq!(run.steps[1].started_at, None, "{workflow}");
     }
 }

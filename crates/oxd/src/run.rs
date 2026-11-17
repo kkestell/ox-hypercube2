@@ -59,6 +59,8 @@ struct RunRecord {
     state: RunState,
     error: Option<String>,
     steps: Vec<StepInfo>,
+    /// When the run succeeded, failed or was cancelled.
+    ended_at: Option<u64>,
     unseen: Option<Unseen>,
 }
 
@@ -112,6 +114,7 @@ impl Run {
                 state: saved.state,
                 error: saved.error,
                 steps: saved.steps,
+                ended_at: saved.ended_at,
                 unseen: saved.unseen,
             }),
             store,
@@ -230,6 +233,7 @@ impl Run {
             error: record.error.clone(),
             steps: record.steps.clone(),
             created_at: self.created_at,
+            ended_at: record.ended_at,
             unseen: record.unseen,
         }
     }
@@ -243,6 +247,7 @@ impl Run {
             record.state,
             record.error.as_deref(),
             &record.steps,
+            record.ended_at,
             record.unseen,
         ) {
             eprintln!("oxd: saving run {}: {error}", self.id);
@@ -274,7 +279,7 @@ impl Run {
         });
     }
 
-    /// Ends the run in `state` with `error`, and step `position`, if one was
+    /// Ends the run now in `state` with `error`, and step `position`, if one was
     /// running, in `step_state` with `output`. Out of focus, a run that
     /// succeeded gets an unseen finish and one that failed an unseen error.
     fn end(
@@ -290,6 +295,7 @@ impl Run {
             }
             record.state = state;
             record.error = error;
+            record.ended_at = Some(now());
             if self.focused.load(Ordering::SeqCst) == 0 {
                 record.unseen = match state {
                     RunState::Succeeded => Some(Unseen::Finished),
