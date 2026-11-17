@@ -8,9 +8,11 @@ import { mockIPC } from "@tauri-apps/api/mocks";
 import { act, render, screen } from "@testing-library/react";
 import { App } from "../App";
 import type {
+  Choice,
   ConversationUpdate,
   DirEntry,
   FileContent,
+  HarnessConfig,
   ListingChange,
   SessionInfo,
   WatchMessage,
@@ -19,13 +21,39 @@ import type {
 } from "../lib/protocol";
 
 type Args = Record<string, unknown>;
+
+const levels = (...names: string[]): Choice[] =>
+  names.map((name) => ({ id: name.toLowerCase(), name }));
+
+/**
+ * What Ox's config lists for Claude: Fast and Smart at Low, Medium and High,
+ * Deep at High and Max, and Tiny with no effort levels, in modes Ask and
+ * Code.
+ */
+export const claudeConfig: HarnessConfig = {
+  harness: "claude",
+  models: [
+    { id: "fast", name: "Fast", provider: "OpenRouter", efforts: levels("Low", "Medium", "High") },
+    { id: "smart", name: "Smart", provider: null, efforts: levels("Low", "Medium", "High") },
+    { id: "deep", name: "Deep", provider: null, efforts: levels("High", "Max") },
+    { id: "tiny", name: "Tiny", provider: null, efforts: [] },
+  ],
+  modes: levels("Ask", "Code"),
+};
+
+/** What Ox's config lists for Pi: Big at Low and High, and no modes. */
+export const piConfig: HarnessConfig = {
+  harness: "pi",
+  models: [{ id: "a/big", name: "Big", provider: null, efforts: levels("Low", "High") }],
+  modes: [],
+};
 type MenuItem = { text: string; enabled: boolean; handler: Channel<unknown> };
 
 export class Core {
   /** Every command the app invoked, in order. */
   readonly calls: { cmd: string; args: Args }[] = [];
   /** The answer to `agents`. */
-  agents = ["claude"];
+  agents: HarnessConfig[] = [claudeConfig];
   private readonly handlers = new Map<string, (args: Args) => unknown>();
   private watch: Channel<WatchMessage> | undefined;
   private readonly views = new Map<string, Channel<ConversationUpdate[]>>();
@@ -59,8 +87,6 @@ export class Core {
           return this.agents;
         case "workspace_branches":
           return { head: "main" };
-        case "agent_controls":
-          return { config_options: [], available_commands: [] };
         case "plugin:menu|new":
           this.menu = (payload.options as { items: MenuItem[] }).items;
           return [1, "menu"];

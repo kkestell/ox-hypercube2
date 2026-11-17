@@ -17,8 +17,8 @@ use agent_client_protocol::v2::schema::{
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use ox_protocol::{
-    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo, SessionState,
-    TranscriptPage, Unseen, code,
+    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo, SessionRequest,
+    SessionState, TranscriptPage, Unseen, code,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -47,7 +47,8 @@ pub struct Opening {
     /// Option values the agent is set to where it reports others.
     pub options: Vec<(String, SessionConfigOptionValue)>,
     /// The first prompt, with the seq of the `PromptStarted` event that
-    /// `record_first_prompt` recorded for it, sent after the options.
+    /// `record_first_prompt` recorded for it, sent once the agent has
+    /// accepted the options, and rejected when it has not.
     pub prompt: Option<(Vec<ContentBlock>, u64)>,
 }
 
@@ -291,20 +292,16 @@ impl Session {
     }
 
     /// Starts the agent task in `task`, which opens or resumes an ACP
-    /// session. A new session's first prompt is its task's first command.
+    /// session. A new session's first prompt goes before its task's
+    /// commands.
     fn launch(
         self: &Arc<Self>,
         task: &mut Option<JoinHandle<()>>,
         env: BTreeMap<String, String>,
-        mut launch: Launch,
+        launch: Launch,
     ) {
         self.env.lock().unwrap().clone_from(&env);
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        if let Launch::New(opening) = &mut launch
-            && let Some((prompt, seq)) = opening.prompt.take()
-        {
-            let _ = commands.send(Command::Prompt { prompt, seq });
-        }
         *self.commands.lock().unwrap() = commands;
         *task = Some(tokio::spawn(self.clone().run(commands_rx, env, launch)));
     }
@@ -382,11 +379,6 @@ impl Session {
 
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
-    }
-
-    /// The command that runs the session's agent.
-    pub fn command(&self) -> &[String] {
-        &self.command
     }
 
     /// The environment the agent was last launched with, over the daemon's:
@@ -586,20 +578,22 @@ impl Session {
         }
     }
 
-    /// Asks the session's user a permission request of the daemon's own,
-    /// with `title`, `description` and `options`, and waits for the answer.
-    /// A request the session cannot take, or that is cancelled, as stopping
-    /// the turn does, is answered `cancelled`.
+    /// Asks the session's user, in a permission request of the daemon's own
+    /// with `title` and `options`, to start the session `request` describes,
+    /// and waits for the answer. A request the session cannot take, or that
+    /// is cancelled, as stopping the turn does, is answered `cancelled`.
     pub async fn ask(
         &self,
         title: String,
-        description: String,
+        request: SessionRequest,
         options: Vec<PermissionOption>,
     ) -> RequestPermissionOutcome {
         let (answer, outcome) = oneshot::channel();
-        let request =
-            RequestPermissionRequest::new(self.id.clone(), title, options).description(description);
-        self.record(Change::PermissionRequested { request, answer });
+        self.record(Change::PermissionRequested {
+            request: RequestPermissionRequest::new(self.id.clone(), title, options),
+            session_request: Some(request),
+            answer,
+        });
         outcome
             .await
             .unwrap_or_else(|_| CancelledPermissionOutcome::new().into())
@@ -869,7 +863,11 @@ impl Session {
                                 responder: Responder<RequestPermissionResponse>,
                                 connection: ConnectionTo<Agent>| {
                         let (answer, outcome) = oneshot::channel();
-                        session.record(Change::PermissionRequested { request, answer });
+                        session.record(Change::PermissionRequested {
+                            request,
+                            session_request: None,
+                            answer,
+                        });
                         connection.spawn(async move {
                             let outcome = outcome
                                 .await
@@ -984,7 +982,7 @@ impl Session {
                             let _ = opened.send(result);
                         }
                     };
-                    let options = match launch {
+                    let (options, opening) = match launch {
                         Launch::Resume(Resume {
                             session_id,
                             replay,
@@ -1011,7 +1009,7 @@ impl Session {
                                     }));
                                     Ok(())
                                 })?;
-                            options
+                            (options, None)
                         }
                         Launch::New(opening) => {
                             connection
@@ -1029,7 +1027,7 @@ impl Session {
                                     }));
                                     Ok(())
                                 })?;
-                            opening.options
+                            (opening.options, Some(opening.prompt))
                         }
                     };
                     let acp_session = open.await.map_err(|_| {
@@ -1038,13 +1036,46 @@ impl Session {
                     })??;
                     // The agent reports its own option values, and is set to
                     // the resumed session's, or those a new session was
-                    // given, where they differ.
+                    // given, where they differ. A resumed agent's values are
+                    // ones it accepted before, so they are set without
+                    // waiting. A new session's first prompt waits for its
+                    // settings, and is not sent when one fails.
                     let reported = state::option_values(&session.info().config_options);
+                    let mut failed = Vec::new();
                     for (config_id, value) in options {
-                        if !reported
+                        let current = reported
                             .iter()
-                            .any(|(id, current)| *id == config_id && *current != value)
-                        {
+                            .find(|(id, _)| *id == config_id)
+                            .map(|(_, current)| current);
+                        if current == Some(&value) {
+                            continue;
+                        }
+                        if opening.is_some() {
+                            if current.is_none() {
+                                failed.push(format!("The agent has no {config_id} option"));
+                                continue;
+                            }
+                            let shown = shown(&value);
+                            match connection
+                                .send_request(SetSessionConfigOptionRequest::new(
+                                    acp_session.clone(),
+                                    config_id.clone(),
+                                    value,
+                                ))
+                                .block_task()
+                                .await
+                            {
+                                Ok(response) => {
+                                    session
+                                        .record(Change::ConfigOptionsSet(response.config_options));
+                                }
+                                Err(error) => failed.push(format!(
+                                    "The agent refused {config_id} {shown}: {error}"
+                                )),
+                            }
+                            continue;
+                        }
+                        if current.is_none() {
                             continue;
                         }
                         let session = session.clone();
@@ -1066,10 +1097,28 @@ impl Session {
                                 Ok(())
                             })?;
                     }
+                    let mut first = None;
+                    match opening.flatten() {
+                        Some((prompt, seq)) if failed.is_empty() => {
+                            first = Some(Command::Prompt { prompt, seq });
+                        }
+                        Some((_, seq)) => session.record(Change::PromptRejected {
+                            prompt: seq,
+                            error: failed.join("\n"),
+                        }),
+                        None => {
+                            for failure in failed {
+                                eprintln!("oxd: session {}: {failure}", session.id);
+                            }
+                        }
+                    }
                     loop {
-                        let command = tokio::select! {
-                            () = connection.incoming_closed() => break,
-                            command = commands.recv() => command,
+                        let command = match first.take() {
+                            Some(command) => Some(command),
+                            None => tokio::select! {
+                                () = connection.incoming_closed() => break,
+                                command = commands.recv() => command,
+                            },
                         };
                         match command {
                             None => break,
@@ -1139,6 +1188,15 @@ impl Session {
             )
             .await;
         self.record(Change::Exited(result.err().map(|error| error.to_string())));
+    }
+}
+
+/// An option value as an error message shows it.
+fn shown(value: &SessionConfigOptionValue) -> String {
+    match value {
+        SessionConfigOptionValue::Id { value } => value.to_string(),
+        SessionConfigOptionValue::Boolean { value } => value.to_string(),
+        other => format!("{other:?}"),
     }
 }
 

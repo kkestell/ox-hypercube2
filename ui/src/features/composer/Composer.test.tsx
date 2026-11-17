@@ -239,9 +239,7 @@ describe("A permission request", () => {
     core.update(task.id, { type: "removed", key: "request:7" });
     expect(screen.queryByRole("button", { name: "Allow" })).not.toBeInTheDocument();
   });
-});
 
-describe("A session request", () => {
   it("shows its description under its title", async () => {
     const task = session(project, { title: "Task", state: "awaiting_permission" });
     const core = await viewSession(task);
@@ -249,14 +247,45 @@ describe("A session request", () => {
       type: "permission",
       key: "request:1",
       request_id: "1",
+      title: "Run `rm -rf build`",
+      description: "Deletes the build directory.\nIt is rebuilt on the next build.",
+      options: [{ optionId: "yes", name: "Allow", kind: "allow_once" }],
+    });
+    const panel = document.querySelector(".request-panel")!;
+    expect(panel.querySelector(".title")).toHaveTextContent("Run rm -rf build");
+    expect(panel.querySelector(".title + .description")!.textContent).toBe(
+      "Deletes the build directory.\nIt is rebuilt on the next build.",
+    );
+  });
+});
+
+describe("A session request", () => {
+  it("shows the requested session's model, mode, checkout and prompt", async () => {
+    const task = session(project, { title: "Task", state: "awaiting_permission" });
+    const core = await viewSession(task);
+    core.update(task.id, {
+      type: "permission",
+      key: "request:1",
+      request_id: "1",
       title: "Start a session in ox?",
-      description: "Harness: claude\nCheckout: New worktree\n\nReview the change.",
+      session_request: {
+        harness: "claude",
+        model: "Opus",
+        provider: "Anthropic",
+        effort: "High",
+        mode: "Manual",
+        checkout: { type: "worktree", branch: null, base: "main" },
+        prompt: "Review the change.",
+      },
       options: [{ optionId: "start", name: "Start Session", kind: "allow_once" }],
     });
     const panel = document.querySelector(".request-panel")!;
-    expect(panel.querySelector(".title")).toHaveTextContent("Start a session in ox?");
-    expect(panel.querySelector(".title + .description")!.textContent).toBe(
-      "Harness: claude\nCheckout: New worktree\n\nReview the change.",
+    const pairs = [...panel.querySelectorAll(".subheader-meta > div")].map(
+      (pair) => pair.textContent,
+    );
+    expect(pairs).toEqual(["Claude CodeOpusAnthropicHighManual", "New worktree frommain"]);
+    expect(panel.querySelector(".subheader-meta + .markdown")).toHaveTextContent(
+      "Review the change.",
     );
   });
 });
@@ -470,6 +499,7 @@ describe("The model picker", () => {
   const mode: ConfigOption = {
     configId: "mode",
     name: "Mode",
+    category: "mode",
     type: "select",
     currentValue: "ask",
     options: [
@@ -518,6 +548,48 @@ describe("The model picker", () => {
       ["model", "fast"],
       ["effort", "high"],
     ]);
+  });
+
+  it("offers only the models the config lists, at the one the agent reports", async () => {
+    const reported = (currentValue: string): ConfigOption => ({
+      ...model,
+      currentValue,
+      options: ["fast", "smart", "other/one", "other/two"].map((value) => ({
+        value,
+        name: value,
+      })),
+    });
+    const { core, task } = await withOptions();
+    core.list({ type: "session", session: { ...task, config_options: [reported("smart")] } });
+    const listbox = screen.getByRole("listbox", { name: "Model", hidden: true });
+    expect([...listbox.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "FastOpenRouter",
+      "Smart",
+      "Deep",
+      "Tiny",
+    ]);
+    expect(picker()).toHaveTextContent("Smart");
+
+    core.list({ type: "session", session: { ...task, config_options: [reported("other/one")] } });
+    expect(picker()).toHaveTextContent("other/one");
+  });
+
+  it("shows a reported effort or mode the config does not list as its ID", async () => {
+    const { core, task } = await withOptions();
+    core.list({
+      type: "session",
+      session: {
+        ...task,
+        config_options: [
+          { ...model, currentValue: "deep" },
+          effort,
+          { ...mode, currentValue: "plan" },
+        ],
+      },
+    });
+    expect(picker()).toHaveTextContent("Deepmedium");
+    expect(screen.getByRole("slider", { name: "Effort", hidden: true })).toHaveValue("2");
+    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("plan");
   });
 
   it("shows other options as their own pickers", async () => {

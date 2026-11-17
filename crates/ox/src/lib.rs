@@ -7,11 +7,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use ox_protocol::config::{self, HarnessConfig};
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, Error,
-    FileContent, Harness, ListingChange, SessionInfo, WorkspaceInfo, code, content,
-    default_socket_path, describe,
+    Branches, Checkout, Client, ConfigSetting, ConfigValue, Deleted, DirEntry, Error, FileContent,
+    Harness, ListingChange, SessionInfo, WorkspaceInfo, code, content, default_socket_path,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -84,16 +84,18 @@ fn on_path(path: &OsStr, name: &str) -> bool {
     })
 }
 
-/// The harnesses whose executables are on the `PATH` sessions get.
+/// The harnesses Ox's config lists whose executables are on the `PATH`
+/// sessions get, with the models, effort levels, and modes it lists.
 #[tauri::command]
-fn agents() -> Vec<Harness> {
+fn agents() -> Result<Vec<HarnessConfig>, String> {
+    let harnesses = config::load()?.harnesses;
     let Some(path) = utf8_env().remove("PATH") else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    Harness::ALL
+    Ok(harnesses
         .into_iter()
-        .filter(|harness| on_path(path.as_ref(), harness.executable()))
-        .collect()
+        .filter(|config| on_path(path.as_ref(), config.harness.executable()))
+        .collect())
 }
 
 // `watch`, `view_session`, and the file and directory watch commands are
@@ -401,13 +403,6 @@ async fn new_session(
         .map_err(message)
 }
 
-/// The controls `agent` offers a new session in `cwd`, which its bridge's
-/// `--describe` mode reports. A bridge that fails gives its standard error.
-#[tauri::command]
-async fn agent_controls(agent: Harness, cwd: PathBuf) -> Result<Controls, String> {
-    describe(&bridge(agent)?, &cwd, &utf8_env()).await
-}
-
 /// Restarts the agent of an exited session, which replays its conversation.
 #[tauri::command]
 async fn load_session(app: State<'_, App>, session_id: String) -> Result<(), String> {
@@ -677,7 +672,6 @@ pub fn run() {
             workspace_branches,
             move_branch,
             new_session,
-            agent_controls,
             load_session,
             prompt,
             queue_add,

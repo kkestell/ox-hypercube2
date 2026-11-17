@@ -46,10 +46,26 @@ export interface ConfigSetting {
   value: string | boolean;
 }
 
-/** The config options and slash commands an agent offers a new session. */
-export interface Controls {
-  config_options: ConfigOption[];
-  available_commands: Command[];
+/** An effort level or mode Ox's config lists: the value its option takes, and its name. */
+export interface Choice {
+  id: string;
+  name: string;
+}
+
+/** A model Ox's config lists, with the effort levels it offers it at. */
+export interface ModelConfig {
+  id: string;
+  name: string;
+  /** The provider that serves the model, shown beside it. */
+  provider: string | null;
+  efforts: Choice[];
+}
+
+/** What Ox's config lists for one harness, in picker order. */
+export interface HarnessConfig {
+  harness: "claude" | "pi";
+  models: ModelConfig[];
+  modes: Choice[];
 }
 
 export interface WorkspaceInfo {
@@ -170,6 +186,27 @@ export type Field = {
     }
 );
 
+/** A session an agent asks the user to start, with the prompt it starts with. */
+export type SessionRequest = {
+  harness: "claude" | "pi";
+  /** The name of the model the session starts on. */
+  model: string;
+  /** The name of the provider that serves the model, when the config gives one. */
+  provider: string | null;
+  /** The name of the effort level the session starts on, if the model has effort levels. */
+  effort: string | null;
+  /** The name of the mode the session starts in, if the harness has modes. */
+  mode: string | null;
+  /**
+   * The workspace's checkout at `path`, or a new worktree on existing local
+   * branch `branch`, or on a new branch from `base` when `branch` is null.
+   */
+  checkout:
+    | { type: "workspace"; path: string }
+    | { type: "worktree"; branch: string | null; base: string };
+  prompt: string;
+};
+
 /** The session that sent a peer message, with its title as of sending. */
 export type Sender = { session_id: string; title: string | null };
 
@@ -208,6 +245,8 @@ export type Item =
       request_id: string;
       title: string;
       description?: string;
+      /** The session the request asks the user to start, when it is a session request. */
+      session_request?: SessionRequest;
       options: PermissionOption[];
     }
   | {

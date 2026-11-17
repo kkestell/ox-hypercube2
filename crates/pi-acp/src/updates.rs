@@ -37,24 +37,13 @@ enum Sent {
 /// Sends one session's updates to the client.
 #[derive(Clone)]
 pub struct Updates {
-    /// The client, which a Pi that `--describe` starts has not.
-    connection: Option<ConnectionTo<Client>>,
+    connection: ConnectionTo<Client>,
     session_id: String,
     state: Arc<Mutex<State>>,
 }
 
 impl Updates {
     pub fn new(connection: ConnectionTo<Client>, session_id: &str) -> Self {
-        Self::with(Some(connection), session_id)
-    }
-
-    /// Updates of a Pi with no client: they go nowhere, and forms are
-    /// cancelled.
-    pub fn without_client() -> Self {
-        Self::with(None, "")
-    }
-
-    fn with(connection: Option<ConnectionTo<Client>>, session_id: &str) -> Self {
         Self {
             connection,
             session_id: session_id.to_owned(),
@@ -63,9 +52,7 @@ impl Updates {
     }
 
     fn send(&self, update: SessionUpdate) {
-        if let Some(connection) = &self.connection {
-            notify(connection, &self.session_id, update);
-        }
+        notify(&self.connection, &self.session_id, update);
     }
 
     pub fn snapshot(&self) -> StateUpdate {
@@ -113,18 +100,18 @@ impl Updates {
         schema: acp::ElicitationSchema,
     ) -> impl Future<Output = Option<acp::ElicitationAction>> + Send + 'static {
         let asking = Asking::new(self.clone());
-        let answer = self.connection.as_ref().map(|connection| {
-            connection.send_request(acp::CreateElicitationRequest::new(
+        let answer = self
+            .connection
+            .send_request(acp::CreateElicitationRequest::new(
                 acp::ElicitationFormMode::new(
                     acp::ElicitationSessionScope::new(self.session_id.clone()),
                     schema,
                 ),
                 message,
-            ))
-        });
+            ));
         async move {
             let _asking = asking;
-            answer?
+            answer
                 .block_task()
                 .await
                 .ok()

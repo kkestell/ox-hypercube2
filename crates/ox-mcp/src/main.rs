@@ -16,14 +16,18 @@
 //!   message, from the first listing of a `watch`
 //! - `send_message { to, text }`: a peer message to another session
 //!   (`session.send_message`)
-//! - `start_session { prompt, worktree, workspace?, branch?, harness?,
-//!   model?, effort? }`: asks the user to start a session (`session.request`)
+//! - `start_session { prompt, worktree, workspace?, branch?, harness,
+//!   model, effort?, mode? }`: asks the user to start a session
+//!   (`session.request`)
+//! - `list_harnesses {}`: the harnesses, models, effort levels, and modes
+//!   Ox's config lists
 
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use ox_protocol::config::{Choice, HarnessConfig};
 use ox_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
 use ox_protocol::{Client, Harness, Listing, ListingChange, SessionInfo, SessionState};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -105,13 +109,20 @@ struct StartSession {
     /// An existing local branch for a worktree, or the branch the
     /// workspace's checkout must be on.
     branch: Option<String>,
-    /// `claude` or `pi`.
-    harness: Option<String>,
-    /// A model the harness offers.
-    model: Option<String>,
-    /// An effort the harness offers.
+    /// A harness from `list_harnesses`.
+    harness: String,
+    /// A model ID `list_harnesses` lists for the harness.
+    model: String,
+    /// An effort level `list_harnesses` lists for the model; required when
+    /// it lists any.
     effort: Option<String>,
+    /// A mode `list_harnesses` lists for the harness; required when it
+    /// lists any.
+    mode: Option<String>,
 }
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListHarnesses {}
 
 #[tool_router]
 impl Ox {
@@ -205,22 +216,12 @@ impl Ox {
     }
 
     #[tool(
-        description = "Ask the user to start a new, independent Ox session with prompt as its first message. worktree true runs it in a new worktree, on branch if given (an existing local branch) or a new branch from HEAD; false runs it in the workspace's checkout, whose branch must match branch if given. workspace is a workspace directory from list_sessions and defaults to yours; harness (claude or pi) defaults to yours; model and effort are values the harness offers and default to its own. Waits for the user's answer and returns the new session's ID."
+        description = "Ask the user to start a new, independent Ox session with prompt as its first message. worktree true runs it in a new worktree, on branch if given (an existing local branch) or a new branch from HEAD; false runs it in the workspace's checkout, whose branch must match branch if given. workspace is a workspace directory from list_sessions and defaults to yours. harness, model, effort and mode are IDs list_harnesses lists: effort is required when the model has effort levels, and mode when the harness has modes. Waits for the user's answer and returns the new session's ID."
     )]
     async fn start_session(
         &self,
         Parameters(request): Parameters<StartSession>,
     ) -> Result<String, String> {
-        let harness = request
-            .harness
-            .as_deref()
-            .map(|name| {
-                Harness::ALL
-                    .into_iter()
-                    .find(|harness| harness.executable() == name)
-                    .ok_or_else(|| format!("unknown harness {name}; use claude or pi"))
-            })
-            .transpose()?;
         let client = self.client().await?;
         let started = client
             .request_session(
@@ -229,9 +230,10 @@ impl Ox {
                 request.workspace,
                 request.worktree,
                 request.branch,
-                harness,
+                request.harness,
                 request.model,
                 request.effort,
+                request.mode,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -239,6 +241,17 @@ impl Ox {
             Some(session) => format!("The user started session {}.", session.id),
             None => "The user did not start the session.".into(),
         })
+    }
+
+    #[tool(
+        description = "List the harnesses, models and effort levels a session can be started with, as start_session takes them, and each harness's modes."
+    )]
+    async fn list_harnesses(
+        &self,
+        Parameters(ListHarnesses {}): Parameters<ListHarnesses>,
+    ) -> Result<String, String> {
+        let config = ox_protocol::config::load()?;
+        Ok(format_harnesses(&config.harnesses))
     }
 }
 
@@ -328,6 +341,42 @@ fn format_listing(
     text
 }
 
+/// Each harness Ox's config lists, with its modes and its models' effort
+/// levels, by the IDs `start_session` takes.
+fn format_harnesses(harnesses: &[HarnessConfig]) -> String {
+    let blocks: Vec<String> = harnesses
+        .iter()
+        .map(|config| {
+            let mut block = format!("{}\n", config.harness.executable());
+            if !config.modes.is_empty() {
+                let _ = writeln!(block, "modes: {}", ids(&config.modes));
+            }
+            for model in &config.models {
+                let name = match &model.provider {
+                    Some(provider) => format!("{}, {provider}", model.name),
+                    None => model.name.clone(),
+                };
+                let efforts = if model.efforts.is_empty() {
+                    "no effort levels".to_owned()
+                } else {
+                    format!("effort: {}", ids(&model.efforts))
+                };
+                let _ = writeln!(block, "- {} ({name}), {efforts}", model.id);
+            }
+            block
+        })
+        .collect();
+    if blocks.is_empty() {
+        return "No harnesses.".into();
+    }
+    blocks.join("\n")
+}
+
+fn ids(choices: &[Choice]) -> String {
+    let ids: Vec<&str> = choices.iter().map(|choice| choice.id.as_str()).collect();
+    ids.join(", ")
+}
+
 /// The current value of the session's select option of `category`.
 fn current_value(session: &SessionInfo, category: &SessionConfigOptionCategory) -> Option<String> {
     session.config_options.iter().find_map(|option| {
@@ -372,5 +421,64 @@ async fn main() -> ExitCode {
             eprintln!("ox-mcp: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_protocol::config::ModelConfig;
+
+    use super::*;
+
+    fn choice(id: &str) -> Choice {
+        Choice {
+            id: id.into(),
+            name: id.to_uppercase(),
+        }
+    }
+
+    #[test]
+    fn harnesses_list_modes_models_and_effort_levels_by_id() {
+        let harnesses = [
+            HarnessConfig {
+                harness: Harness::Claude,
+                models: vec![ModelConfig {
+                    id: "claude-opus-5-5".into(),
+                    name: "Opus 5.5".into(),
+                    provider: None,
+                    efforts: vec![choice("medium"), choice("high")],
+                }],
+                modes: vec![choice("manual"), choice("auto")],
+            },
+            HarnessConfig {
+                harness: Harness::Pi,
+                models: vec![
+                    ModelConfig {
+                        id: "openai/gpt-6-luna".into(),
+                        name: "GPT-6 Luna".into(),
+                        provider: Some("OpenAI".into()),
+                        efforts: vec![choice("low")],
+                    },
+                    ModelConfig {
+                        id: "openrouter/plain".into(),
+                        name: "Plain".into(),
+                        provider: None,
+                        efforts: Vec::new(),
+                    },
+                ],
+                modes: Vec::new(),
+            },
+        ];
+        assert_eq!(
+            format_harnesses(&harnesses),
+            "claude\n\
+             modes: manual, auto\n\
+             - claude-opus-5-5 (Opus 5.5), effort: medium, high\n\
+             \n\
+             pi\n\
+             - openai/gpt-6-luna (GPT-6 Luna, OpenAI), effort: low\n\
+             - openrouter/plain (Plain), no effort levels\n"
+        );
+        assert_eq!(format_harnesses(&[]), "No harnesses.");
     }
 }

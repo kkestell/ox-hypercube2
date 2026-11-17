@@ -1,7 +1,15 @@
 import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { renderApp, session, sidebarRow, view, workspace } from "../../test/core";
+import {
+  claudeConfig,
+  piConfig,
+  renderApp,
+  session,
+  sidebarRow,
+  view,
+  workspace,
+} from "../../test/core";
 
 /** The status dot of the sidebar row titled `title`: its class and label. */
 function dot(title: string) {
@@ -51,7 +59,7 @@ describe("The session list", () => {
     const newSession = screen.getByRole("button", { name: "New Session" });
     expect(screen.queryByLabelText("Harness")).not.toBeInTheDocument();
 
-    core.agents = ["claude", "pi"];
+    core.agents = [claudeConfig, piConfig];
     await act(async () => window.dispatchEvent(new Event("focus")));
     expect(screen.getByLabelText("Harness")).toBeInTheDocument();
 

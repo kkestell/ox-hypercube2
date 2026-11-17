@@ -6,7 +6,7 @@ closes.
 
 ## Features
 
-- Claude Code and Pi sessions with model, effort, and thinking controls, tool
+- Claude Code and Pi sessions with model, effort, and mode controls, tool
   permissions, skills, and extension commands.
 - Sessions grouped by workspace, each in the workspace checkout or its own Git
   worktree and branch.
@@ -40,6 +40,11 @@ be installed and authenticated to use the Claude bridge. Pi must be installed
 with a model provider authenticated to use the Pi bridge. The app reads `PATH`
 from your interactive login shell so it can find these tools when opened from
 Finder or the Dock.
+
+`make install` also copies `config/config.json` to `~/.config/ox/config.json`
+when no config is there yet. Its `harnesses` object lists the harnesses,
+models, effort levels, and modes Ox offers; the first of each listed is a new
+session's default.
 
 ## Development
 

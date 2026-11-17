@@ -3,8 +3,9 @@ import { useState } from "react";
 import type {
   Branches,
   Checkout,
+  Command,
+  ConfigOption,
   ConfigSetting,
-  Controls,
   SessionInfo,
   WorkspaceInfo,
 } from "../../lib/protocol";
@@ -14,31 +15,33 @@ import { Composer } from "./Composer";
 import type { Values } from "./controls";
 import type { Unsents } from "./useUnsent";
 
+const noCommands: Command[] = [];
+
 /**
- * A draft's composer, with the controls its agent offers in its workspace.
- * Send creates the session with the message as its first prompt and the
- * shown option values, then `onSent` gets the session and those values. A
+ * A draft's composer, with the options Ox's config lists for its agent and
+ * no slash commands, which an agent reports once it has started. Send
+ * creates the session with the message as its first prompt and the shown
+ * option values, then `onSent` gets the session and those values. A
  * worktree draft is compared with the branch the workspace's checkout is on
  * at Send.
  */
 export function DraftComposer({
   draft,
   workspace,
-  controls,
+  options,
   unsent,
   onSetOption,
   onSent,
 }: {
   draft: Draft;
   workspace: WorkspaceInfo;
-  /** The controls to show, with the draft's values. */
-  controls: Controls | undefined;
+  /** The options to show, with the draft's values. */
+  options: ConfigOption[];
   unsent: Unsents;
   onSetOption: (configId: string, value: string | boolean) => void;
   onSent: (session: SessionInfo, values: Values) => void;
 }) {
   const [sending, setSending] = useState(false);
-  const options = controls?.config_options ?? [];
 
   const send = async (text: string, attachments: string[]) => {
     setSending(true);
@@ -78,7 +81,7 @@ export function DraftComposer({
       unsent={unsent}
       agent={draft.agent}
       configOptions={options}
-      commands={controls?.available_commands ?? []}
+      commands={noCommands}
       running={false}
       disabled={false}
       idle={!sending}

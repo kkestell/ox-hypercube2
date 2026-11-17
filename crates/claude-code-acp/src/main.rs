@@ -30,8 +30,6 @@ async fn main() -> Result<()> {
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     let history = || history::History::new(&claude_dir);
     let printed = match args.as_slice() {
-        // `--describe <dir>` prints what a new session in `dir` offers.
-        [flag, dir] if flag == "--describe" => bridge::describe(dir.as_ref()).await,
         // `--sessions <dir>` prints the interactive sessions started in `dir`.
         [flag, dir] if flag == "--sessions" => {
             directory(dir).map(|dir| sessions::sessions(&history(), &dir))

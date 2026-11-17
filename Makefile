@@ -36,6 +36,12 @@ install:
 	rm -rf "$(HOME)/Applications/Ox.app"
 	ditto "$(APP_BUNDLE)" "$(HOME)/Applications/Ox.app"
 	@printf '%s\n' "Installed $(HOME)/Applications/Ox.app"
+	@config_home="$${XDG_CONFIG_HOME:-}"; \
+	case "$$config_home" in /*) ;; *) config_home="$(HOME)/.config";; esac; \
+	config="$$config_home/ox/config.json"; \
+	if [ ! -e "$$config" ]; then \
+		mkdir -p "$$config_home/ox" && cp config/config.json "$$config" && printf '%s\n' "Installed $$config"; \
+	fi
 
 check: check-rust check-ui check-scripts
 

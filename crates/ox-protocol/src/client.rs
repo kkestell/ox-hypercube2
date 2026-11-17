@@ -19,9 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, ErrorBody, Event,
-    EventKind, FileContent, Harness, HelloResult, ImportedSessions, ListingChange, MessageSent,
-    Method, PROTOCOL_VERSION, QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage,
+    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind,
+    FileContent, HelloResult, ImportedSessions, ListingChange, MessageSent, Method,
+    PROTOCOL_VERSION, QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage,
     WorkspaceInfo, WorktreeInfo,
 };
 
@@ -94,17 +94,6 @@ pub fn default_socket_path() -> PathBuf {
 /// The daemon binary: `oxd` beside the current executable.
 pub fn daemon_binary() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name("oxd"))
-}
-
-/// The controls the agent of `bridge` offers a new session in `cwd`, which
-/// the bridge's `--describe` mode reports. The bridge runs with `env` over
-/// this process's environment. A bridge that fails gives its standard error.
-pub async fn describe(
-    bridge: &Path,
-    cwd: &Path,
-    env: &BTreeMap<String, String>,
-) -> Result<Controls, String> {
-    bridge_mode(bridge, &["--describe".as_ref(), cwd.as_os_str()], env).await
 }
 
 /// What `bridge` prints as JSON when run with `args`, which select one of
@@ -513,7 +502,7 @@ impl Client {
     /// declines.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the method's parameters, most of them optional"
+        reason = "the method's parameters, several of them optional"
     )]
     pub async fn request_session(
         &self,
@@ -522,9 +511,10 @@ impl Client {
         workspace: Option<PathBuf>,
         worktree: bool,
         branch: Option<String>,
-        harness: Option<Harness>,
-        model: Option<String>,
+        harness: String,
+        model: String,
         effort: Option<String>,
+        mode: Option<String>,
     ) -> Result<Option<SessionInfo>, Error> {
         self.call(Method::SessionRequest {
             session_id: session_id.into(),
@@ -535,6 +525,7 @@ impl Client {
             harness,
             model,
             effort,
+            mode,
         })
         .await
     }

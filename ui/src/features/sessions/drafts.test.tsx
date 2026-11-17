@@ -1,43 +1,29 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type {
-  Command,
-  ConfigOption,
-  Controls,
-  SessionInfo,
-  WorkspaceInfo,
-} from "../../lib/protocol";
-import { renderApp, session, sidebarRow, view, workspace } from "../../test/core";
+import type { Command, ConfigOption, SessionInfo } from "../../lib/protocol";
+import {
+  claudeConfig,
+  piConfig,
+  renderApp,
+  session,
+  sidebarRow,
+  view,
+  workspace,
+} from "../../test/core";
 
-const model: ConfigOption = {
-  configId: "model",
-  name: "Model",
-  category: "model",
-  type: "select",
-  currentValue: "smart",
-  options: [
-    { value: "fast", name: "Fast" },
-    { value: "smart", name: "Smart" },
-  ],
-};
-const mode: ConfigOption = {
-  configId: "mode",
-  name: "Mode",
-  type: "select",
-  currentValue: "ask",
-  options: [
-    { value: "ask", name: "Ask" },
-    { value: "code", name: "Code" },
-  ],
-};
-const review: Command = { type: "command", name: "review", description: "Review a file" };
-const controls: Controls = { config_options: [model, mode], available_commands: [review] };
-
-/** Caches `controls` as Claude's controls in `workspaceInfo`. */
-function cache(workspaceInfo: WorkspaceInfo) {
-  localStorage.setItem(`controls:claude:${workspaceInfo.id}`, JSON.stringify(controls));
+/** An option as an agent reports it, offering only its current value. */
+function reported(configId: string, category: string, currentValue: string): ConfigOption {
+  return {
+    configId,
+    name: configId,
+    category,
+    type: "select",
+    currentValue,
+    options: [{ value: currentValue, name: currentValue }],
+  };
 }
+const review: Command = { type: "command", name: "review", description: "Review a file" };
 
 /** Chooses `item` from the New Session menu of the workspace named `name`. */
 async function newDraft(name: string, item = "Session in Checkout") {
@@ -124,7 +110,7 @@ describe("A draft", () => {
     const repo = workspace({ path: "/src/repo", git_working_tree: true });
     const core = await renderApp({ type: "workspace", workspace: repo });
     core.on("new_session", ({ text }) => session(repo, { title: text as string }));
-    core.agents = ["claude", "pi"];
+    core.agents = [claudeConfig, piConfig];
     await act(async () => window.dispatchEvent(new Event("focus")));
     await newDraft("repo", "Session in Worktree");
     await userEvent.type(message(), "First");
@@ -146,9 +132,7 @@ describe("A draft", () => {
 
   it("creates the session with its first message when sent", async () => {
     const repo = workspace({ path: "/src/repo", git_working_tree: true });
-    cache(repo);
     const core = await renderApp({ type: "workspace", workspace: repo });
-    core.on("agent_controls", () => controls);
     const started = session(repo, {
       title: "Fix the bug",
       state: "starting",
@@ -169,7 +153,8 @@ describe("A draft", () => {
         text: "Fix the bug",
         attachments: ["/src/repo/notes.txt"],
         config: [
-          { config_id: "model", value: "smart" },
+          { config_id: "model", value: "fast" },
+          { config_id: "effort", value: "low" },
           { config_id: "mode", value: "ask" },
         ],
       },
@@ -201,103 +186,84 @@ describe("A draft", () => {
   });
 });
 
-describe("A draft's controls", () => {
-  it("are probed one at a time for each agent and workspace with none cached", async () => {
-    const first = workspace({ path: "/src/first" });
-    const second = workspace({ path: "/src/second" });
-    const core = await renderApp();
-    core.agents = ["claude", "pi"];
-    await act(async () => window.dispatchEvent(new Event("focus")));
-    const answers: ((controls: Controls) => void)[] = [];
-    core.on("agent_controls", () => new Promise((resolve) => answers.push(resolve)));
-    core.list({ type: "workspace", workspace: first }, { type: "workspace", workspace: second });
-    await act(async () => {});
-    expect(core.invoked("agent_controls")).toEqual([{ agent: "claude", cwd: "/src/first" }]);
-    for (let answered = 0; answered < 3; answered++) {
-      await act(async () => answers[answered]!(controls));
-    }
-    expect(core.invoked("agent_controls")).toEqual([
-      { agent: "claude", cwd: "/src/first" },
-      { agent: "claude", cwd: "/src/second" },
-      { agent: "pi", cwd: "/src/first" },
-      { agent: "pi", cwd: "/src/second" },
+describe("A draft's options", () => {
+  const listbox = () => screen.getByRole("listbox", { name: "Model", hidden: true });
+  const choose = (name: string) => userEvent.click(within(listbox()).getByText(name));
+  const slider = () => screen.queryByRole("slider", { name: "Effort", hidden: true });
+  const levels = () => document.querySelector(".effort .stops")!.textContent;
+  const modePicker = () => screen.queryByRole("combobox", { name: "Mode" });
+
+  it("offer what the config lists, starting on the first listed", async () => {
+    const project = workspace({ path: "/src/project" });
+    const core = await renderApp({ type: "workspace", workspace: project });
+    core.on("new_session", () => session(project, { title: "Go" }));
+    await newDraft("project");
+    expect([...listbox().querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+      "FastOpenRouter",
+      "Smart",
+      "Deep",
+      "Tiny",
+    ]);
+    expect(picker()).toHaveTextContent("FastOpenRouterLow");
+    expect(levels()).toBe("LowMediumHigh");
+    expect(modePicker()).toHaveValue("ask");
+
+    await choose("Tiny");
+    expect(picker()).toHaveTextContent("Tiny");
+    expect(slider()).not.toBeInTheDocument();
+    await choose("Deep");
+    expect(picker()).toHaveTextContent("DeepHigh");
+    expect(levels()).toBe("HighMax");
+    await userEvent.type(message(), "Go{Enter}");
+    expect(core.invoked("new_session")[0]!.config).toEqual([
+      { config_id: "model", value: "deep" },
+      { config_id: "effort", value: "high" },
+      { config_id: "mode", value: "ask" },
     ]);
   });
 
-  it("probes no pair that is cached until a draft of it is viewed", async () => {
+  it("start at the values last used in the workspace", async () => {
     const project = workspace({ path: "/src/project" });
-    cache(project);
-    const core = await renderApp({ type: "workspace", workspace: project });
-    expect(core.invoked("agent_controls")).toEqual([]);
-    await newDraft("project");
-    expect(core.invoked("agent_controls")).toEqual([{ agent: "claude", cwd: "/src/project" }]);
-  });
-
-  it("show at once, from another workspace while the draft's has none, until a probe replaces them", async () => {
-    const cached = workspace({ path: "/src/cached" });
-    const fresh = workspace({ path: "/src/fresh" });
-    cache(cached);
-    const core = await renderApp({ type: "workspace", workspace: cached });
-    let answer: (controls: Controls) => void = () => {};
-    core.on("agent_controls", () => new Promise((resolve) => (answer = resolve)));
-    core.list({ type: "workspace", workspace: fresh });
-    await newDraft("fresh");
-    expect(picker()).toHaveTextContent("Smart");
-    await userEvent.type(message(), "/");
-    expect(document.querySelector(".menu-item-text > span")).toHaveTextContent("/review");
-
-    await act(async () =>
-      answer({ config_options: [{ ...model, currentValue: "fast" }], available_commands: [] }),
-    );
-    expect(picker()).toHaveTextContent("Fast");
-    expect(screen.queryByRole("combobox", { name: "Mode" })).not.toBeInTheDocument();
-  });
-
-  it("start at the values of the agent's newest session in the workspace", async () => {
-    const project = workspace({ path: "/src/project" });
-    cache(project);
+    const used = (title: string, model: string, effort: string, mode: string) =>
+      session(project, {
+        title,
+        config_options: [
+          reported("model", "model", model),
+          reported("effort", "thought_level", effort),
+          reported("mode", "mode", mode),
+        ],
+      });
     const core = await renderApp(
       { type: "workspace", workspace: project },
-      {
-        type: "session",
-        session: session(project, {
-          title: "Old",
-          config_options: [{ ...model, currentValue: "smart" }, mode],
-        }),
-      },
-      {
-        type: "session",
-        session: session(project, {
-          title: "New",
-          config_options: [
-            { ...model, currentValue: "fast" },
-            { ...mode, currentValue: "code" },
-          ],
-        }),
-      },
+      { type: "session", session: used("Old", "fast", "low", "ask") },
+      { type: "session", session: used("New", "smart", "high", "code") },
     );
-    core.on("agent_controls", () => controls);
     core.on("new_session", () => session(project, { title: "Go" }));
     await newDraft("project");
-    expect(picker()).toHaveTextContent("Fast");
-    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveValue("code");
-
-    await userEvent.click(
-      within(screen.getByRole("listbox", { name: "Model", hidden: true })).getByText("Smart"),
-    );
-    expect(picker()).toHaveTextContent("Smart");
+    expect(picker()).toHaveTextContent("SmartHigh");
+    expect(modePicker()).toHaveValue("code");
     await userEvent.type(message(), "Go{Enter}");
     expect(core.invoked("new_session")[0]!.config).toEqual([
       { config_id: "model", value: "smart" },
+      { config_id: "effort", value: "high" },
       { config_id: "mode", value: "code" },
     ]);
   });
 
+  it("have no Mode picker for a harness with no modes", async () => {
+    const project = workspace({ path: "/src/project" });
+    const core = await renderApp({ type: "workspace", workspace: project });
+    core.agents = [claudeConfig, piConfig];
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    await userEvent.selectOptions(screen.getByLabelText("Harness"), "pi");
+    await newDraft("project");
+    expect(picker()).toHaveTextContent("BigLow");
+    expect(modePicker()).not.toBeInTheDocument();
+  });
+
   it("stay disabled at the sent values while the new session's agent starts", async () => {
     const project = workspace({ path: "/src/project" });
-    cache(project);
     const core = await renderApp({ type: "workspace", workspace: project });
-    core.on("agent_controls", () => controls);
     const started: SessionInfo = session(project, {
       title: "Go",
       state: "starting",
@@ -305,12 +271,13 @@ describe("A draft's controls", () => {
     });
     core.on("new_session", () => started);
     await newDraft("project");
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
+    await userEvent.selectOptions(modePicker()!, "code");
     await userEvent.type(message(), "Go{Enter}");
     core.list({ type: "session", session: started });
     expect(picker()).toBeDisabled();
-    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveValue("code");
-    expect(screen.getByRole("combobox", { name: "Mode" })).toBeDisabled();
+    expect(picker()).toHaveTextContent("FastOpenRouterLow");
+    expect(modePicker()).toHaveValue("code");
+    expect(modePicker()).toBeDisabled();
 
     core.list({
       type: "session",
@@ -318,12 +285,26 @@ describe("A draft's controls", () => {
         ...started,
         state: "idle",
         agent_session_id: "agent",
-        config_options: [{ ...model, currentValue: "fast" }],
+        config_options: [reported("model", "model", "smart")],
       },
     });
     expect(picker()).toBeEnabled();
-    expect(picker()).toHaveTextContent("Fast");
-    expect(screen.queryByRole("combobox", { name: "Mode" })).not.toBeInTheDocument();
+    expect(picker()).toHaveTextContent("Smart");
+    expect(modePicker()).not.toBeInTheDocument();
+  });
+
+  it("complete no slash commands", async () => {
+    const project = workspace({ path: "/src/project" });
+    await renderApp(
+      { type: "workspace", workspace: project },
+      {
+        type: "session",
+        session: session(project, { title: "Task", available_commands: [review] }),
+      },
+    );
+    await newDraft("project");
+    await userEvent.type(message(), "/");
+    expect(document.querySelector(".menu-item-text")).not.toBeInTheDocument();
   });
 });
 
@@ -349,20 +330,18 @@ describe("Unsent work", () => {
       { type: "workspace" as const, workspace: project },
       { type: "session" as const, session: task },
     ];
-    let core = await renderApp();
-    core.on("agent_controls", () => controls);
-    core.list(...listing);
+    await renderApp(...listing);
     await view("Task");
     await userEvent.type(message(), "Session text");
     await newDraft("project");
     await userEvent.type(message(), "Draft text");
+    await userEvent.click(
+      within(screen.getByRole("listbox", { name: "Model", hidden: true })).getByText("Smart"),
+    );
 
     cleanup();
     sessionStorage.clear();
-    core = await renderApp(...listing);
-    expect(core.invoked("agent_controls")).toEqual([]);
-    // The probe on viewing the draft stays unanswered.
-    core.on("agent_controls", () => new Promise(() => {}));
+    await renderApp(...listing);
     expect(rows("project")).toEqual(["Draft text", "Task"]);
     await view("Draft text");
     expect(message()).toHaveValue("Draft text");

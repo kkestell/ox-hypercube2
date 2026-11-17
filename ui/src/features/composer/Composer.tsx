@@ -1,13 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect, useMemo, useRef } from "react";
 import { HarnessLogo, sessionAgent } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import type {
   Command,
   ConfigOption,
-  Controls,
+  HarnessConfig,
   QueuedPrompt,
   Request,
   SessionInfo,
@@ -15,6 +15,7 @@ import type {
 import { showError } from "../../lib/showError";
 import type { AgentId } from "../sessions/useAgents";
 import { CommandInput } from "./CommandInput";
+import { sessionOptions } from "./controls";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { OpenRequest } from "./OpenRequest";
 import { QueuedPrompts, queuedMessage } from "./QueuedPrompts";
@@ -244,33 +245,41 @@ export function Composer({
 /**
  * A session's composer. On an idle session, Enter and Cmd+Enter send the
  * message. While the agent works, Enter queues it and Cmd+Enter steers the
- * running turn with it. A new session whose agent is starting shows
- * `starting`, the controls it was sent with, disabled, until its agent
- * reports its own.
+ * running turn with it. The model, effort and mode pickers offer what
+ * `harness`, the config of the session's agent, lists. A new session whose
+ * agent is starting shows `starting`, the options it was sent with,
+ * disabled, until its agent reports its own.
  */
 export const SessionComposer = memo(function SessionComposer({
   session,
   request,
   unsent,
+  harness,
   starting,
 }: {
   session: SessionInfo;
   /** The session's oldest unanswered permission request or form. */
   request: Request | undefined;
   unsent: Unsents;
-  starting: Controls | undefined;
+  harness: HarnessConfig | undefined;
+  starting: ConfigOption[] | undefined;
 }) {
   const running =
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
+  const reported = session.config_options;
+  const options = useMemo(
+    () => starting ?? sessionOptions(harness, reported),
+    [starting, harness, reported],
+  );
   return (
     <Composer
       unsentId={session.id}
       unsent={unsent}
       agent={sessionAgent(session.command)}
-      configOptions={starting?.config_options ?? session.config_options}
-      commands={starting?.available_commands ?? session.available_commands}
+      configOptions={options}
+      commands={session.available_commands}
       request={request}
       queue={session.queue}
       running={running}

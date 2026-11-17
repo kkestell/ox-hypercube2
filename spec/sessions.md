@@ -9,10 +9,10 @@ Sessions let users keep independent agent conversations in their projects, conti
 1. Open the workspace's + menu and choose the agent. The desktop offers Claude.
 2. Choose Session in Checkout to run in the workspace directory, or Session in Worktree to follow the [isolated Git workflow](git.md#start-a-task).
 3. The app opens a draft at the top of the workspace. Nothing is saved, started, or created in Git yet. The draft's row shows the start of its message, and the workspace's files show beside it so the message can refer to them.
-4. The composer offers the agent's model, mode, and slash commands for the workspace, at the values last used with that agent in the workspace.
+4. The composer offers the models, effort levels, and modes [Ox's config](../docs/dev/architecture.md#oxs-config) lists for the agent, at the values last used with that agent in the workspace, else the first listed. The effort levels are the chosen model's. A draft offers no slash commands; the agent reports them once it has started.
 5. Send the first message. It appears in the conversation at once, and the session is created with it as its first prompt. The row shows the start of the message until the agent titles the session.
-6. The session starts in Starting, with its model and mode shown but not changeable, and runs the prompt once the agent is ready.
-7. A failure to start leaves the session Exited, ends the prompt's turn, and reports the failure in its conversation. A draft that cannot be sent shows the error and keeps its message.
+6. The session starts in Starting, with its model, effort, and mode shown but not changeable. Once the agent is ready, it is set to them, then runs the prompt.
+7. A failure to start leaves the session Exited, ends the prompt's turn, and reports the failure in its conversation. A model, effort, or mode the agent refuses ends the prompt's turn with an error naming it, without sending the prompt. A draft that cannot be sent shows the error and keeps its message.
 
 Each New Session opens its own draft. A draft keeps its message while other sessions are viewed. A draft with no message goes when something else is viewed, and Delete Draft on its row discards one. Drafts survive restarting the app.
 

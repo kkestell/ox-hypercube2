@@ -14,12 +14,13 @@
 
 #[cfg(unix)]
 mod client;
+pub mod config;
 mod messages;
 
 #[cfg(unix)]
 pub use client::{
     Client, End, Error, Stream, Subscription, bridge_mode, daemon_binary, data_dir,
-    default_socket_path, describe,
+    default_socket_path,
 };
 #[cfg(unix)]
 pub mod content;

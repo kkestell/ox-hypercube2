@@ -119,23 +119,19 @@ pub struct Pi {
 
 impl Pi {
     /// Starts Pi in `cwd` on the Pi session `pi_session_id`, which Pi opens,
-    /// or creates when it does not exist, or on a session Pi does not save
-    /// when there is none, with `instructions` appended to Pi's system
-    /// prompt. The extension `MCP_EXTENSION` registers `mcp_servers` with
-    /// Pi, their tools declared to the model directly.
+    /// or creates when it does not exist, with `instructions` appended to
+    /// Pi's system prompt. The extension `MCP_EXTENSION` registers
+    /// `mcp_servers` with Pi, their tools declared to the model directly.
     pub fn start(
         cwd: &Path,
-        pi_session_id: Option<&str>,
+        pi_session_id: &str,
         instructions: Option<&str>,
         mcp_servers: &[McpServer],
         updates: Updates,
     ) -> Result<Self, String> {
         let mut command = Command::new("pi");
         command.args(["--mode", "rpc", "--approve"]);
-        match pi_session_id {
-            Some(id) => command.args(["--session-id", id]),
-            None => command.arg("--no-session"),
-        };
+        command.args(["--session-id", pi_session_id]);
         if let Some(instructions) = instructions {
             command.arg("--append-system-prompt").arg(instructions);
         }

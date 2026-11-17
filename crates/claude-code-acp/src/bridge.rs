@@ -11,14 +11,14 @@ use agent_client_protocol::v2::schema::{
 };
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
     content,
     history::History,
-    runner::{self, Claude, Conversation, StartRequest},
+    runner::{Claude, Conversation, StartRequest},
     updates::{self, Updates},
 };
 
@@ -76,15 +76,35 @@ impl Session {
         }
     }
 
+    /// The session's options, each with its current value as its only
+    /// choice: the client lists the values it offers.
     fn options(&self) -> Vec<SessionConfigOption> {
-        vec![
-            SessionConfigOption::select("model", "Model", self.model.clone(), model_options())
-                .category(SessionConfigOptionCategory::Model),
-            SessionConfigOption::select("effort", "Effort", self.effort.clone(), effort_options())
-                .category(SessionConfigOptionCategory::ThoughtLevel),
-            SessionConfigOption::select("mode", "Mode", self.mode.clone(), mode_options())
-                .category(SessionConfigOptionCategory::Mode),
+        [
+            (
+                "model",
+                "Model",
+                &self.model,
+                SessionConfigOptionCategory::Model,
+            ),
+            (
+                "effort",
+                "Effort",
+                &self.effort,
+                SessionConfigOptionCategory::ThoughtLevel,
+            ),
+            (
+                "mode",
+                "Mode",
+                &self.mode,
+                SessionConfigOptionCategory::Mode,
+            ),
         ]
+        .into_iter()
+        .map(|(id, name, value, category)| {
+            let current = SessionConfigSelectOption::new(value.clone(), value.clone());
+            SessionConfigOption::select(id, name, value.clone(), vec![current]).category(category)
+        })
+        .collect()
     }
 
     /// How to start the session's claude on `conversation`.
@@ -104,25 +124,6 @@ impl Session {
             transcript,
         }
     }
-}
-
-/// What a new session in `dir` offers, as `--describe` prints it: its config
-/// options at their defaults and the commands of claude's answer to the
-/// initialize request. Claude starts in `dir` without saving a session and
-/// stops once it answers.
-pub async fn describe(dir: &Path) -> Result<Value, String> {
-    let session = Session::new(
-        String::new(),
-        acp_bridge::cwd(dir)?,
-        Vec::new(),
-        None,
-        false,
-    );
-    let commands = runner::commands(&session.start_request(Conversation::Unsaved, &[])).await?;
-    Ok(json!({
-        "configOptions": session.options(),
-        "availableCommands": commands,
-    }))
 }
 
 /// A bridge process serves one session, opened with `session/new` or
@@ -363,19 +364,19 @@ impl Bridge {
         };
         let value = value.to_string();
         let (setting, accepted) = match request.config_id.to_string().as_str() {
-            "mode" if is_mode(&value) => {
+            "mode" => {
                 let accepted = claude.map(|claude| claude.set_permission_mode(&value));
                 (Setting::Mode(value), accepted)
             }
-            "model" if is_model(&value) => {
+            "model" => {
                 let accepted = claude.map(|claude| claude.set_model(&value));
                 (Setting::Model(value), accepted)
             }
-            "effort" if is_effort(&value) => {
+            "effort" => {
                 let accepted = claude.map(|claude| claude.set_effort(&value));
                 (Setting::Effort(value), accepted)
             }
-            _ => return Err(invalid("Unknown configuration option or value")),
+            _ => return Err(invalid("Unknown configuration option")),
         };
         Ok(ConfigChange {
             id,
@@ -463,64 +464,4 @@ impl Bridge {
 /// The session `require` found open.
 fn open_session<'a>(open: &'a mut MutexGuard<'_, Option<Session>>) -> &'a mut Session {
     open.as_mut().expect("require found the session open")
-}
-
-/// The models a session can use, by id and name.
-const MODELS: [(&str, &str); 4] = [
-    ("claude-fable-5-2", "Fable 5.2"),
-    ("claude-opus-5-5", "Opus 5.5"),
-    ("claude-sonnet-5-5", "Sonnet 5.5"),
-    ("claude-haiku-5-5", "Haiku 5.5"),
-];
-
-fn is_model(value: &str) -> bool {
-    MODELS.iter().any(|(id, _)| *id == value)
-}
-
-fn model_options() -> Vec<SessionConfigSelectOption> {
-    MODELS
-        .into_iter()
-        .map(|(id, name)| SessionConfigSelectOption::new(id, name))
-        .collect()
-}
-
-/// The effort levels a session can use, by id and name.
-const EFFORTS: [(&str, &str); 4] = [
-    ("low", "Low"),
-    ("medium", "Medium"),
-    ("high", "High"),
-    ("xhigh", "XHigh"),
-];
-
-fn is_effort(value: &str) -> bool {
-    EFFORTS.iter().any(|(id, _)| *id == value)
-}
-
-fn effort_options() -> Vec<SessionConfigSelectOption> {
-    EFFORTS
-        .into_iter()
-        .map(|(id, name)| SessionConfigSelectOption::new(id, name))
-        .collect()
-}
-
-fn is_mode(value: &str) -> bool {
-    ["auto", "manual", "acceptEdits", "plan"].contains(&value)
-}
-
-fn mode_options() -> Vec<SessionConfigSelectOption> {
-    [
-        ("auto", "Auto", "Let Claude assess actions automatically"),
-        ("manual", "Manual", "Ask before edits and commands"),
-        (
-            "acceptEdits",
-            "Accept edits",
-            "Accept file edits automatically",
-        ),
-        ("plan", "Plan", "Explore and plan without editing files"),
-    ]
-    .into_iter()
-    .map(|(id, name, description)| {
-        SessionConfigSelectOption::new(id, name).description(description)
-    })
-    .collect()
 }

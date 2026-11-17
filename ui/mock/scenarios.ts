@@ -183,6 +183,64 @@ function sidebar(): Scenario {
           attachments: [],
         },
       ],
+      [explainer.id]: [
+        {
+          type: "prompt",
+          key: "1",
+          text: "Hand the event store change to another session for review.",
+          attachments: [],
+        },
+        {
+          type: "tool_call",
+          key: "tool:1",
+          title: "ListSessions",
+          status: "completed",
+          raw_input: {},
+          content: [
+            {
+              type: "text",
+              text:
+                "Workspace /Users/dev/src/project\n" +
+                `- id: ${reviewer.id}, title: "Hand off the store review", state: idle, ` +
+                "harness: claude, directory: /Users/dev/src/project, branch: main\n" +
+                `- id: ${working.id}, title: "Fix sidebar colors", state: running, ` +
+                "harness: claude, directory: /Users/dev/src/project, branch: main",
+            },
+          ],
+        },
+        {
+          type: "tool_call",
+          key: "tool:2",
+          title: "SendMessage `The event store change is ready. Can someone review it?`",
+          status: "completed",
+          raw_input: {
+            to: reviewer.id,
+            text: "The event store change is ready. Can someone review it?",
+          },
+          content: [{ type: "text", text: `Sent. Session ${reviewer.id} started a turn with it.` }],
+        },
+        {
+          type: "text",
+          key: "text:1",
+          text: "I sent the change to **Hand off the store review**.",
+          replace: false,
+        },
+        { type: "turn_completed", key: "5" },
+        {
+          type: "prompt",
+          key: "6",
+          text: "On it. I'm asking the user to start a review session in a new worktree.",
+          attachments: [],
+          from: { session_id: reviewer.id, title: "Hand off the store review" },
+        },
+        {
+          type: "text",
+          key: "text:2",
+          text: "The reviewer is asking for a review session.",
+          replace: false,
+        },
+        { type: "turn_completed", key: "8" },
+      ],
       [reviewer.id]: [
         {
           type: "prompt",
@@ -192,19 +250,41 @@ function sidebar(): Scenario {
           from: { session_id: explainer.id, title: "Explain the event store" },
         },
         {
-          type: "text",
-          key: "text:1",
-          text: "I'll ask for a review session.",
-          replace: false,
+          type: "tool_call",
+          key: "tool:1",
+          title:
+            "SendMessage `On it. I'm asking the user to start a review session in a new worktree.`",
+          status: "completed",
+          raw_input: {
+            to: explainer.id,
+            text: "On it. I'm asking the user to start a review session in a new worktree.",
+          },
+          content: [
+            { type: "text", text: `Sent. Session ${explainer.id} started a turn with it.` },
+          ],
+        },
+        {
+          type: "tool_call",
+          key: "tool:2",
+          title: "StartSession `Review the event store change on main.`",
+          status: "in_progress",
+          raw_input: { prompt: "Review the event store change on main.", worktree: true },
+          content: [],
         },
         {
           type: "permission",
           key: "request:1",
           request_id: "1",
-          title: "Start a session in ox?",
-          description:
-            "Harness: claude\nModel: Default\nEffort: Default\nCheckout: New worktree\n" +
-            "Branch: New branch from main\n\nReview the event store change on main.",
+          title: "Start a session in project?",
+          session_request: {
+            harness: "claude",
+            model: "Opus 5.5",
+            provider: null,
+            effort: "High",
+            mode: "Manual",
+            checkout: { type: "worktree", branch: null, base: "main" },
+            prompt: "Review the event store change on main.",
+          },
           options: [
             { optionId: "start", name: "Start Session", kind: "allow_once" },
             { optionId: "decline", name: "Decline", kind: "reject_once" },

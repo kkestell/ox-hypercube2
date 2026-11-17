@@ -116,8 +116,6 @@
 //!   response
 //! - `--hold <path>`: open `path`, a FIFO, for writing and keep it open
 //!   until the process exits, so its reader sees end of file then
-//! - `--describe <dir>`: print the config options and commands a new
-//!   session offers, as a bridge's `--describe` does, and exit
 //! - `--sessions <dir>`: print the sessions of `<dir>/fake-transcripts.json`,
 //!   in its order, as `[{"sessionId", "startedAt"}]`, as the Claude bridge's
 //!   `--sessions` does, and exit. The file holds
@@ -517,14 +515,6 @@ async fn main() -> agent_client_protocol::Result<()> {
             None => eprintln!("session {id} not found"),
         }
         std::process::exit(1);
-    }
-    if value("--describe").is_some() {
-        let description = serde_json::json!({
-            "configOptions": state.config_options(),
-            "availableCommands": *state.commands.lock().unwrap(),
-        });
-        println!("{description}");
-        return Ok(());
     }
     agent_client_protocol::Agent
         .v2()

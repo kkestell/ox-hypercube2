@@ -10,7 +10,9 @@ use agent_client_protocol::v2::schema::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
     SessionUpdate, StateUpdate, TextContent, ToolCallId,
 };
-use ox_protocol::{ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionState, Unseen, code};
+use ox_protocol::{
+    ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionRequest, SessionState, Unseen, code,
+};
 use tokio::sync::oneshot;
 
 /// Events a subscriber is handed at a time.
@@ -88,8 +90,11 @@ pub enum Change {
     /// recorded, and options that differ from the session's have not been
     /// reported.
     ConfigOptionsSet(Vec<SessionConfigOption>),
+    /// A permission request, the agent's or, with `session_request`, the
+    /// daemon's own for `session.request`.
     PermissionRequested {
         request: RequestPermissionRequest,
+        session_request: Option<SessionRequest>,
         answer: oneshot::Sender<RequestPermissionOutcome>,
     },
     /// A form elicitation that `check_form` accepted.
@@ -449,7 +454,14 @@ impl Phase {
                 }
                 (Self::Live(live), events)
             }
-            (Self::Live(mut live), Change::PermissionRequested { request, answer }) => {
+            (
+                Self::Live(mut live),
+                Change::PermissionRequested {
+                    request,
+                    session_request,
+                    answer,
+                },
+            ) => {
                 let request_id = next_request.to_string();
                 *next_request += 1;
                 live.pending.push(Pending {
@@ -465,6 +477,7 @@ impl Phase {
                     description: request.description,
                     subject: request.subject,
                     options: request.options,
+                    session_request,
                 };
                 (Self::Live(live), vec![requested])
             }
@@ -1427,6 +1440,7 @@ mod tests {
                     PermissionOptionKind::AllowOnce,
                 )],
             ),
+            session_request: None,
             answer,
         });
         outcome
@@ -2164,6 +2178,7 @@ mod tests {
             Change::ConfigOptionsSet(Vec::new()),
             Change::PermissionRequested {
                 request: RequestPermissionRequest::new("agent", "Tool", Vec::new()),
+                session_request: None,
                 answer,
             },
             Change::Cancelled,
@@ -2230,6 +2245,7 @@ mod tests {
             description: None,
             subject: None,
             options: Vec::new(),
+            session_request: None,
         }
     }
 

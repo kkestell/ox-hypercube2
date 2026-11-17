@@ -13,7 +13,6 @@ use agent_client_protocol::v2::schema::{
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{mpsc, oneshot},
     task::AbortHandle,
@@ -74,8 +73,6 @@ pub enum Conversation<'a> {
     New(&'a str),
     /// The session with this ID, whose transcript Claude continues.
     Resume(&'a str),
-    /// A session Claude does not save, as `--describe` starts.
-    Unsaved,
 }
 
 pub struct StartRequest<'a> {
@@ -314,7 +311,6 @@ fn spawn(request: &StartRequest<'_>) -> Result<Child, String> {
     match request.conversation {
         Conversation::New(id) => command.arg("--session-id").arg(id),
         Conversation::Resume(id) => command.arg("--resume").arg(id),
-        Conversation::Unsaved => command.arg("--no-session-persistence"),
     };
     if !request.mcp_servers.is_empty() {
         let servers: BTreeMap<_, _> = request
@@ -361,42 +357,6 @@ fn initialized(response: &Value) -> Result<Vec<AvailableCommand>, String> {
             .to_owned());
     }
     Ok(commands::catalog(&response["response"]["commands"]))
-}
-
-/// Starts claude as `request` says and returns the commands of its answer to
-/// the initialize request, stopping claude once it answers.
-pub async fn commands(request: &StartRequest<'_>) -> Result<Vec<AvailableCommand>, String> {
-    let mut child = spawn(request)?;
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let stderr = tokio::spawn(async move {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes).await;
-        bytes
-    });
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut line = initialize_request().to_string().into_bytes();
-    line.push(b'\n');
-    // A claude that exits before reading it says why on stderr.
-    let _ = stdin.write_all(&line).await;
-    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if value["type"] == "control_response" && value["response"]["request_id"] == "initialize" {
-            // Dropping `child` stops claude.
-            return initialized(&value["response"]);
-        }
-    }
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| format!("claude process failed: {error}"))?;
-    let stderr = stderr.await.unwrap_or_default();
-    Err(format!(
-        "claude exited with {status}: {}",
-        String::from_utf8_lossy(&stderr).trim()
-    ))
 }
 
 /// Claude's output, translated as it arrives.

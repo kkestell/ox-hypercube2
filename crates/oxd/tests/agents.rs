@@ -13,8 +13,8 @@ use ox_protocol::schema::{
     ContentBlock, SessionConfigKind, SessionUpdate, TextContent, UserMessage,
 };
 use ox_protocol::{
-    Checkout, Client, Event, EventKind, ListingChange, Sender, SessionInfo, SessionState,
-    Subscription,
+    Checkout, Client, Event, EventKind, Harness, ListingChange, RequestedCheckout, Sender,
+    SessionInfo, SessionRequest, SessionState, Subscription,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -504,14 +504,44 @@ fn repo() -> TempDir {
     repo
 }
 
-/// A daemon that finds the fake agent as each harness's bridge, a requester
-/// in a repository's workspace, and its subscription.
+/// Ox's config for the session request tests: `claude` offers `fast`, at
+/// Low, Medium and High, and `smart`, which has no effort levels, in modes
+/// Ask and Code; `pi` offers `fast`, with no effort levels and no modes.
+const CONFIG: &str = r#"{
+  "harnesses": {
+    "claude": {
+      "models": [
+        {
+          "id": "fast",
+          "name": "Fast",
+          "efforts": [
+            { "id": "low", "name": "Low" },
+            { "id": "medium", "name": "Medium" },
+            { "id": "high", "name": "High" }
+          ]
+        },
+        { "id": "smart", "name": "Smart" }
+      ],
+      "modes": [{ "id": "ask", "name": "Ask" }, { "id": "code", "name": "Code" }]
+    },
+    "pi": {
+      "models": [{ "id": "fast", "name": "Fast" }]
+    }
+  }
+}"#;
+
+/// A daemon that finds the fake agent as each harness's bridge, with
+/// [`CONFIG`] as Ox's config, a requester in a repository's workspace, and
+/// its subscription.
 async fn requester(repo: &Path) -> (Daemon, Client, SessionInfo, Subscription) {
     let daemon = Daemon::start_with(Options {
         bridges: true,
         ..Options::default()
     })
     .await;
+    let config = daemon.dir.path().join("ox");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.json"), CONFIG).unwrap();
     let client = daemon.client().await;
     let workspace = workspace_id(&client, repo).await;
     let (session, events) = new_session(&client, &workspace, &[], BTreeMap::new()).await;
@@ -519,13 +549,13 @@ async fn requester(repo: &Path) -> (Daemon, Client, SessionInfo, Subscription) {
 }
 
 /// Prompts the requester to call `start_session` with `arguments` and
-/// returns its permission request's ID, title and description.
+/// returns its permission request's ID, title and requested session.
 async fn request(
     client: &Client,
     session: &str,
     events: &mut Subscription,
     arguments: &serde_json::Value,
-) -> (String, String, String) {
+) -> (String, String, SessionRequest) {
     client
         .prompt(session, call("start_session", arguments))
         .await
@@ -538,12 +568,14 @@ async fn request(
         request_id,
         title,
         description,
+        session_request,
         ..
     } = requested.last().unwrap().kind.clone()
     else {
         unreachable!("until stopped at the request");
     };
-    (request_id, title, description.unwrap())
+    assert_eq!(description, None);
+    (request_id, title, session_request.unwrap())
 }
 
 fn config_value(session: &SessionInfo, id: &str) -> String {
@@ -563,7 +595,7 @@ fn config_value(session: &SessionInfo, id: &str) -> String {
 async fn an_approved_request_starts_the_session_it_describes() {
     let repo = repo();
     let (_daemon, client, requester, mut events) = requester(repo.path()).await;
-    let (request_id, title, description) = request(
+    let (request_id, title, asked) = request(
         &client,
         &requester.id,
         &mut events,
@@ -574,15 +606,26 @@ async fn an_approved_request_starts_the_session_it_describes() {
             "harness": "claude",
             "model": "fast",
             "effort": "low",
+            "mode": "code",
         }),
     )
     .await;
     let name = repo.path().file_name().unwrap().to_string_lossy();
     assert_eq!(title, format!("Start a session in {name}?"));
     assert_eq!(
-        description,
-        "Harness: claude\nModel: fast\nEffort: low\nCheckout: New worktree\nBranch: topic\n\n\
-         text \"started\""
+        asked,
+        SessionRequest {
+            harness: Harness::Claude,
+            model: "Fast".into(),
+            provider: None,
+            effort: Some("Low".into()),
+            mode: Some("Code".into()),
+            checkout: RequestedCheckout::Worktree {
+                branch: Some("topic".into()),
+                base: "main".into(),
+            },
+            prompt: r#"text "started""#.into(),
+        }
     );
     client
         .permit(&requester.id, &request_id, "start")
@@ -610,6 +653,7 @@ async fn an_approved_request_starts_the_session_it_describes() {
     assert_eq!(session.title.as_deref(), Some(r#"text "started""#));
     assert_eq!(config_value(session, "model"), "fast");
     assert_eq!(config_value(session, "effort"), "low");
+    assert_eq!(config_value(session, "mode"), "code");
     let worktree = listing
         .worktrees
         .iter()
@@ -621,6 +665,26 @@ async fn an_approved_request_starts_the_session_it_describes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_request_in_the_workspaces_checkout_names_its_directory() {
+    let repo = repo();
+    let (_daemon, client, requester, mut events) = requester(repo.path()).await;
+    let (_, _, asked) = request(
+        &client,
+        &requester.id,
+        &mut events,
+        &json!({"prompt": "hello", "worktree": false, "harness": "pi", "model": "fast"}),
+    )
+    .await;
+    assert_eq!(
+        asked.checkout,
+        RequestedCheckout::Workspace {
+            path: repo.path().to_owned()
+        }
+    );
+    assert_eq!((asked.effort, asked.mode), (None, None));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_declined_request_creates_nothing() {
     let repo = repo();
     let (daemon, client, requester, mut events) = requester(repo.path()).await;
@@ -628,7 +692,7 @@ async fn a_declined_request_creates_nothing() {
         &client,
         &requester.id,
         &mut events,
-        &json!({"prompt": "hello", "worktree": true, "harness": "claude"}),
+        &json!({"prompt": "hello", "worktree": true, "harness": "pi", "model": "fast"}),
     )
     .await;
     client
@@ -648,18 +712,60 @@ async fn a_declined_request_creates_nothing() {
 async fn a_request_that_cannot_be_started_is_refused_without_asking() {
     let repo = repo();
     let (_daemon, client, requester, mut events) = requester(repo.path()).await;
+    let claude = |fields: serde_json::Value| {
+        let mut arguments = json!({
+            "prompt": "hi", "worktree": false, "harness": "claude", "model": "fast",
+            "effort": "low", "mode": "ask",
+        });
+        for (key, value) in fields.as_object().unwrap() {
+            if value.is_null() {
+                arguments.as_object_mut().unwrap().remove(key);
+            } else {
+                arguments[key] = value.clone();
+            }
+        }
+        arguments
+    };
     for (arguments, refusal) in [
         (
-            json!({"prompt": "hi", "worktree": true, "branch": "nope", "harness": "claude"}),
+            claude(json!({"worktree": true, "branch": "nope"})),
             "nope is not a local branch",
         ),
         (
-            json!({"prompt": "hi", "worktree": false, "branch": "topic", "harness": "claude"}),
+            claude(json!({"branch": "topic"})),
             "the workspace's checkout is on main, not topic",
         ),
         (
-            json!({"prompt": "hi", "worktree": false, "harness": "claude", "model": "huge"}),
-            "huge is not a model claude offers; it offers fast, smart",
+            claude(json!({"harness": "codex"})),
+            "codex is not a harness Ox offers; it offers claude, pi",
+        ),
+        (
+            claude(json!({"model": "huge"})),
+            "huge is not a claude model Ox offers; it offers fast, smart",
+        ),
+        (
+            claude(json!({"effort": null})),
+            "fast needs an effort; Ox offers low, medium, high",
+        ),
+        (
+            claude(json!({"effort": "max"})),
+            "max is not an effort Ox offers for fast; it offers low, medium, high",
+        ),
+        (
+            claude(json!({"model": "smart"})),
+            "low is not an effort Ox offers for smart; it has no effort levels",
+        ),
+        (
+            claude(json!({"mode": null})),
+            "claude needs a mode; Ox offers ask, code",
+        ),
+        (
+            claude(json!({"mode": "plan"})),
+            "plan is not a claude mode Ox offers; it offers ask, code",
+        ),
+        (
+            json!({"prompt": "hi", "worktree": false, "harness": "pi", "model": "fast", "mode": "ask"}),
+            "ask is not a pi mode Ox offers; it has no modes",
         ),
     ] {
         client
@@ -667,7 +773,7 @@ async fn a_request_that_cannot_be_started_is_refused_without_asking() {
             .await
             .unwrap();
         let turn = until(&mut events, turn_ended).await;
-        assert_eq!(chunks(&turn), [refusal]);
+        assert_eq!(chunks(&turn), [refusal], "{arguments}");
         assert!(
             !turn
                 .iter()
@@ -675,4 +781,28 @@ async fn a_request_that_cannot_be_started_is_refused_without_asking() {
             "{arguments}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn list_harnesses_lists_the_config() {
+    let repo = repo();
+    let (_daemon, client, requester, mut events) = requester(repo.path()).await;
+    let listed = tool(
+        &client,
+        &requester.id,
+        &mut events,
+        "list_harnesses",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        listed,
+        "claude\n\
+         modes: ask, code\n\
+         - fast (Fast), effort: low, medium, high\n\
+         - smart (Smart), no effort levels\n\
+         \n\
+         pi\n\
+         - fast (Fast), no effort levels\n"
+    );
 }

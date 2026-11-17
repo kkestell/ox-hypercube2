@@ -1,18 +1,17 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ox_protocol::config::{Choice, HarnessConfig};
 use ox_protocol::schema::{
     ContentBlock, PermissionOption, PermissionOptionKind, PromptCapabilities,
-    RequestPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, TextContent,
+    RequestPermissionOutcome, TextContent,
 };
 use ox_protocol::{
     Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, Harness, ImportedSessions,
-    ListingChange, MessageSent, Method, QueueAdded, Sender, SessionInfo, SessionState,
-    WorkspaceInfo, code,
+    ListingChange, MessageSent, Method, QueueAdded, RequestedCheckout, Sender, SessionInfo,
+    SessionRequest, SessionState, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -373,10 +372,11 @@ impl Daemon {
                 harness,
                 model,
                 effort,
+                mode,
             } => Ok(to_value(
                 self.request_session(
                     &session_id,
-                    SessionRequest {
+                    RequestParams {
                         prompt,
                         workspace,
                         worktree,
@@ -384,6 +384,7 @@ impl Daemon {
                         harness,
                         model,
                         effort,
+                        mode,
                     },
                 )
                 .await?,
@@ -859,19 +860,20 @@ impl Daemon {
     }
 
     /// Asks the user, through a permission request on session
-    /// `requester_id`, to start the session `request` describes, once it is
-    /// checked. Starting it, the new session gets the requester's
-    /// environment. Resolves to `None` when the user does not start it.
+    /// `requester_id`, to start the session `params` describes, once it is
+    /// checked against the workspace and Ox's config. Starting it, the new
+    /// session gets the requester's environment. Resolves to `None` when the
+    /// user does not start it.
     async fn request_session(
         self: &Arc<Self>,
         requester_id: &str,
-        request: SessionRequest,
+        params: RequestParams,
     ) -> Result<Option<SessionInfo>, ErrorBody> {
         let requester = self.session(requester_id)?;
-        if request.prompt.trim().is_empty() {
+        if params.prompt.trim().is_empty() {
             return Err(invalid_request("the prompt is empty".into()));
         }
-        let (workspace_id, workspace) = match &request.workspace {
+        let (workspace_id, workspace) = match &params.workspace {
             Some(path) => {
                 let wanted = resolved(path);
                 self.lock()
@@ -889,83 +891,69 @@ impl Daemon {
                 (id, path)
             }
         };
-        let harness = match request.harness {
-            Some(harness) => harness,
-            None => Harness::of_command(requester.command()).ok_or_else(|| {
-                invalid_request("this session's harness is not known; name one".into())
-            })?,
-        };
-        let bridge = bridge(harness)?;
+        let harnesses = ox_protocol::config::load()
+            .map_err(|error| invalid_state(&error))?
+            .harnesses;
+        let chosen = chosen(&harnesses, &params)?;
+        let bridge = bridge(chosen.harness)?;
         let env = requester.env();
         let git = Git::for_client(env.clone());
-        let (checkout, branch_line) = if request.worktree {
+        let (checkout, approved) = if params.worktree {
             let worktree_id = uuid::Uuid::new_v4().to_string();
             worktree::plan(
                 &git,
                 &workspace,
                 None,
-                request.branch.clone(),
+                params.branch.clone(),
                 &self.worktrees_dir,
                 &worktree_id,
             )
             .await?;
             let head = branches::list(&git, &workspace).await?.head;
-            let branch_line = match &request.branch {
-                Some(branch) => branch.clone(),
-                None => format!("New branch from {}", head.as_deref().unwrap_or("HEAD")),
+            let shown = RequestedCheckout::Worktree {
+                branch: params.branch.clone(),
+                base: head.clone().unwrap_or_else(|| "HEAD".into()),
             };
             let checkout = Checkout::Worktree {
                 compare: head,
-                branch: request.branch.clone(),
+                branch: params.branch.clone(),
             };
-            (checkout, Some(branch_line))
+            (checkout, shown)
         } else {
-            let head = match &request.branch {
-                Some(branch) => {
-                    let head = branches::list(&git, &workspace).await?.head;
-                    if head.as_ref() != Some(branch) {
-                        return Err(invalid_request(format!(
-                            "the workspace's checkout is on {}, not {branch}",
-                            head.as_deref().unwrap_or("no branch")
-                        )));
-                    }
-                    head
+            if let Some(branch) = &params.branch {
+                let head = branches::list(&git, &workspace).await?.head;
+                if head.as_ref() != Some(branch) {
+                    return Err(invalid_request(format!(
+                        "the workspace's checkout is on {}, not {branch}",
+                        head.as_deref().unwrap_or("no branch")
+                    )));
                 }
-                None => branches::list(&git, &workspace)
-                    .await
-                    .ok()
-                    .and_then(|b| b.head),
+            }
+            let shown = RequestedCheckout::Workspace {
+                path: workspace.clone(),
             };
-            (Checkout::Workspace, head)
+            (Checkout::Workspace, shown)
         };
-        let config = settings(&bridge, harness, &workspace, &env, &request).await?;
 
         let name = workspace.file_name().map_or_else(
             || workspace.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        let default = || "Default".to_owned();
-        let mut description = format!(
-            "Harness: {}\nModel: {}\nEffort: {}\nCheckout: {}\n",
-            harness.executable(),
-            request.model.clone().unwrap_or_else(default),
-            request.effort.clone().unwrap_or_else(default),
-            if request.worktree {
-                "New worktree"
-            } else {
-                "Workspace checkout"
-            },
-        );
-        if let Some(branch) = branch_line {
-            let _ = writeln!(description, "Branch: {branch}");
-        }
-        let _ = write!(description, "\n{}", request.prompt);
+        let request = SessionRequest {
+            harness: chosen.harness,
+            model: chosen.model,
+            provider: chosen.provider,
+            effort: chosen.effort,
+            mode: chosen.mode,
+            checkout: approved,
+            prompt: params.prompt.clone(),
+        };
         let options = vec![
             PermissionOption::new("start", "Start Session", PermissionOptionKind::AllowOnce),
             PermissionOption::new("decline", "Decline", PermissionOptionKind::RejectOnce),
         ];
         let outcome = requester
-            .ask(format!("Start a session in {name}?"), description, options)
+            .ask(format!("Start a session in {name}?"), request, options)
             .await;
         let RequestPermissionOutcome::Selected(selected) = outcome else {
             return Ok(None);
@@ -974,10 +962,17 @@ impl Daemon {
             return Ok(None);
         }
         let command = vec![bridge.to_string_lossy().into_owned()];
-        let prompt = vec![ContentBlock::Text(TextContent::new(request.prompt))];
-        self.new_session(&workspace_id, command, env, checkout, Some(prompt), config)
-            .await
-            .map(Some)
+        let prompt = vec![ContentBlock::Text(TextContent::new(params.prompt))];
+        self.new_session(
+            &workspace_id,
+            command,
+            env,
+            checkout,
+            Some(prompt),
+            chosen.config,
+        )
+        .await
+        .map(Some)
     }
 
     fn workspace_path(&self, id: &str) -> Result<PathBuf, ErrorBody> {
@@ -1302,81 +1297,135 @@ impl Daemon {
 }
 
 /// A session that one asks the user to start, as `session.request` gives it.
-struct SessionRequest {
+struct RequestParams {
     prompt: String,
     workspace: Option<PathBuf>,
     worktree: bool,
     branch: Option<String>,
-    harness: Option<Harness>,
-    model: Option<String>,
+    harness: String,
+    model: String,
     effort: Option<String>,
+    mode: Option<String>,
 }
 
-/// The settings of the requested model and effort, each checked against
-/// the values of the option of its category that the bridge's `--describe`
-/// reports in `workspace`.
-async fn settings(
-    bridge: &Path,
+/// A requested harness, model, effort and mode, checked against Ox's
+/// config.
+struct Chosen {
     harness: Harness,
-    workspace: &Path,
-    env: &BTreeMap<String, String>,
-    request: &SessionRequest,
-) -> Result<Vec<ConfigSetting>, ErrorBody> {
-    let wanted = [
-        (SessionConfigOptionCategory::Model, "model", &request.model),
-        (
-            SessionConfigOptionCategory::ThoughtLevel,
-            "effort",
-            &request.effort,
-        ),
-    ];
-    if wanted.iter().all(|(_, _, value)| value.is_none()) {
-        return Ok(Vec::new());
-    }
-    let harness = harness.executable();
-    let controls = ox_protocol::describe(bridge, workspace, env)
-        .await
-        .map_err(|error| ErrorBody {
-            code: code::AGENT,
-            message: format!("asking {harness} for its options: {error}"),
+    /// The names of the model, its provider, effort and mode, for the user
+    /// to approve.
+    model: String,
+    provider: Option<String>,
+    effort: Option<String>,
+    mode: Option<String>,
+    /// The settings that start the session on them.
+    config: Vec<ConfigSetting>,
+}
+
+/// The harness, model, effort and mode `params` asks for, when `harnesses`
+/// lists them. An effort is required for a model with effort levels and
+/// refused for one without, and a mode likewise for a harness with modes.
+fn chosen(harnesses: &[HarnessConfig], params: &RequestParams) -> Result<Chosen, ErrorBody> {
+    let ids = |choices: &[Choice]| -> String {
+        let ids: Vec<&str> = choices.iter().map(|choice| choice.id.as_str()).collect();
+        ids.join(", ")
+    };
+    let wanted = &params.harness;
+    let config = harnesses
+        .iter()
+        .find(|config| config.harness.executable() == wanted)
+        .ok_or_else(|| {
+            let names: Vec<&str> = harnesses
+                .iter()
+                .map(|config| config.harness.executable())
+                .collect();
+            invalid_request(format!(
+                "{wanted} is not a harness Ox offers; it offers {}",
+                names.join(", ")
+            ))
         })?;
-    let mut settings = Vec::new();
-    for (category, label, value) in wanted {
-        let Some(value) = value else {
-            continue;
-        };
-        let option = controls
-            .config_options
-            .iter()
-            .find(|option| option.category.as_ref() == Some(&category))
-            .ok_or_else(|| invalid_request(format!("{harness} has no {label} option")))?;
-        let values: Vec<String> = match &option.kind {
-            SessionConfigKind::Select(select) => match &select.options {
-                SessionConfigSelectOptions::Ungrouped(options) => options
-                    .iter()
-                    .map(|option| option.value.to_string())
-                    .collect(),
-                SessionConfigSelectOptions::Grouped(groups) => groups
-                    .iter()
-                    .flat_map(|group| &group.options)
-                    .map(|option| option.value.to_string())
-                    .collect(),
-                _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
-        if !values.contains(value) {
+    let harness = config.harness.executable();
+    let model = config
+        .models
+        .iter()
+        .find(|model| model.id == params.model)
+        .ok_or_else(|| {
+            let models: Vec<&str> = config
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect();
+            invalid_request(format!(
+                "{} is not a {harness} model Ox offers; it offers {}",
+                params.model,
+                models.join(", ")
+            ))
+        })?;
+    let effort = match (&params.effort, model.efforts.as_slice()) {
+        (None, []) => None,
+        (Some(effort), []) => {
             return Err(invalid_request(format!(
-                "{value} is not a {label} {harness} offers; it offers {}",
-                values.join(", ")
+                "{effort} is not an effort Ox offers for {}; it has no effort levels",
+                model.id
             )));
         }
-        settings.push(ConfigSetting {
-            config_id: option.config_id.to_string(),
-            value: ConfigValue::Id(value.clone()),
-        });
-    }
-    Ok(settings)
+        (None, efforts) => {
+            return Err(invalid_request(format!(
+                "{} needs an effort; Ox offers {}",
+                model.id,
+                ids(efforts)
+            )));
+        }
+        (Some(wanted), efforts) => Some(
+            efforts
+                .iter()
+                .find(|effort| effort.id == *wanted)
+                .ok_or_else(|| {
+                    invalid_request(format!(
+                        "{wanted} is not an effort Ox offers for {}; it offers {}",
+                        model.id,
+                        ids(efforts)
+                    ))
+                })?,
+        ),
+    };
+    let mode = match (&params.mode, config.modes.as_slice()) {
+        (None, []) => None,
+        (Some(mode), []) => {
+            return Err(invalid_request(format!(
+                "{mode} is not a {harness} mode Ox offers; it has no modes"
+            )));
+        }
+        (None, listed) => {
+            return Err(invalid_request(format!(
+                "{harness} needs a mode; Ox offers {}",
+                ids(listed)
+            )));
+        }
+        (Some(wanted), listed) => Some(listed.iter().find(|mode| mode.id == *wanted).ok_or_else(
+            || {
+                invalid_request(format!(
+                    "{wanted} is not a {harness} mode Ox offers; it offers {}",
+                    ids(listed)
+                ))
+            },
+        )?),
+    };
+    let setting = |config_id: &str, value: &str| ConfigSetting {
+        config_id: config_id.into(),
+        value: ConfigValue::Id(value.into()),
+    };
+    let mut settings = vec![setting("model", &model.id)];
+    settings.extend(effort.map(|effort| setting("effort", &effort.id)));
+    settings.extend(mode.map(|mode| setting("mode", &mode.id)));
+    Ok(Chosen {
+        harness: config.harness,
+        model: model.name.clone(),
+        provider: model.provider.clone(),
+        effort: effort.map(|effort| effort.name.clone()),
+        mode: mode.map(|mode| mode.name.clone()),
+        config: settings,
+    })
 }
 
 /// The path of the ACP bridge of `harness`, which sits beside the daemon's

@@ -7,9 +7,7 @@ use std::{
     process::Stdio,
 };
 
-use acp_bridge::testing::{
-    TIMEOUT, finish, is_state, receive, response, send, until_method, update,
-};
+use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -36,25 +34,19 @@ answer() {
   id=$(printf '%s\n' "$command" | sed 's/.*"id":"\([^"]*\)".*/\1/')
   printf '{"id":"%s","type":"response","command":"%s","success":true%s}\n' "$id" "$1" "$2"
 }
-# Reads all four description queries before answering them out of order.
+# Reads both description queries before answering them out of order.
 describe() {
-  for query in 1 2 3 4; do
+  for query in 1 2; do
     next_command
     printf '%s\n' "$command" >> queries
     case "$command" in
       *'"type":"get_state"'*) state_command=$command;;
-      *'"type":"get_available_models"'*) models_command=$command;;
-      *'"type":"get_available_thinking_levels"'*) levels_command=$command;;
       *'"type":"get_commands"'*) commands_command=$command;;
       *) printf 'unexpected query: %s\n' "$command" >&2; exit 21;;
     esac
   done
   command=$commands_command
   answer get_commands ',"data":{"commands":[{"name":"template","description":"A template","source":"prompt"},{"name":"extension","source":"extension"},{"name":"skill:review","description":"Review","source":"skill"}]}'
-  command=$levels_command
-  answer get_available_thinking_levels ',"data":{"levels":["off","low","high"]}'
-  command=$models_command
-  answer get_available_models ',"data":{"models":[{"provider":"first","id":"one","name":"One"},{"provider":"second","id":"org/two","name":"Two"}]}'
   command=$state_command
   model=${current_model:-'{"provider":"first","id":"one","name":"One"}'}
   answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\",\"model\":$model,\"thinkingLevel\":\"${thinking:-high}\"}"
@@ -289,62 +281,6 @@ async fn a_new_session_starts_pi_and_answers_with_its_options_and_commands() {
     child.kill().await.unwrap();
 }
 
-/// Runs the bridge's `--describe` in `project`, with the pi in `bin`.
-async fn describe(bin: &Path, project: &Path) -> std::process::Output {
-    let output = Command::new(env!("CARGO_BIN_EXE_pi-acp"))
-        .arg("--describe")
-        .arg(project)
-        .env(
-            "PATH",
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-        )
-        .kill_on_drop(true)
-        .output();
-    tokio::time::timeout(TIMEOUT, output)
-        .await
-        .expect("timed out waiting for --describe")
-        .unwrap()
-}
-
-#[tokio::test]
-async fn describe_prints_the_options_and_commands_pi_reports() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_pi(&bin, "");
-    let output = describe(&bin, &project).await;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{stderr}");
-    let description: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let options = &description["configOptions"];
-    assert_eq!(options[0]["category"], "model", "{description}");
-    assert_eq!(options[0]["currentValue"], "first/one", "{description}");
-    assert_eq!(options[1]["category"], "thought_level", "{description}");
-    assert_eq!(options[1]["currentValue"], "high", "{description}");
-    assert_eq!(
-        description["availableCommands"],
-        json!([
-            {"type":"command","name":"template","description":"A template"},
-            {"type":"command","name":"extension","description":""},
-            {"type":"command","name":"skill:review","description":"Review"}
-        ])
-    );
-    let calls = lines(&project, "calls", 2);
-    assert_eq!(calls[0], "--mode rpc --approve --no-session");
-    assert_eq!(calls[1], project.display().to_string());
-}
-
-#[tokio::test]
-async fn describe_fails_with_the_error_of_a_pi_that_does_not_start() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    fake_pi_script(&bin, "echo 'no models configured' >&2\nexit 3");
-    let output = describe(&bin, &project).await;
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains("no models configured"), "{stderr}");
-    assert!(output.stdout.is_empty());
-}
-
 #[tokio::test]
 async fn a_prompt_is_answered_when_pi_accepts_it_and_ends_when_pi_settles() {
     let (_temp, project, mut child, mut reader, session) = session(
@@ -542,7 +478,7 @@ describe
     assert_eq!(result["error"]["message"], "No model selected", "{result}");
     // The bridge handles Pi's answers in order, so what it sends for the
     // prompt's answer precedes the answer to a later config change.
-    send(&mut child, config_request(4, &session, "thinking", "high")).await;
+    send(&mut child, config_request(4, &session, "effort", "high")).await;
     let (set, more) = response(&mut reader, 4).await;
     assert!(set["result"].is_object(), "{set}");
     updates.extend(more);
@@ -1045,7 +981,7 @@ expect set_thinking_level
         let (_temp, _project, mut child, mut reader, session) = session(&script).await;
         send(&mut child, prompt_request(3, &session)).await;
         let (request, _) = until_method(&mut reader, "elicitation/create").await;
-        send(&mut child, config_request(4, &session, "thinking", "high")).await;
+        send(&mut child, config_request(4, &session, "effort", "high")).await;
         let (cancel, _) = until_method(&mut reader, "$/cancel_request").await;
         assert_eq!(cancel["params"]["requestId"], request["id"], "{ending}");
         child.kill().await.unwrap();
@@ -1151,7 +1087,7 @@ settled
         set["result"]["configOptions"][0]["currentValue"],
         "second/org/two"
     );
-    send(&mut child, config_request(5, &session, "thinking", "low")).await;
+    send(&mut child, config_request(5, &session, "effort", "low")).await;
     let (set, _) = response(&mut reader, 5).await;
     assert_eq!(set["result"]["configOptions"][1]["currentValue"], "low");
     let (_, updates) = prompt(&mut child, &mut reader, 6, &session).await;
@@ -1172,8 +1108,8 @@ settled
     let changes = lines(&project, "changes", 2);
     let model: Value = serde_json::from_str(&changes[0]).unwrap();
     assert_eq!(model["modelId"], "org/two");
-    let thinking: Value = serde_json::from_str(&changes[1]).unwrap();
-    assert_eq!(thinking["level"], "low");
+    let effort: Value = serde_json::from_str(&changes[1]).unwrap();
+    assert_eq!(effort["level"], "low");
     child.kill().await.unwrap();
 }
 
@@ -1216,7 +1152,7 @@ while :; do describe; done
         resumed["result"]["availableCommands"][2]["name"],
         "skill:review"
     );
-    let queries = lines(&project, "queries", 8);
+    let queries = lines(&project, "queries", 4);
     let states = queries
         .iter()
         .filter(|line| line.contains("\"type\":\"get_state\""))
@@ -1434,7 +1370,7 @@ while :; do
 done
 "#,
     );
-    send(&mut child, config_request(4, &session, "thinking", "high")).await;
+    send(&mut child, config_request(4, &session, "effort", "high")).await;
     let (result, mut notifications) = response(&mut reader, 4).await;
     assert!(result["result"].is_object(), "{result}");
     while !notifications
@@ -1473,7 +1409,7 @@ describe
     .await;
     for (id, config, value, level) in [
         (3, "model", "second/org/two", "low"),
-        (4, "thinking", "high", "high"),
+        (4, "effort", "high", "high"),
     ] {
         send(&mut child, config_request(id, &session, config, value)).await;
         let (result, notifications) = response(&mut reader, id).await;
@@ -1489,8 +1425,8 @@ describe
     let model: Value = serde_json::from_str(&changes[0]).unwrap();
     assert_eq!(model["provider"], "second");
     assert_eq!(model["modelId"], "org/two");
-    let thinking: Value = serde_json::from_str(&changes[1]).unwrap();
-    assert_eq!(thinking["level"], "high");
+    let effort: Value = serde_json::from_str(&changes[1]).unwrap();
+    assert_eq!(effort["level"], "high");
     child.kill().await.unwrap();
 }
 
@@ -1507,12 +1443,12 @@ printf '{"id":"%s","type":"response","command":"set_model","success":false,"erro
     .await;
     for (id, request) in [
         (3, config_request(3, &session, "unknown", "high")),
-        (4, config_request(4, &session, "thinking", "huge")),
+        (4, config_request(4, &session, "effort", "")),
         (5, config_request(5, &session, "model", "no-provider")),
         (
             6,
             json!({"jsonrpc":"2.0","id":6,"method":"session/set_config_option","params":{
-                "sessionId":session,"configId":"thinking","type":"boolean","value":true
+                "sessionId":session,"configId":"effort","type":"boolean","value":true
             }}),
         ),
     ] {
@@ -1523,7 +1459,7 @@ printf '{"id":"%s","type":"response","command":"set_model","success":false,"erro
     }
     send(
         &mut child,
-        config_request(7, &json!("unknown"), "thinking", "high"),
+        config_request(7, &json!("unknown"), "effort", "high"),
     )
     .await;
     let (result, _) = response(&mut reader, 7).await;

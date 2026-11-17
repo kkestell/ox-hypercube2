@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -359,7 +359,7 @@ impl Bridge {
         }
         let pi = Pi::start(
             &session.cwd,
-            Some(id),
+            id,
             session.instructions.as_deref(),
             &session.mcp_servers,
             Updates::new(connection.clone(), id),
@@ -380,24 +380,6 @@ impl Bridge {
     }
 }
 
-/// What a new session in `dir` offers, as `--describe` prints it: the
-/// config options and commands Pi reports. Pi starts in `dir` without saving
-/// a session and stops once it answers.
-pub async fn describe(dir: &Path) -> Result<Value, String> {
-    let pi = Pi::start(
-        &acp_bridge::cwd(dir)?,
-        None,
-        None,
-        &[],
-        Updates::without_client(),
-    )?;
-    let description = description(&pi).await.map_err(|error| error.message)?;
-    Ok(json!({
-        "configOptions": description.config_options,
-        "availableCommands": description.available_commands,
-    }))
-}
-
 /// Sends `pi` the description queries and returns the future of their
 /// answers.
 fn description(
@@ -405,18 +387,14 @@ fn description(
 ) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
     let queries = [
         pi.request(json!({"type":"get_state"})),
-        pi.request(json!({"type":"get_available_models"})),
-        pi.request(json!({"type":"get_available_thinking_levels"})),
         pi.request(json!({"type":"get_commands"})),
     ];
     async move {
-        let [state, models, levels, catalog] = queries;
+        let [state, catalog] = queries;
         let state = answer(state).await?;
-        let models = answer(models).await?;
-        let levels = answer(levels).await?;
         let catalog = answer(catalog).await?;
         Ok(Description {
-            config_options: options::build(&state, &models["models"], &levels["levels"]),
+            config_options: options::build(&state),
             available_commands: commands::catalog(&catalog["commands"]),
             state,
         })

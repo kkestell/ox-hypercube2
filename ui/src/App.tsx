@@ -2,7 +2,7 @@ import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react
 import { sessionAgent } from "./components/HarnessLogo";
 import { Workbench } from "./components/Workbench";
 import { SessionComposer } from "./features/composer/Composer";
-import { useControls, useLastUsed, type Values, withValues } from "./features/composer/controls";
+import { draftOptions, useLastUsed, type Values } from "./features/composer/controls";
 import { DraftComposer } from "./features/composer/DraftComposer";
 import { useUnsent } from "./features/composer/useUnsent";
 import { Conversation } from "./features/conversation/Conversation";
@@ -26,7 +26,8 @@ const noItems: Item[] = [];
 
 export function App() {
   const { workspaces, worktrees, sessions, connection } = useWorkspaces();
-  const agents = useAgents();
+  const harnesses = useAgents();
+  const agents = useMemo(() => harnesses.map(({ harness }) => harness), [harnesses]);
   const drafts = useDrafts(workspaces, connection > 0);
   // Each session's files are under its directory, and each draft's under its
   // workspace's directory.
@@ -46,7 +47,6 @@ export function App() {
     [sessions, drafts.list],
   );
   const unsent = useUnsent(unsentIds, connection > 0);
-  const controls = useControls(agents, workspaces);
   const lastUsed = useLastUsed(sessions);
   // The viewed session or draft survives a webview reload.
   const [viewed, setViewed] = useState(() => sessionStorage.getItem("viewed"));
@@ -90,36 +90,28 @@ export function App() {
   const draft = drafts.list.find((draft) => draft.id === viewed);
   const draftWorkspace = draft && workspaces.find(({ id }) => id === draft.workspaceId);
   const root = session?.cwd ?? draftWorkspace?.path;
-  // Viewing a draft asks its agent for its controls again.
-  const { probe } = controls;
-  const draftAgent = draft?.agent;
-  useEffect(() => {
-    if (draftAgent !== undefined && draftWorkspace !== undefined) probe(draftAgent, draftWorkspace);
-  }, [probe, draftAgent, draftWorkspace]);
-  // A draft shows its agent's controls with the draft's values, else the
-  // last used.
-  const draftControls = useMemo(() => {
-    const cached = draft && controls.get(draft.agent, draft.workspaceId);
-    if (!draft || !cached) return undefined;
-    const values = [draft.config, lastUsed.get(draft.agent, draft.workspaceId)];
-    return { ...cached, config_options: withValues(cached.config_options, ...values) };
-  }, [draft, controls, lastUsed]);
-  // A new session shows its agent's controls at the values it was sent
-  // with until the agent reports its own.
-  const startingAgent = session && sessionAgent(session.command);
-  const startingControls = useMemo(() => {
+  // A draft offers what the config lists for its agent, at the draft's
+  // values, else the last used.
+  const draftHarness = draft && harnesses.find(({ harness }) => harness === draft.agent);
+  const draftConfig = useMemo(() => {
+    if (!draft || !draftHarness) return [];
+    return draftOptions(draftHarness, draft.config, lastUsed.get(draft.agent, draft.workspaceId));
+  }, [draft, draftHarness, lastUsed]);
+  // A session offers what the config lists for its agent. A new session
+  // shows the values it was sent with until its agent reports its own.
+  const sessionAgentId = session && sessionAgent(session.command);
+  const sessionHarness = harnesses.find(({ harness }) => harness === sessionAgentId);
+  const startingConfig = useMemo(() => {
     if (
       !session ||
-      startingAgent === undefined ||
+      !sessionHarness ||
       session.state !== "starting" ||
       session.agent_session_id !== null
     ) {
       return undefined;
     }
-    const cached = controls.get(startingAgent, session.workspace_id);
-    const values = lastUsed.get(startingAgent, session.workspace_id);
-    return cached && { ...cached, config_options: withValues(cached.config_options, values) };
-  }, [session, startingAgent, controls, lastUsed]);
+    return draftOptions(sessionHarness, lastUsed.get(sessionHarness.harness, session.workspace_id));
+  }, [session, sessionHarness, lastUsed]);
   const { setConfig } = drafts;
   const { remember } = lastUsed;
   const draftSent = useCallback(
@@ -162,7 +154,8 @@ export function App() {
             session={session}
             request={request}
             unsent={unsent}
-            starting={startingControls}
+            harness={sessionHarness}
+            starting={startingConfig}
           />
         </SessionContent>
       );
@@ -181,7 +174,7 @@ export function App() {
             key={draft.id}
             draft={draft}
             workspace={draftWorkspace}
-            controls={draftControls}
+            options={draftConfig}
             unsent={unsent}
             onSetOption={(configId, value) => setConfig(draft.id, configId, value)}
             onSent={(session, values) => draftSent(draft, session, values)}

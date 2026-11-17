@@ -13,13 +13,6 @@ The Claude Code bridge lets Ox and other ACP clients use an installed, authentic
 
 Inherited `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` do not override the subscription authentication path. The bridge does not offer ACP login/logout, provider switching, or audio prompts.
 
-### Describe a new session
-
-- `claude-code-acp --describe <dir>` prints one JSON object, `{"configOptions": [...], "availableCommands": [...]}` in ACP's schema, for a new session in `<dir>`, and exits. `<dir>` is an existing absolute directory.
-- The options are the [models, effort, and modes](#models-effort-and-modes) at their defaults. The commands are the catalog Claude reports when it initializes in `<dir>`.
-- Claude starts without saving a conversation and stops once it has answered. No prompt is sent.
-- A Claude that fails to start or refuses to initialize makes the bridge exit non-zero with the error on standard error.
-
 ### Read sessions for import
 
 Two modes read Claude's transcripts under `CLAUDE_CONFIG_DIR` without starting Claude, print one JSON value, and exit. `<dir>` is an existing absolute directory.
@@ -48,17 +41,17 @@ Two modes read Claude's transcripts under `CLAUDE_CONFIG_DIR` without starting C
 
 ### Models, effort, and modes
 
-The bridge exposes these per-session choices:
+The bridge exposes three per-session options, each reported with its current value as its only choice:
 
-| Control | Choices | Default |
-| --- | --- | --- |
-| Model | Fable 5.2 (`claude-fable-5-2`), Opus 5.5 (`claude-opus-5-5`), Sonnet 5.5 (`claude-sonnet-5-5`), Haiku 5.5 (`claude-haiku-5-5`) | Opus 5.5 |
-| Effort | Low (`low`), Medium (`medium`), High (`high`), XHigh (`xhigh`) | High |
-| Mode | Auto (`auto`), Manual (`manual`), Accept edits (`acceptEdits`), Plan (`plan`) | Manual |
+| Option | Default |
+| --- | --- |
+| `model` | `claude-opus-5-5` |
+| `effort` | `high` |
+| `mode` | `manual` |
 
-Auto lets Claude assess actions automatically; Manual asks before edits and commands; Accept edits allows file edits automatically; Plan explores and plans without editing files. Claude applies the selected mode's permission policy.
+The bridge passes any value of these options to Claude, which decides whether it accepts it. Claude's modes include Auto (`auto`), Manual (`manual`), Accept edits (`acceptEdits`), and Plan (`plan`); Claude applies the selected mode's permission policy.
 
-Changes are sent to active Claude work. A refusal reports Claude's error and does not replace the accepted setting. Accepted model, effort, and mode selections survive later resuming. Unknown options, values, or non-selection values are rejected.
+Changes are sent to active Claude work. A refusal reports Claude's error and does not replace the accepted setting. Accepted model, effort, and mode selections survive later resuming. Unknown options and non-selection values are rejected.
 
 ### Send content and commands
 

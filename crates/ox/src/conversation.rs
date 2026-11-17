@@ -8,7 +8,7 @@ use ox_protocol::schema::{
     MessageId, PermissionOption, RequestPermissionSubject, SessionUpdate, StopReason,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
 };
-use ox_protocol::{Event, EventKind, MaybeUndefined, Sender};
+use ox_protocol::{Event, EventKind, MaybeUndefined, Sender, SessionRequest};
 use serde::Serialize;
 
 /// An item for the UI to insert or update by key, or a request to remove.
@@ -46,13 +46,16 @@ pub enum Item {
         raw_input: Option<serde_json::Value>,
         content: Vec<ToolContent>,
     },
-    /// A permission request, with its Markdown title and its description.
+    /// A permission request, with its Markdown title and its description,
+    /// or the session it asks the user to start.
     Permission {
         key: String,
         request_id: String,
         title: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         description: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_request: Option<SessionRequest>,
         options: Vec<PermissionOption>,
     },
     /// A form the agent asks the user to fill in, with its message and fields.
@@ -270,6 +273,7 @@ impl Conversation {
                 description,
                 subject,
                 options,
+                session_request,
             } => {
                 // A tool call subject carries the tool call's details.
                 let mut items = match subject {
@@ -283,6 +287,7 @@ impl Conversation {
                     request_id: request_id.clone(),
                     title: title.clone(),
                     description: description.clone(),
+                    session_request: session_request.clone(),
                     options: options.clone(),
                 });
                 items
@@ -566,6 +571,7 @@ mod tests {
         UserMessage as UserMessageUpdate,
     };
 
+    use ox_protocol::{Harness, RequestedCheckout};
     use serde_json::json;
 
     use super::*;
@@ -1004,6 +1010,7 @@ mod tests {
                 PermissionOption::new("allow", "Allow", PermissionOptionKind::AllowOnce),
                 PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectOnce),
             ],
+            session_request: None,
         };
         let items = fold(vec![
             requested("1"),
@@ -1112,6 +1119,7 @@ mod tests {
                 ToolCallPermissionSubject::new(details),
             ))),
             options: Vec::new(),
+            session_request: None,
         }]);
         assert!(matches!(
             &items[..],
@@ -1120,6 +1128,41 @@ mod tests {
                     && title == "Allow Read?"
                     && description == "Reads a.rs"
         ));
+    }
+
+    #[test]
+    fn a_session_request_reaches_its_permission() {
+        let request = SessionRequest {
+            harness: Harness::Claude,
+            model: "Opus 5.5".into(),
+            provider: None,
+            effort: Some("High".into()),
+            mode: Some("Manual".into()),
+            checkout: RequestedCheckout::Worktree {
+                branch: None,
+                base: "main".into(),
+            },
+            prompt: "Review the change.".into(),
+        };
+        let items = fold(vec![EventKind::PermissionRequested {
+            request_id: "1".into(),
+            title: "Start a session in ox?".into(),
+            description: None,
+            subject: None,
+            options: Vec::new(),
+            session_request: Some(request.clone()),
+        }]);
+        assert_eq!(
+            items,
+            [Item::Permission {
+                key: "request:1".into(),
+                request_id: "1".into(),
+                title: "Start a session in ox?".into(),
+                description: None,
+                session_request: Some(request),
+                options: Vec::new(),
+            }]
+        );
     }
 
     #[test]
@@ -1189,6 +1232,7 @@ mod tests {
             request_id: request_id.into(),
             title: "Allow?".into(),
             description: None,
+            session_request: None,
             options: Vec::new(),
         };
         let resolved = |request_id: &str| Item::Removed {

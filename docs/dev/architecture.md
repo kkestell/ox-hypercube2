@@ -43,8 +43,21 @@ The desktop app uses Tauri 2. Its React webview calls the Rust core through
 Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
 streams updates back over Tauri channels.
 
-The app offers an agent for each [harness](glossary.md) on the `PATH` it
-passes to sessions, and checks again each time its window gains focus.
+The app offers an agent for each [harness](glossary.md) that Ox's config
+lists and that is on the `PATH` it passes to sessions, and reads both again
+each time its window gains focus.
+
+### Ox's config
+
+`config.json` in Ox's config directory, `$XDG_CONFIG_HOME/ox` when
+`XDG_CONFIG_HOME` is absolute and `~/.config/ox` otherwise, holds Ox's
+settings. Its `harnesses` object lists, for each harness by executable name,
+the models Ox offers, each with its effort levels and an optional provider
+name, and the harness's modes, in the order pickers offer them. The desktop
+core reads it for the `agents` command, the daemon for each
+`session.request`, and `ox-mcp` for each `list_harnesses` call, so an edit
+applies at the next window focus, request, or listing. `config/config.json`
+is the example `make install` copies into place when no config exists.
 
 ### Daemon and agents
 
@@ -62,11 +75,9 @@ stream-json messages and control requests with it.
 Claude authenticates with the user's subscription. The bridge can restart
 an exited Claude process on the same session.
 
-Each bridge's `--describe <dir>` mode prints the config options and slash
-commands its harness offers a new session in `<dir>`, starting the harness
-briefly with no prompt and no saved session. The desktop core runs it to show
-a draft's controls, and the daemon runs it to check the model and effort of a
-session an agent asks to start.
+Each bridge reports its `model`, `effort`, and `mode` options with their
+current values and passes any value it is set to through to its harness.
+What a session can choose from comes from Ox's config.
 
 `pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
 project's settings, skills, and extensions, and an extension of its own that
@@ -89,6 +100,7 @@ session:
 | `list_sessions` | `watch` | Lists the workspaces and the sessions the agent can message |
 | `send_message` | `session.send_message` | Sends a [peer message](glossary.md) to another session |
 | `start_session` | `session.request` | Asks the user to start a new session |
+| `list_harnesses` | none; reads Ox's config | Lists the harnesses, models, effort levels, and modes a session can start with |
 
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
@@ -117,8 +129,8 @@ Clients own presentation and workflow choices: which branch to use, which
 comparison ref to select, and which daemon operations to request in what
 order. The daemon exposes repository operations without choosing the user's
 workflow. Local presentation state stays in the webview's storage: file-tree
-expansion and scroll position, drafts, unsent messages, and the controls each
-agent last reported for each workspace.
+expansion and scroll position, drafts, unsent messages, and the option values
+last used with each agent in each workspace.
 
 Clients pass their environment when starting an agent and requesting Git
 operations. The daemon does not persist that environment. For Git operations
@@ -200,13 +212,18 @@ restart, is loaded first with the sender's environment, and the message is
 sent once its agent has started.
 
 An agent asks to start a session through a permission request the daemon
-records on the agent's own session, titled with the workspace and describing
-the harness, model, effort, checkout, branch and prompt. The daemon checks the
-request before asking: the workspace, the harness's bridge, the checkout and
-branch, and the model and effort against the values the bridge's
-`--describe` reports. Starting it creates the session as a client's
-`session.new` would, with the requester's environment; declining it, or
-stopping the requester's turn, creates nothing.
+records on the agent's own session, titled with the workspace and carrying the
+requested session for the request panel: the harness, the names of its model,
+effort, and mode, the checkout, and the prompt. The daemon checks the request
+before asking: the workspace, the checkout and branch, the harness's bridge,
+and the harness, model, effort, and mode against Ox's config. Starting it
+creates the session as a client's `session.new` would, with the requester's
+environment; declining it, or stopping the requester's turn, creates nothing.
+
+A new session's first prompt waits for the agent's answers to the session's
+option settings. When the agent refuses one, or has no option with its ID,
+the prompt is not sent and its turn ends with an error naming each failed
+setting.
 
 `workspace.import_claude_sessions` imports the Claude sessions started in a
 workspace's directory. The daemon runs the Claude bridge beside its executable

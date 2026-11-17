@@ -224,7 +224,10 @@
 }
 
 .model-picker .provider-name,
-.model-picker .effort-name {
+.model-picker .effort-name,
+.request-panel .provider-name,
+.request-panel .effort-name,
+.request-panel .mode-name {
   opacity: var(--dimmed-opacity);
 }
 
@@ -239,13 +242,10 @@
   color: var(--foreground);
 }
 
-/* A request's border has the colour of the dot of a session awaiting the
-   user. */
 .request-panel {
   max-height: var(--request-panel-max-height);
   padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4)
     calc(var(--spacing) * 4 + var(--radius-2xl));
-  border-color: var(--warning);
 }
 
 /* Each queued message is one line, its actions shown while it is hovered or

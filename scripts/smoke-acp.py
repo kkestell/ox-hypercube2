@@ -511,33 +511,6 @@ class SmokeRun:
         check(not running_after(self.agent_pids, 10), "ACP agent did not exit")
         self.report("delete_and_idle_exit", agent_exited=True, socket_removed=True)
 
-    def check_describe(self):
-        """Reads a new session's controls with the bridge's `--describe`, as
-        the app does for a draft."""
-        description = json.loads(
-            command(
-                [*self.agent, "--describe", str(self.project)],
-                env=self.env,
-                timeout=self.args.timeout,
-            )
-        )
-        model = next(
-            (o for o in description["configOptions"] if o.get("category") == "model"),
-            None,
-        )
-        check(model is not None, f"Described no model option: {description}")
-        probe = next(
-            (c for c in description["availableCommands"] if c["name"] == self.probe),
-            None,
-        )
-        check(probe is not None, f"Described no probe command: {description}")
-        self.check_probe(probe)
-        self.report(
-            "describe_lists_options_and_commands",
-            model=model["currentValue"],
-            command=probe,
-        )
-
     def check_reconnect(self):
         token = self.directory.name
         self.attach(0)
@@ -792,7 +765,6 @@ class ClaudeRun(SmokeRun):
 
     def checks(self):
         return (
-            self.check_describe,
             self.check_reconnect,
             self.check_effort,
             self.check_commands,
@@ -1131,9 +1103,8 @@ class PiRun(SmokeRun):
 
     def checks(self):
         return (
-            self.check_describe,
             self.check_reconnect,
-            self.check_thinking,
+            self.check_effort,
             self.check_commands,
             self.check_dialog,
             self.check_steer,
@@ -1145,10 +1116,11 @@ class PiRun(SmokeRun):
             self.check_parking,
         )
 
-    def check_thinking(self):
-        thinking = self.set_option("thinking", "low")
-        check(thinking == "low", f"Thinking was not set: {thinking}")
-        self.report("thinking_set_on_running_pi", thinking=thinking)
+    def check_effort(self):
+        """Sets the thinking level of the session's running Pi."""
+        effort = self.set_option("effort", "low")
+        check(effort == "low", f"Effort was not set: {effort}")
+        self.report("effort_set_on_running_pi", effort=effort)
 
     def check_commands(self):
         self.prompt("/skill:ox-command-probe copper-lantern")

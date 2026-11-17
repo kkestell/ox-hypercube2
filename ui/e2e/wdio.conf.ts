@@ -40,16 +40,26 @@ export const config: WebdriverIO.Config = {
     for (const name of ["ox", "oxd", "ox-mcp", "oxd-fake-agent"]) {
       linkSync(join(target, name), join(bin, name));
     }
-    // The app detects Claude on its login shell's PATH. The fixture bridge
-    // answers the controls probe and runs the scripted ACP agent for sessions.
+    // The app offers Claude, which Ox's config lists and the app detects on
+    // its login shell's PATH, with the model, effort and mode the scripted
+    // ACP agent starts on. The fixture bridge runs that agent for sessions.
+    const configDir = join(runDir, "config", "ox");
+    mkdirSync(configDir, { recursive: true });
+    writeFileSync(
+      join(configDir, "config.json"),
+      JSON.stringify({
+        harnesses: {
+          claude: {
+            models: [{ id: "smart", name: "Smart", efforts: [{ id: "medium", name: "Medium" }] }],
+            modes: [{ id: "ask", name: "Ask" }],
+          },
+        },
+      }),
+    );
     writeFileSync(join(bin, "claude"), "#!/bin/sh\n", { mode: 0o755 });
     writeFileSync(
       join(bin, "claude-code-acp"),
       `#!/bin/sh
-if [ "$1" = --describe ]; then
-  printf '%s\\n' '{"configOptions":[],"availableCommands":[]}'
-  exit
-fi
 exec "$(dirname "$0")/oxd-fake-agent" "$@"
 `,
       { mode: 0o755 },

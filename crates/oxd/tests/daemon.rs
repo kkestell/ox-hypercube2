@@ -1933,6 +1933,7 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
                 description: None,
                 subject: None,
                 options: Vec::new(),
+                session_request: None,
             },
         ),
         (
@@ -2287,6 +2288,57 @@ async fn a_new_session_sets_its_options_before_its_first_prompt() {
         .unwrap();
     let turn = until_turn_ended(&client, &session.id, 0).await;
     assert_eq!(chunks(&turn), ["code"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setting_the_agent_fails_rejects_the_first_prompt() {
+    for (config_id, value, error) in [
+        (
+            "model",
+            "huge",
+            "The agent refused model huge: Invalid params",
+        ),
+        ("speed", "fast", "The agent has no speed option"),
+    ] {
+        let daemon = Daemon::start().await;
+        let client = daemon.client().await;
+        let session = daemon
+            .new_session_prompted(
+                &client,
+                &[],
+                vec![ConfigSetting {
+                    config_id: config_id.into(),
+                    value: ConfigValue::Id(value.into()),
+                }],
+                text("text \"first\""),
+            )
+            .await
+            .unwrap();
+        let mut events = client.subscribe(&session.id, 0).await.unwrap();
+        let turn = until(&mut events, turn_ended).await;
+        assert!(
+            matches!(
+                &turn.last().unwrap().kind,
+                EventKind::TurnEnded { error: Some(message), .. } if message.starts_with(error)
+            ),
+            "{turn:?}"
+        );
+        // The agent answers prompts in order, so a first prompt it was sent
+        // would show before the second's answer.
+        client
+            .prompt(&session.id, text("text \"second\""))
+            .await
+            .unwrap();
+        let second = until(&mut events, turn_ended).await;
+        assert_eq!(
+            chunks(&turn)
+                .into_iter()
+                .chain(chunks(&second))
+                .collect::<Vec<_>>(),
+            ["second"],
+            "{config_id}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

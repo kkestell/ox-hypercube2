@@ -88,8 +88,10 @@ pub enum Method {
         #[serde(default)]
         prompt: Option<Vec<ContentBlock>>,
         /// Option values the agent is set to once it has started, in order,
-        /// each only where the agent reports a different value. A value the
-        /// agent refuses leaves the agent's own.
+        /// each only where the agent reports a different value. The first
+        /// prompt waits for the agent's answers; when it refuses a value, or
+        /// reports no option with its ID, the first prompt is not sent and
+        /// its turn ends with an error naming each failed setting.
         #[serde(default)]
         config: Vec<ConfigSetting>,
     },
@@ -185,11 +187,13 @@ pub enum Method {
     /// requester's; `worktree` runs it in a new worktree on `branch`, an
     /// existing local branch, or a new branch at `HEAD`; otherwise in the
     /// workspace's checkout, whose branch must be `branch` if given.
-    /// `harness` defaults to the requester's; `model` and `effort` must be
-    /// values the harness offers. Everything is checked before the request.
-    /// The session starts with the requester's environment. The result is
-    /// its [`SessionInfo`], or `null` when the user declines or the request
-    /// is cancelled.
+    /// `harness`, `model`, `effort` and `mode` are IDs Ox's config lists:
+    /// `effort` is required for a model with effort levels and refused for
+    /// one without, and `mode` likewise for a harness with modes.
+    /// Everything is checked before the request, which records the
+    /// [`SessionRequest`] the user approves. The session starts with the
+    /// requester's environment. The result is its [`SessionInfo`], or
+    /// `null` when the user declines or the request is cancelled.
     #[serde(rename = "session.request")]
     SessionRequest {
         session_id: String,
@@ -199,12 +203,12 @@ pub enum Method {
         worktree: bool,
         #[serde(default)]
         branch: Option<String>,
-        #[serde(default)]
-        harness: Option<Harness>,
-        #[serde(default)]
-        model: Option<String>,
+        harness: String,
+        model: String,
         #[serde(default)]
         effort: Option<String>,
+        #[serde(default)]
+        mode: Option<String>,
     },
     /// Starts a subscription: after the answer, the daemon sends the
     /// session's events with `seq > after_seq`, from the daemon's database
@@ -386,13 +390,32 @@ impl Harness {
     }
 }
 
-/// The config options and slash commands an agent offers a new session, as
-/// its bridge's `--describe` mode reports them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all(deserialize = "camelCase"))]
-pub struct Controls {
-    pub config_options: Vec<SessionConfigOption>,
-    pub available_commands: Vec<AvailableCommand>,
+/// A session an agent asks the user to start, as the user approves it.
+/// `model`, `effort` and `mode` are the names Ox's config gives them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRequest {
+    pub harness: Harness,
+    pub model: String,
+    /// The name of the provider that serves the model, when the config gives one.
+    pub provider: Option<String>,
+    pub effort: Option<String>,
+    pub mode: Option<String>,
+    pub checkout: RequestedCheckout,
+    pub prompt: String,
+}
+
+/// Where a requested session runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RequestedCheckout {
+    /// The checkout of the workspace at `path`.
+    Workspace { path: PathBuf },
+    /// A new worktree on existing local branch `branch`, or on a new branch
+    /// from `base`, the workspace's branch or else `HEAD`.
+    Worktree {
+        branch: Option<String>,
+        base: String,
+    },
 }
 
 /// Where a new session runs.
@@ -720,6 +743,10 @@ pub enum EventKind {
         description: Option<String>,
         subject: Option<RequestPermissionSubject>,
         options: Vec<PermissionOption>,
+        /// The session the request asks the user to start, when the request
+        /// is the daemon's own, for `session.request`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_request: Option<SessionRequest>,
     },
     PermissionResolved {
         request_id: String,
