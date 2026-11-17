@@ -31,7 +31,7 @@ relays the update or acts on it as the protocol requires.
 | `session/list` | ❌ | ❌ | ❌ | |
 | `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |
-| `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude waits to accept the next prompt; Pi queues it as a follow-up. |
+| `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude takes the prompt in at its next opportunity (`priority: "next"`), and Pi steers the turn with it; each bridge answers the prompt when its harness takes it in. A prompt Claude has not taken in when the turn ends starts a turn of its own. |
 | `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `thinking` when available. Pi model choices carry a provider display label in `_meta["ox/provider"]`. Ox supports select and boolean options. |
 | `session/delete` | ❌ | ❌ | ❌ | |
 | `session/fork` (unstable) | ❌ | ❌ | ❌ | |
@@ -49,7 +49,7 @@ relays the update or acts on it as the protocol requires.
 
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
-| `session/cancel` | ✅ | ✅ | ✅ | Claude also drops prompts it has not accepted. Ox closes permission requests, but elicitations remain open until the agent withdraws them. |
+| `session/cancel` | ✅ | ✅ | ✅ | Both bridges drop the prompts their harness has not taken in, failing them with `request_cancelled`. Ox closes permission requests, but elicitations remain open until the agent withdraws them. |
 | `$/cancel_request` | ❌ | ❌ | ❌ | |
 | `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
 | Extension notifications (`_`-prefixed) | ❌ | ❌ | ❌ | |

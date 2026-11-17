@@ -8,6 +8,12 @@ ownership and lifecycle.
   workspace. A session can outlive its agent process and the daemon.
 - **Turn**: One period of agent work within a session, started by a prompt or by
   the agent itself.
+- **Queued prompt**: A prompt waiting in a session's queue, which `oxd` keeps.
+  The first starts a turn each time the session's agent becomes idle, unless a
+  cancelled or failed turn holds the queue.
+- **Steered prompt**: A prompt sent during a turn, which the agent takes into
+  that turn at its next opportunity. Distinct from a queued prompt, which
+  waits for the turn to end.
 - **Agent**: The ACP-speaking process that `oxd` runs for a session.
 - **Bridge**: An ACP agent that adapts another tool's interface. `claude-code-acp`
   bridges the Claude Code CLI to ACP.

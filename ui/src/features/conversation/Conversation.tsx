@@ -77,10 +77,12 @@ type Row = { type: "item"; item: Item } | { type: "worked"; key: string; items: 
  * The transcript's rows. A turn's work is the items after the previous
  * prompt or turn end. When the turn completes and its last shown item is a
  * text reply with shown work before it, that work becomes one `worked` row;
- * otherwise each item is its own row.
+ * otherwise each item is its own row. Steered prompts the agent has not
+ * taken in come after every other row.
  */
 function rows(items: Item[]): Row[] {
   const rows: Row[] = [];
+  const steered: Item[] = [];
   let turn: Item[] = [];
   const flush = (from: number) => {
     for (const item of turn.slice(from)) rows.push({ type: "item", item });
@@ -108,11 +110,15 @@ function rows(items: Item[]): Row[] {
         flush(0);
         rows.push({ type: "item", item });
         break;
+      case "steered":
+        steered.push(item);
+        break;
       default:
         turn.push(item);
     }
   }
   flush(0);
+  for (const item of steered) rows.push({ type: "item", item });
   return rows;
 }
 
@@ -176,8 +182,9 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
   if (!shown(item)) return null;
   switch (item.type) {
     case "prompt":
+    case "steered":
       return (
-        <div className="prompt">
+        <div className={item.type === "steered" ? "prompt steered" : "prompt"}>
           <Markdown text={item.text} />
           {item.attachments.map((name, index) => (
             // biome-ignore lint/suspicious/noArrayIndexKey: a prompt's attachments never change, and names can repeat

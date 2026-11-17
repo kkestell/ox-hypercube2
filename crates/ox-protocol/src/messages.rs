@@ -79,12 +79,50 @@ pub enum Method {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
+    /// Sends a prompt now. On an idle session it starts a turn
+    /// (`prompt_started`); during a turn (state `running`,
+    /// `awaiting_permission` or `awaiting_input`) it steers it
+    /// (`prompt_steered`), and the agent takes it in at its next
+    /// opportunity. Either resumes a queue held after a cancelled or failed
+    /// turn.
     #[serde(rename = "session.prompt")]
     SessionPrompt {
         session_id: String,
         /// ACP content blocks. Blocks other than text and resource links
         /// need the matching prompt capability of the agent.
         prompt: Vec<ContentBlock>,
+    },
+    /// Appends a prompt to the session's queue. The result is
+    /// `{"prompt_id": "..."}`. The daemon starts the queue's first prompt
+    /// whenever the session is idle with no steered prompt pending, one
+    /// prompt per turn; a cancelled turn, or one that ends other than with
+    /// `end_turn`, holds the queue until `session.prompt` or
+    /// `session.queue_send`.
+    #[serde(rename = "session.queue_add")]
+    SessionQueueAdd {
+        session_id: String,
+        prompt: Vec<ContentBlock>,
+    },
+    /// Replaces a queued prompt in place. An ID no longer queued is
+    /// `not_found`.
+    #[serde(rename = "session.queue_edit")]
+    SessionQueueEdit {
+        session_id: String,
+        prompt_id: String,
+        prompt: Vec<ContentBlock>,
+    },
+    /// Removes a queued prompt. An ID no longer queued is `not_found`.
+    #[serde(rename = "session.queue_remove")]
+    SessionQueueRemove {
+        session_id: String,
+        prompt_id: String,
+    },
+    /// Removes a queued prompt and sends it as `session.prompt` does. A
+    /// refused send leaves it queued.
+    #[serde(rename = "session.queue_send")]
+    SessionQueueSend {
+        session_id: String,
+        prompt_id: String,
     },
     #[serde(rename = "session.cancel")]
     SessionCancel { session_id: String },
@@ -375,6 +413,12 @@ pub struct Deleted {
     pub kept_branch: Option<String>,
 }
 
+/// The result of `session.queue_add`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueAdded {
+    pub prompt_id: String,
+}
+
 /// A value for a session config option: the value id of a select option, or
 /// a boolean.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,6 +687,15 @@ pub struct SessionInfo {
     /// with an error, otherwise `finished` when a turn ended other than by
     /// cancellation. A run's child session never has `finished`.
     pub unseen: Option<Unseen>,
+    /// The prompts waiting to start a turn each, in order.
+    pub queue: Vec<QueuedPrompt>,
+}
+
+/// A prompt in a session's queue.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QueuedPrompt {
+    pub id: String,
+    pub prompt: Vec<ContentBlock>,
 }
 
 /// One entry in a session's history. `seq` starts at 1 and increases by one
@@ -673,6 +726,20 @@ pub enum EventKind {
     },
     PromptStarted {
         prompt: Vec<ContentBlock>,
+    },
+    /// A prompt sent during a turn. The agent takes it in at its next
+    /// opportunity, or starts a turn of its own with it.
+    PromptSteered {
+        prompt: Vec<ContentBlock>,
+    },
+    /// The agent took in the steered prompt recorded at seq `prompt`.
+    SteeredPromptTaken {
+        prompt: u64,
+    },
+    /// The agent refused the steered prompt recorded at seq `prompt`, dropped
+    /// it on cancellation, or exited before taking it in.
+    SteeredPromptDropped {
+        prompt: u64,
     },
     /// The agent reported work no prompt asked for, as Claude does when a
     /// background task it started reports back.
@@ -1318,7 +1385,8 @@ mod tests {
                 "worktree_id": "01234567-89ab",
                 "archived": false,
                 "created_at": 1_700_000_000_000_u64,
-                "unseen": "finished"
+                "unseen": "finished",
+                "queue": [{"id": "q1", "prompt": [{"type": "text", "text": "Then test"}]}]
                 }},
                 {"type": "session_removed", "session_id": "r"},
                 {"type": "run", "run": {
@@ -1456,6 +1524,7 @@ mod tests {
         assert_eq!(session.worktree_id.as_deref(), Some("01234567-89ab"));
         assert_eq!(session.created_at, 1_700_000_000_000);
         assert_eq!(session.unseen, Some(Unseen::Finished));
+        assert_eq!(session.queue[0].id, "q1");
         let value = serde_json::to_value(session).unwrap();
         assert_eq!(
             serde_json::from_value::<SessionInfo>(value).unwrap(),

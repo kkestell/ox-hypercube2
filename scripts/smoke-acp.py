@@ -511,6 +511,81 @@ class SmokeRun:
         check(token in response, f"Loaded session lost the conversation: {response}")
         self.report("loaded_session_retains_conversation", response=response)
 
+    def permitting(self, predicate):
+        """The events up to the first that matches `predicate`, allowing each
+        permission request on the way once."""
+        events = []
+        while True:
+            events += self.until(
+                lambda e: predicate(e) or kind(e) == "permission_requested"
+            )
+            if predicate(events[-1]):
+                return events
+            permission = events[-1]["kind"]["data"]
+            option = next(
+                o["optionId"]
+                for o in permission["options"]
+                if o["kind"] == "allow_once"
+            )
+            self.ctl("permit", self.session, permission["request_id"], option)
+
+    def check_steer(self):
+        self.ctl(
+            "prompt",
+            self.session,
+            "New task: use your shell tool to run `sleep 15; echo slept`. When it "
+            "finishes, reply with only the word done.",
+        )
+        self.permitting(
+            lambda e: (
+                update(e).get("sessionUpdate") == "tool_call_update"
+                and update(e).get("status") in ("pending", "in_progress")
+            )
+        )
+        self.ctl(
+            "prompt",
+            self.session,
+            "Also include the word steered in your reply. Do not use tools.",
+        )
+        steered = self.permitting(lambda e: kind(e) == "steered_prompt_taken")
+        check(
+            any(kind(e) == "prompt_steered" for e in steered),
+            "The prompt was not steered",
+        )
+        rest = self.permitting(lambda e: kind(e) == "turn_ended")
+        check(
+            rest[-1]["kind"]["data"] == turn_result("end_turn"),
+            f"Unexpected turn result: {rest[-1]}",
+        )
+        reply = text(steered + rest)
+        check("steered" in reply.lower(), f"The reply ignored the steer: {reply}")
+        self.report("steered_prompt_taken_into_turn", reply=reply.strip())
+
+    def check_queue(self):
+        self.ctl(
+            "prompt",
+            self.session,
+            "New task: use your shell tool to run `sleep 5`. Then reply with only "
+            "the word first.",
+        )
+        queued = "Reply with only the word queued. Do not use tools."
+        self.ctl("queue", "add", self.session, queued)
+        first = self.permitting(lambda e: kind(e) == "turn_ended")
+        check(
+            first[-1]["kind"]["data"] == turn_result("end_turn"),
+            f"Unexpected turn result: {first[-1]}",
+        )
+        started = self.until(lambda e: kind(e) == "prompt_started")
+        prompt = blocks_text(started[-1]["kind"]["data"]["prompt"])
+        check(prompt == queued, f"The next turn did not start with the queue: {prompt}")
+        reply = text(self.finish()).strip()
+        check("queued" in reply.lower(), f"The queued prompt was not answered: {reply}")
+        check(
+            self.ctl("queue", "ls", self.session) == "",
+            "The sent prompt is still queued",
+        )
+        self.report("queued_prompt_starts_next_turn", reply=reply)
+
     def check_cancel_generation(self):
         self.ctl(
             "prompt",
@@ -698,6 +773,8 @@ class ClaudeRun(SmokeRun):
             self.check_question,
             self.check_background_wake,
             self.check_cancel_permission,
+            self.check_steer,
+            self.check_queue,
             self.check_cancel_generation,
             self.verify_model,
             self.check_title_tool,
@@ -1046,6 +1123,8 @@ class PiRun(SmokeRun):
             self.check_thinking,
             self.check_commands,
             self.check_dialog,
+            self.check_steer,
+            self.check_queue,
             self.check_cancel_generation,
             self.verify_model,
             self.check_title_tool,

@@ -9,6 +9,8 @@ use ox_protocol::{Event, EventKind, RunState, StepInfo, Unseen};
 use rusqlite::{Connection, params};
 use tokio::sync::oneshot;
 
+use crate::state::Queue;
+
 /// A workspace as the database holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedWorkspace {
@@ -17,7 +19,7 @@ pub struct SavedWorkspace {
 }
 
 /// A session as the database holds it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SavedSession {
     pub number: u64,
     pub id: String,
@@ -35,6 +37,7 @@ pub struct SavedSession {
     /// When the session was created, in milliseconds since the Unix epoch.
     pub created_at: u64,
     pub unseen: Option<Unseen>,
+    pub queue: Queue,
 }
 
 /// A worktree as the database holds it.
@@ -174,6 +177,11 @@ impl Store {
             CREATE TABLE IF NOT EXISTS run_unseen (
                 run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
                 unseen TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS session_queues (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                paused     INTEGER NOT NULL,
+                prompts    TEXT NOT NULL  -- JSON array of QueuedPrompt
             );",
         )?;
         let connection = Arc::new(Mutex::new(connection));
@@ -286,8 +294,10 @@ impl Store {
                 (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
                 EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
                 created_at,
-                (SELECT unseen FROM session_unseen WHERE session_id = sessions.id)
+                (SELECT unseen FROM session_unseen WHERE session_id = sessions.id),
+                session_queues.paused, session_queues.prompts
             FROM sessions
+            LEFT JOIN session_queues ON session_queues.session_id = sessions.id
             ORDER BY number",
         )?;
         query
@@ -312,6 +322,19 @@ impl Store {
                     archived: row.get(9)?,
                     created_at: time_value(row, 10)?,
                     unseen: parse_unseen(row, 11)?,
+                    queue: Queue {
+                        paused: row.get::<_, Option<bool>>(12)?.unwrap_or(false),
+                        prompts: match row.get::<_, Option<String>>(13)? {
+                            Some(prompts) => serde_json::from_str(&prompts).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    13,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                            None => Vec::new(),
+                        },
+                    },
                 })
             })?
             .collect()
@@ -536,6 +559,17 @@ impl Store {
         Ok(())
     }
 
+    /// Saves a session's queue and whether it is held.
+    pub fn set_session_queue(&self, id: &str, queue: &Queue) -> rusqlite::Result<()> {
+        let prompts = serde_json::to_string(&queue.prompts).expect("prompts serialize");
+        self.lock().execute(
+            "INSERT OR REPLACE INTO session_queues (session_id, paused, prompts)
+             VALUES (?1, ?2, ?3)",
+            params![id, queue.paused, prompts],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a session, with its events and the worktree it runs in unless
     /// a run owns the worktree.
     pub fn remove_session(&self, id: &str) -> rusqlite::Result<()> {
@@ -668,7 +702,8 @@ fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
 
 #[cfg(test)]
 mod tests {
-    use ox_protocol::{CommandInfo, CommandKind, CommandState, StepState};
+    use ox_protocol::schema::{ContentBlock, TextContent};
+    use ox_protocol::{CommandInfo, CommandKind, CommandState, QueuedPrompt, StepState};
 
     use super::*;
 
@@ -751,6 +786,7 @@ mod tests {
                     archived: false,
                     created_at: 1_700_000_000_000,
                     unseen: None,
+                    queue: Queue::default(),
                 },
                 SavedSession {
                     number: second,
@@ -765,6 +801,7 @@ mod tests {
                     archived: false,
                     created_at: 1_700_000_000_001,
                     unseen: None,
+                    queue: Queue::default(),
                 },
             ]
         );
@@ -824,6 +861,36 @@ mod tests {
             .unwrap();
         store.remove_session("one").unwrap();
         assert_eq!(count(&store, "session_unseen"), 0);
+    }
+
+    #[test]
+    fn a_saved_queue_comes_back_with_its_session_and_is_deleted_with_it() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        store
+            .add_session(
+                "one",
+                "w",
+                &command(),
+                Path::new("/work"),
+                SessionWorktree::None,
+                0,
+            )
+            .unwrap();
+        let queue = Queue {
+            prompts: vec![QueuedPrompt {
+                id: "q".into(),
+                prompt: vec![ContentBlock::Text(TextContent::new("Then test"))],
+            }],
+            paused: true,
+        };
+        store.set_session_queue("one", &queue).unwrap();
+        assert_eq!(store.sessions().unwrap()[0].queue, queue);
+        store.set_session_queue("one", &Queue::default()).unwrap();
+        assert_eq!(store.sessions().unwrap()[0].queue, Queue::default());
+        store.set_session_queue("one", &queue).unwrap();
+        store.remove_session("one").unwrap();
+        assert_eq!(count(&store, "session_queues"), 0);
     }
 
     #[test]

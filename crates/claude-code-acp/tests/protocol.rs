@@ -2308,6 +2308,109 @@ next_message
     child.kill().await.unwrap();
 }
 
+/// Sends the prompt `text` as request `id`.
+async fn send_prompt(child: &mut Child, id: i64, session: &Value, text: &str) {
+    send(
+        child,
+        json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{
+            "sessionId":session,"prompt":[{"type":"text","text":text}]
+        }}),
+    )
+    .await;
+}
+
+/// The idle updates among `notifications`.
+fn idles(notifications: &[Value]) -> Vec<&Value> {
+    notifications
+        .iter()
+        .filter(|v| is_state(v, "idle"))
+        .map(update)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_prompt_sent_during_a_turn_steers_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    // Claude folds the second prompt into the running turn and echoes it.
+    fake_claude(
+        &bin,
+        r#"
+next_prompt
+printf '%s\n' "$message" >> prompts
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
+next_message
+printf '%s\n' "$message" >> prompts
+echoed
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"steered"}]}}'
+printf '%s\n' '{"type":"result"}'
+next_message
+"#,
+    );
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    let session = new_session(&mut child, &mut reader, 2, &project).await;
+    send_prompt(&mut child, 3, &session, "first").await;
+    let (answer, seen) = response(&mut reader, 3).await;
+    assert!(answer["result"].is_object(), "{answer}");
+    let seen = and_until_text(seen, &mut reader, "working").await;
+    send_prompt(&mut child, 4, &session, "steer").await;
+    let (idle, updates) = finish(&mut reader, 4, seen).await;
+    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+    assert_eq!(idles(&updates).len(), 1, "{:?}", describe_updates(&updates));
+    // Claude got both prompts before the turn ended, each marked for its
+    // next opportunity.
+    let prompts: Vec<Value> = fs::read_to_string(project.join("prompts"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    for prompt in &prompts {
+        assert_eq!(prompt["type"], "user", "{prompt}");
+        assert_eq!(prompt["priority"], "next", "{prompt}");
+    }
+    assert_eq!(prompts[1]["message"]["content"][0]["text"], "steer");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_preempted_turn_continues_with_the_prompt_that_preempted_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    // The second prompt preempts the turn before it shows output: claude
+    // ends that turn as aborted and runs the prompt's turn.
+    fake_claude(
+        &bin,
+        r#"
+next_prompt
+next_message
+uuid=$(printf '%s\n' "$message" | sed 's/.*"uuid":"\([^"]*\)".*/\1/')
+printf '{"type":"system","subtype":"turn_preempted","preempted_by_uuid":"%s"}\n' "$uuid"
+printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming"}'
+started
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}'
+printf '%s\n' '{"type":"result"}'
+next_message
+"#,
+    );
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    let session = new_session(&mut child, &mut reader, 2, &project).await;
+    send_prompt(&mut child, 3, &session, "first").await;
+    let (answer, seen) = response(&mut reader, 3).await;
+    assert!(answer["result"].is_object(), "{answer}");
+    send_prompt(&mut child, 4, &session, "follow-up").await;
+    let (idle, updates) = finish(&mut reader, 4, seen).await;
+    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+    assert_eq!(idles(&updates).len(), 1, "{:?}", describe_updates(&updates));
+    assert!(
+        updates.iter().any(|v| shown_text(v) == Some("answer")),
+        "{updates:?}"
+    );
+    child.kill().await.unwrap();
+}
+
 #[tokio::test]
 async fn mcp_commands_are_absolute_paths() {
     let temp = tempfile::tempdir().unwrap();

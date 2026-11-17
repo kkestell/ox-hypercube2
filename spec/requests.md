@@ -25,8 +25,8 @@ The desktop uses appropriate controls for email, URL, date, and date-time fields
 
 ### Stop work
 
-1. Choose Stop while a session is Running, Awaiting permission, or Awaiting input, or cancel it from the command line.
-2. Ox asks the agent to interrupt the current turn and cancels pending permission requests. The turn ends when the agent reports it stopped.
+1. Choose Stop or press Escape while a session is Running, Awaiting permission, or Awaiting input, or cancel it from the command line. Escape that dismisses command suggestions, a menu, or a dialog does not stop the turn.
+2. Ox asks the agent to interrupt the current turn and cancels pending permission requests. The turn ends when the agent reports it stopped. Steered messages the agent has not taken in are discarded, and the session's [queue](conversations.md#queue-and-steer-while-the-agent-works) is held until a message is sent.
 3. A form withdrawn by the agent disappears and ends as cancelled. Until the agent withdraws it or a client answers it, a form remains pending.
 
 Stopping also applies to a turn the agent started without a user prompt. It is not deletion or archiving. For Claude-specific interruption and background-work behavior, see [the bridge](claude.md#work-and-interruption).

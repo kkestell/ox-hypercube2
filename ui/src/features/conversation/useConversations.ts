@@ -17,8 +17,8 @@ type Action =
 const empty: Conversation = { items: new Map(), list: [] };
 
 // Viewing a session starts it empty. Each batch of updates inserts or
-// replaces items by key, appends text chunks, or removes resolved requests,
-// in that session's conversation only. An item keeps the time its key first
+// replaces items by key, appends text chunks, or removes items by key, in
+// that session's conversation only. An item keeps the time its key first
 // appeared.
 function reduce(state: Map<string, Conversation>, action: Action): Map<string, Conversation> {
   const next = new Map(state);
@@ -34,8 +34,8 @@ function reduce(state: Map<string, Conversation>, action: Action): Map<string, C
   if (current === undefined) return state;
   const items = new Map(current.items);
   for (const update of action.updates) {
-    if (update.type === "request_resolved") {
-      items.delete(`request:${update.request_id}`);
+    if (update.type === "removed") {
+      items.delete(update.key);
       continue;
     }
     const existing = items.get(update.key);

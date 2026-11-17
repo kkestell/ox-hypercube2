@@ -57,8 +57,16 @@ pub enum Item {
         message: String,
         fields: Vec<Field>,
     },
-    RequestResolved {
-        request_id: String,
+    /// A prompt sent during a turn that the agent has not taken in yet.
+    Steered {
+        key: String,
+        text: String,
+        attachments: Vec<String>,
+    },
+    /// The item with `key` is gone: a resolved request, or a steered prompt
+    /// the agent took in or dropped.
+    Removed {
+        key: String,
     },
     /// A turn the agent ended on its own without an error.
     TurnCompleted {
@@ -189,10 +197,14 @@ struct UserMessage {
 /// The fold of a session's events, from its first.
 #[derive(Default)]
 pub struct Conversation {
-    /// Whether a turn that `prompt_started` opened is running.
-    in_turn: bool,
+    /// Whether the agent has started. Every user message after its start
+    /// echoes a prompt the session recorded; one before it is replayed.
+    started: bool,
     tool_calls: HashMap<ToolCallId, Call>,
     user_messages: HashMap<String, UserMessage>,
+    /// The text and attachments of each steered prompt the agent has not
+    /// taken in or dropped, by the seq of its event.
+    steered: HashMap<u64, UserMessage>,
 }
 
 impl Conversation {
@@ -211,20 +223,50 @@ impl Conversation {
     fn items(&mut self, event: &Event) -> Vec<Item> {
         let key = event.seq.to_string();
         match &event.kind {
-            EventKind::AgentStarted { .. } | EventKind::TurnStarted | EventKind::AgentParked => {
+            EventKind::AgentStarted { .. } => {
+                self.started = true;
                 Vec::new()
             }
+            EventKind::TurnStarted | EventKind::AgentParked => Vec::new(),
             EventKind::PromptStarted { prompt } => {
-                self.in_turn = true;
-                let mut text = Vec::new();
-                let mut attachments = Vec::new();
-                for block in prompt {
-                    add_content(block, &mut text, &mut attachments);
-                }
+                let prompt = prompt_message(prompt);
                 vec![Item::Prompt {
                     key,
-                    text: text.join("\n\n"),
-                    attachments,
+                    text: prompt.text,
+                    attachments: prompt.attachments,
+                }]
+            }
+            EventKind::PromptSteered { prompt } => {
+                let prompt = prompt_message(prompt);
+                let item = Item::Steered {
+                    key,
+                    text: prompt.text.clone(),
+                    attachments: prompt.attachments.clone(),
+                };
+                self.steered.insert(event.seq, prompt);
+                vec![item]
+            }
+            // A taken prompt moves to where the agent took it in.
+            EventKind::SteeredPromptTaken { prompt } => {
+                let removed = Item::Removed {
+                    key: prompt.to_string(),
+                };
+                match self.steered.remove(prompt) {
+                    Some(message) => vec![
+                        removed,
+                        Item::Prompt {
+                            key,
+                            text: message.text,
+                            attachments: message.attachments,
+                        },
+                    ],
+                    None => vec![removed],
+                }
+            }
+            EventKind::SteeredPromptDropped { prompt } => {
+                self.steered.remove(prompt);
+                vec![Item::Removed {
+                    key: prompt.to_string(),
                 }]
             }
             EventKind::Update(update) => self.update(update),
@@ -263,12 +305,11 @@ impl Conversation {
             }],
             EventKind::PermissionResolved { request_id, .. }
             | EventKind::ElicitationResolved { request_id, .. } => {
-                vec![Item::RequestResolved {
-                    request_id: request_id.clone(),
+                vec![Item::Removed {
+                    key: format!("request:{request_id}"),
                 }]
             }
             EventKind::TurnEnded { stop_reason, error } => {
-                self.in_turn = false;
                 let message = match (error, stop_reason) {
                     (Some(error), _) => error.clone(),
                     (None, Some(StopReason::Error(details))) => details
@@ -291,7 +332,6 @@ impl Conversation {
                 vec![Item::TurnError { key, message }]
             }
             EventKind::AgentExited { error } => {
-                self.in_turn = false;
                 vec![Item::AgentExited {
                     key,
                     error: error.clone(),
@@ -303,8 +343,8 @@ impl Conversation {
 
     fn update(&mut self, update: &SessionUpdate) -> Vec<Item> {
         match update {
-            // The prompt that opened the turn is its item already.
-            SessionUpdate::UserMessageChunk(_) | SessionUpdate::UserMessage(_) if self.in_turn => {
+            // The prompt the message echoes is its item already.
+            SessionUpdate::UserMessageChunk(_) | SessionUpdate::UserMessage(_) if self.started => {
                 Vec::new()
             }
             SessionUpdate::UserMessageChunk(chunk) => {
@@ -417,6 +457,19 @@ fn texts(content: &[ContentBlock]) -> String {
         .collect()
 }
 
+/// A prompt's text blocks, joined, and the names of its attachments.
+fn prompt_message(prompt: &[ContentBlock]) -> UserMessage {
+    let mut text = Vec::new();
+    let mut attachments = Vec::new();
+    for block in prompt {
+        add_content(block, &mut text, &mut attachments);
+    }
+    UserMessage {
+        text: text.join("\n\n"),
+        attachments,
+    }
+}
+
 fn user_item(id: &MessageId, message: &UserMessage) -> Item {
     Item::Prompt {
         key: format!("user:{id}"),
@@ -450,6 +503,7 @@ impl Item {
     fn key(&self) -> Option<&str> {
         match self {
             Self::Prompt { key, .. }
+            | Self::Steered { key, .. }
             | Self::Text { key, .. }
             | Self::Thought { key, .. }
             | Self::ToolCall { key, .. }
@@ -459,7 +513,7 @@ impl Item {
             | Self::TurnError { key, .. }
             | Self::AgentExited { key, .. }
             | Self::SessionClosed { key } => Some(key),
-            Self::RequestResolved { .. } => None,
+            Self::Removed { .. } => None,
         }
     }
 }
@@ -472,8 +526,8 @@ pub fn coalesce(updates: impl IntoIterator<Item = ConversationUpdate>) -> Vec<Co
     let mut merged: Vec<ConversationUpdate> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
     for update in updates {
-        if let Item::RequestResolved { request_id } = &update.item {
-            positions.remove(&format!("request:{request_id}"));
+        if let Item::Removed { key } = &update.item {
+            positions.remove(key);
         }
         let Some(&position) = update.item.key().and_then(|key| positions.get(key)) else {
             if let Some(key) = update.item.key() {
@@ -757,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn user_messages_are_prompts_only_outside_a_turn() {
+    fn user_messages_are_prompts_only_before_the_agent_starts() {
         let whole = |id: &str, content: &str| {
             let mut message = UserMessageUpdate::new(id);
             message.content = MaybeUndefined::Value(vec![text(content)]);
@@ -768,10 +822,13 @@ mod tests {
             user("u1", "prompt"),
             whole("u2", "whole"),
             agent("m", "answer"),
+            agent_started(),
             prompt("live"),
             user("u3", "live"),
             whole("u3", "live"),
             turn_ended(),
+            // A steered prompt the agent runs as a turn of its own.
+            whole("u4", "steered"),
         ]);
         let replayed = |id: &str, text: &str| Item::Prompt {
             key: format!("user:{id}"),
@@ -786,13 +843,69 @@ mod tests {
                 replayed("u2", "whole"),
                 item_text("text:m", "answer", false),
                 Item::Prompt {
-                    key: "5".into(),
+                    key: "6".into(),
                     text: "live".into(),
                     attachments: vec!["a.rs".into()],
                 },
-                Item::TurnCompleted { key: "8".into() },
+                Item::TurnCompleted { key: "9".into() },
             ]
         );
+    }
+
+    fn agent_started() -> EventKind {
+        EventKind::AgentStarted {
+            agent_session_id: "a".into(),
+            prompt_capabilities: ox_protocol::schema::PromptCapabilities::default(),
+            config_options: Vec::new(),
+            available_commands: Vec::new(),
+        }
+    }
+
+    fn steered(prompt: &str) -> EventKind {
+        EventKind::PromptSteered {
+            prompt: vec![
+                text(prompt),
+                ContentBlock::ResourceLink(ResourceLink::new("a.rs", "file:///a.rs")),
+            ],
+        }
+    }
+
+    #[test]
+    fn a_steered_prompt_moves_to_where_the_agent_took_it_in() {
+        let items = fold(vec![
+            prompt("first"),
+            steered("also"),
+            agent("m", "working"),
+            EventKind::SteeredPromptTaken { prompt: 2 },
+        ]);
+        assert_eq!(
+            items[1..],
+            [
+                Item::Steered {
+                    key: "2".into(),
+                    text: "also".into(),
+                    attachments: vec!["a.rs".into()],
+                },
+                item_text("text:m", "working", false),
+                Item::Removed { key: "2".into() },
+                Item::Prompt {
+                    key: "4".into(),
+                    text: "also".into(),
+                    attachments: vec!["a.rs".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dropped_steered_prompt_is_removed() {
+        let items = fold(vec![
+            prompt("first"),
+            steered("also"),
+            EventKind::SteeredPromptDropped { prompt: 2 },
+        ]);
+        assert_eq!(items[2], Item::Removed { key: "2".into() });
+        assert_eq!(items.len(), 3);
     }
 
     #[test]
@@ -900,9 +1013,9 @@ mod tests {
             [
                 Item::Permission { request_id: first, .. },
                 Item::Permission { request_id: second, .. },
-                Item::RequestResolved { request_id: resolved_second },
-                Item::RequestResolved { request_id: resolved_first },
-            ] if first == "1" && second == "2" && second == resolved_second && first == resolved_first
+                Item::Removed { key: resolved_second },
+                Item::Removed { key: resolved_first },
+            ] if first == "1" && second == "2" && resolved_second == "request:2" && resolved_first == "request:1"
         ));
     }
 
@@ -969,8 +1082,8 @@ mod tests {
             items,
             [
                 item,
-                json!({"type": "request_resolved", "request_id": "2"}),
-                json!({"type": "request_resolved", "request_id": "1"}),
+                json!({"type": "removed", "key": "request:2"}),
+                json!({"type": "removed", "key": "request:1"}),
             ]
         );
     }
@@ -1064,8 +1177,8 @@ mod tests {
             title: "Allow?".into(),
             options: Vec::new(),
         };
-        let resolved = |request_id: &str| Item::RequestResolved {
-            request_id: request_id.into(),
+        let resolved = |request_id: &str| Item::Removed {
+            key: format!("request:{request_id}"),
         };
         let cases = [
             (
@@ -1103,6 +1216,19 @@ mod tests {
                 "a resolved request stays between its request and a later one",
                 vec![permission("1"), resolved("1"), permission("1")],
                 vec![permission("1"), resolved("1"), permission("1")],
+            ),
+            (
+                "a removed item is not merged into",
+                vec![
+                    item_text("a", "x", false),
+                    Item::Removed { key: "a".into() },
+                    item_text("a", "y", false),
+                ],
+                vec![
+                    item_text("a", "x", false),
+                    Item::Removed { key: "a".into() },
+                    item_text("a", "y", false),
+                ],
             ),
         ];
         for (name, items, expected) in cases {

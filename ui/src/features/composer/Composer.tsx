@@ -1,19 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
-import { memo } from "react";
+import { memo, useEffect, useRef } from "react";
 import { HarnessLogo, sessionAgent } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
-import type { ConfigOption, Request, RunInfo, SessionInfo } from "../../lib/protocol";
+import type { ConfigOption, QueuedPrompt, Request, RunInfo, SessionInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { CommandInput } from "./CommandInput";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { OpenRequest } from "./OpenRequest";
+import { QueuedPrompts, queuedMessage } from "./QueuedPrompts";
 import type { Drafts } from "./useDrafts";
 
 /**
- * A session's composer. While the run a child session belongs to is running,
- * the entry and attachments are disabled and Stop cancels the run.
+ * A session's composer. On an idle session, Enter and Cmd+Enter send the
+ * message. While the agent works, Enter queues it and Cmd+Enter steers the
+ * running turn with it; the form's button sends a message that has content
+ * and stops the turn otherwise, and Escape stops the turn. While a queued
+ * prompt is edited, Enter saves it in its place and brings back the draft it
+ * replaced. While the run a child session belongs to is running, the entry
+ * and attachments are disabled and Stop and Escape cancel the run.
  */
 export const Composer = memo(function Composer({
   session,
@@ -30,15 +36,20 @@ export const Composer = memo(function Composer({
 }) {
   const draft = drafts.get(session.id);
   const { text, attachments } = draft;
+  // An edit of a prompt that has left the queue is sent as a new message.
+  const editing = session.queue.some(({ id }) => id === draft.editing?.promptId)
+    ? draft.editing
+    : undefined;
 
   const running =
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
   const runRunning = parent?.state === "running";
-  const canSend =
-    session.state === "idle" && !runRunning && (text.trim() !== "" || attachments.length > 0);
+  const hasContent = text.trim() !== "" || attachments.length > 0;
+  const canSend = (session.state === "idle" || running) && !runRunning && hasContent;
   const disabled = session.state === "exited" || runRunning;
+  const showStop = (running || runRunning) && !hasContent;
 
   /** Runs `action`, shows its error if it fails, and resolves to whether it succeeded. */
   const run = async (action: () => Promise<unknown>) => {
@@ -51,10 +62,16 @@ export const Composer = memo(function Composer({
     }
   };
 
-  const send = () =>
+  /** Saves an edit, sends the message now when `steer` is set or the agent is idle, or queues it. */
+  const send = (steer: boolean) =>
     run(async () => {
-      await invoke("prompt", { sessionId: session.id, text: text.trim(), attachments });
-      drafts.update(session.id, (current) => (current === draft ? undefined : current));
+      const message = { sessionId: session.id, text: text.trim(), attachments };
+      if (editing) await invoke("queue_edit", { ...message, promptId: editing.promptId });
+      else if (steer || !running) await invoke("prompt", message);
+      else await invoke("queue_add", message);
+      drafts.update(session.id, (current) =>
+        current === draft ? (draft.editing?.held ?? undefined) : current,
+      );
     });
 
   const stop = () =>
@@ -63,6 +80,34 @@ export const Composer = memo(function Composer({
         ? invoke("cancel_run", { runId: parent.id })
         : invoke("cancel", { sessionId: session.id }),
     );
+
+  // Escape stops the work, unless something else handled it first or it
+  // closes an open popover, such as the model menu, or a dialog.
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
+  useEffect(() => {
+    if (!running && !runRunning) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        !event.defaultPrevented &&
+        !document.querySelector(":popover-open, dialog[open]")
+      ) {
+        stopRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [running, runRunning]);
+
+  const edit = (queued: QueuedPrompt) =>
+    drafts.update(session.id, (current) => ({
+      ...queuedMessage(queued.prompt),
+      editing: {
+        promptId: queued.id,
+        held: current.editing?.held ?? { text: current.text, attachments: current.attachments },
+      },
+    }));
 
   const setOption = (option: ConfigOption, value: string | boolean) =>
     run(() =>
@@ -92,13 +137,14 @@ export const Composer = memo(function Composer({
     <div className="composer">
       <div className="stack">
         {request && <OpenRequest key={request.request_id} item={request} sessionId={session.id} />}
+        <QueuedPrompts sessionId={session.id} queue={session.queue} onEdit={edit} />
         <div className="entry">
           <form
             className="box"
             onSubmit={(event) => {
               event.preventDefault();
-              if (running) stop();
-              else if (canSend) send();
+              if (showStop) stop();
+              else if (canSend) send(false);
             }}
           >
             {attachments.length > 0 && (
@@ -145,11 +191,11 @@ export const Composer = memo(function Composer({
               <button
                 type="submit"
                 className="icon-button"
-                title={running ? "Stop" : "Send"}
-                aria-label={running ? "Stop" : "Send"}
-                disabled={!running && !canSend}
+                title={showStop ? "Stop" : "Send"}
+                aria-label={showStop ? "Stop" : "Send"}
+                disabled={!showStop && !canSend}
               >
-                {running ? <Square /> : <ArrowUp />}
+                {showStop ? <Square /> : <ArrowUp />}
               </button>
             </div>
           </form>

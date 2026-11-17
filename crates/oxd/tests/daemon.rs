@@ -231,6 +231,9 @@ fn update_names(events: &[Event]) -> Vec<&'static str> {
         .iter()
         .map(|event| match &event.kind {
             EventKind::PromptStarted { .. } => "prompt_started",
+            EventKind::PromptSteered { .. } => "prompt_steered",
+            EventKind::SteeredPromptTaken { .. } => "steered_prompt_taken",
+            EventKind::SteeredPromptDropped { .. } => "steered_prompt_dropped",
             EventKind::TurnStarted => "turn_started",
             EventKind::TurnEnded { .. } => "turn_ended",
             EventKind::Update(SessionUpdate::UserMessage(_)) => "user_message",
@@ -268,6 +271,238 @@ fn remote_code(error: Error) -> i32 {
         Error::Remote(body) => body.code,
         other => panic!("expected a daemon error, got {other}"),
     }
+}
+
+fn running(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Update(SessionUpdate::StateUpdate(StateUpdate::Running(_)))
+    )
+}
+
+/// The prompt of a `prompt_started` event.
+fn started_prompt(event: &Event) -> &[ContentBlock] {
+    match &event.kind {
+        EventKind::PromptStarted { prompt } => prompt,
+        other => panic!("expected prompt_started, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prompt_sent_during_a_turn_is_taken_into_it() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client.prompt(&session.id, text("take")).await.unwrap();
+    until(&mut events, running).await;
+    client.prompt(&session.id, text("also")).await.unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(
+        update_names(&turn),
+        [
+            "prompt_steered",
+            "user_message",
+            "steered_prompt_taken",
+            "idle",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(
+        turn[0].kind,
+        EventKind::PromptSteered {
+            prompt: text("also")
+        }
+    );
+    assert_eq!(
+        turn[2].kind,
+        EventKind::SteeredPromptTaken {
+            prompt: turn[0].seq
+        }
+    );
+    assert_eq!(
+        turn[4].kind,
+        EventKind::TurnEnded {
+            stop_reason: Some(StopReason::EndTurn),
+            error: None
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_prompts_are_sent_when_turns_end_with_no_client_connected() {
+    let daemon = Daemon::start().await;
+    let gate = tempfile::tempdir().unwrap();
+    mkfifos(gate.path());
+    let gated = format!(
+        "shell {}",
+        json!(format!(
+            "echo blocked > '{0}/blocked'; read _ < '{0}/release'",
+            gate.path().display()
+        ))
+    );
+    let client = daemon.client().await;
+    let (session, _) = daemon.new_session(&client).await;
+    client.prompt(&session.id, text(&gated)).await.unwrap();
+    let first = client
+        .queue_add(&session.id, text("text \"first\""))
+        .await
+        .unwrap();
+    client
+        .queue_add(&session.id, text("text \"second\""))
+        .await
+        .unwrap();
+    let queued = info(&client, &session.id).await.unwrap().queue;
+    assert_eq!(queued.len(), 2);
+    assert_eq!(queued[0].id, first);
+    blocked(gate.path()).await;
+    drop(client);
+
+    release(gate.path()).await;
+    let client = daemon.client().await;
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    let mut prompts = Vec::new();
+    while prompts.len() < 3 {
+        let event = next(&mut events).await;
+        if matches!(event.kind, EventKind::PromptStarted { .. }) {
+            prompts.push(started_prompt(&event).to_vec());
+        }
+    }
+    assert_eq!(
+        prompts[1..],
+        [text("text \"first\""), text("text \"second\"")]
+    );
+    let rest = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&rest), ["second"]);
+    assert!(info(&client, &session.id).await.unwrap().queue.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_holds_the_queue_and_drops_a_prompt_the_agent_has_not_taken() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client.prompt(&session.id, text("wait")).await.unwrap();
+    until(&mut events, running).await;
+    client.prompt(&session.id, text("pid")).await.unwrap();
+    client
+        .queue_add(&session.id, text("text \"queued\""))
+        .await
+        .unwrap();
+    client.cancel(&session.id).await.unwrap();
+    let rest = until(&mut events, turn_ended).await;
+    assert_eq!(
+        update_names(&rest),
+        [
+            "prompt_steered",
+            "steered_prompt_dropped",
+            "idle",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(
+        rest[1].kind,
+        EventKind::SteeredPromptDropped {
+            prompt: rest[0].seq
+        }
+    );
+
+    // The queue waits for a prompt, and its first prompt follows that turn.
+    assert_eq!(info(&client, &session.id).await.unwrap().queue.len(), 1);
+    client
+        .prompt(&session.id, text("text \"sent\""))
+        .await
+        .unwrap();
+    let sent = until(&mut events, turn_ended).await;
+    assert_eq!(started_prompt(&sent[0]), text("text \"sent\""));
+    let queued = until(&mut events, turn_ended).await;
+    assert_eq!(started_prompt(&queued[0]), text("text \"queued\""));
+    assert_eq!(chunks(&queued), ["queued"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_queue_survives_a_restart() {
+    let mut first = Daemon::start().await;
+    let client = first.client().await;
+    let (session, started) = first.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client.prompt(&session.id, text("wait")).await.unwrap();
+    until(&mut events, running).await;
+    let id = client
+        .queue_add(&session.id, text("text \"queued\""))
+        .await
+        .unwrap();
+    client.cancel(&session.id).await.unwrap();
+    until(&mut events, turn_ended).await;
+    let queue = info(&client, &session.id).await.unwrap().queue;
+    drop(events);
+    drop(client);
+    first.stop().await;
+
+    let second = first.again(Options::default()).await;
+    let client = second.client().await;
+    assert_eq!(info(&client, &session.id).await.unwrap().queue, queue);
+    client
+        .load_session(&session.id, BTreeMap::new())
+        .await
+        .unwrap();
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    until(&mut events, agent_started).await;
+    let loaded = until(&mut events, agent_started).await;
+    let after = loaded.last().unwrap().seq;
+    // Still held after the agent started: sending it now starts its turn.
+    assert_eq!(info(&client, &session.id).await.unwrap().queue, queue);
+    client.queue_send(&session.id, &id).await.unwrap();
+    let turn = until_turn_ended(&client, &session.id, after).await;
+    assert_eq!(started_prompt(&turn[0]), text("text \"queued\""));
+    assert!(info(&client, &session.id).await.unwrap().queue.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_prompts_are_edited_and_removed_until_they_are_sent() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, started) = daemon.new_session(&client).await;
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client.prompt(&session.id, text("wait")).await.unwrap();
+    until(&mut events, running).await;
+    let kept = client.queue_add(&session.id, text("a")).await.unwrap();
+    let removed = client.queue_add(&session.id, text("b")).await.unwrap();
+    client
+        .queue_edit(&session.id, &kept, text("text \"edited\""))
+        .await
+        .unwrap();
+    client.queue_remove(&session.id, &removed).await.unwrap();
+    let queue = info(&client, &session.id).await.unwrap().queue;
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].id, kept);
+    assert_eq!(queue[0].prompt, text("text \"edited\""));
+    let gone = client
+        .queue_remove(&session.id, &removed)
+        .await
+        .unwrap_err();
+    assert_eq!(remote_code(gone), code::NOT_FOUND);
+
+    // Sending it now steers the running turn.
+    client.queue_send(&session.id, &kept).await.unwrap();
+    let steered = until(&mut events, |kind| {
+        matches!(kind, EventKind::PromptSteered { .. })
+    })
+    .await;
+    assert_eq!(
+        steered.last().unwrap().kind,
+        EventKind::PromptSteered {
+            prompt: text("text \"edited\"")
+        }
+    );
+    let edit = client
+        .queue_edit(&session.id, &kept, text("late"))
+        .await
+        .unwrap_err();
+    assert_eq!(remote_code(edit), code::NOT_FOUND);
+    client.cancel(&session.id).await.unwrap();
+    until(&mut events, turn_ended).await;
 }
 
 /// A client that reconnects during a turn receives the rest of it after the
@@ -957,9 +1192,6 @@ async fn a_turn_the_agent_starts_runs_until_the_agent_is_idle() {
         info(&client, &session.id).await.unwrap().state,
         SessionState::Running
     );
-    let refused = client.prompt(&session.id, text("pid")).await.unwrap_err();
-    assert_eq!(remote_code(refused), code::INVALID_STATE);
-
     client.cancel(&session.id).await.unwrap();
     let rest = until(&mut events, turn_ended).await;
     assert_eq!(update_names(&rest), ["idle", "turn_ended"], "{rest:?}");
@@ -1967,9 +2199,6 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
         info(&client, &session.id).await.unwrap().state,
         SessionState::Running
     );
-    let refused = client.prompt(&session.id, text("pid")).await.unwrap_err();
-    assert_eq!(remote_code(refused), code::INVALID_STATE);
-
     client.cancel(&session.id).await.unwrap();
     let rest = until(&mut events, |kind| {
         matches!(

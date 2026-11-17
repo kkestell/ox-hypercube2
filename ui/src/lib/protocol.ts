@@ -103,7 +103,21 @@ export interface SessionInfo {
   created_at: number;
   /** How the session's turns ended while it was out of focus, until it is focused. */
   unseen: Unseen | null;
+  /** The prompts waiting to start a turn each, in order. */
+  queue: QueuedPrompt[];
 }
+
+/** A prompt in a session's queue. */
+export interface QueuedPrompt {
+  id: string;
+  prompt: ContentBlock[];
+}
+
+/** The ACP content blocks of a prompt that the UI reads. */
+export type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "resource_link"; name: string; uri: string }
+  | { type: string };
 
 /** How a session's turn or a run ended while no client had it in focus. */
 export type Unseen = "finished" | "error";
@@ -213,6 +227,8 @@ export type ToolContent =
  */
 export type Item = { recorded_at: number } & (
   | { type: "prompt"; key: string; text: string; attachments: string[] }
+  /** A prompt sent during a turn that the agent has not taken in yet. */
+  | { type: "steered"; key: string; text: string; attachments: string[] }
   | { type: "text"; key: string; text: string; replace: boolean }
   | { type: "thought"; key: string; text: string; replace: boolean }
   | {
@@ -251,9 +267,8 @@ export function isRequest(item: Item): item is Request {
   return item.type === "permission" || item.type === "elicitation";
 }
 
-export type ConversationUpdate =
-  | Item
-  | { type: "request_resolved"; recorded_at: number; request_id: string };
+/** An item to insert or update by key, or the removal of the item with a key. */
+export type ConversationUpdate = Item | { type: "removed"; recorded_at: number; key: string };
 
 /**
  * A change to the listing: a workspace, worktree, session or run added or

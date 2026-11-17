@@ -6,13 +6,23 @@ Users send prompts to a session, follow the agent's streaming responses, and ins
 
 ### Compose and send
 
-1. Enter a message. Enter sends it; Shift+Enter inserts a newline. Text composition is not submitted while an input method is composing characters.
+1. Enter a message. Enter or Cmd+Enter sends it; Shift+Enter inserts a newline. Text composition is not submitted while an input method is composing characters.
 2. Choose Attach Files to select one or more local files. Selected names appear above the message; hover for the full path, or remove an attachment before sending. Selecting the same path again does not duplicate it in the draft.
-3. Send is enabled only while the session is Idle and the draft has non-whitespace text or at least one attachment. Leading and trailing whitespace is removed from submitted message text.
+3. Send is enabled while the session is Idle, Running, Awaiting permission, or Awaiting input and the draft has non-whitespace text or at least one attachment. Leading and trailing whitespace is removed from submitted message text.
 4. A successful submission clears the draft and attachment list. A failed submission shows its error and leaves them available to correct or retry.
 5. The prompt appears in the conversation with attachment labels, and the session becomes Running. Sending accepts the prompt for processing; it does not wait for the agent's completed reply.
 
-The message editor and attachment button are disabled for an Exited session. During a turn the user can compose a draft but cannot send another prompt. The send button becomes Stop; see [stopping work](requests.md#stop-work).
+The message editor and attachment button are disabled for an Exited session. While the agent works, the form's button is Send when the draft has content and Stop when it is empty; see [stopping work](requests.md#stop-work).
+
+### Queue and steer while the agent works
+
+1. While the session is Running, Awaiting permission, or Awaiting input, Enter queues the message and Cmd+Enter steers the running turn with it.
+2. Queued messages are listed directly above the message editor, in order, each with its text and attachment names. Hovering a message shows Edit, Send Now, and Delete.
+3. Edit loads the message into the editor and sets the current draft aside. Enter saves the edit in the message's place in the queue and brings the set-aside draft back. If the message was sent before the edit is saved, Enter queues the edited text as a new message. A save that fails shows its error and keeps the edit.
+4. Send Now takes the message out of the queue and sends it at once: it steers a running turn, or starts a turn on an Idle session. Delete removes it.
+5. Each time a turn ends normally, the first queued message starts the next turn, one message per turn, whether or not the app is open.
+6. After Stop, or a turn that ends with an error, a token or request limit, or a refusal, the queue stays listed but nothing is sent from it. Sending a message or using Send Now resumes it.
+7. A steered message appears at once at the end of the conversation, dimmed, until the agent takes it in; it then moves to where it landed. It cannot be edited or deleted. A steered message the agent has not taken in when the turn ends starts the next turn, ahead of the queue. Stop discards a steered message the agent has not taken in.
 
 Desktop attachments, including images and PDFs, give the agent references to local files it can open; their contents are not embedded in the prompt. The referenced paths must still exist when sending, or submission fails. The conversation shows attachment labels rather than previews of the attached files.
 

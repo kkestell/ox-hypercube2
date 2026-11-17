@@ -67,8 +67,12 @@ next_prompt() {
 accept() {
   answer prompt ",\"data\":{\"disposition\":\"${1:-started}\"}"
 }
-# Reads an abort and answers it.
+# Reads the clear_queue and the abort a cancel sends, in that order, and
+# answers them.
 aborted() {
+  next_command
+  expect clear_queue
+  answer clear_queue ',"data":{"steering":[],"followUp":[]}'
   next_command
   expect abort
   answer abort
@@ -391,7 +395,7 @@ settled
     let prompts = lines(&project, "prompts", 1);
     let sent: Value = serde_json::from_str(&prompts[0]).unwrap();
     assert_eq!(sent["message"], "hello");
-    assert_eq!(sent["streamingBehavior"], "followUp");
+    assert_eq!(sent["streamingBehavior"], "steer");
     child.kill().await.unwrap();
 }
 
@@ -583,6 +587,163 @@ settled true
         .unwrap();
     let (idle, _) = finish(&mut reader, 3, Vec::new()).await;
     assert_eq!(idle["stopReason"], "cancelled", "{idle}");
+    child.kill().await.unwrap();
+}
+
+fn steer_request(id: i64, session: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"steer"}]}})
+}
+
+/// Starts prompt 3, then sends prompt 4 once Pi works on it. Returns what
+/// was read until the update the fake emits after it queues prompt 4, which
+/// does not answer prompt 4.
+async fn steer(
+    child: &mut Child,
+    reader: &mut BufReader<ChildStdout>,
+    session: &Value,
+) -> Vec<Value> {
+    send(child, prompt_request(3, session)).await;
+    let mut seen = Vec::new();
+    while update(seen.last().unwrap_or(&Value::Null))["content"]["text"] != "working" {
+        seen.push(receive(reader).await);
+    }
+    send(child, steer_request(4, session)).await;
+    while update(seen.last().unwrap())["content"]["text"] != "queued" {
+        seen.push(receive(reader).await);
+    }
+    assert!(!seen.iter().any(|value| value["id"] == 4), "{seen:?}");
+    seen
+}
+
+/// The fake's run of prompt 3, up to queueing prompt 4.
+const STEERED_RUN: &str = r#"
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}'
+emit '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}'
+emit '{"type":"message_start","message":{"role":"assistant","content":[]}}'
+emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"working"}}'
+next_prompt
+accept queued
+emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"queued"}}'
+"#;
+
+#[tokio::test]
+async fn a_steering_prompt_is_answered_when_pi_takes_it_in() {
+    let (_temp, project, mut child, mut reader, session) = session(&format!(
+        r#"{STEERED_RUN}
+emit '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"workingqueued"}}],"stopReason":"stop"}}}}'
+emit '{{"type":"message_start","message":{{"role":"user","content":[{{"type":"text","text":"steer"}}]}}}}'
+emit '{{"type":"message_end","message":{{"role":"user","content":[{{"type":"text","text":"steer"}}]}}}}'
+assistant '[{{"type":"text","text":"steered"}}]'
+settled
+"#
+    ))
+    .await;
+    let mut seen = steer(&mut child, &mut reader, &session).await;
+    let (answer, more) = response(&mut reader, 4).await;
+    let echo = receive(&mut reader).await;
+    assert_eq!(kind(&echo), "user_message", "{echo}");
+    assert_eq!(
+        update(&echo)["messageId"],
+        answer["result"]["messageId"],
+        "{echo}"
+    );
+    assert_eq!(update(&echo)["content"][0]["text"], "steer", "{echo}");
+    seen.extend(more);
+    seen.extend([answer, echo]);
+    let (idle, updates) = finish(&mut reader, 3, seen).await;
+    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
+    let user_messages = updates
+        .iter()
+        .filter(|value| kind(value) == "user_message")
+        .count();
+    assert_eq!(user_messages, 2, "{updates:?}");
+    let prompts = lines(&project, "prompts", 2);
+    let sent: Value = serde_json::from_str(&prompts[1]).unwrap();
+    assert_eq!(sent["message"], "steer");
+    assert_eq!(sent["streamingBehavior"], "steer");
+    child.kill().await.unwrap();
+}
+
+/// Pi starts a run before it answers the prompt that starts it, so it can
+/// queue a steer first. The user message of the started prompt still comes
+/// first, and does not answer the steer.
+#[tokio::test]
+async fn a_steer_queued_before_its_run_is_answered_waits_for_its_own_message() {
+    let (_temp, _project, mut child, mut reader, session) = session(
+        r#"
+next_prompt
+started=$command
+next_prompt
+accept queued
+command=$started
+accept
+emit '{"type":"agent_start"}'
+emit '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}'
+assistant '[{"type":"text","text":"first"}]'
+emit '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"steer"}]}}'
+assistant '[{"type":"text","text":"second"}]'
+settled
+"#,
+    )
+    .await;
+    send(&mut child, prompt_request(3, &session)).await;
+    send(&mut child, steer_request(4, &session)).await;
+    let (answer, seen) = response(&mut reader, 4).await;
+    assert!(answer["result"]["messageId"].is_string(), "{answer}");
+    assert!(
+        seen.iter()
+            .any(|value| update(value)["content"][0]["text"] == "first"),
+        "{seen:?}"
+    );
+    finish(&mut reader, 3, seen).await;
+    child.kill().await.unwrap();
+}
+
+/// Pi's abort goes on to deliver the steering queue, so cancel clears it
+/// first; the fake's `aborted` expects the two in that order.
+#[tokio::test]
+async fn cancel_clears_the_steering_queue_and_fails_its_prompts() {
+    let (_temp, _project, mut child, mut reader, session) = session(&format!(
+        r#"{STEERED_RUN}
+aborted
+emit '{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"text","text":"workingqueued"}}],"stopReason":"aborted"}}}}'
+settled true
+"#
+    ))
+    .await;
+    let mut seen = steer(&mut child, &mut reader, &session).await;
+    send(&mut child, cancel_notification(&session)).await;
+    let (answer, more) = response(&mut reader, 4).await;
+    assert_eq!(answer["error"]["code"], -32800, "{answer}");
+    seen.extend(more);
+    let (idle, updates) = finish(&mut reader, 3, seen).await;
+    assert_eq!(idle["stopReason"], "cancelled", "{idle}");
+    assert!(
+        !updates
+            .iter()
+            .any(|value| update(value)["content"][0]["text"] == "steer"),
+        "{updates:?}"
+    );
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pi_that_exits_fails_its_steering_prompts() {
+    let (_temp, _project, mut child, mut reader, session) = session(&format!(
+        "{STEERED_RUN}
+echo 'model crashed' >&2
+exit 3
+"
+    ))
+    .await;
+    steer(&mut child, &mut reader, &session).await;
+    let (answer, _) = response(&mut reader, 4).await;
+    assert_eq!(answer["error"]["code"], -32603, "{answer}");
+    let error = answer["error"]["message"].as_str().unwrap();
+    assert!(error.contains("model crashed"), "{error}");
     child.kill().await.unwrap();
 }
 

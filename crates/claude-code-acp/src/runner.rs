@@ -220,6 +220,7 @@ impl Claude {
             text_id: None,
             thought_id: None,
             unclaimed_error: None,
+            preempted: false,
         };
         tokio::spawn(output.read(child));
         let _ = input.send(json!({
@@ -249,10 +250,12 @@ impl Claude {
 
     /// Sends a prompt. Once claude takes it into a turn, which inserts it
     /// into the conversation, the session gets it as the user message
-    /// `message_id` and `responder` answers with that ID. Messages reach
-    /// claude in the order they are sent, so an interrupt sent after this
-    /// call stops this prompt's turn or drops the prompt. If claude has
-    /// exited, the responder comes back.
+    /// `message_id` and `responder` answers with that ID. A prompt sent
+    /// during a turn steers it: claude takes it in at the turn's next
+    /// opportunity, or runs it as its own turn if the turn ends first.
+    /// Messages reach claude in the order they are sent, so an interrupt
+    /// sent after this call stops this prompt's turn or drops the prompt. If
+    /// claude has exited, the responder comes back.
     pub fn prompt(
         &self,
         message_id: &str,
@@ -276,7 +279,9 @@ impl Claude {
             "uuid": message_id,
             "session_id": "",
             "message": {"role": "user", "content": content},
-            "parent_tool_use_id": null
+            "parent_tool_use_id": null,
+            // Claude's default priority depends on its feature flags.
+            "priority": "next"
         }));
         Ok(())
     }
@@ -343,6 +348,9 @@ struct Output {
     /// is why the prompt fails if claude exits, as when claude cannot resume
     /// the conversation.
     unclaimed_error: Option<String>,
+    /// A prompt preempted the running turn, so the turn's result continues
+    /// the work with that prompt's turn rather than ending it.
+    preempted: bool,
 }
 
 impl Output {
@@ -538,6 +546,10 @@ impl Output {
                         .collect();
                     self.updates.background_tasks(tasks);
                 }
+                // Claude stops a turn that has shown no output when a prompt
+                // arrives, and runs the prompt's turn after the stopped
+                // turn's result.
+                Some("turn_preempted") => self.preempted = true,
                 _ => {}
             },
             Some("result") => self.result(&value),
@@ -613,6 +625,10 @@ impl Output {
 
     /// Ends a turn. An interrupt also drops the prompts claude had not taken.
     fn result(&mut self, result: &Value) {
+        if std::mem::take(&mut self.preempted) {
+            self.continued();
+            return;
+        }
         let aborted = result["terminal_reason"]
             .as_str()
             .is_some_and(|reason| reason.starts_with("aborted"));
@@ -658,6 +674,18 @@ impl Output {
             return;
         }
         self.updates.idle(stop_reason(&outcome));
+    }
+
+    /// Ends a turn that a prompt preempted. The work goes on with the
+    /// prompt's turn, so the prompts claude has not taken stay and the
+    /// client sees no end; what the stopped turn left open fails.
+    fn continued(&mut self) {
+        for (_, permission) in self.state.lock().unwrap().permissions.drain() {
+            permission.abort();
+        }
+        self.updates.fail_open_tools();
+        self.text_id = None;
+        self.thought_id = None;
     }
 }
 

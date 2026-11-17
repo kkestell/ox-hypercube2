@@ -228,18 +228,50 @@
   opacity: var(--dimmed-opacity);
 }
 
-/* A request rises from behind the composer's box, inset from its sides, its
-   lower edge hidden under the box. Its border has the colour of the dot of a
-   session awaiting the user. */
-.request-panel {
-  max-height: var(--request-panel-max-height);
+/* A request and the queued messages rise from behind the composer's box,
+   inset from its sides, their lower edges hidden under what follows them. */
+.request-panel,
+.composer .queue {
   margin: 0 var(--composer-padding) calc(var(--radius-2xl) * -1);
-  padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4)
-    calc(var(--spacing) * 4 + var(--radius-2xl));
-  border: var(--border-width) solid var(--warning);
+  border: var(--border-width) solid var(--border);
   border-radius: var(--radius-2xl) var(--radius-2xl) 0 0;
   background: var(--card);
   color: var(--foreground);
+}
+
+/* A request's border has the colour of the dot of a session awaiting the
+   user. */
+.request-panel {
+  max-height: var(--request-panel-max-height);
+  padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4)
+    calc(var(--spacing) * 4 + var(--radius-2xl));
+  border-color: var(--warning);
+}
+
+/* Each queued message is one line, its actions shown while it is hovered or
+   has keyboard focus. */
+.composer .queue {
+  padding: var(--spacing) var(--spacing) calc(var(--spacing) + var(--radius-2xl))
+    calc(var(--spacing) * 3);
+  list-style: none;
+}
+
+.composer .queue li {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing);
+}
+
+.composer .queue .text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer .queue li:not(:hover, :focus-within) .icon-button {
+  visibility: hidden;
 }
 
 .request-panel,

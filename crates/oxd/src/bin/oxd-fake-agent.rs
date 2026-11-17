@@ -5,6 +5,13 @@
 //! then runs the script as a turn: `running`, the directives' output, and
 //! `idle` with a stop reason.
 //!
+//! A prompt that arrives while a prompt's turn runs is held, not run as a
+//! script. `take` inserts held prompts into the turn. Prompts still held
+//! when the turn ends are inserted in a turn of the agent's own after it:
+//! `running`, each prompt's echo and answer, and `idle` with `end_turn`.
+//! A cancelled turn answers its held prompts with `request_cancelled`
+//! before its `idle`.
+//!
 //! - `say <n> <delay_ms>`: n `agent_message_chunk` updates `chunk-1..n` of
 //!   one message, spaced by the delay
 //! - `stream <n> <delay_ms> <JSON string>`: n chunks of the turn's message,
@@ -44,6 +51,9 @@
 //! - `config <id>`: one chunk with the current value of the config option
 //!   `id`
 //! - `wait`: keep the turn open until it is cancelled
+//! - `take`: wait until a prompt is held, then insert every held prompt in
+//!   order, echoing each as a `user_message` and answering it; a cancel
+//!   ends the wait and the turn
 //! - `title <text>`: a `session_info_update` setting the title to the rest of
 //!   the line
 //! - `title-null`: a `session_info_update` clearing the title
@@ -174,9 +184,25 @@ fn commands() -> Vec<acp::AvailableCommand> {
     .collect()
 }
 
+/// A prompt that arrived during a turn, with its unsent answer.
+struct Held {
+    request: acp::PromptRequest,
+    responder: Responder<acp::PromptResponse>,
+}
+
+/// Whether a prompt's turn is running, and the prompts held during it.
+#[derive(Default)]
+struct Turn {
+    running: bool,
+    held: Vec<Held>,
+}
+
 struct State {
     /// Whether the current turn was cancelled.
     cancelled: watch::Sender<bool>,
+    turn: Mutex<Turn>,
+    /// Counts the prompts held, signalling each.
+    holds: watch::Sender<u64>,
     /// The current value of each config option, by ID.
     config: Mutex<HashMap<&'static str, String>>,
     commands: Mutex<Vec<acp::AvailableCommand>>,
@@ -424,6 +450,8 @@ async fn main() -> agent_client_protocol::Result<()> {
     });
     let state = Arc::new(State {
         cancelled: watch::Sender::new(false),
+        turn: Mutex::default(),
+        holds: watch::Sender::new(0),
         config: Mutex::new(
             CONFIG
                 .iter()
@@ -684,6 +712,14 @@ async fn main() -> agent_client_protocol::Result<()> {
                 async move |mut request: acp::PromptRequest,
                             responder: Responder<acp::PromptResponse>,
                             connection: ConnectionTo<Client>| {
+                    {
+                        let mut turn = state.turn.lock().unwrap();
+                        if turn.running {
+                            turn.held.push(Held { request, responder });
+                            state.holds.send_modify(|holds| *holds += 1);
+                            return Ok(());
+                        }
+                    }
                     if flag("--no-system-prompt") {
                         let mut instructions = state.instructions.lock().unwrap();
                         let id = request.session_id.to_string();
@@ -734,6 +770,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         ),
                     )?;
                     responder.respond(acp::PromptResponse::new(id))?;
+                    state.turn.lock().unwrap().running = true;
                     let state = state.clone();
                     let task_connection = connection.clone();
                     connection.spawn(async move {
@@ -776,6 +813,7 @@ enum Directive {
     Echo(String),
     Commands(Vec<acp::AvailableCommand>),
     Wait,
+    Take,
     Title(String),
     TitleNull,
     Touch,
@@ -839,6 +877,7 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
                     .map_err(|error| Error::invalid_params().data(error.to_string()))?,
             ),
             ["wait"] => Directive::Wait,
+            ["take"] => Directive::Take,
             ["title", ..] => Directive::Title(rest("title")),
             ["title-null"] => Directive::TitleNull,
             ["touch"] => Directive::Touch,
@@ -878,7 +917,7 @@ async fn turn(
         .any(|directive| matches!(directive, Directive::OwnTurn));
     state_update(connection, &session_id, running())?;
     let stop_reason = run(state, connection, request, directives).await?;
-    state_update(connection, &session_id, idle(stop_reason))?;
+    end_turn(state, connection, &session_id, stop_reason)?;
     if late_permission {
         connection
             .send_request(permission_request(session_id.clone()))
@@ -896,6 +935,57 @@ async fn turn(
         state_update(connection, &session_id, idle(acp::StopReason::Cancelled))?;
     }
     Ok(())
+}
+
+/// Ends a prompt's turn with `stop_reason`. Prompts held when it ends are
+/// refused if it was cancelled, and otherwise inserted in turns of the
+/// agent's own until none is left.
+fn end_turn(
+    state: &State,
+    connection: &ConnectionTo<Client>,
+    session_id: &acp::SessionId,
+    mut stop_reason: acp::StopReason,
+) -> agent_client_protocol::Result<()> {
+    loop {
+        let held = {
+            // Ending the turn under the lock leaves no prompt held after it.
+            let mut turn = state.turn.lock().unwrap();
+            let held = std::mem::take(&mut turn.held);
+            if held.is_empty() || stop_reason == acp::StopReason::Cancelled {
+                for prompt in held {
+                    prompt
+                        .responder
+                        .respond_with_error(Error::request_cancelled())?;
+                }
+                turn.running = false;
+                return state_update(connection, session_id, idle(stop_reason));
+            }
+            held
+        };
+        state_update(connection, session_id, idle(stop_reason))?;
+        state_update(connection, session_id, running())?;
+        for prompt in held {
+            insert(state, connection, prompt)?;
+        }
+        stop_reason = acp::StopReason::EndTurn;
+    }
+}
+
+/// Inserts a held prompt: echoes it as a `user_message` and answers it.
+fn insert(
+    state: &State,
+    connection: &ConnectionTo<Client>,
+    prompt: Held,
+) -> agent_client_protocol::Result<()> {
+    let Held { request, responder } = prompt;
+    state.record(&request.session_id, "user", &script(&request.prompt));
+    let id = message_id();
+    notify(
+        connection,
+        &request.session_id,
+        acp::SessionUpdate::UserMessage(acp::UserMessage::new(id.clone()).content(request.prompt)),
+    )?;
+    responder.respond(acp::PromptResponse::new(id))
 }
 
 /// Waits `delay` between the chunks of `say` and `stream`.
@@ -1044,6 +1134,17 @@ async fn run(
             Directive::Wait => {
                 state.until_cancelled().await;
                 return Ok(acp::StopReason::Cancelled);
+            }
+            Directive::Take => {
+                let mut holds = state.holds.subscribe();
+                tokio::select! {
+                    () = state.until_cancelled() => return Ok(acp::StopReason::Cancelled),
+                    _ = holds.wait_for(|_| !state.turn.lock().unwrap().held.is_empty()) => {}
+                }
+                let held = std::mem::take(&mut state.turn.lock().unwrap().held);
+                for prompt in held {
+                    insert(state, connection, prompt)?;
+                }
             }
             Directive::Title(title) => info(acp::SessionInfoUpdate::new().title(title))?,
             Directive::TitleNull => info(acp::SessionInfoUpdate::new().title(None::<String>))?,

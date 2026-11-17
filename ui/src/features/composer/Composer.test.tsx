@@ -62,6 +62,64 @@ describe("The composer", () => {
     expect(core.invoked("cancel")).toEqual([{ sessionId: task.id }]);
   });
 
+  it("queues with Enter and steers with Cmd+Enter while the agent works", async () => {
+    const task = session(project, { title: "Task", state: "running" });
+    const core = await viewSession(task);
+    await userEvent.type(message(), "next{Enter}");
+    expect(core.invoked("queue_add")).toEqual([
+      { sessionId: task.id, text: "next", attachments: [] },
+    ]);
+    expect(message()).toHaveValue("");
+    await userEvent.type(message(), "now{Meta>}{Enter}{/Meta}");
+    expect(core.invoked("prompt")).toEqual([{ sessionId: task.id, text: "now", attachments: [] }]);
+  });
+
+  it("sends with Cmd+Enter on an idle session", async () => {
+    const task = session(project, { title: "Task" });
+    const core = await viewSession(task);
+    await userEvent.type(message(), "now{Meta>}{Enter}{/Meta}");
+    expect(core.invoked("prompt")).toEqual([{ sessionId: task.id, text: "now", attachments: [] }]);
+    expect(core.invoked("queue_add")).toEqual([]);
+  });
+
+  it("offers Send for a draft and Stop without one while the agent works", async () => {
+    const task = session(project, { title: "Task", state: "awaiting_input" });
+    const core = await viewSession(task);
+    expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+    await userEvent.type(message(), "later");
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(core.invoked("queue_add")).toEqual([
+      { sessionId: task.id, text: "later", attachments: [] },
+    ]);
+    expect(core.invoked("cancel")).toEqual([]);
+  });
+
+  it("stops the turn with Escape, unless Escape closes the command menu", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "running",
+      available_commands: [{ type: "command", name: "echo", description: "Echo" }],
+    });
+    const core = await viewSession(task);
+    await userEvent.type(message(), "/");
+    expect(screen.getByRole("listbox", { name: "Commands" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("listbox", { name: "Commands" })).not.toBeInTheDocument();
+    expect(core.invoked("cancel")).toEqual([]);
+    await userEvent.keyboard("{Escape}");
+    expect(core.invoked("cancel")).toEqual([{ sessionId: task.id }]);
+  });
+
+  it("leaves the turn running when Escape closes a dialog", async () => {
+    const core = await viewSession(session(project, { title: "Task", state: "running" }));
+    const dialog = document.body.appendChild(document.createElement("dialog"));
+    dialog.showModal();
+    await userEvent.keyboard("{Escape}");
+    expect(core.invoked("cancel")).toEqual([]);
+    dialog.remove();
+  });
+
   it("is disabled once the agent has exited", async () => {
     await viewSession(session(project, { title: "Task", state: "exited", agent_session_id: null }));
     expect(message()).toBeDisabled();
@@ -88,6 +146,97 @@ describe("The composer", () => {
   });
 });
 
+describe("The queue", () => {
+  const queued = (id: string, text: string, ...paths: string[]) => ({
+    id,
+    prompt: [
+      { type: "text", text },
+      ...paths.map((path) => ({
+        type: "resource_link",
+        name: path.split("/").pop()!,
+        uri: `file://${path.split("/").map(encodeURIComponent).join("/")}`,
+      })),
+    ],
+  });
+  const row = (text: string) =>
+    within(screen.getByRole("list", { name: "Queued Messages" }))
+      .getByText(text)
+      .closest("li")!;
+
+  it("sends a queued prompt now or deletes it", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "running",
+      queue: [queued("q1", "First"), queued("q2", "Second")],
+    });
+    const core = await viewSession(task);
+    await userEvent.click(within(row("First")).getByRole("button", { name: "Send Now" }));
+    expect(core.invoked("queue_send")).toEqual([{ sessionId: task.id, promptId: "q1" }]);
+    await userEvent.click(within(row("Second")).getByRole("button", { name: "Delete" }));
+    expect(core.invoked("queue_remove")).toEqual([{ sessionId: task.id, promptId: "q2" }]);
+  });
+
+  it("edits a queued prompt in place and brings the draft back", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "running",
+      queue: [queued("q1", "First", "/src/my notes.txt")],
+    });
+    const core = await viewSession(task);
+    await userEvent.type(message(), "draft");
+    await userEvent.click(within(row("First")).getByRole("button", { name: "Edit" }));
+    expect(message()).toHaveValue("First");
+    expect(screen.getByTitle("/src/my notes.txt")).toBeInTheDocument();
+    await userEvent.type(message(), " edited{Enter}");
+    expect(core.invoked("queue_edit")).toEqual([
+      {
+        sessionId: task.id,
+        promptId: "q1",
+        text: "First edited",
+        attachments: ["/src/my notes.txt"],
+      },
+    ]);
+    expect(core.invoked("queue_add")).toEqual([]);
+    expect(message()).toHaveValue("draft");
+    expect(screen.queryByTitle("/src/my notes.txt")).not.toBeInTheDocument();
+  });
+
+  it("keeps editing when the edit cannot be saved", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "running",
+      queue: [queued("q1", "First")],
+    });
+    const core = await viewSession(task);
+    core.on("queue_edit", () => {
+      throw "prompt q1 is not queued";
+    });
+    await userEvent.click(within(row("First")).getByRole("button", { name: "Edit" }));
+    await userEvent.clear(message());
+    await userEvent.type(message(), "Changed{Enter}");
+    expect(core.invoked("queue_edit")).toHaveLength(1);
+    expect(message()).toHaveValue("Changed");
+  });
+
+  it("queues an edit whose prompt was sent meanwhile as a new message", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "running",
+      queue: [queued("q1", "First")],
+    });
+    const core = await viewSession(task);
+    await userEvent.type(message(), "draft");
+    await userEvent.click(within(row("First")).getByRole("button", { name: "Edit" }));
+    core.list({ type: "session", session: { ...task, queue: [] } });
+    await userEvent.type(message(), "!{Enter}");
+    expect(core.invoked("queue_edit")).toEqual([]);
+    expect(core.invoked("queue_add")).toEqual([
+      { sessionId: task.id, text: "First!", attachments: [] },
+    ]);
+    expect(message()).toHaveValue("draft");
+  });
+});
+
 describe("A permission request", () => {
   it("is answered from above the composer", async () => {
     const task = session(project, { title: "Task", state: "awaiting_permission" });
@@ -107,7 +256,7 @@ describe("A permission request", () => {
     expect(core.invoked("permit")).toEqual([
       { sessionId: task.id, requestId: "7", optionId: "yes" },
     ]);
-    core.update(task.id, { type: "request_resolved", recorded_at: 0, request_id: "7" });
+    core.update(task.id, { type: "removed", recorded_at: 0, key: "request:7" });
     expect(screen.queryByRole("button", { name: "Allow" })).not.toBeInTheDocument();
   });
 });

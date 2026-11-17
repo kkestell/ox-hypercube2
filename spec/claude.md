@@ -62,7 +62,7 @@ Changes are sent to active Claude work. A refusal reports Claude's error and doe
 ### Work and interruption
 
 - A standalone ACP prompt is acknowledged with its user-message ID when Claude takes it into the conversation, not when the turn finishes. Its output and completion arrive separately.
-- A standalone prompt submitted during another turn waits for Claude to take it; [Ox sessions](agents.md#turn-behavior) instead refuse a second prompt while busy.
+- A prompt submitted during another turn goes to Claude at once and is taken in at Claude's next opportunity within that turn; it is acknowledged when Claude takes it. One Claude has not taken when the turn ends runs as a turn of its own.
 - Streaming replies and thinking appear as they arrive. Tool calls report a name, title, arguments, and status, then text and image output. Unfinished tool calls are marked Failed when a turn ends.
 - A subagent's tool activity appears within the tool call that started it, ahead of the subagent's final result. A subagent tool requiring permission can appear separately so it can be answered.
 - Interrupt stops the current turn and its running tools, sends withdrawals for open permission requests and forms, and drops prompts Claude has not yet taken. Dropped prompts are answered as cancelled. Further prompts can continue the conversation. Ox's handling of withdrawals is described in [permissions and questions](requests.md#answer-a-permission-request).

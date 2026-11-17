@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -37,7 +37,8 @@ fn write_mcp_extension() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// A prompt waiting for Pi's answer to its `prompt` command.
+/// A prompt waiting for Pi's answer to its `prompt` command, or for Pi to
+/// take it into the run it steers.
 struct Prompt {
     message_id: String,
     content: Vec<ContentBlock>,
@@ -47,7 +48,8 @@ struct Prompt {
 /// A command waiting for Pi's response.
 enum Pending {
     Prompt(Box<Prompt>),
-    Abort,
+    /// `clear_queue` or `abort`, named for the log.
+    Stop(&'static str),
     Request(oneshot::Sender<Result<Value, String>>),
 }
 
@@ -58,9 +60,11 @@ struct State {
     dialogs: HashMap<String, AbortHandle>,
     /// Commands Pi has not answered, by ID.
     pending: HashMap<String, Pending>,
-    /// The client cancelled while a prompt waited for Pi's answer. Pi's abort
-    /// does not stop a run that has not started, so the bridge aborts again
-    /// once Pi starts or queues the prompt.
+    /// Prompts Pi queued to steer its run, in the order Pi takes them in.
+    steering: VecDeque<Box<Prompt>>,
+    /// The client cancelled while prompts waited for Pi's answer. Pi's abort
+    /// does not stop a run that has not started, nor a steer it has yet to
+    /// queue, so the bridge stops again as Pi answers each of them.
     abort_on_start: bool,
     /// Why Pi exited, once it has.
     exited: Option<String>,
@@ -74,6 +78,22 @@ impl State {
                 let _ =
                     input.send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}));
             }
+        }
+    }
+
+    /// Stops Pi's run. Pi's `abort` goes on to deliver the steering queue, so
+    /// the queue is cleared first and its prompts fail as cancelled.
+    fn stop(&mut self, input: &mpsc::UnboundedSender<Value>) {
+        self.send(
+            input,
+            json!({"type": "clear_queue"}),
+            Pending::Stop("clear_queue"),
+        );
+        self.send(input, json!({"type": "abort"}), Pending::Stop("abort"));
+        for prompt in self.steering.drain(..) {
+            let _ = prompt
+                .responder
+                .respond_with_error(agent_client_protocol::Error::request_cancelled());
         }
     }
 
@@ -150,6 +170,7 @@ impl Pi {
             input: input.downgrade(),
             cwd: cwd.to_owned(),
             running: false,
+            starting: 0,
             blocks: HashMap::new(),
             tools: HashMap::new(),
             last_stop: None,
@@ -199,9 +220,9 @@ impl Pi {
         let mut command = json!({
             "type": "prompt",
             "message": message,
-            // Pi ignores this while idle, and queues the prompt after its
-            // run while it works on a run of its own.
-            "streamingBehavior": "followUp",
+            // Pi ignores this while idle, and steers its run with the prompt
+            // while it works on a run of its own.
+            "streamingBehavior": "steer",
         });
         if !images.is_empty() {
             command["images"] = json!(images);
@@ -218,7 +239,8 @@ impl Pi {
         Ok(())
     }
 
-    /// Stops Pi's run, including the run of a prompt Pi has yet to answer.
+    /// Stops Pi's run, including the run of a prompt Pi has yet to answer,
+    /// and fails the prompts waiting to steer it.
     pub fn abort(&self) {
         let mut state = self.state.lock().unwrap();
         if state.exited.is_some() {
@@ -232,7 +254,7 @@ impl Pi {
             state.abort_on_start = true;
         }
         state.withdraw_dialogs(Some(&self.input));
-        state.send(&self.input, json!({"type": "abort"}), Pending::Abort);
+        state.stop(&self.input);
     }
 }
 
@@ -261,6 +283,9 @@ struct Output {
     cwd: PathBuf,
     /// Pi has started a run and not settled.
     running: bool,
+    /// Prompts Pi started whose user message has not started yet. Their
+    /// user messages precede those of the prompts steering their runs.
+    starting: usize,
     /// The blocks of the assistant message being streamed, by content index.
     blocks: HashMap<u64, Block>,
     tools: HashMap<String, Tool>,
@@ -279,28 +304,30 @@ impl Output {
                 ),
                 Err(error) => format!("pi process failed: {error}"),
             };
-        let pending = {
+        let (pending, steering) = {
             let mut state = self.state.lock().unwrap();
             state.exited = Some(error.clone());
             state.withdraw_dialogs(None);
-            std::mem::take(&mut state.pending)
+            (
+                std::mem::take(&mut state.pending),
+                std::mem::take(&mut state.steering),
+            )
+        };
+        let fail = |prompt: Box<Prompt>| {
+            let _ = prompt
+                .responder
+                .respond_with_error(agent_client_protocol::Error::new(-32603, error.clone()));
         };
         for (_, pending) in pending {
             match pending {
-                Pending::Prompt(prompt) => {
-                    let _ = prompt
-                        .responder
-                        .respond_with_error(agent_client_protocol::Error::new(
-                            -32603,
-                            error.clone(),
-                        ));
-                }
+                Pending::Prompt(prompt) => fail(prompt),
                 Pending::Request(send) => {
                     let _ = send.send(Err(error.clone()));
                 }
-                Pending::Abort => {}
+                Pending::Stop(_) => {}
             }
         }
+        steering.into_iter().for_each(fail);
 
         self.updates.fail_open_tools();
         self.updates.idle(error_stop(error));
@@ -317,7 +344,8 @@ impl Output {
         let Ok(record) = serde_json::from_str::<Value>(line) else {
             return;
         };
-        let assistant = record["message"]["role"] == "assistant";
+        let role = &record["message"]["role"];
+        let assistant = role == "assistant";
         match record["type"].as_str() {
             Some("response") => self.response(&record),
             Some("agent_start") => {
@@ -326,6 +354,7 @@ impl Output {
             }
             Some("agent_settled") => self.settled(record["aborted"] == true),
             Some("message_start") if assistant => self.blocks.clear(),
+            Some("message_start") if role == "user" => self.user_message_started(),
             Some("message_update") => self.message_update(&record["assistantMessageEvent"]),
             Some("message_end") if assistant => self.assistant_message(&record["message"]),
             Some("tool_execution_start") => {
@@ -402,9 +431,9 @@ impl Output {
                 };
                 let _ = send.send(result);
             }
-            Some(Pending::Abort) => {
+            Some(Pending::Stop(command)) => {
                 if response["success"] != true {
-                    eprintln!("pi refused to abort: {}", response["error"]);
+                    eprintln!("pi refused to {command}: {}", response["error"]);
                 }
             }
             None => eprintln!("pi answered an unknown command: {response}"),
@@ -413,9 +442,20 @@ impl Output {
 
     /// Answers a prompt once Pi accepted or refused it. A prompt an
     /// extension command handled ends its turn unless the command started a
-    /// run.
+    /// run. A prompt Pi queued to steer its run waits for Pi to take it in.
     fn prompt_answered(&mut self, prompt: Box<Prompt>, response: &Value) {
-        let abort = std::mem::take(&mut self.state.lock().unwrap().abort_on_start);
+        let abort = {
+            let mut state = self.state.lock().unwrap();
+            let abort = state.abort_on_start;
+            if !state
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Prompt(_)))
+            {
+                state.abort_on_start = false;
+            }
+            abort
+        };
         if response["success"] != true {
             let error = response["error"]
                 .as_str()
@@ -425,22 +465,48 @@ impl Output {
                 .respond_with_error(agent_client_protocol::Error::new(-32603, error));
             return;
         }
+        let disposition = &response["data"]["disposition"];
+        if disposition == "queued" {
+            let mut state = self.state.lock().unwrap();
+            state.steering.push_back(prompt);
+            if abort && let Some(input) = self.input.upgrade() {
+                state.stop(&input);
+            }
+            return;
+        }
         let _ = prompt
             .responder
             .respond(PromptResponse::new(prompt.message_id.clone()));
         self.updates
             .user_message(&prompt.message_id, prompt.content);
         self.updates.working();
-        if response["data"]["disposition"] == "handled" {
+        if disposition == "handled" {
             if !self.running {
                 self.updates.idle(StopReason::EndTurn);
             }
-        } else if abort && let Some(input) = self.input.upgrade() {
-            self.state
-                .lock()
-                .unwrap()
-                .send(&input, json!({"type": "abort"}), Pending::Abort);
+        } else {
+            self.starting += 1;
+            if abort && let Some(input) = self.input.upgrade() {
+                self.state.lock().unwrap().stop(&input);
+            }
         }
+    }
+
+    /// Answers the next steering prompt once Pi takes it into its run. The
+    /// user message of a prompt Pi started is already sent.
+    fn user_message_started(&mut self) {
+        if self.starting > 0 {
+            self.starting -= 1;
+            return;
+        }
+        let Some(prompt) = self.state.lock().unwrap().steering.pop_front() else {
+            return;
+        };
+        let _ = prompt
+            .responder
+            .respond(PromptResponse::new(prompt.message_id.clone()));
+        self.updates
+            .user_message(&prompt.message_id, prompt.content);
     }
 
     /// Ends the turn once Pi has no more automatic work.
