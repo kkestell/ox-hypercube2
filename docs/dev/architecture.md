@@ -180,7 +180,8 @@ the rows. Each schema version has a SQL fixture in
 code. Values the UI keeps in local storage follow the same rule: a new shape
 still reads what the previous build wrote.
 
-Session metadata is saved as sessions are created or changed. Conversation
+Session metadata is saved as sessions are created, and each change to it is
+saved in the step that makes the change, before clients are told. Conversation
 events are queued and committed in batches, ordered by session and sequence
 number. Graceful shutdown drains the queue. A forced stop can lose queued
 events; a failed batch is logged and dropped, leaving gaps in saved history.
@@ -263,14 +264,16 @@ restart is. A session whose history holds a prompt keeps it when it loads, so
 an imported session resumes without replay.
 
 Each session keeps a queue of prompts. Whenever the session's agent is idle,
-with no pending request and no steered prompt pending, the daemon starts the
-queue's first prompt as a turn, whether or not a client is connected. A
+with no pending request, no steered prompt pending, and no branch move under
+way in its checkout, the daemon starts the queue's first prompt as a turn, whether or not a client is connected. A
 cancelled turn, or one that ends other than with `end_turn`, holds the queue
 until a client sends a prompt or sends a queued one now.
 
 ### Loading and stopping agents
 
-After a daemon restart, saved sessions begin without running agents. Loading
+After a daemon restart, every saved session returns `exited`, without a
+running agent. A session whose agent never started keeps its history,
+including its first prompt and the error that ended it, and cannot load. Loading
 a session starts its stored command in its stored directory, resumes the
 agent's conversation, and sends it the session's config again, retaining
 the Ox session ID and subscriptions. Missing history can be recovered through
@@ -287,8 +290,8 @@ unarchived; deleting a session removes its saved history.
 [Where sessions run](../worktrees.md#deleting-and-archiving) owns what each
 does to the worktree and branch.
 
-Startup, load, parking, and deletion coordinate through a per-session
-lifecycle lock. Shutdown stops agents but preserves saved sessions. Each
+Worktree startup, load, parking, archiving, unarchiving, deletion, and
+workspace removal coordinate through a per-session lifecycle lock. Shutdown stops agents but preserves saved sessions. Each
 connected client then receives the rest of every session it follows, up to
 the session's close, before the daemon exits; a client that has not read
 it within five seconds is disconnected. The daemon can exit when it has no
@@ -312,8 +315,8 @@ ownership before returning a starting session, and launches the session's
 agent once the worktree is added. Failure to add the worktree triggers
 cleanup of the partial worktree and of a newly created branch still at its
 starting commit, and the worktree's record is removed. A session whose agent
-never started keeps its worktree and stays `exited` with its error until it
-is deleted.
+never started keeps its worktree and stays `exited` with its error, across
+daemon restarts, until it is deleted.
 
 Each worktree records the repository's common Git directory, so cleanup and
 branch operations do not depend on the workspace directory still existing.
@@ -323,5 +326,7 @@ checkout, and applies the branch cleanup rule separately.
 Branch moves use Git ref transactions to check the commits the client
 expected, including a source branch when supplied. If updating a checked-out
 branch's files fails, the daemon attempts to restore its previous tip and
-reports the failure. [Where sessions run](../worktrees.md#moving-a-branch)
-owns the checks and limitations.
+reports the failure. While a branch moves, the sessions in its checkout refuse
+prompts and loads, and their queues wait.
+[Where sessions run](../worktrees.md#moving-a-branch) owns the checks and
+limitations.

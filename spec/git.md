@@ -34,7 +34,7 @@ In the desktop, a non-archived session with a comparison shows a branch indicato
 
 Merging moves the target branch only while it is still at the commit used in the comparison; otherwise it fails without moving it.
 
-If a checkout has the target branch, its tracked files and index move with it. The move is refused while tracked files have uncommitted changes, if it would overwrite an untracked file, or if an Ox session in that checkout is Starting, Running, Awaiting permission, or Awaiting input. Idle sessions and unrelated untracked files do not prevent a move. Submodule checkouts are not updated. A refusal leaves existing work intact.
+If a checkout has the target branch, its tracked files and index move with it. The move is refused while tracked files have uncommitted changes, if it would overwrite an untracked file, or if an Ox session in that checkout is Starting, Running, Awaiting permission, or Awaiting input. Idle sessions and unrelated untracked files do not prevent a move. While a move runs, sessions in that checkout refuse new messages and resumes, and their queued messages wait until it finishes. Submodule checkouts are not updated. A refusal leaves existing work intact.
 
 ### Inspect branches through a connected client
 

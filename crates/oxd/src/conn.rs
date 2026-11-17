@@ -207,8 +207,9 @@ pub async fn serve(
             }
             // Creating a session in a worktree, deleting a session, listing
             // or moving branches and comparing a worktree's branch wait on
-            // git, importing Claude sessions waits on the Claude bridge, and
-            // messaging a session, reading
+            // git, importing Claude sessions waits on the Claude bridge,
+            // removing a workspace waits on its sessions' lifecycle
+            // operations, and messaging a session, reading
             // its transcript and requesting a session wait on agents, the
             // database or the user, so each runs in its own task and the
             // connection keeps serving other requests. A client that
@@ -220,6 +221,7 @@ pub async fn serve(
             | Method::SessionDelete { .. }
             | Method::SessionArchive { .. }
             | Method::SessionUnarchive { .. }
+            | Method::WorkspaceRemove { .. }
             | Method::WorkspaceBranches { .. }
             | Method::WorkspaceImportClaudeSessions { .. }
             | Method::BranchMove { .. }

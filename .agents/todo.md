@@ -10,13 +10,13 @@ of these; remove it with the fix.
 
 ### Daemon
 
-- [ ] **Restart loses never-started sessions.** High. Startup deletes every
+- [x] **Restart loses never-started sessions.** High. Startup deletes every
   session with no agent session and no worktree, archived ones included, so
   archiving a session whose agent failed to start reports success and the
   session is gone after a restart. A never-started worktree session survives
   but loses its first prompt, because it is restored with no events.
   `crates/oxd/src/daemon.rs:139`, `crates/oxd/src/state.rs:691`.
-- [ ] **A queued prompt can start while the session's branch is moving.**
+- [x] **A queued prompt can start while the session's branch is moving.**
   Medium. Queue draining starts the next prompt inside `Session::update`
   without the daemon's move guard, though `session.prompt` refuses the same
   prompt. `crates/oxd/src/state.rs:811`, `crates/oxd/src/session.rs:816`.
@@ -83,10 +83,10 @@ of these; remove it with the fix.
 - [ ] **A new session whose agent exits before its first prompt resumes
   without its MCP servers and Ox instructions.** Low.
   `crates/oxd/src/session.rs:1008`.
-- [ ] **Removing a workspace can race an archived session's unarchive or
+- [x] **Removing a workspace can race an archived session's unarchive or
   delete.** Low. Workspace removal deletes rows without the sessions'
   lifecycle guards. `crates/oxd/src/daemon.rs:630`.
-- [ ] **A failed worktree start briefly publishes a dangling worktree ID.**
+- [x] **A failed worktree start briefly publishes a dangling worktree ID.**
   Low. The worktree is removed and announced before `fail_start` clears the
   session's reference. `crates/oxd/src/daemon.rs:859`.
 - [ ] **Compact transcripts omit replayed user messages.** Low.
@@ -205,7 +205,7 @@ of these; remove it with the fix.
   [Workspaces](../spec/workspaces.md), `ui/src/features/sessions/SessionList.tsx:214`.
 - [ ] **The performance guide omits worktree identity in the UI.**
   `docs/dev/performance.md:26`.
-- [ ] **The session lifecycle comment says the session adds its worktree.**
+- [x] **The session lifecycle comment says the session adds its worktree.**
   The daemon does. `crates/oxd/src/session.rs:87`.
 - [ ] **Decide what the bottom panel is for, or remove it.** It has a toggle
   and a sash but no content. `ui/src/components/Workbench.tsx:173`.

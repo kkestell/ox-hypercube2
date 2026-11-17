@@ -1839,10 +1839,14 @@ async fn workspaces_and_sessions_survive_a_restart() {
     };
     assert_eq!(
         sessions(&client).await,
-        [saved(titled), saved(plain)],
-        "the session that never started ({}) is gone",
-        unstarted.id
+        [saved(titled), saved(plain), saved(unstarted.clone())]
     );
+    assert_eq!(unstarted.agent_session_id, None);
+    let error = client
+        .load_session(&unstarted.id, BTreeMap::new())
+        .await
+        .unwrap_err();
+    assert_eq!(remote_code(error), code::INVALID_STATE);
 
     // Sessions created after the restart follow the saved ones.
     let (new, _) = second.new_session(&client).await;
@@ -1851,7 +1855,7 @@ async fn workspaces_and_sessions_survive_a_restart() {
         .into_iter()
         .map(|session| session.id)
         .collect();
-    assert_eq!(ids[2], new.id);
+    assert_eq!(ids[3], new.id);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2454,6 +2458,42 @@ async fn a_first_prompt_ends_when_the_agent_does_not_start() {
         .new_session_prompted(&client, &["--no-sessions"], Vec::new(), text("hello"))
         .await
         .unwrap();
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::PromptStarted { .. }
+    ));
+    let ended = next(&mut events).await;
+    assert!(
+        matches!(&ended.kind, EventKind::TurnEnded { error: Some(error), .. } if error.contains("does not support sessions")),
+        "{ended:?}"
+    );
+    assert!(agent_exited(&next(&mut events).await.kind));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_archived_session_that_never_started_keeps_its_history_across_a_restart() {
+    let mut first = Daemon::start().await;
+    let client = first.client().await;
+    let session = first
+        .new_session_prompted(&client, &["--no-sessions"], Vec::new(), text("hello"))
+        .await
+        .unwrap();
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    until(&mut events, agent_exited).await;
+    client
+        .archive(&session.id, false, BTreeMap::new())
+        .await
+        .unwrap();
+    drop(events);
+    drop(client);
+    first.stop().await;
+
+    let second = first.again(Options::default()).await;
+    let client = second.client().await;
+    let restored = info(&client, &session.id).await.unwrap();
+    assert!(restored.archived);
+    assert_eq!(restored.state, SessionState::Exited);
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     assert!(matches!(
         next(&mut events).await.kind,

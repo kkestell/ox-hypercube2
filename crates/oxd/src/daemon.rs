@@ -74,14 +74,21 @@ impl Drop for ClientGuard {
     }
 }
 
+/// A branch move under way in a checkout, with the sessions in the checkout,
+/// which refuse turns and loads until it ends.
 struct CheckoutMove<'a> {
     daemon: &'a Daemon,
     checkout: PathBuf,
+    sessions: Vec<Arc<Session>>,
 }
 
 impl Drop for CheckoutMove<'_> {
     fn drop(&mut self) {
-        self.daemon.lock().moving_checkouts.remove(&self.checkout);
+        let mut registry = self.daemon.lock();
+        registry.moving_checkouts.remove(&self.checkout);
+        for session in &self.sessions {
+            session.end_move();
+        }
     }
 }
 
@@ -110,9 +117,8 @@ impl Daemon {
     /// session that has been idle, with no background work, and unviewed for
     /// `park_after`, whose directory watches follow `directories`, and whose
     /// sessions' agents are given `ox_server`. Each saved session is
-    /// `exited`, with no agent, until it loads. A saved session that never
-    /// started has nothing to load. One without a worktree is deleted; one
-    /// with a worktree stays `exited`.
+    /// `exited`, with no agent, until it loads. A saved session whose agent
+    /// never started keeps its history and has nothing to load.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
@@ -128,39 +134,20 @@ impl Daemon {
             .map(|saved| (saved.id.clone(), Worktree::new(saved, changed.clone())))
             .collect();
         let mut sessions = HashMap::new();
-        let saved_sessions = store.sessions()?;
-        for saved in saved_sessions {
+        for saved in store.sessions()? {
             let worktree = saved.worktree_id.as_ref().map(|id| {
                 worktrees
                     .get(id)
                     .expect("a session's worktree is saved")
                     .clone()
             });
-            // TODO: A never-started session's first prompt is not shown
-            // after a restart.
-            if saved.agent_session_id.is_none() && worktree.is_none() {
-                store.remove_session(&saved.id)?;
-                continue;
-            }
-            let state = match saved.agent_session_id.clone() {
-                Some(agent_session_id) => State::restored(
-                    saved.id.clone(),
-                    saved.title.clone(),
-                    agent_session_id,
-                    saved.last_seq,
-                    saved.queue.clone(),
-                ),
-                None => {
-                    State::unstarted(saved.id.clone(), saved.title.clone(), saved.queue.clone())
-                }
-            };
+            let state = State::restored(&saved, worktree);
             let session = Session::new(
                 store.clone(),
                 changed.clone(),
                 park_after,
                 ox_server.clone(),
                 saved,
-                worktree,
                 state,
             );
             sessions.insert(session.id.clone(), session);
@@ -274,23 +261,6 @@ impl Daemon {
             .ok_or_else(|| not_found("session", id))
     }
 
-    /// Calls `send` on a session, which may start a turn, unless its
-    /// checkout's branch is moving. The registry stays locked throughout, so
-    /// no move starts in between.
-    fn send_unmoved<R>(
-        &self,
-        id: &str,
-        send: impl FnOnce(&Session) -> Result<R, ErrorBody>,
-    ) -> Result<R, ErrorBody> {
-        let registry = self.lock();
-        let session = registry
-            .sessions
-            .get(id)
-            .ok_or_else(|| not_found("session", id))?;
-        registry.refuse_moving(session.cwd())?;
-        send(session)
-    }
-
     fn worktree(&self, id: &str) -> Result<Arc<Worktree>, ErrorBody> {
         self.lock()
             .worktrees
@@ -320,7 +290,7 @@ impl Daemon {
         match method {
             Method::WorkspaceAdd { path } => Ok(to_value(self.add_workspace(path)?)),
             Method::WorkspaceRemove { workspace_id } => {
-                self.remove_workspace(&workspace_id)?;
+                self.remove_workspace(&workspace_id).await?;
                 Ok(Value::Null)
             }
             Method::WorkspaceBranches { workspace_id, env } => {
@@ -342,20 +312,15 @@ impl Daemon {
             )),
             Method::SessionLoad { session_id, env } => {
                 let session = self.session(&session_id)?;
-                let _lifecycle = self.lifecycle(&session).await?;
-                session.history().await?;
-                let registry = self.lock();
-                registry.refuse_moving(session.cwd())?;
-                session.load(env)?;
+                session.load(env).await?;
                 Ok(to_value(session.info()))
             }
             Method::SessionPrompt { session_id, prompt } => {
-                self.send_unmoved(&session_id, |session| session.prompt(prompt))?;
+                self.session(&session_id)?.prompt(prompt)?;
                 Ok(Value::Null)
             }
             Method::SessionQueueAdd { session_id, prompt } => {
-                let prompt_id =
-                    self.send_unmoved(&session_id, |session| session.queue_add(prompt))?;
+                let prompt_id = self.session(&session_id)?.queue_add(prompt)?;
                 Ok(to_value(QueueAdded { prompt_id }))
             }
             Method::SessionQueueEdit {
@@ -377,7 +342,7 @@ impl Daemon {
                 session_id,
                 prompt_id,
             } => {
-                self.send_unmoved(&session_id, |session| session.queue_send(prompt_id))?;
+                self.session(&session_id)?.queue_send(prompt_id)?;
                 Ok(Value::Null)
             }
             Method::SessionSetConfig { session_id, config } => {
@@ -608,53 +573,93 @@ impl Daemon {
     }
 
     /// Removes a workspace whose sessions are all archived, deleting them
-    /// with their worktrees' rows. Their branches are kept.
-    fn remove_workspace(&self, id: &str) -> Result<(), ErrorBody> {
-        let removed = self.update(|registry| {
-            let index = registry
-                .workspaces
-                .iter()
-                .position(|workspace| workspace.id == id)
-                .ok_or_else(|| not_found("workspace", id))?;
-            // The store has the rows of sessions still being created.
-            if self
-                .store
-                .workspace_has_unarchived_sessions(id)
-                .map_err(|error| storage(&error))?
-            {
-                return Err(ErrorBody {
-                    code: code::INVALID_STATE,
-                    message: "the workspace has sessions that are not archived".into(),
-                });
+    /// with their worktrees' rows. Their branches are kept. An unarchive or
+    /// delete of one of its sessions already under way finishes first.
+    async fn remove_workspace(&self, id: &str) -> Result<(), ErrorBody> {
+        let not_archived = || ErrorBody {
+            code: code::INVALID_STATE,
+            message: "the workspace has sessions that are not archived".into(),
+        };
+        loop {
+            let mut sessions = self.workspace_sessions(id)?;
+            if !sessions.iter().all(|session| session.archived()) {
+                return Err(not_archived());
             }
-            // TODO: an archived session being unarchived or deleted meanwhile
-            // is removed under its operation.
-            self.store
-                .remove_workspace(id)
-                .map_err(|error| storage(&error))?;
-            registry.workspaces.remove(index);
-            let ids: Vec<String> = registry
-                .sessions
-                .values()
-                .filter(|session| session.workspace_id() == id)
-                .map(|session| session.id.clone())
-                .collect();
-            let removed: Vec<Arc<Session>> = ids
-                .iter()
-                .filter_map(|id| registry.sessions.remove(id))
-                .collect();
-            for worktree in removed.iter().filter_map(|session| session.worktree()) {
-                registry.worktrees.remove(&worktree.id);
+            sessions.sort_by_key(|session| session.number);
+            let mut guards = Vec::with_capacity(sessions.len());
+            for session in &sessions {
+                match session.lifecycle().await {
+                    Ok(guard) => guards.push(guard),
+                    // Deleted meanwhile.
+                    Err(_) => break,
+                }
             }
-            Ok::<_, ErrorBody>(removed)
-        })?;
-        for session in removed {
-            if let Some(worktree) = session.worktree() {
-                worktree.close();
+            if guards.len() < sessions.len() {
+                continue;
             }
-            session.close();
+            let removed = self.update(|registry| {
+                let index = registry
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == id)
+                    .ok_or_else(|| not_found("workspace", id))?;
+                let current = registry
+                    .sessions
+                    .values()
+                    .filter(|session| session.workspace_id() == id)
+                    .count();
+                // A session added meanwhile, such as by an import.
+                if current != sessions.len()
+                    || !sessions
+                        .iter()
+                        .all(|session| registry.sessions.contains_key(&session.id))
+                {
+                    return Ok(false);
+                }
+                if !sessions.iter().all(|session| session.archived()) {
+                    return Err(not_archived());
+                }
+                self.store
+                    .remove_workspace(id)
+                    .map_err(|error| storage(&error))?;
+                registry.workspaces.remove(index);
+                for session in &sessions {
+                    registry.sessions.remove(&session.id);
+                    if let Some(worktree) = session.worktree() {
+                        registry.worktrees.remove(&worktree.id);
+                    }
+                }
+                Ok(true)
+            })?;
+            if !removed {
+                continue;
+            }
+            for session in &sessions {
+                if let Some(worktree) = session.worktree() {
+                    worktree.close();
+                }
+                session.close();
+            }
+            return Ok(());
         }
-        Ok(())
+    }
+
+    /// The sessions of workspace `id`.
+    fn workspace_sessions(&self, id: &str) -> Result<Vec<Arc<Session>>, ErrorBody> {
+        let registry = self.lock();
+        if !registry
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == id)
+        {
+            return Err(not_found("workspace", id));
+        }
+        Ok(registry
+            .sessions
+            .values()
+            .filter(|session| session.workspace_id() == id)
+            .cloned()
+            .collect())
     }
 
     /// Creates a session in the workspace's directory or in a new worktree,
@@ -786,14 +791,17 @@ impl Daemon {
                 queue: Queue::default(),
                 config,
             };
+            let state = State::created(
+                &saved,
+                saved_worktree.map(|saved| Worktree::new(saved, self.changed.clone())),
+            );
             let session = Session::new(
                 self.store.clone(),
                 self.changed.clone(),
                 self.park_after,
                 self.ox_server.clone(),
                 saved,
-                saved_worktree.map(|saved| Worktree::new(saved, self.changed.clone())),
-                State::new(id.clone()),
+                state,
             );
             registry.sessions.insert(id, session.clone());
             if let Some(prompt) = prompt {
@@ -845,20 +853,15 @@ impl Daemon {
         env: BTreeMap<String, String>,
         opening: Opening,
     ) {
-        let Err(mut message) = worktree::add(&git, &plan).await else {
+        let Err(message) = worktree::add(&git, &plan).await else {
             session.start(env, opening);
             return;
         };
-        if let Err(error) = self.store.remove_worktree(&live_worktree.id) {
-            eprintln!(
-                "oxd: forgetting the worktree of session {}: {error}",
-                session.id
-            );
-            message = format!("{message}; forgetting the worktree failed: {error}");
-        }
-        self.update(|registry| registry.worktrees.remove(&live_worktree.id));
+        self.update(|registry| {
+            registry.worktrees.remove(&live_worktree.id);
+            session.fail_start(message);
+        });
         live_worktree.close();
-        session.fail_start(message);
     }
 
     /// Sends a peer message from session `sender_id` to session `to`. An
@@ -881,21 +884,13 @@ impl Daemon {
         if recipient.archived() {
             return Err(invalid_state(&format!("session {to} is archived")));
         }
-        if recipient.state() == SessionState::Exited {
-            let _lifecycle = self.lifecycle(&recipient).await?;
-            recipient.history().await?;
-            if recipient.state() == SessionState::Exited {
-                let registry = self.lock();
-                registry.refuse_moving(recipient.cwd())?;
-                recipient.load(sender.env())?;
-            }
-        }
+        recipient.load_if_exited(sender.env()).await?;
         recipient.started().await?;
         let from = Sender {
             session_id: sender.id.clone(),
             title: sender.title(),
         };
-        let steered = self.send_unmoved(to, |session| session.message(text, from))?;
+        let steered = recipient.message(text, from)?;
         Ok(MessageSent { steered })
     }
 
@@ -1036,20 +1031,6 @@ impl Daemon {
         branches::list(&git, &workspace).await
     }
 
-    /// Waits until the session is not starting, loading or being deleted,
-    /// and returns the guard that keeps it so. A session deleted meanwhile
-    /// is not found.
-    async fn lifecycle<'a>(
-        &self,
-        session: &'a Session,
-    ) -> Result<tokio::sync::MutexGuard<'a, ()>, ErrorBody> {
-        let guard = session.lifecycle().await;
-        if !self.lock().sessions.contains_key(&session.id) {
-            return Err(not_found("session", &session.id));
-        }
-        Ok(guard)
-    }
-
     /// Deletes a session once its startup has finished. A session in a
     /// worktree has its agent stopped, then its worktree removed and the
     /// branch rule applied, with git run with `env`. A worktree that would
@@ -1063,7 +1044,7 @@ impl Daemon {
         env: BTreeMap<String, String>,
     ) -> Result<Deleted, ErrorBody> {
         let session = self.session(id)?;
-        let _lifecycle = self.lifecycle(&session).await?;
+        let _lifecycle = session.lifecycle().await?;
         let mut kept_branch = None;
         if let Some(worktree) = session.worktree() {
             let git = Git::for_client(env);
@@ -1078,60 +1059,27 @@ impl Daemon {
         Ok(Deleted { kept_branch })
     }
 
-    /// Archives a session that is not starting: its agent is stopped and its
-    /// worktree removed, with git run with `env`, and the branch is kept. A
-    /// worktree that would lose work refuses the archive unless `discard` is
-    /// set, leaving the session as it was, or `exited`
-    /// when the work appeared after its agent stopped.
+    /// Archives a session, as `Session::archive` describes, with git run
+    /// with `env`.
     async fn archive_session(
         &self,
         id: &str,
         discard: bool,
         env: BTreeMap<String, String>,
     ) -> Result<SessionInfo, ErrorBody> {
-        let session = self.session(id)?;
-        refuse_starting(&session)?;
-        let _lifecycle = self.lifecycle(&session).await?;
-        refuse_starting(&session)?;
-        if session.archived() {
-            return Err(invalid_state("the session is already archived"));
-        }
-        match session.worktree() {
-            Some(worktree) => {
-                let git = Git::for_client(env);
-                worktree
-                    .remove(&git, discard, session.stop(Change::Parked))
-                    .await?;
-            }
-            None => session.stop(Change::Parked).await,
-        }
-        self.store
-            .set_archived(id, true)
-            .map_err(|error| storage(&error))?;
-        session.set_archived(true);
-        Ok(session.info())
+        self.session(id)?
+            .archive(&Git::for_client(env), discard)
+            .await
     }
 
-    /// Adds an archived session's worktree again, with git run with
-    /// `env`, and unarchives it.
+    /// Unarchives a session, as `Session::unarchive` describes, with git run
+    /// with `env`.
     async fn unarchive_session(
         &self,
         id: &str,
         env: BTreeMap<String, String>,
     ) -> Result<SessionInfo, ErrorBody> {
-        let session = self.session(id)?;
-        let _lifecycle = self.lifecycle(&session).await?;
-        if !session.archived() {
-            return Err(invalid_state("the session is not archived"));
-        }
-        if let Some(worktree) = session.worktree() {
-            worktree.restore(&Git::for_client(env)).await?;
-        }
-        self.store
-            .set_archived(id, false)
-            .map_err(|error| storage(&error))?;
-        session.set_archived(false);
-        Ok(session.info())
+        self.session(id)?.unarchive(&Git::for_client(env)).await
     }
 
     /// Moves local branch `branch` of the workspace's repository from
@@ -1156,18 +1104,23 @@ impl Daemon {
     }
 
     /// Keeps Ox from starting or prompting agents in the checkout during
-    /// a branch move. The registry lock makes the busy check and reservation
-    /// one operation with respect to those requests.
+    /// a branch move: each session in it, which must be `idle` or `exited`,
+    /// refuses turns and loads until the move ends, and no session is
+    /// created in it. Under the registry lock, no session is added or begins
+    /// another move meanwhile.
     fn reserve_checkout(&self, checkout: &Path) -> Result<CheckoutMove<'_>, ErrorBody> {
         let checkout = resolved(checkout);
         let mut registry = self.lock();
         registry.refuse_moving(&checkout)?;
+        let mut sessions: Vec<Arc<Session>> = Vec::new();
         for session in registry.sessions.values() {
-            let state = session.state();
-            if matches!(state, SessionState::Idle | SessionState::Exited) {
+            if !resolved(session.cwd()).starts_with(&checkout) {
                 continue;
             }
-            if resolved(session.cwd()).starts_with(&checkout) {
+            if let Err(state) = session.begin_move() {
+                for marked in &sessions {
+                    marked.end_move();
+                }
                 return Err(ErrorBody {
                     code: code::INVALID_STATE,
                     message: format!(
@@ -1178,11 +1131,13 @@ impl Daemon {
                     ),
                 });
             }
+            sessions.push(session.clone());
         }
         registry.moving_checkouts.insert(checkout.clone());
         Ok(CheckoutMove {
             daemon: self,
             checkout,
+            sessions,
         })
     }
 
@@ -1229,7 +1184,7 @@ impl Daemon {
                         continue;
                     }
                 };
-            if self.add_imported(workspace_id, &bridge, claude, transcript)? {
+            if self.add_imported(workspace_id, &bridge, &claude, transcript)? {
                 imported += 1;
             }
         }
@@ -1261,7 +1216,7 @@ impl Daemon {
         &self,
         workspace_id: &str,
         bridge: &Path,
-        claude: ClaudeSession,
+        claude: &ClaudeSession,
         transcript: Transcript,
     ) -> Result<bool, ErrorBody> {
         self.update(|registry| {
@@ -1273,6 +1228,8 @@ impl Daemon {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .ok_or_else(|| not_found("workspace", workspace_id))?;
+            // TODO: a session imported during a branch move in the
+            // workspace's checkout does not refuse loads until the move ends.
             let id = uuid::Uuid::new_v4().to_string();
             let events = import::events(&id, transcript.updates);
             let mut saved = SavedSession {
@@ -1295,20 +1252,13 @@ impl Daemon {
                 .store
                 .import_session(&saved, &events)
                 .map_err(|error| storage(&error))?;
-            let state = State::restored(
-                id.clone(),
-                saved.title.clone(),
-                claude.session_id,
-                saved.last_seq,
-                Queue::default(),
-            );
+            let state = State::restored(&saved, None);
             let session = Session::new(
                 self.store.clone(),
                 self.changed.clone(),
                 self.park_after,
                 self.ox_server.clone(),
                 saved,
-                None,
                 state,
             );
             registry.sessions.insert(id, session);
@@ -1513,13 +1463,6 @@ fn resolved(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_owned())
 }
 
-fn refuse_starting(session: &Session) -> Result<(), ErrorBody> {
-    if session.state() == SessionState::Starting {
-        return Err(invalid_state("the session is still starting"));
-    }
-    Ok(())
-}
-
 /// The workspace as clients see it.
 /// The items whose version differs from the one in `sent`, and the IDs in
 /// `sent` with no item.
@@ -1563,14 +1506,14 @@ fn not_found(kind: &str, id: &str) -> ErrorBody {
     }
 }
 
-fn invalid_state(message: &str) -> ErrorBody {
+pub(crate) fn invalid_state(message: &str) -> ErrorBody {
     ErrorBody {
         code: code::INVALID_STATE,
         message: message.into(),
     }
 }
 
-fn storage(error: &rusqlite::Error) -> ErrorBody {
+pub(crate) fn storage(error: &rusqlite::Error) -> ErrorBody {
     ErrorBody {
         code: code::STORAGE,
         message: format!("the database failed: {error}"),

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
@@ -18,16 +18,16 @@ use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use ox_protocol::{
     ConfigSetting, ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo,
-    SessionRequest, SessionState, TranscriptPage, Unseen, code,
+    SessionRequest, SessionState, TranscriptPage, code,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, Store};
 use crate::transcript;
-use crate::worktree::Worktree;
+use crate::worktree::{Git, Worktree};
 
 type ConfigReply = oneshot::Sender<Result<(), String>>;
 
@@ -67,6 +67,10 @@ enum Command {
 /// One ACP agent process and its event history. The database keeps the
 /// session's workspace, command, directory, title, agent session ID, config,
 /// and the ID of its worktree.
+///
+/// Everything about the session that changes is in `state`, and every change
+/// goes through `update`. Lock order is the lifecycle guard, then the
+/// daemon's registry, then `state`, then `agent`.
 pub struct Session {
     pub id: String,
     pub number: u64,
@@ -75,46 +79,37 @@ pub struct Session {
     created_at: u64,
     command: Vec<String>,
     cwd: PathBuf,
-    /// The environment the agent was last launched with, over the daemon's.
-    env: Mutex<BTreeMap<String, String>>,
-    /// The worktree the session runs in. Unset when it could not be added.
-    worktree: Mutex<Option<Arc<Worktree>>>,
-    /// Whether the session is archived.
-    archived: Mutex<bool>,
-    /// The values Ox set the agent to, in the order they are sent. Changed
-    /// under the state lock.
-    config: Mutex<Vec<ConfigSetting>>,
-    /// Held while the session adds its worktree and launches its agent,
-    /// while it loads, and while it is deleted.
-    lifecycle: Arc<tokio::sync::Mutex<()>>,
     store: Arc<Store>,
     /// The `ox` MCP server the agent is given.
     ox_server: Arc<OxServer>,
-    state: Mutex<State>,
-    /// Set once the stored history is in the state.
-    history: tokio::sync::OnceCell<()>,
-    /// The seq of the session's last event. Updated under the state lock.
-    last_seq: watch::Sender<u64>,
     /// The daemon's signal that the lists or the sessions' states changed,
     /// sent when this session's `SessionInfo` changes.
     changed: watch::Sender<()>,
-    /// Counts the changes to the session's `SessionInfo`. Changed under the
-    /// state lock.
+    state: Mutex<State>,
+    agent: Mutex<AgentTask>,
+    /// Held while the session adds its worktree and launches its agent, and
+    /// while it loads, is parked, archived, unarchived or deleted, or its
+    /// workspace is removed.
+    lifecycle: Arc<tokio::sync::Mutex<()>>,
+    /// Set once the stored history is in the state.
+    history: tokio::sync::OnceCell<()>,
+    /// The seq of the session's last event.
+    last_seq: watch::Sender<u64>,
+    /// Counts the changes to the session's `SessionInfo`.
     info_version: AtomicU64,
-    /// Sends to the running agent task. A load replaces it.
-    commands: Mutex<mpsc::UnboundedSender<Command>>,
-    task: Mutex<Option<JoinHandle<()>>>,
-    /// The subscriptions to the session's events. Locked after the state.
-    viewers: Mutex<usize>,
     /// Whether the session may be parked.
     parkable: Parkability,
     /// Stops the agent of a session that stays parkable for the park delay.
-    parker: Mutex<Option<JoinHandle<()>>>,
-    /// How the session's turns ended while it was out of focus. Changed
-    /// under the state lock.
-    unseen: Mutex<Option<Unseen>>,
-    /// The connections that focus the session.
-    focused: AtomicUsize,
+    parker: OnceLock<AbortHandle>,
+}
+
+/// The running agent: the environment it was launched with, over the
+/// daemon's, the channel to its task, and the task. A load replaces them.
+#[derive(Default)]
+struct AgentTask {
+    env: BTreeMap<String, String>,
+    commands: Option<mpsc::UnboundedSender<Command>>,
+    task: Option<JoinHandle<()>>,
 }
 
 /// Whether a session is quiet and unviewed. `lapses` counts the times it
@@ -189,7 +184,7 @@ pub struct Viewer(Arc<Session>);
 
 impl Drop for Viewer {
     fn drop(&mut self) {
-        self.0.update(|_| *self.0.viewers.lock().unwrap() -= 1);
+        self.0.update(State::unview);
     }
 }
 
@@ -198,27 +193,26 @@ pub struct SessionFocus(Arc<Session>);
 
 impl Drop for SessionFocus {
     fn drop(&mut self) {
-        self.0.focused.fetch_sub(1, Ordering::SeqCst);
+        self.0.update(State::unfocus);
     }
 }
 
 impl Session {
-    /// The session `saved` in `state`, in `worktree` if it runs in one: a
-    /// session just saved is `starting`, and `start` launches its agent; a
-    /// restored one is `exited`, and its stored history is read by
-    /// `history`.
+    /// The session `saved` in `state`: a session just saved is `starting`,
+    /// and `start` launches its agent; a restored one is `exited`, and its
+    /// stored history is read by `history`.
     pub fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
         park_after: Duration,
         ox_server: Arc<OxServer>,
         saved: SavedSession,
-        worktree: Option<Arc<Worktree>>,
         state: State,
     ) -> Arc<Self> {
         let session = Arc::new(Self {
             last_seq: watch::Sender::new(state.last_seq()),
             state: Mutex::new(state),
+            agent: Mutex::default(),
             history: tokio::sync::OnceCell::new(),
             id: saved.id,
             number: saved.number,
@@ -226,25 +220,19 @@ impl Session {
             created_at: saved.created_at,
             command: saved.command,
             cwd: saved.cwd,
-            env: Mutex::default(),
-            worktree: Mutex::new(worktree),
-            archived: Mutex::new(saved.archived),
-            config: Mutex::new(saved.config),
             lifecycle: Arc::default(),
             store,
             ox_server,
             changed,
             info_version: AtomicU64::new(0),
-            commands: Mutex::new(mpsc::unbounded_channel().0),
-            task: Mutex::new(None),
-            viewers: Mutex::new(0),
             parkable: Parkability::default(),
-            parker: Mutex::new(None),
-            unseen: Mutex::new(saved.unseen),
-            focused: AtomicUsize::new(0),
+            parker: OnceLock::new(),
         });
-        *session.parker.lock().unwrap() =
-            Some(tokio::spawn(session.clone().park_when_idle(park_after)));
+        let parker = tokio::spawn(session.clone().park_when_idle(park_after));
+        session
+            .parker
+            .set(parker.abort_handle())
+            .expect("the park task is set once");
         session
     }
 
@@ -256,7 +244,9 @@ impl Session {
             async move {
                 // A load, startup or delete in progress finishes first, and
                 // the session is checked again after.
-                let _lifecycle = session.lifecycle().await;
+                let Ok(_lifecycle) = session.lifecycle().await else {
+                    return;
+                };
                 if session.parkable.holds(seen) {
                     session.stop(Change::Parked).await;
                 }
@@ -270,11 +260,9 @@ impl Session {
     /// session is open, or `AgentExited` if it cannot be opened. A session
     /// closed before it started stays closed.
     pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>, opening: Opening) {
-        // Holding the task slot keeps a concurrent `close` from missing the
-        // agent's task.
-        let mut task = self.task.lock().unwrap();
-        if self.state() == SessionState::Starting {
-            self.launch(&mut task, env, Launch::New(opening));
+        let state = self.lock();
+        if state.state() == SessionState::Starting {
+            self.launch(env, Launch::New(opening));
         }
     }
 
@@ -285,33 +273,53 @@ impl Session {
     }
 
     /// Records that the session's worktree could not be added: the session
-    /// has no worktree and exits with `message`.
+    /// forgets its worktree and exits with `message`.
     pub fn fail_start(&self, message: String) {
-        self.update(|state| {
-            *self.worktree.lock().unwrap() = None;
-            state.record(Change::Exited(Some(message)));
-        });
+        self.update(|state| state.fail_start(message));
     }
 
-    /// Starts the agent task in `task`, which opens or resumes an ACP
-    /// session. A new session's first prompt goes before its task's
-    /// commands.
-    fn launch(
-        self: &Arc<Self>,
-        task: &mut Option<JoinHandle<()>>,
-        env: BTreeMap<String, String>,
-        launch: Launch,
-    ) {
-        self.env.lock().unwrap().clone_from(&env);
+    /// Starts the agent task, which opens or resumes an ACP session. A new
+    /// session's first prompt goes before its task's commands. Called under
+    /// the state lock, so a `close` cannot miss the task.
+    fn launch(self: &Arc<Self>, env: BTreeMap<String, String>, launch: Launch) {
         let (commands, commands_rx) = mpsc::unbounded_channel();
-        *self.commands.lock().unwrap() = commands;
-        *task = Some(tokio::spawn(self.clone().run(commands_rx, env, launch)));
+        let task = tokio::spawn(self.clone().run(commands_rx, env.clone(), launch));
+        *self.agent.lock().unwrap() = AgentTask {
+            env,
+            commands: Some(commands),
+            task: Some(task),
+        };
     }
 
-    /// Starts a new agent on an exited session that has an agent session ID,
-    /// resuming it with replay if the history has no recorded agent start.
+    /// Loads an exited session that has an agent session ID, once no other
+    /// lifecycle operation runs: its history is read, and a new agent
+    /// resumes it, with replay if the history has no recorded agent start.
     /// Records `AgentStarted` on success or `AgentExited` on failure.
-    pub fn load(self: &Arc<Self>, env: BTreeMap<String, String>) -> Result<(), ErrorBody> {
+    pub async fn load(self: &Arc<Self>, env: BTreeMap<String, String>) -> Result<(), ErrorBody> {
+        let _lifecycle = self.lifecycle().await?;
+        self.history().await?;
+        self.resume(env)
+    }
+
+    /// Loads the session as `load` does if it is `exited` once no other
+    /// lifecycle operation runs, and otherwise leaves it as it is.
+    pub async fn load_if_exited(
+        self: &Arc<Self>,
+        env: BTreeMap<String, String>,
+    ) -> Result<(), ErrorBody> {
+        if self.state() != SessionState::Exited {
+            return Ok(());
+        }
+        let _lifecycle = self.lifecycle().await?;
+        self.history().await?;
+        if self.state() != SessionState::Exited {
+            return Ok(());
+        }
+        self.resume(env)
+    }
+
+    /// Starts a new agent on the session, which `State::load` checks.
+    fn resume(self: &Arc<Self>, env: BTreeMap<String, String>) -> Result<(), ErrorBody> {
         if self.archived() {
             return Err(ErrorBody {
                 code: code::INVALID_STATE,
@@ -327,12 +335,72 @@ impl Session {
                 ),
             });
         }
-        // Holding the task slot keeps a concurrent `close` from missing the
-        // new task.
-        let mut task = self.task.lock().unwrap();
-        let resume = self.update(State::load)?;
-        self.launch(&mut task, env, Launch::Resume(resume));
+        self.update(|state| {
+            let resume = state.load()?;
+            self.launch(env, Launch::Resume(resume));
+            Ok(())
+        })
+    }
+
+    /// Archives a session that is not starting, once no other lifecycle
+    /// operation runs: its agent is stopped and its worktree removed, with
+    /// `git`, and the branch is kept. A worktree that would lose work
+    /// refuses the archive unless `discard` is set, leaving the session as it
+    /// was, or `exited` when the work appeared after its agent stopped.
+    pub async fn archive(&self, git: &Git, discard: bool) -> Result<SessionInfo, ErrorBody> {
+        self.refuse_starting()?;
+        let _lifecycle = self.lifecycle().await?;
+        self.refuse_starting()?;
+        if self.archived() {
+            return Err(crate::daemon::invalid_state(
+                "the session is already archived",
+            ));
+        }
+        match self.worktree() {
+            Some(worktree) => {
+                worktree
+                    .remove(git, discard, self.stop(Change::Parked))
+                    .await?;
+            }
+            None => self.stop(Change::Parked).await,
+        }
+        self.commit(|state| state.set_archived(true))?;
+        Ok(self.info())
+    }
+
+    /// Adds an archived session's worktree again, with `git`, and unarchives
+    /// it, once no other lifecycle operation runs.
+    pub async fn unarchive(&self, git: &Git) -> Result<SessionInfo, ErrorBody> {
+        let _lifecycle = self.lifecycle().await?;
+        if !self.archived() {
+            return Err(crate::daemon::invalid_state("the session is not archived"));
+        }
+        if let Some(worktree) = self.worktree() {
+            worktree.restore(git).await?;
+        }
+        self.commit(|state| state.set_archived(false))?;
+        Ok(self.info())
+    }
+
+    fn refuse_starting(&self) -> Result<(), ErrorBody> {
+        if self.state() == SessionState::Starting {
+            return Err(crate::daemon::invalid_state(
+                "the session is still starting",
+            ));
+        }
         Ok(())
+    }
+
+    /// Marks a branch move under way in the session's checkout, which an
+    /// `idle` or `exited` session allows; another gives its state.
+    pub fn begin_move(&self) -> Result<(), SessionState> {
+        self.update(State::begin_move)
+    }
+
+    /// Ends the branch move, and starts the queue's first prompt if the
+    /// session can take it.
+    pub fn end_move(&self) {
+        self.update(State::end_move);
     }
 
     pub fn info(&self) -> SessionInfo {
@@ -352,7 +420,7 @@ impl Session {
     }
 
     pub fn archived(&self) -> bool {
-        *self.archived.lock().unwrap()
+        self.lock().archived()
     }
 
     /// Sets the title, with runs of whitespace collapsed to one space, and
@@ -369,11 +437,6 @@ impl Session {
         Ok(())
     }
 
-    /// Marks the session archived, or not, and signals the change.
-    pub fn set_archived(&self, archived: bool) {
-        self.update(|_| *self.archived.lock().unwrap() = archived);
-    }
-
     /// The directory the session's agent runs in.
     pub fn cwd(&self) -> &Path {
         &self.cwd
@@ -386,7 +449,7 @@ impl Session {
     /// The environment the agent was last launched with, over the daemon's:
     /// empty for a session restored from the database that has not loaded.
     pub fn env(&self) -> BTreeMap<String, String> {
-        self.env.lock().unwrap().clone()
+        self.agent.lock().unwrap().env.clone()
     }
 
     pub fn title(&self) -> Option<String> {
@@ -399,7 +462,7 @@ impl Session {
     }
 
     pub fn worktree(&self) -> Option<Arc<Worktree>> {
-        self.worktree.lock().unwrap().clone()
+        self.lock().worktree().cloned()
     }
 
     /// The lifecycle guard of a session no one else has seen yet, such as one
@@ -411,10 +474,19 @@ impl Session {
             .expect("nothing else holds a new session's lifecycle lock")
     }
 
-    /// Waits until the session is not starting in its worktree, loading, or
-    /// being deleted, and keeps others from doing so while the guard lives.
-    pub async fn lifecycle(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.lifecycle.lock().await
+    /// Waits until no other lifecycle operation runs on the session, and
+    /// keeps others from running while the guard lives. A session closed
+    /// meanwhile, as deleting it or removing its workspace does, is not
+    /// found.
+    pub async fn lifecycle(&self) -> Result<OwnedMutexGuard<()>, ErrorBody> {
+        let guard = self.lifecycle.clone().lock_owned().await;
+        if self.lock().closed() {
+            return Err(ErrorBody {
+                code: code::NOT_FOUND,
+                message: format!("no session {}", self.id),
+            });
+        }
+        Ok(guard)
     }
 
     pub fn state(&self) -> SessionState {
@@ -423,12 +495,6 @@ impl Session {
 
     fn info_of(&self, state: &State) -> SessionInfo {
         let agent = state.agent();
-        let worktree_id = self
-            .worktree
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|worktree| worktree.id.clone());
         SessionInfo {
             id: self.id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -440,14 +506,14 @@ impl Session {
             prompt_capabilities: agent
                 .map(|agent| agent.prompt_capabilities.clone())
                 .unwrap_or_default(),
-            config: self.config.lock().unwrap().clone(),
+            config: state.config().to_vec(),
             available_commands: agent
                 .map(|agent| agent.available_commands.clone())
                 .unwrap_or_default(),
-            worktree_id,
-            archived: *self.archived.lock().unwrap(),
+            worktree_id: state.worktree().map(|worktree| worktree.id.clone()),
+            archived: state.archived(),
             created_at: self.created_at,
-            unseen: *self.unseen.lock().unwrap(),
+            unseen: state.unseen(),
             queue: state.queued().to_vec(),
         }
     }
@@ -455,32 +521,13 @@ impl Session {
     /// Counts a connection's focus on the session while the guard lives, and
     /// clears its unseen outcome.
     pub fn focus(self: &Arc<Self>) -> SessionFocus {
-        self.update(|_| {
-            self.focused.fetch_add(1, Ordering::SeqCst);
-            *self.unseen.lock().unwrap() = None;
-        });
+        self.update(State::focus);
         SessionFocus(self.clone())
-    }
-
-    /// Records the unseen outcome `events` give a session out of focus. An
-    /// error replaces a finish but not the reverse.
-    fn note_unseen(&self, events: &[Event]) {
-        if self.focused.load(Ordering::SeqCst) > 0 {
-            return;
-        }
-        let mut unseen = self.unseen.lock().unwrap();
-        match state::unseen(events) {
-            Some(Unseen::Error) => *unseen = Some(Unseen::Error),
-            Some(Unseen::Finished) if unseen.is_none() => {
-                *unseen = Some(Unseen::Finished);
-            }
-            _ => {}
-        }
     }
 
     /// Counts a subscription to the session's events while the guard lives.
     pub fn view(self: &Arc<Self>) -> Viewer {
-        self.update(|_| *self.viewers.lock().unwrap() += 1);
+        self.update(State::view);
         Viewer(self.clone())
     }
 
@@ -720,7 +767,7 @@ impl Session {
     /// subscriptions. `change` is what the session records: `Exited(None)`,
     /// or `Parked`.
     pub async fn stop(&self, change: Change) {
-        let task = self.task.lock().unwrap().take();
+        let task = self.agent.lock().unwrap().task.take();
         if let Some(task) = task {
             task.abort();
             // The task ends cancelled, having dropped the agent.
@@ -732,13 +779,14 @@ impl Session {
     /// Stops the agent, killing its process group, and ends every
     /// subscription with `SessionClosed`.
     pub fn close(&self) {
-        self.record(Change::Closed);
-        let task = self.task.lock().unwrap().take();
+        let task = self.update(|state| {
+            state.record(Change::Closed);
+            self.agent.lock().unwrap().task.take()
+        });
         if let Some(task) = task {
             task.abort();
         }
-        let parker = self.parker.lock().unwrap().take();
-        if let Some(parker) = parker {
+        if let Some(parker) = self.parker.get() {
             parker.abort();
         }
     }
@@ -750,131 +798,66 @@ impl Session {
     /// Sends a command to the running agent task. A session whose agent has
     /// exited has none, and its commands are dropped.
     fn send(&self, command: Command) {
-        let _ = self.commands.lock().unwrap().send(command);
+        if let Some(commands) = &self.agent.lock().unwrap().commands {
+            let _ = commands.send(command);
+        }
     }
 
     /// The values Ox set the agent to.
     fn config(&self) -> Vec<ConfigSetting> {
-        self.config.lock().unwrap().clone()
+        self.lock().config().to_vec()
     }
 
-    /// Records that the agent opened its ACP session. A session without a
-    /// config takes the one the agent reports.
-    fn record_start(&self, agent: state::Agent) {
-        self.update(|state| {
-            let mut config = self.config.lock().unwrap();
-            if state.state() == SessionState::Starting && config.is_empty() {
-                *config = state::reported_config(&agent.config_options);
-            }
-            drop(config);
-            state.record(Change::Started(agent));
-        });
-    }
-
-    /// Records the agent's answers to a new config: the session's config
-    /// becomes the answered settings when the agent accepted them all, and
-    /// otherwise each accepted setting replaces the one with its ID. Returns
-    /// the error naming each refused setting.
-    fn settle_config(&self, answers: Vec<(ConfigSetting, Option<String>)>) -> Result<(), String> {
-        let refusals = refusals(&answers);
-        self.update(|_| {
-            let mut config = self.config.lock().unwrap();
-            if refusals.is_empty() {
-                *config = answers.into_iter().map(|(setting, _)| setting).collect();
-                return;
-            }
-            for (setting, refusal) in answers {
-                if refusal.is_some() {
-                    continue;
-                }
-                match config
-                    .iter_mut()
-                    .find(|current| current.config_id == setting.config_id)
-                {
-                    Some(current) => *current = setting,
-                    None => config.push(setting),
-                }
-            }
-        });
-        if refusals.is_empty() {
-            Ok(())
-        } else {
-            Err(refusals.join("\n"))
-        }
-    }
-
-    /// Changes the state, starts the queue's next prompt if the session can
-    /// take it, publishes the seq of its last event, records the unseen
-    /// outcome its new events give, queues them for the database, saves a
-    /// changed title, agent session ID, unseen outcome, config or queue,
-    /// signals the daemon if the session's `SessionInfo` changed, and asks
-    /// the worktree for its comparison again when a turn ended.
+    /// Changes the state, then, under the state lock, starts the queue's
+    /// next prompt if the session can take it, records the unseen outcome
+    /// the new events give, saves the changes to the session's row, queues
+    /// the events for the database, asks the worktree for its comparison
+    /// again when a turn ended, and publishes the seq of the last event,
+    /// whether the session is parkable and, if its `SessionInfo` changed,
+    /// the change. A failed save goes to oxd's log and the session carries
+    /// on.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
+        let (result, saved) = self.apply(change);
+        if let Err(error) = saved {
+            eprintln!("oxd: saving session {}: {error}", self.id);
+        }
+        result
+    }
+
+    /// Changes the state as `update` does, and gives the error of a failed
+    /// save.
+    fn commit<R>(&self, change: impl FnOnce(&mut State) -> R) -> Result<R, ErrorBody> {
+        let (result, saved) = self.apply(change);
+        saved.map_err(|error| crate::daemon::storage(&error))?;
+        Ok(result)
+    }
+
+    fn apply<R>(&self, change: impl FnOnce(&mut State) -> R) -> (R, rusqlite::Result<()>) {
         let mut state = self.lock();
         let before = self.info_of(&state);
         let result = change(&mut state);
         if let Some((prompt, seq)) = state.start_queued() {
             self.send(Command::Prompt { prompt, seq });
         }
-        if let Some(queue) = state.take_changed_queue()
-            && let Err(error) = self.store.set_session_queue(&self.id, &queue)
-        {
-            eprintln!("oxd: saving the queue of session {}: {error}", self.id);
-        }
-        self.last_seq.send_replace(state.last_seq());
         let events = state.take_unlogged();
-        self.note_unseen(&events);
-        if events
+        state.note_unseen(&events);
+        let saved = self.store.save_session(&self.id, &state.take_unsaved());
+        let turn_ended = events
             .iter()
-            .any(|event| matches!(event.kind, EventKind::TurnEnded { .. }))
-            && let Some(worktree) = self.worktree()
-        {
-            worktree.recompare();
-        }
+            .any(|event| matches!(event.kind, EventKind::TurnEnded { .. }));
         if !events.is_empty() {
             self.store.log(events);
         }
-        self.parkable
-            .set(state.quiet() && *self.viewers.lock().unwrap() == 0);
-        let after = self.info_of(&state);
-        if after != before {
-            self.save(&before, &after);
+        if turn_ended && let Some(worktree) = state.worktree() {
+            worktree.recompare();
+        }
+        self.last_seq.send_replace(state.last_seq());
+        self.parkable.set(state.parkable());
+        if self.info_of(&state) != before {
             self.info_version.fetch_add(1, Ordering::Release);
             self.changed.send_replace(());
         }
-        result
-    }
-
-    /// Writes what differs between two infos to the session's row. A failed
-    /// write goes to oxd's log and the session carries on.
-    fn save(&self, before: &SessionInfo, after: &SessionInfo) {
-        if after.title != before.title
-            && let Err(error) = self.store.set_title(&self.id, after.title.as_deref())
-        {
-            eprintln!("oxd: saving the title of session {}: {error}", self.id);
-        }
-        if after.agent_session_id != before.agent_session_id
-            && let Some(agent_session_id) = &after.agent_session_id
-            && let Err(error) = self.store.set_agent_session_id(&self.id, agent_session_id)
-        {
-            eprintln!(
-                "oxd: saving the agent session of session {}: {error}",
-                self.id
-            );
-        }
-        if after.unseen != before.unseen
-            && let Err(error) = self.store.set_session_unseen(&self.id, after.unseen)
-        {
-            eprintln!(
-                "oxd: saving the unseen outcome of session {}: {error}",
-                self.id
-            );
-        }
-        if after.config != before.config
-            && let Err(error) = self.store.set_session_config(&self.id, &after.config)
-        {
-            eprintln!("oxd: saving the config of session {}: {error}", self.id);
-        }
+        (result, saved)
     }
 
     fn record(&self, change: Change) {
@@ -1028,7 +1011,7 @@ impl Session {
                         move |result: Result<state::Agent, _>| {
                             let result = result.map(|agent| {
                                 let id = agent.session_id.clone();
-                                session.record_start(agent);
+                                session.record(Change::Started(agent));
                                 id
                             });
                             let _ = opened.send(result);
@@ -1091,7 +1074,7 @@ impl Session {
                     let mut first = None;
                     match opening {
                         Some(prompt) => {
-                            let refused = refusals(&answers.await);
+                            let refused = state::refusals(&answers.await);
                             match prompt {
                                 Some((prompt, seq)) if refused.is_empty() => {
                                     first = Some(Command::Prompt { prompt, seq });
@@ -1110,7 +1093,7 @@ impl Session {
                         None => {
                             let id = session.id.clone();
                             connection.spawn(async move {
-                                for refusal in refusals(&answers.await) {
+                                for refusal in state::refusals(&answers.await) {
                                     eprintln!("oxd: session {id}: {refusal}");
                                 }
                                 Ok(())
@@ -1166,7 +1149,9 @@ impl Session {
                                 let answers = send_config(&connection, &acp_session, config);
                                 let session = session.clone();
                                 connection.spawn(async move {
-                                    let _ = reply.send(session.settle_config(answers.await));
+                                    let answers = answers.await;
+                                    let _ = reply
+                                        .send(session.update(|state| state.settle_config(answers)));
                                     Ok(())
                                 })?;
                             }
@@ -1207,23 +1192,6 @@ fn send_config(
         }
         answers
     }
-}
-
-/// The refused settings of `answers`, each as `The agent refused <id>
-/// <value>: <error>`.
-fn refusals(answers: &[(ConfigSetting, Option<String>)]) -> Vec<String> {
-    answers
-        .iter()
-        .filter_map(|(setting, refusal)| {
-            let value = match &setting.value {
-                ConfigValue::Id(id) => id.clone(),
-                ConfigValue::Boolean(value) => value.to_string(),
-            };
-            refusal
-                .as_ref()
-                .map(|error| format!("The agent refused {} {value}: {error}", setting.config_id))
-        })
-        .collect()
 }
 
 /// The ACP value of an option value from a client.

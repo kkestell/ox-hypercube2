@@ -9,8 +9,8 @@ use std::process::Stdio;
 
 use ox_protocol::schema::{ContentBlock, SessionUpdate};
 use ox_protocol::{
-    Branches, Checkout, Client, Comparison, Deleted, Error, EventKind, ListingChange, SessionInfo,
-    SessionState, WorktreeInfo, code,
+    Branches, Checkout, Client, Comparison, Deleted, Error, EventKind, Listing, ListingChange,
+    SessionInfo, SessionState, WorktreeInfo, code,
 };
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -546,7 +546,7 @@ async fn a_worktree_that_cannot_be_added_is_undone() {
     drop(client);
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
-    assert!(sessions(&client).await.is_empty());
+    assert_eq!(info(&client, &session.id).await, Some(after));
 }
 
 /// Asks for a session of the fake agent in a new worktree of the
@@ -734,8 +734,32 @@ async fn a_failed_worktree_leaves_a_branch_another_worktree_checked_out() {
             &branch,
         ],
     );
+    let mut watch = client.watch().await.unwrap();
     blocked.release().await;
 
+    // Every listing names only listed worktrees, through the session's exit.
+    let mut listing = Listing::default();
+    loop {
+        for change in next_changes(&mut watch).await {
+            apply(&mut listing, change);
+        }
+        for listed in &listing.sessions {
+            if let Some(id) = &listed.worktree_id {
+                assert!(
+                    listing.worktrees.iter().any(|worktree| worktree.id == *id),
+                    "session {} names worktree {id}, which is not listed",
+                    listed.id
+                );
+            }
+        }
+        if listing
+            .sessions
+            .iter()
+            .any(|listed| listed.id == session.id && listed.state == SessionState::Exited)
+        {
+            break;
+        }
+    }
     let error = exited(&client, &session).await;
     assert!(error.contains("worktree add"), "{error}");
     assert_eq!(info(&client, &session.id).await.unwrap().worktree_id, None);
@@ -781,6 +805,88 @@ async fn a_workspace_removed_during_a_creation() {
     blocked.release().await;
     started(&client, &session).await;
     assert_eq!(workspaces(&client).await, [workspace]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_workspace_waits_for_an_unarchive_under_way() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let session = new_session(&client, repo.path(), on_ox_branch())
+        .await
+        .unwrap();
+    let session = started(&client, &session).await;
+    client
+        .archive(&session.id, false, BTreeMap::new())
+        .await
+        .unwrap();
+    let workspace = workspace_id(&client, repo.path()).await;
+
+    let blocked = BlockedGit::new(" worktree add ");
+    let unarchiving = client.unarchive(&session.id, blocked.env());
+    let removing = async {
+        blocked.blocked().await;
+        let removal = client.remove_workspace(&workspace);
+        tokio::pin!(removal);
+        // Polling the removal once sends it.
+        tokio::select! {
+            biased;
+            removed = &mut removal => panic!("removed during the unarchive: {removed:?}"),
+            () = std::future::ready(()) => {}
+        }
+        // The daemon reads a connection's requests in order, so this listing
+        // is answered after the removal arrived.
+        assert_eq!(workspaces(&client).await.len(), 1);
+        blocked.release().await;
+        removal.await
+    };
+    let (unarchived, removed) = tokio::join!(unarchiving, removing);
+    assert!(!unarchived.unwrap().archived);
+    let refused = refusal(removed);
+    assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
+    assert_eq!(workspaces(&client).await.len(), 1);
+    assert!(!info(&client, &session.id).await.unwrap().archived);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_session_that_never_started_keeps_its_first_prompt_across_a_restart() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let workspace = workspace_id(&client, repo.path()).await;
+    let session = client
+        .new_session(
+            &workspace,
+            vec![FAKE_AGENT.into(), "--no-sessions".into()],
+            BTreeMap::new(),
+            on_ox_branch(),
+            Vec::new(),
+            Some(text("hello")),
+        )
+        .await
+        .unwrap();
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    until(&mut events, |kind| {
+        matches!(kind, EventKind::AgentExited { .. })
+    })
+    .await;
+    drop(events);
+    drop(client);
+
+    let daemon = daemon.restart().await;
+    let client = daemon.client().await;
+    let restored = info(&client, &session.id).await.unwrap();
+    assert_eq!(restored.state, SessionState::Exited);
+    assert_eq!(restored.worktree_id, session.worktree_id);
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    let first = next(&mut events).await;
+    assert_eq!(
+        first.kind,
+        EventKind::PromptStarted {
+            prompt: text("hello"),
+            from: None,
+        }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1576,19 +1682,20 @@ fn compared_with(reference: &str) -> Checkout {
 }
 
 /// Moves `branch` of the workspace for `path` from `expected` to `to`, from
-/// a source branch at `to`, with git run with the daemon's environment.
+/// a source branch at `to`, with git run with `env`.
 async fn move_branch(
     client: &Client,
     path: &Path,
     branch: &str,
     to: &str,
     expected: &str,
+    env: BTreeMap<String, String>,
 ) -> Result<(), Error> {
     git(path, &["branch", "--force", "source", to]);
     let workspace = workspace_id(client, path).await;
     timeout(
         TIMEOUT,
-        client.fast_forward_branch(&workspace, branch, expected, "source", to, BTreeMap::new()),
+        client.fast_forward_branch(&workspace, branch, expected, "source", to, env),
     )
     .await
     .expect("timed out moving the branch")
@@ -1679,17 +1786,44 @@ async fn a_branch_no_checkout_has_moves_only_from_where_it_is_expected() {
     commit_file(repo.path(), "second");
     let second = commit_of(repo.path(), "HEAD");
 
-    let refused = refusal(move_branch(&client, repo.path(), "topic", "main", &second).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "topic",
+            "main",
+            &second,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "topic"), first);
 
-    move_branch(&client, repo.path(), "topic", "main", &first)
-        .await
-        .unwrap();
+    move_branch(
+        &client,
+        repo.path(),
+        "topic",
+        "main",
+        &first,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_of(repo.path(), "topic"), second);
 
     let side = commit_beside(repo.path(), &first, "side");
-    let refused = refusal(move_branch(&client, repo.path(), "topic", &side, &second).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "topic",
+            &side,
+            &second,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::INVALID_REQUEST, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "topic"), second);
 }
@@ -1702,9 +1836,16 @@ async fn moving_a_checked_out_branch_moves_its_checkout() {
     let first = commit_of(repo.path(), "HEAD");
     let topic = commit_beside(repo.path(), &first, "added");
 
-    move_branch(&client, repo.path(), "main", &topic, &first)
-        .await
-        .unwrap();
+    move_branch(
+        &client,
+        repo.path(),
+        "main",
+        &topic,
+        &first,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_of(repo.path(), "HEAD"), topic);
     assert_eq!(
         std::fs::read_to_string(repo.path().join("added")).unwrap(),
@@ -1722,7 +1863,17 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
     let topic = commit_beside(repo.path(), &first, "added");
 
     std::fs::write(repo.path().join("README"), "changed\n").unwrap();
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "main",
+            &topic,
+            &first,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::UNSAVED_WORK, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
     assert_eq!(
@@ -1734,7 +1885,17 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
     // An untracked file where the move adds one fails it in git, and the
     // branch goes back.
     std::fs::write(repo.path().join("added"), "mine\n").unwrap();
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "main",
+            &topic,
+            &first,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::GIT, "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
     assert_eq!(
@@ -1746,9 +1907,16 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
 
     // An untracked file the move leaves alone does not stop it.
     std::fs::write(repo.path().join("notes"), "notes\n").unwrap();
-    move_branch(&client, repo.path(), "main", &topic, &first)
-        .await
-        .unwrap();
+    move_branch(
+        &client,
+        repo.path(),
+        "main",
+        &topic,
+        &first,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
     assert_eq!(commit_of(repo.path(), "HEAD"), topic);
     assert!(repo.path().join("added").exists());
     assert_eq!(git(repo.path(), &["status", "--porcelain"]), "?? notes");
@@ -1766,7 +1934,17 @@ async fn a_move_keeps_an_ignored_file_it_would_overwrite() {
     let topic = commit_beside(repo.path(), &first, "added");
     std::fs::write(repo.path().join("added"), "mine\n").unwrap();
 
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "main",
+            &topic,
+            &first,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::UNSAVED_WORK, "{refused:?}");
     assert!(refused.message.contains("added"), "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
@@ -1791,17 +1969,79 @@ async fn a_move_waits_for_an_agent_in_the_checkout_to_end_its_turn() {
     client.prompt(&session.id, text("wait")).await.unwrap();
     until_state(&client, &session.id, SessionState::Running).await;
 
-    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
+    let refused = refusal(
+        move_branch(
+            &client,
+            repo.path(),
+            "main",
+            &topic,
+            &first,
+            BTreeMap::new(),
+        )
+        .await,
+    );
     assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
     assert!(refused.message.contains(&session.id), "{refused:?}");
     assert_eq!(commit_of(repo.path(), "main"), first);
 
     client.cancel(&session.id).await.unwrap();
     until(&mut events, turn_ended).await;
-    move_branch(&client, repo.path(), "main", &topic, &first)
+    move_branch(
+        &client,
+        repo.path(),
+        "main",
+        &topic,
+        &first,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(commit_of(repo.path(), "HEAD"), topic);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_prompt_waits_for_a_branch_move_in_its_checkout() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let first = commit_of(repo.path(), "HEAD");
+    let topic = commit_beside(repo.path(), &first, "added");
+    let session = new_session(&client, repo.path(), Checkout::Workspace)
         .await
         .unwrap();
-    assert_eq!(commit_of(repo.path(), "HEAD"), topic);
+    let session = started(&client, &session).await;
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+
+    let blocked = BlockedGit::new(" update-ref ");
+    let moving = move_branch(&client, repo.path(), "main", &topic, &first, blocked.env());
+    let during = async {
+        blocked.blocked().await;
+        let refused = refusal(client.prompt(&session.id, text("say 1 0")).await);
+        assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
+        assert!(refused.message.contains("branch move"), "{refused:?}");
+        client
+            .queue_add(&session.id, text("say 1 0"))
+            .await
+            .unwrap();
+        // Read after the queued prompt on the same connection.
+        let listed = info(&client, &session.id).await.unwrap();
+        assert_eq!(listed.state, SessionState::Idle);
+        assert_eq!(listed.queue.len(), 1);
+        blocked.release().await;
+    };
+    let (moved, ()) = tokio::join!(moving, during);
+    moved.unwrap();
+    let started = until(&mut events, |kind| {
+        matches!(kind, EventKind::PromptStarted { .. })
+    })
+    .await;
+    assert_eq!(
+        started.last().unwrap().kind,
+        EventKind::PromptStarted {
+            prompt: text("say 1 0"),
+            from: None,
+        }
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1870,9 +2110,16 @@ async fn a_move_compares_the_repositorys_sessions_again() {
     let session = started(&client, &session).await;
     until_compared(&client, &session, counts(0, 0)).await;
 
-    move_branch(&client, repo.path(), "main", &topic, &first)
-        .await
-        .unwrap();
+    move_branch(
+        &client,
+        repo.path(),
+        "main",
+        &topic,
+        &first,
+        BTreeMap::new(),
+    )
+    .await
+    .unwrap();
     until_compared(&client, &session, counts(0, 1)).await;
 }
 

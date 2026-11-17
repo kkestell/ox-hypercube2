@@ -47,7 +47,8 @@ When the branch is checked out, its files and index move with it. Ox checks
 for uncommitted tracked changes, untracked files the move would overwrite
 (including ignored files), and agents starting, working, or waiting for an
 answer. While the move runs, Ox refuses requests to start, load, or prompt a
-session in that checkout.
+session in that checkout, and prompts queued in that checkout wait until the
+move finishes.
 
 Submodule checkouts stay at their current commits when the branch moves.
 

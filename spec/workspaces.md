@@ -38,7 +38,7 @@ Users add local project directories as workspaces and browse their sessions in t
 ## Rules
 
 - A workspace must be an existing directory. Adding a missing path, a non-directory, or an already-added path fails.
-- A workspace cannot be removed while a session that is not archived belongs to it, including an exited one. Remove Workspace is disabled in that case.
+- A workspace cannot be removed while a session that is not archived belongs to it, including an exited one. Remove Workspace is disabled in that case. Removing a workspace waits for an unarchive or delete of one of its sessions already in progress, then checks again.
 - Removing or hiding a workspace's presentation is not an instruction to delete project files.
 - Changes made by another connected client appear in the app's lists.
 - An import takes only interactive Claude Code sessions, run in a terminal or the Claude desktop app, started in the workspace directory itself. Sessions started in a subdirectory, and `claude -p` and Agent SDK runs, are left out.

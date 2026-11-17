@@ -60,6 +60,20 @@ pub struct SavedWorktree {
     pub common_dir: PathBuf,
 }
 
+/// One change to a session's saved data.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowChange {
+    Title(Option<String>),
+    AgentSessionId(String),
+    Config(Vec<ConfigSetting>),
+    Unseen(Option<Unseen>),
+    Archived(bool),
+    Queue(Queue),
+    /// The session's worktree could not be added, so its row is deleted and
+    /// the session keeps no worktree.
+    WorktreeForgotten(String),
+}
+
 /// What the event writer thread is sent.
 enum Write {
     Events(Vec<Event>),
@@ -336,83 +350,60 @@ impl Store {
         )
     }
 
-    /// Forgets a worktree. The session that ran in it is kept, with no
-    /// worktree.
-    pub fn remove_worktree(&self, worktree_id: &str) -> rusqlite::Result<()> {
-        self.lock()
-            .execute("DELETE FROM worktrees WHERE id = ?1", [worktree_id])?;
-        Ok(())
-    }
-
-    /// Whether a session that is not archived belongs to the workspace.
-    pub fn workspace_has_unarchived_sessions(&self, workspace_id: &str) -> rusqlite::Result<bool> {
-        self.lock().query_row(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = ?1
-                AND id NOT IN (SELECT session_id FROM archived))",
-            [workspace_id],
-            |row| row.get(0),
-        )
-    }
-
-    pub fn set_title(&self, id: &str, title: Option<&str>) -> rusqlite::Result<()> {
-        self.lock().execute(
-            "UPDATE sessions SET title = ?2 WHERE id = ?1",
-            params![id, title],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_agent_session_id(&self, id: &str, agent_session_id: &str) -> rusqlite::Result<()> {
-        self.lock().execute(
-            "UPDATE sessions SET agent_session_id = ?2 WHERE id = ?1",
-            params![id, agent_session_id],
-        )?;
-        Ok(())
-    }
-
-    /// Replaces a session's config.
-    pub fn set_session_config(&self, id: &str, config: &[ConfigSetting]) -> rusqlite::Result<()> {
-        let config = serde_json::to_string(config).expect("settings serialize");
-        self.lock().execute(
-            "UPDATE sessions SET config = ?2 WHERE id = ?1",
-            params![id, config],
-        )?;
-        Ok(())
-    }
-
-    /// Marks a session archived, or not.
-    pub fn set_archived(&self, id: &str, archived: bool) -> rusqlite::Result<()> {
-        let sql = if archived {
-            "INSERT OR IGNORE INTO archived (session_id) VALUES (?1)"
-        } else {
-            "DELETE FROM archived WHERE session_id = ?1"
-        };
-        self.lock().execute(sql, [id])?;
-        Ok(())
-    }
-
-    /// Saves a session's unseen outcome, or deletes it with `None`.
-    pub fn set_session_unseen(&self, id: &str, unseen: Option<Unseen>) -> rusqlite::Result<()> {
-        let connection = self.lock();
-        match unseen {
-            Some(unseen) => connection.execute(
-                "INSERT OR REPLACE INTO session_unseen (session_id, unseen) VALUES (?1, ?2)",
-                params![id, unseen_name(unseen)],
-            )?,
-            None => connection.execute("DELETE FROM session_unseen WHERE session_id = ?1", [id])?,
-        };
-        Ok(())
-    }
-
-    /// Saves a session's queue and whether it is held.
-    pub fn set_session_queue(&self, id: &str, queue: &Queue) -> rusqlite::Result<()> {
-        let prompts = serde_json::to_string(&queue.prompts).expect("prompts serialize");
-        self.lock().execute(
-            "INSERT OR REPLACE INTO session_queues (session_id, paused, prompts)
-             VALUES (?1, ?2, ?3)",
-            params![id, queue.paused, prompts],
-        )?;
-        Ok(())
+    /// Writes `changes` to session `id`'s saved data in one transaction, so
+    /// that none of them is written if one fails.
+    pub fn save_session(&self, id: &str, changes: &[RowChange]) -> rusqlite::Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        for change in changes {
+            match change {
+                RowChange::Title(title) => transaction.execute(
+                    "UPDATE sessions SET title = ?2 WHERE id = ?1",
+                    params![id, title],
+                )?,
+                RowChange::AgentSessionId(agent_session_id) => transaction.execute(
+                    "UPDATE sessions SET agent_session_id = ?2 WHERE id = ?1",
+                    params![id, agent_session_id],
+                )?,
+                RowChange::Config(config) => transaction.execute(
+                    "UPDATE sessions SET config = ?2 WHERE id = ?1",
+                    params![
+                        id,
+                        serde_json::to_string(config).expect("settings serialize")
+                    ],
+                )?,
+                RowChange::Unseen(Some(unseen)) => transaction.execute(
+                    "INSERT OR REPLACE INTO session_unseen (session_id, unseen) VALUES (?1, ?2)",
+                    params![id, unseen_name(*unseen)],
+                )?,
+                RowChange::Unseen(None) => {
+                    transaction.execute("DELETE FROM session_unseen WHERE session_id = ?1", [id])?
+                }
+                RowChange::Archived(true) => transaction.execute(
+                    "INSERT OR IGNORE INTO archived (session_id) VALUES (?1)",
+                    [id],
+                )?,
+                RowChange::Archived(false) => {
+                    transaction.execute("DELETE FROM archived WHERE session_id = ?1", [id])?
+                }
+                RowChange::Queue(queue) => transaction.execute(
+                    "INSERT OR REPLACE INTO session_queues (session_id, paused, prompts)
+                    VALUES (?1, ?2, ?3)",
+                    params![
+                        id,
+                        queue.paused,
+                        serde_json::to_string(&queue.prompts).expect("prompts serialize")
+                    ],
+                )?,
+                RowChange::WorktreeForgotten(worktree_id) => {
+                    transaction.execute("DELETE FROM worktrees WHERE id = ?1", [worktree_id])?
+                }
+            };
+        }
+        transaction.commit()
     }
 
     /// Deletes a session, with its events and the worktree it runs in, and
@@ -801,11 +792,11 @@ mod tests {
             .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert!(!store.sessions().unwrap()[0].archived);
-        store.set_archived("one", true).unwrap();
+        save(&store, "one", RowChange::Archived(true));
         assert!(store.sessions().unwrap()[0].archived);
-        store.set_archived("one", false).unwrap();
+        save(&store, "one", RowChange::Archived(false));
         assert!(!store.sessions().unwrap()[0].archived);
-        store.set_archived("one", true).unwrap();
+        save(&store, "one", RowChange::Archived(true));
         store.remove_session("one").unwrap();
         assert_eq!(count(&store, "archived"), 0);
     }
@@ -818,19 +809,13 @@ mod tests {
             .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert_eq!(store.sessions().unwrap()[0].unseen, None);
-        store
-            .set_session_unseen("one", Some(Unseen::Finished))
-            .unwrap();
+        save(&store, "one", RowChange::Unseen(Some(Unseen::Finished)));
         assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Finished));
-        store
-            .set_session_unseen("one", Some(Unseen::Error))
-            .unwrap();
+        save(&store, "one", RowChange::Unseen(Some(Unseen::Error)));
         assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Error));
-        store.set_session_unseen("one", None).unwrap();
+        save(&store, "one", RowChange::Unseen(None));
         assert_eq!(store.sessions().unwrap()[0].unseen, None);
-        store
-            .set_session_unseen("one", Some(Unseen::Error))
-            .unwrap();
+        save(&store, "one", RowChange::Unseen(Some(Unseen::Error)));
         store.remove_session("one").unwrap();
         assert_eq!(count(&store, "session_unseen"), 0);
     }
@@ -849,13 +834,18 @@ mod tests {
             }],
             paused: true,
         };
-        store.set_session_queue("one", &queue).unwrap();
+        save(&store, "one", RowChange::Queue(queue.clone()));
         assert_eq!(store.sessions().unwrap()[0].queue, queue);
-        store.set_session_queue("one", &Queue::default()).unwrap();
+        save(&store, "one", RowChange::Queue(Queue::default()));
         assert_eq!(store.sessions().unwrap()[0].queue, Queue::default());
-        store.set_session_queue("one", &queue).unwrap();
+        save(&store, "one", RowChange::Queue(queue.clone()));
         store.remove_session("one").unwrap();
         assert_eq!(count(&store, "session_queues"), 0);
+    }
+
+    /// Writes one change to session `id`.
+    fn save(store: &Store, id: &str, change: RowChange) {
+        store.save_session(id, &[change]).unwrap();
     }
 
     fn setting(config_id: &str, value: &str) -> ConfigSetting {
@@ -866,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn title_agent_session_id_and_config_updates_are_saved() {
+    fn saved_title_agent_session_id_and_config_read_back() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
@@ -884,16 +874,23 @@ mod tests {
             store.sessions().unwrap()[0].config,
             [setting("model", "smart")]
         );
-        store.set_title("s", Some("Fix the build")).unwrap();
-        store.set_agent_session_id("s", "agent").unwrap();
-        let config = [setting("model", "fast"), setting("effort", "low")];
-        store.set_session_config("s", &config).unwrap();
+        let config = vec![setting("model", "fast"), setting("effort", "low")];
+        store
+            .save_session(
+                "s",
+                &[
+                    RowChange::Title(Some("Fix the build".into())),
+                    RowChange::AgentSessionId("agent".into()),
+                    RowChange::Config(config.clone()),
+                ],
+            )
+            .unwrap();
         let saved = &store.sessions().unwrap()[0];
         assert_eq!(saved.title.as_deref(), Some("Fix the build"));
         assert_eq!(saved.agent_session_id.as_deref(), Some("agent"));
         assert_eq!(saved.config, config);
 
-        store.set_title("s", None).unwrap();
+        store.save_session("s", &[RowChange::Title(None)]).unwrap();
         assert_eq!(store.sessions().unwrap()[0].title, None);
     }
 
@@ -921,7 +918,9 @@ mod tests {
         store
             .add_session("o", "v", &command(), Path::new("/other"), None, 0, &[])
             .unwrap();
-        store.set_agent_session_id("s", "claude").unwrap();
+        store
+            .save_session("s", &[RowChange::AgentSessionId("claude".into())])
+            .unwrap();
         store.remove_workspace("w").unwrap();
         assert_eq!(store.workspaces().unwrap(), [workspace("v", "/other")]);
         let sessions: Vec<_> = store
@@ -982,11 +981,13 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_worktree_leaves_its_session_without_one() {
+    fn a_forgotten_worktree_leaves_its_session_without_one() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         add_worktree_session(&store, "s", &worktree("one"));
-        store.remove_worktree("one").unwrap();
+        store
+            .save_session("s", &[RowChange::WorktreeForgotten("one".into())])
+            .unwrap();
         assert!(store.worktrees().unwrap().is_empty());
         assert_eq!(store.sessions().unwrap()[0].worktree_id, None);
     }
@@ -1027,18 +1028,28 @@ mod tests {
     }
 
     #[test]
-    fn whether_a_workspace_has_unarchived_sessions() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        store.add_workspace(&workspace("v", "/other")).unwrap();
-        assert!(!store.workspace_has_unarchived_sessions("w").unwrap());
+    fn a_failed_change_leaves_the_others_unwritten() {
+        let store = store_with_session();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None, 0, &[])
+            .lock()
+            .execute_batch("DROP TABLE session_queues")
             .unwrap();
-        assert!(store.workspace_has_unarchived_sessions("w").unwrap());
-        assert!(!store.workspace_has_unarchived_sessions("v").unwrap());
-        store.set_archived("s", true).unwrap();
-        assert!(!store.workspace_has_unarchived_sessions("w").unwrap());
+        store
+            .save_session(
+                "s",
+                &[
+                    RowChange::Title(Some("Fix the build".into())),
+                    RowChange::Queue(Queue::default()),
+                ],
+            )
+            .unwrap_err();
+        let title: Option<String> = store
+            .lock()
+            .query_row("SELECT title FROM sessions WHERE id = 's'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, None);
     }
 
     /// Event `seq` of `session`, recorded `seq` milliseconds after the
@@ -1134,7 +1145,9 @@ mod tests {
         store
             .add_session("two", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
-        store.set_agent_session_id("one", "claude").unwrap();
+        store
+            .save_session("one", &[RowChange::AgentSessionId("claude".into())])
+            .unwrap();
         assert!(!store.was_deleted("claude").unwrap());
         store.remove_session("one").unwrap();
         assert!(store.was_deleted("claude").unwrap());

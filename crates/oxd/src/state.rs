@@ -1,5 +1,7 @@
 //! A session's state machine and the event history it writes.
 
+use std::sync::Arc;
+
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v2::schema::StopReason;
 use agent_client_protocol::v2::schema::{
@@ -15,6 +17,9 @@ use ox_protocol::{
     SessionState, Unseen, code,
 };
 use tokio::sync::oneshot;
+
+use crate::store::{RowChange, SavedSession};
+use crate::worktree::Worktree;
 
 /// Events a subscriber is handed at a time.
 const BATCH: usize = 256;
@@ -585,7 +590,8 @@ pub struct Queue {
     pub paused: bool,
 }
 
-/// A session's phase, its queue, and every event it has recorded.
+/// Everything about a session that changes: its phase, its queue, every
+/// event it has recorded, and the rest of what the database saves for it.
 /// `SessionClosed` ends a session's subscriptions and is not stored. Each
 /// `PromptStarted` and `TurnStarted` is followed by one `TurnEnded`, each
 /// `PromptSteered` by one `SteeredPromptTaken` or `SteeredPromptDropped`,
@@ -594,6 +600,9 @@ pub struct Queue {
 ///
 /// A session restored from the database knows its last seq but holds no
 /// events until `fill` gives it the stored history, and records none before.
+///
+/// Each transition that changes what the database saves for the session
+/// records the change in `unsaved`, as it records its events in `unlogged`.
 pub struct State {
     session_id: String,
     phase: Phase,
@@ -609,8 +618,21 @@ pub struct State {
     /// stay unique for the session's lifetime, across every agent it loads.
     next_request: u64,
     queue: Queue,
-    /// Whether the queue changed since `take_changed_queue`.
-    queue_changed: bool,
+    /// The worktree the session runs in. Unset when it could not be added.
+    worktree: Option<Arc<Worktree>>,
+    archived: bool,
+    /// The values Ox set the agent to, in the order they are sent.
+    config: Vec<ConfigSetting>,
+    /// How the session's turns ended while it was out of focus.
+    unseen: Option<Unseen>,
+    /// The connections that focus the session.
+    focused: usize,
+    /// The subscriptions to the session's events.
+    viewers: usize,
+    /// Whether a branch move is under way in the session's checkout.
+    moving: bool,
+    /// Changes to the session's saved data since `take_unsaved`.
+    unsaved: Vec<RowChange>,
 }
 
 #[derive(Debug)]
@@ -644,61 +666,49 @@ pub fn reported_config(options: &[SessionConfigOption]) -> Vec<ConfigSetting> {
 }
 
 impl State {
-    pub fn new(session_id: String) -> Self {
-        Self {
-            session_id,
-            phase: Phase::Starting {
-                replay: Some(Vec::new()),
-                busy: false,
-                background: None,
-                previous: None,
-                prompt: None,
-            },
-            title: None,
-            events: Some(Vec::new()),
-            last_seq: 0,
-            unlogged: Vec::new(),
-            next_request: 1,
-            queue: Queue::default(),
-            queue_changed: false,
-        }
+    /// A session just saved: `starting`, holding its events from the first.
+    pub fn created(saved: &SavedSession, worktree: Option<Arc<Worktree>>) -> Self {
+        let phase = Phase::Starting {
+            replay: Some(Vec::new()),
+            busy: false,
+            background: None,
+            previous: None,
+            prompt: None,
+        };
+        Self::of(saved, worktree, phase, Some(Vec::new()))
     }
 
-    /// A session saved in the database: exited, with no agent and its
-    /// history, which ends at `last_seq`, not yet read, and its saved queue.
-    pub fn restored(
-        session_id: String,
-        title: Option<String>,
-        agent_session_id: String,
-        last_seq: u64,
-        queue: Queue,
+    /// A session read from the database or imported: `exited`, with the
+    /// saved agent session if its agent ever opened one, and its history,
+    /// which ends at its last seq, not yet read.
+    pub fn restored(saved: &SavedSession, worktree: Option<Arc<Worktree>>) -> Self {
+        let agent = saved.agent_session_id.clone().map(Agent::saved);
+        Self::of(saved, worktree, Phase::Exited(agent), None)
+    }
+
+    fn of(
+        saved: &SavedSession,
+        worktree: Option<Arc<Worktree>>,
+        phase: Phase,
+        events: Option<Vec<Event>>,
     ) -> Self {
         Self {
-            session_id,
-            phase: Phase::Exited(Some(Agent::saved(agent_session_id))),
-            title,
-            events: None,
-            last_seq,
+            session_id: saved.id.clone(),
+            phase,
+            title: saved.title.clone(),
+            events,
+            last_seq: saved.last_seq,
             unlogged: Vec::new(),
             next_request: 1,
-            queue,
-            queue_changed: false,
-        }
-    }
-
-    /// A saved session whose agent never started: exited, with no events and
-    /// nothing to load, and its saved queue.
-    pub fn unstarted(session_id: String, title: Option<String>, queue: Queue) -> Self {
-        Self {
-            session_id,
-            phase: Phase::Exited(None),
-            title,
-            events: Some(Vec::new()),
-            last_seq: 0,
-            unlogged: Vec::new(),
-            next_request: 1,
-            queue,
-            queue_changed: false,
+            queue: saved.queue.clone(),
+            worktree,
+            archived: saved.archived,
+            config: saved.config.clone(),
+            unseen: saved.unseen,
+            focused: 0,
+            viewers: 0,
+            moving: false,
+            unsaved: Vec::new(),
         }
     }
 
@@ -781,9 +791,20 @@ impl State {
         std::mem::take(&mut self.unlogged)
     }
 
-    /// The queue, if it changed since the last call, for the database.
-    pub fn take_changed_queue(&mut self) -> Option<Queue> {
-        std::mem::take(&mut self.queue_changed).then(|| self.queue.clone())
+    /// The changes to the session's saved data since the last call, the
+    /// last of each kind, for the database.
+    pub fn take_unsaved(&mut self) -> Vec<RowChange> {
+        let mut unsaved: Vec<RowChange> = Vec::new();
+        for change in std::mem::take(&mut self.unsaved) {
+            unsaved.retain(|kept| std::mem::discriminant(kept) != std::mem::discriminant(&change));
+            unsaved.push(change);
+        }
+        unsaved
+    }
+
+    /// Records that the queue changed.
+    fn queue_changed(&mut self) {
+        self.unsaved.push(RowChange::Queue(self.queue.clone()));
     }
 
     /// The prompts waiting to start a turn each, in order.
@@ -794,23 +815,23 @@ impl State {
     fn pause(&mut self) {
         if !self.queue.paused {
             self.queue.paused = true;
-            self.queue_changed = true;
+            self.queue_changed();
         }
     }
 
     fn resume(&mut self) {
         if self.queue.paused {
             self.queue.paused = false;
-            self.queue_changed = true;
+            self.queue_changed();
         }
     }
 
     /// Starts a turn with the queue's first prompt when the agent is idle,
-    /// has no steered prompt to take in, and the queue is not held. Returns
-    /// the prompt to send and the seq of its `PromptStarted` event.
-    // TODO: a queued prompt can start while the session's branch is moving,
-    // which `session.prompt` refuses.
+    /// has no steered prompt to take in, the queue is not held, and no
+    /// branch move is under way in the session's checkout. Returns the
+    /// prompt to send and the seq of its `PromptStarted` event.
     pub fn start_queued(&mut self) -> Option<(Vec<ContentBlock>, u64)> {
+        self.refuse_moving().ok()?;
         let Phase::Live(live) = &mut self.phase else {
             return None;
         };
@@ -825,7 +846,7 @@ impl State {
         let seq = self.last_seq + 1;
         live.turn = Some(Turn::Prompted(seq));
         let prompt = self.queue.prompts.remove(0).prompt;
-        self.queue_changed = true;
+        self.queue_changed();
         self.append(EventKind::PromptStarted {
             prompt: prompt.clone(),
             from: None,
@@ -838,6 +859,7 @@ impl State {
     /// neither an agent start nor a prompt requests and records replay to
     /// recover its conversation.
     pub fn load(&mut self) -> Result<Resume, ErrorBody> {
+        self.refuse_moving()?;
         let id = match &self.phase {
             Phase::Exited(Some(agent)) => agent.session_id.clone(),
             Phase::Exited(None) => {
@@ -879,7 +901,8 @@ impl State {
 
     /// Replaces the title, recording no event.
     pub fn set_title(&mut self, title: String) {
-        self.title = Some(title);
+        self.title = Some(title.clone());
+        self.unsaved.push(RowChange::Title(Some(title)));
     }
 
     pub fn state(&self) -> SessionState {
@@ -978,27 +1001,27 @@ impl State {
             (_, Request::QueueAdd(queued)) => {
                 self.check_queued(&queued.prompt)?;
                 self.queue.prompts.push(queued);
-                self.queue_changed = true;
+                self.queue_changed();
                 return Ok(None);
             }
             (_, Request::QueueEdit(queued)) => {
                 self.check_queued(&queued.prompt)?;
                 let index = self.queued_index(&queued.id)?;
                 self.queue.prompts[index] = queued;
-                self.queue_changed = true;
+                self.queue_changed();
                 return Ok(None);
             }
             (_, Request::QueueRemove { id }) => {
                 let index = self.queued_index(&id)?;
                 self.queue.prompts.remove(index);
-                self.queue_changed = true;
+                self.queue_changed();
                 return Ok(None);
             }
             (_, Request::QueueSend { id }) => {
                 let index = self.queued_index(&id)?;
                 let sent = self.send_now(self.queue.prompts[index].prompt.clone(), None, true)?;
                 self.queue.prompts.remove(index);
-                self.queue_changed = true;
+                self.queue_changed();
                 return Ok(Some(sent));
             }
             (
@@ -1075,6 +1098,7 @@ impl State {
         from: Option<Sender>,
         resume_queue: bool,
     ) -> Result<(Vec<ContentBlock>, u64), ErrorBody> {
+        self.refuse_moving()?;
         let seq = self.last_seq + 1;
         let Phase::Live(live) = &mut self.phase else {
             return Err(invalid_state(self.phase.state()));
@@ -1126,6 +1150,19 @@ impl State {
     /// Records a change. A cancelled turn, and a turn that ends other than
     /// normally, holds the queue.
     pub fn record(&mut self, change: Change) {
+        if let (Phase::Starting { previous, .. }, Change::Started(agent)) = (&self.phase, &change) {
+            if previous.as_ref().map(|previous| &previous.session_id) != Some(&agent.session_id) {
+                self.unsaved
+                    .push(RowChange::AgentSessionId(agent.session_id.clone()));
+            }
+            // A session without a config takes the one the agent reports.
+            if self.config.is_empty() {
+                self.config = reported_config(&agent.config_options);
+                if !self.config.is_empty() {
+                    self.unsaved.push(RowChange::Config(self.config.clone()));
+                }
+            }
+        }
         let cancelled = matches!(change, Change::Cancelled);
         let phase = std::mem::replace(&mut self.phase, Phase::Closed);
         let (phase, events) = phase.after(change, &mut self.next_request);
@@ -1138,12 +1175,162 @@ impl State {
         }
     }
 
+    /// Refuses a turn or a load while a branch move is under way in the
+    /// session's checkout.
+    pub fn refuse_moving(&self) -> Result<(), ErrorBody> {
+        if self.moving {
+            return Err(ErrorBody {
+                code: code::INVALID_STATE,
+                message: "a branch move is in progress in this checkout".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Marks a branch move under way in the session's checkout, which an
+    /// `idle` or `exited` session allows. Another session gives its state.
+    pub fn begin_move(&mut self) -> Result<(), SessionState> {
+        match self.state() {
+            SessionState::Idle | SessionState::Exited => {
+                self.moving = true;
+                Ok(())
+            }
+            state => Err(state),
+        }
+    }
+
+    /// Ends the branch move `begin_move` marked.
+    pub fn end_move(&mut self) {
+        self.moving = false;
+    }
+
+    pub fn archived(&self) -> bool {
+        self.archived
+    }
+
+    pub fn set_archived(&mut self, archived: bool) {
+        self.archived = archived;
+        self.unsaved.push(RowChange::Archived(archived));
+    }
+
+    pub fn worktree(&self) -> Option<&Arc<Worktree>> {
+        self.worktree.as_ref()
+    }
+
+    /// Records that the session's worktree could not be added: the session
+    /// forgets its worktree and exits with `message`.
+    pub fn fail_start(&mut self, message: String) {
+        if let Some(worktree) = self.worktree.take() {
+            self.unsaved
+                .push(RowChange::WorktreeForgotten(worktree.id.clone()));
+        }
+        self.record(Change::Exited(Some(message)));
+    }
+
+    /// The values Ox set the agent to, in the order they are sent.
+    pub fn config(&self) -> &[ConfigSetting] {
+        &self.config
+    }
+
+    /// Records the agent's answers to a new config: the config becomes the
+    /// answered settings when the agent accepted them all, and otherwise
+    /// each accepted setting replaces the one with its ID. Returns the error
+    /// naming each refused setting.
+    pub fn settle_config(
+        &mut self,
+        answers: Vec<(ConfigSetting, Option<String>)>,
+    ) -> Result<(), String> {
+        let refusals = refusals(&answers);
+        if refusals.is_empty() {
+            self.config = answers.into_iter().map(|(setting, _)| setting).collect();
+        } else {
+            for (setting, refusal) in answers {
+                if refusal.is_some() {
+                    continue;
+                }
+                match self
+                    .config
+                    .iter_mut()
+                    .find(|current| current.config_id == setting.config_id)
+                {
+                    Some(current) => *current = setting,
+                    None => self.config.push(setting),
+                }
+            }
+        }
+        self.unsaved.push(RowChange::Config(self.config.clone()));
+        if refusals.is_empty() {
+            Ok(())
+        } else {
+            Err(refusals.join("\n"))
+        }
+    }
+
+    pub fn unseen(&self) -> Option<Unseen> {
+        self.unseen
+    }
+
+    /// Records the unseen outcome `events` give a session out of focus. An
+    /// error replaces a finish but not the reverse.
+    pub fn note_unseen(&mut self, events: &[Event]) {
+        if self.focused > 0 {
+            return;
+        }
+        let unseen = match unseen(events) {
+            Some(Unseen::Error) => Unseen::Error,
+            Some(Unseen::Finished) if self.unseen.is_none() => Unseen::Finished,
+            _ => return,
+        };
+        if self.unseen != Some(unseen) {
+            self.unseen = Some(unseen);
+            self.unsaved.push(RowChange::Unseen(Some(unseen)));
+        }
+    }
+
+    /// Counts a connection's focus on the session, which clears its unseen
+    /// outcome.
+    pub fn focus(&mut self) {
+        self.focused += 1;
+        if self.unseen.take().is_some() {
+            self.unsaved.push(RowChange::Unseen(None));
+        }
+    }
+
+    pub fn unfocus(&mut self) {
+        self.focused -= 1;
+    }
+
+    /// Counts a subscription to the session's events.
+    pub fn view(&mut self) {
+        self.viewers += 1;
+    }
+
+    pub fn unview(&mut self) {
+        self.viewers -= 1;
+    }
+
+    /// Whether the session may be parked: quiet and unviewed.
+    pub fn parkable(&self) -> bool {
+        self.quiet() && self.viewers == 0
+    }
+
+    /// Whether the session is closed, as a deleted session is.
+    pub fn closed(&self) -> bool {
+        matches!(self.phase, Phase::Closed)
+    }
+
     fn append(&mut self, kind: EventKind) {
         if let EventKind::Update(SessionUpdate::SessionInfoUpdate(update)) = &kind {
-            match &update.title {
-                MaybeUndefined::Value(title) => self.title = Some(title.clone()),
-                MaybeUndefined::Null => self.title = None,
-                MaybeUndefined::Undefined => {}
+            let title = match &update.title {
+                MaybeUndefined::Value(title) => Some(Some(title.clone())),
+                MaybeUndefined::Null => Some(None),
+                MaybeUndefined::Undefined => None,
+            };
+            if let Some(title) = title
+                && title != self.title
+            {
+                self.title.clone_from(&title);
+                self.unsaved.push(RowChange::Title(title));
             }
         }
         // A session that has not loaded its history records nothing.
@@ -1219,6 +1406,23 @@ pub fn check_prompt(
         }
     }
     Ok(())
+}
+
+/// The refused settings of `answers`, each as `The agent refused <id>
+/// <value>: <error>`.
+pub fn refusals(answers: &[(ConfigSetting, Option<String>)]) -> Vec<String> {
+    answers
+        .iter()
+        .filter_map(|(setting, refusal)| {
+            let value = match &setting.value {
+                ConfigValue::Id(id) => id.clone(),
+                ConfigValue::Boolean(value) => value.to_string(),
+            };
+            refusal
+                .as_ref()
+                .map(|error| format!("The agent refused {} {value}: {error}", setting.config_id))
+        })
+        .collect()
 }
 
 /// Checks a form elicitation that oxd can show to clients, and returns its
@@ -1333,8 +1537,32 @@ mod tests {
 
     use super::*;
 
+    /// A session as `add_session` saves it.
+    fn saved() -> SavedSession {
+        SavedSession {
+            number: 1,
+            id: "s".into(),
+            workspace_id: "w".into(),
+            command: vec!["agent".into()],
+            cwd: "/work".into(),
+            title: None,
+            agent_session_id: None,
+            worktree_id: None,
+            last_seq: 0,
+            archived: false,
+            created_at: 0,
+            unseen: None,
+            queue: Queue::default(),
+            config: Vec::new(),
+        }
+    }
+
+    fn created() -> State {
+        State::created(&saved(), None)
+    }
+
     fn started() -> State {
-        let mut state = State::new("s".into());
+        let mut state = created();
         state.record(Change::Started(Agent {
             session_id: "agent".into(),
             prompt_capabilities: PromptCapabilities::default(),
@@ -1351,7 +1579,7 @@ mod tests {
                 agent_client_protocol::v2::schema::Command::new(name, "Run"),
             )]
         };
-        let mut state = State::new("s".into());
+        let mut state = created();
         state.record(Change::Started(Agent {
             available_commands: commands("first"),
             ..Agent::saved("agent".into())
@@ -1461,7 +1689,7 @@ mod tests {
 
     #[test]
     fn state_follows_the_turn_and_its_permission_requests() {
-        let mut state = State::new("s".into());
+        let mut state = created();
         assert_eq!(state.state(), SessionState::Starting);
         assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
 
@@ -1512,7 +1740,7 @@ mod tests {
 
     #[test]
     fn a_first_prompt_is_recorded_while_starting_and_runs_once_started() {
-        let mut state = State::new("s".into());
+        let mut state = created();
         let seq = state.record_first_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
         assert_eq!(seq, 1);
         assert_eq!(state.state(), SessionState::Starting);
@@ -1536,7 +1764,7 @@ mod tests {
             (Some("no agent".to_string()), "no agent"),
             (None, "the agent exited before the prompt"),
         ] {
-            let mut state = State::new("s".into());
+            let mut state = created();
             state.record_first_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
             state.record(Change::Exited(error.clone()));
             assert_eq!(state.state(), SessionState::Exited);
@@ -1961,7 +2189,7 @@ mod tests {
 
     #[test]
     fn a_refused_send_leaves_the_prompt_queued() {
-        let mut state = State::new("s".into());
+        let mut state = created();
         enqueue(&mut state, "first");
         let refused = state.request(Request::QueueSend { id: "first".into() });
         assert_eq!(refused.unwrap_err().code, code::INVALID_STATE);
@@ -1996,7 +2224,7 @@ mod tests {
         );
 
         // Left when oxd stopped.
-        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
+        let mut state = restored_at(3);
         state.fill(stored(vec![
             agent_started(),
             EventKind::PromptStarted {
@@ -2013,10 +2241,10 @@ mod tests {
             EventKind::SteeredPromptDropped { prompt: 3 }
         );
         assert_eq!(kinds(&state, 4), ["turn_ended"]);
-        assert_eq!(
-            state.take_changed_queue().map(|queue| queue.paused),
-            Some(true)
-        );
+        assert!(state.take_unsaved().contains(&RowChange::Queue(Queue {
+            prompts: Vec::new(),
+            paused: true,
+        })));
     }
 
     #[test]
@@ -2216,14 +2444,28 @@ mod tests {
 
     fn restored() -> State {
         let mut state = State::restored(
-            "s".into(),
-            Some("Fix the build".into()),
-            "agent".into(),
-            0,
-            Queue::default(),
+            &SavedSession {
+                title: Some("Fix the build".into()),
+                ..saved_with_agent(0)
+            },
+            None,
         );
         state.fill(Vec::new());
         state
+    }
+
+    /// A session restored with agent session `agent` and a history that
+    /// ends at `last_seq`, not yet read.
+    fn restored_at(last_seq: u64) -> State {
+        State::restored(&saved_with_agent(last_seq), None)
+    }
+
+    fn saved_with_agent(last_seq: u64) -> SavedSession {
+        SavedSession {
+            agent_session_id: Some("agent".into()),
+            last_seq,
+            ..saved()
+        }
     }
 
     /// The history of a session whose daemon stopped after `kinds`.
@@ -2272,7 +2514,7 @@ mod tests {
 
     #[test]
     fn a_restored_session_holds_no_events_until_it_is_filled() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
+        let mut state = restored_at(3);
         assert!(!state.loaded());
         assert_eq!(state.last_seq(), 3);
         assert!(state.events_after(0).is_empty());
@@ -2283,7 +2525,7 @@ mod tests {
 
     #[test]
     fn fill_closes_the_turn_and_the_permission_request_a_stop_left_open() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 6, Queue::default());
+        let mut state = restored_at(6);
         state.fill(stored(vec![
             agent_started(),
             EventKind::TurnStarted,
@@ -2321,7 +2563,7 @@ mod tests {
 
     #[test]
     fn fill_leaves_a_finished_history_as_it_is() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 4, Queue::default());
+        let mut state = restored_at(4);
         state.fill(stored(vec![
             agent_started(),
             EventKind::TurnStarted,
@@ -2337,7 +2579,7 @@ mod tests {
 
     #[test]
     fn permission_request_ids_continue_after_the_history() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 2, Queue::default());
+        let mut state = restored_at(2);
         state.fill(stored(vec![agent_started(), requested("5")]));
         state.load().unwrap();
         state.record(Change::Started(Agent {
@@ -2391,7 +2633,7 @@ mod tests {
 
     #[test]
     fn a_restored_session_whose_history_has_a_prompt_loads_without_replay() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 2, Queue::default());
+        let mut state = restored_at(2);
         state.fill(stored(vec![
             EventKind::PromptStarted {
                 prompt: vec![ContentBlock::Text(TextContent::new("Fix the build"))],
@@ -2470,7 +2712,7 @@ mod tests {
         );
         assert_eq!(state.load().unwrap().session_id, "agent");
 
-        let mut state = State::new("s".into());
+        let mut state = created();
         state.record(Change::Parked);
         assert_eq!(state.state(), SessionState::Starting);
         assert!(kinds(&state, 0).is_empty());
@@ -2546,7 +2788,7 @@ mod tests {
 
     #[test]
     fn only_an_exited_session_with_an_agent_session_loads() {
-        let mut state = State::new("s".into());
+        let mut state = created();
         assert_eq!(state.load().unwrap_err().code, code::INVALID_STATE);
         state.record(Change::Exited(Some("never started".into())));
         assert_eq!(state.state(), SessionState::Exited);
@@ -2608,7 +2850,7 @@ mod tests {
     #[test]
     fn session_info_updates_set_clear_and_keep_the_title() {
         // A loading agent replays its title before it starts.
-        let mut state = State::new("s".into());
+        let mut state = created();
         state.record(info(SessionInfoUpdate::new().title("Replayed")));
         state.record(Change::Started(Agent {
             session_id: "agent".into(),
@@ -2801,7 +3043,7 @@ mod tests {
 
     #[test]
     fn fill_cancels_an_open_elicitation_and_ids_continue_past_it() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
+        let mut state = restored_at(3);
         state.fill(stored(vec![
             agent_started(),
             requested("1"),
@@ -2959,5 +3201,226 @@ mod tests {
         for (name, events, expected) in cases {
             assert_eq!(unseen(&events), expected, "{name}");
         }
+    }
+
+    #[test]
+    fn a_restored_session_that_never_started_holds_its_first_prompt_and_cannot_load() {
+        let mut state = State::restored(
+            &SavedSession {
+                last_seq: 3,
+                ..saved()
+            },
+            None,
+        );
+        assert_eq!(state.state(), SessionState::Exited);
+        state.fill(stored(vec![
+            EventKind::PromptStarted {
+                prompt: text("hello"),
+                from: None,
+            },
+            EventKind::TurnEnded {
+                stop_reason: None,
+                error: Some("no agent".into()),
+            },
+            EventKind::AgentExited {
+                error: Some("no agent".into()),
+            },
+        ]));
+        assert_eq!(
+            kinds(&state, 0),
+            ["prompt_started", "turn_ended", "agent_exited"]
+        );
+        assert!(state.take_unlogged().is_empty());
+        let refused = state.load().unwrap_err();
+        assert_eq!(refused.code, code::INVALID_STATE);
+        assert_eq!(
+            refused.message,
+            "the session never started, so it has nothing to load"
+        );
+    }
+
+    #[test]
+    fn a_move_begins_only_on_an_idle_or_exited_session() {
+        let mut starting = created();
+        assert_eq!(starting.begin_move(), Err(SessionState::Starting));
+
+        let mut running = started();
+        prompt(&mut running).unwrap();
+        assert_eq!(running.begin_move(), Err(SessionState::Running));
+
+        let mut awaiting = started();
+        prompt(&mut awaiting).unwrap();
+        let _answer = request_permission(&mut awaiting);
+        assert_eq!(awaiting.begin_move(), Err(SessionState::AwaitingPermission));
+
+        assert_eq!(started().begin_move(), Ok(()));
+        let mut exited = started();
+        exited.record(Change::Exited(None));
+        assert_eq!(exited.begin_move(), Ok(()));
+    }
+
+    #[test]
+    fn a_moving_session_refuses_turns_and_loads_and_holds_its_queue() {
+        let moved = |refused: ErrorBody| {
+            assert_eq!(refused.code, code::INVALID_STATE);
+            assert_eq!(
+                refused.message,
+                "a branch move is in progress in this checkout"
+            );
+        };
+        let mut state = started();
+        state.begin_move().unwrap();
+        moved(prompt(&mut state).unwrap_err());
+        moved(message(&mut state, "hello").unwrap_err());
+        enqueue(&mut state, "first");
+        assert_eq!(start_queued(&mut state), None);
+        moved(
+            state
+                .request(Request::QueueSend { id: "first".into() })
+                .unwrap_err(),
+        );
+        assert_eq!(queued_ids(&state), ["first"]);
+        state.end_move();
+        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
+
+        let mut state = started();
+        state.record(Change::Exited(None));
+        state.begin_move().unwrap();
+        moved(state.load().unwrap_err());
+        state.end_move();
+        state.load().unwrap();
+    }
+
+    fn agent_with(config_options: Vec<SessionConfigOption>) -> Agent {
+        Agent {
+            config_options,
+            ..Agent::saved("agent".into())
+        }
+    }
+
+    fn model_option(value: &str) -> SessionConfigOption {
+        SessionConfigOption::select(
+            "model".to_owned(),
+            "Model".to_owned(),
+            value.to_owned(),
+            vec![SessionConfigSelectOption::new(
+                value.to_owned(),
+                value.to_owned(),
+            )],
+        )
+        .category(Some(SessionConfigOptionCategory::Model))
+    }
+
+    fn model(value: &str) -> ConfigSetting {
+        ConfigSetting {
+            config_id: "model".into(),
+            value: ConfigValue::Id(value.into()),
+        }
+    }
+
+    #[test]
+    fn transitions_record_the_changes_to_the_saved_session() {
+        let mut state = created();
+        state.record(Change::Started(agent_with(vec![model_option("smart")])));
+        assert_eq!(state.config(), [model("smart")]);
+        assert_eq!(
+            state.take_unsaved(),
+            [
+                RowChange::AgentSessionId("agent".into()),
+                RowChange::Config(vec![model("smart")]),
+            ]
+        );
+
+        state.set_title("Plan".into());
+        state.record(info(SessionInfoUpdate::new().title("Fix the build")));
+        state.set_archived(true);
+        enqueue(&mut state, "first");
+        state
+            .request(Request::QueueRemove { id: "first".into() })
+            .unwrap();
+        assert_eq!(
+            state.take_unsaved(),
+            [
+                RowChange::Title(Some("Fix the build".into())),
+                RowChange::Archived(true),
+                RowChange::Queue(Queue::default()),
+            ],
+            "the last change of each kind"
+        );
+        assert!(state.take_unsaved().is_empty());
+    }
+
+    #[test]
+    fn a_session_with_a_config_keeps_it_when_the_agent_reports_another() {
+        let mut state = State::created(
+            &SavedSession {
+                config: vec![model("fast")],
+                ..saved()
+            },
+            None,
+        );
+        state.record(Change::Started(agent_with(vec![model_option("smart")])));
+        assert_eq!(state.config(), [model("fast")]);
+        assert_eq!(
+            state.take_unsaved(),
+            [RowChange::AgentSessionId("agent".into())]
+        );
+    }
+
+    #[test]
+    fn a_settled_config_takes_what_the_agent_accepted() {
+        let effort = |value: &str| ConfigSetting {
+            config_id: "effort".into(),
+            value: ConfigValue::Id(value.into()),
+        };
+        let mut state = State::created(
+            &SavedSession {
+                config: vec![model("fast"), effort("low")],
+                ..saved()
+            },
+            None,
+        );
+        state
+            .settle_config(vec![(model("smart"), None), (effort("high"), None)])
+            .unwrap();
+        assert_eq!(state.config(), [model("smart"), effort("high")]);
+
+        let refused = state
+            .settle_config(vec![
+                (model("fast"), None),
+                (effort("max"), Some("no".into())),
+            ])
+            .unwrap_err();
+        assert_eq!(refused, "The agent refused effort max: no");
+        assert_eq!(state.config(), [model("fast"), effort("high")]);
+        assert_eq!(
+            state.take_unsaved(),
+            [RowChange::Config(vec![model("fast"), effort("high")])]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_forgets_the_worktree() {
+        let worktree = Worktree::new(
+            crate::store::SavedWorktree {
+                id: "t".into(),
+                path: "/worktrees/t".into(),
+                branch: "ox/t".into(),
+                base: "abc".into(),
+                created_branch: true,
+                compare: None,
+                common_dir: "/repos/work/.git".into(),
+            },
+            tokio::sync::watch::Sender::new(()),
+        );
+        let mut state = State::created(&saved(), Some(worktree.clone()));
+        state.fail_start("worktree add failed".into());
+        worktree.close();
+        assert!(state.worktree().is_none());
+        assert_eq!(state.state(), SessionState::Exited);
+        assert_eq!(
+            state.take_unsaved(),
+            [RowChange::WorktreeForgotten("t".into())]
+        );
     }
 }
