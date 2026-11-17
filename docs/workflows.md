@@ -26,7 +26,7 @@ steps:
       harness: claude
       model: claude-opus-5-5
       effort: high
-      permission_mode: manual
+      permission_mode: auto
     prompt: |
       Write an implementation plan for the task in your input.
 
@@ -147,7 +147,7 @@ steps:
       harness: claude
       model: claude-opus-5-5
       effort: high
-      permission_mode: manual
+      permission_mode: auto
     preconditions:
       - shell: |
           set -eu
@@ -209,7 +209,7 @@ steps:
       harness: claude
       model: claude-sonnet-5-5
       effort: low
-      permission_mode: manual
+      permission_mode: auto
     preconditions:
       - shell: >-
           test -n "$(git diff --cached --name-only -- . ':(exclude).agents' ':(exclude)agents')"
@@ -244,7 +244,7 @@ steps:
       harness: claude
       model: claude-opus-5-5
       effort: high
-      permission_mode: manual
+      permission_mode: auto
     preconditions:
       - shell: |
           set -eu
@@ -290,7 +290,7 @@ steps:
       harness: claude
       model: claude-haiku-5-5
       effort: low
-      permission_mode: manual
+      permission_mode: auto
     preconditions:
       - shell: >-
           test -n "$(git diff --cached --name-only -- . ':(exclude).agents' ':(exclude)agents')"
