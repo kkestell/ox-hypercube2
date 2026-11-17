@@ -54,7 +54,7 @@ impl App {
         let connected = Arc::new(
             Client::connect_or_start(&default_socket_path())
                 .await
-                .map_err(message)?,
+                .map_err(connection_failure)?,
         );
         *client = Some(connected.clone());
         Ok(connected)
@@ -638,6 +638,17 @@ fn deletion(answer: Result<Deleted, Error>) -> Result<Deletion, String> {
     }
 }
 
+/// Why the app could not connect to oxd. A daemon that refuses `hello` is
+/// from another build, so the remedy is named here rather than by it.
+fn connection_failure(error: Error) -> String {
+    match error {
+        Error::Remote(error) if error.code == code::PROTOCOL_MISMATCH => {
+            "oxd is running a different build of Ox. Run `make install` to restart it.".into()
+        }
+        error => message(error),
+    }
+}
+
 fn message(error: impl Display) -> String {
     error.to_string()
 }
@@ -701,6 +712,21 @@ mod tests {
             code,
             message: message.into(),
         }))
+    }
+
+    #[test]
+    fn a_daemon_of_another_build_is_named_with_the_remedy() {
+        let Err(error) = remote::<()>(code::PROTOCOL_MISMATCH, "protocol version 1") else {
+            unreachable!()
+        };
+        assert_eq!(
+            connection_failure(error),
+            "oxd is running a different build of Ox. Run `make install` to restart it."
+        );
+        let Err(error) = remote::<()>(code::STORAGE, "disk full") else {
+            unreachable!()
+        };
+        assert_eq!(connection_failure(error), "disk full");
     }
 
     #[test]

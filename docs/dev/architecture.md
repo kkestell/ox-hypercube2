@@ -37,6 +37,15 @@ The socket is `$OX_SOCKET` when set. Otherwise it is `oxd.sock` in
 `~/.local/share/ox`. The database is `<socket>.db`, and the daemon appends its
 stderr to `oxd.log` beside the socket.
 
+A connection opens with `hello`, which carries the protocol version: a hash of
+the `ox-protocol` crate's source, computed when it builds. The daemon refuses
+a client whose version differs from its own, and the app then says that `oxd`
+is running a different build of Ox. `daemon.stop` is the one method accepted
+before `hello`, and its wire form stays the same in every build, so any
+build's `oxd --stop` stops any later build's daemon. The daemon stops only
+when every session is `idle` or `exited`; otherwise it refuses, naming the
+busy sessions.
+
 ### Desktop client
 
 The desktop app uses Tauri 2. Its React webview calls the Rust core through
@@ -158,6 +167,18 @@ comparison refs, archive state, each session's queue, conversation events,
 and the agent session IDs of deleted sessions, which keep an import from
 bringing them back. Each conversation event is saved with the time `oxd`
 recorded it; an imported event, with the time its transcript gives.
+
+The database's `PRAGMA user_version` is its schema version. `oxd` brings an
+older database to the version it writes by applying the migration steps in
+`crates/oxd/src/store.rs` it has not had, all in one transaction, and refuses
+to open a database of a newer version. Stored JSON is part of the schema: a
+change to how `EventKind` (including the ACP updates it holds),
+`QueuedPrompt`, or a session's command serializes either still reads every
+older shape or comes with a migration step that rewrites the rows. Each
+schema version has a SQL fixture in `crates/oxd/tests/fixtures`, and a test
+opens every fixture with the current code. Values the UI keeps in local
+storage follow the same rule: a new shape still reads what the previous build
+wrote.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence

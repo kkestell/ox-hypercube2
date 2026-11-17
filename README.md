@@ -35,7 +35,10 @@ make install
 
 This builds a release `Ox.app` with the daemon, MCP server, and the Claude and
 Pi bridges, signs it with an ad hoc signature, and copies it to
-`~/Applications/Ox.app`, replacing any previous installation. Claude Code must
+`~/Applications/Ox.app`, replacing any previous installation. It stops the
+running `oxd` if no session is busy and relaunches Ox; saved workspaces and
+sessions carry over. `make install-ui` reinstalls only the app and leaves the
+running `oxd` and its sessions alone. Claude Code must
 be installed and authenticated to use the Claude bridge. Pi must be installed
 with a model provider authenticated to use the Pi bridge. The app reads `PATH`
 from your interactive login shell so it can find these tools when opened from

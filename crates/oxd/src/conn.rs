@@ -92,7 +92,7 @@ pub async fn serve(
             Method::Hello { protocol_version } if protocol_version == PROTOCOL_VERSION => {
                 greeted = true;
                 Ok(serde_json::to_value(HelloResult {
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: PROTOCOL_VERSION.into(),
                     daemon_version: env!("CARGO_PKG_VERSION").into(),
                 })
                 .expect("protocol types serialize"))
@@ -103,6 +103,7 @@ pub async fn serve(
                     "protocol version {protocol_version} is not supported; oxd speaks {PROTOCOL_VERSION}"
                 ),
             }),
+            Method::DaemonStop => daemon.stop().map(|()| Value::Null),
             _ if !greeted => Err(ErrorBody {
                 code: code::INVALID_REQUEST,
                 message: "the first message must be hello".into(),

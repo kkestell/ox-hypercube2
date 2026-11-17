@@ -6,7 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ox_protocol::{Event, EventKind, Unseen};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, params};
 use tokio::sync::oneshot;
 
 use crate::state::Queue;
@@ -73,67 +73,22 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the database at `path`, creating it and its tables if they do
-    /// not exist. The schema has no migrations: a schema change means
-    /// deleting the database.
+    /// Opens the database at `path`, creating it if it does not exist, and
+    /// brings its schema to the version this build writes. A database of a
+    /// newer schema version than this build reads is refused.
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         Self::with(Connection::open(path)?)
     }
 
-    fn with(connection: Connection) -> rusqlite::Result<Self> {
+    fn with(mut connection: Connection) -> rusqlite::Result<Self> {
+        // `auto_vacuum` takes effect only before the first table is created.
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA auto_vacuum = FULL;
-            PRAGMA foreign_keys = ON;
-            CREATE TABLE IF NOT EXISTS workspaces (
-                id   TEXT PRIMARY KEY,
-                path TEXT NOT NULL UNIQUE
-            );
-            CREATE TABLE IF NOT EXISTS worktrees (
-                id             TEXT PRIMARY KEY,
-                path           TEXT NOT NULL,
-                branch         TEXT NOT NULL,
-                base           TEXT NOT NULL,
-                created_branch INTEGER NOT NULL,
-                common_dir     TEXT NOT NULL,
-                compare        TEXT
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-                number           INTEGER PRIMARY KEY AUTOINCREMENT,
-                id               TEXT NOT NULL UNIQUE,
-                workspace_id     TEXT NOT NULL REFERENCES workspaces(id),
-                command          TEXT NOT NULL,  -- JSON array
-                cwd              TEXT NOT NULL,
-                title            TEXT,
-                agent_session_id TEXT,
-                worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL,
-                created_at       INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS events (
-                session_id  TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq         INTEGER NOT NULL,
-                recorded_at INTEGER NOT NULL,
-                kind        TEXT    NOT NULL,  -- JSON of EventKind
-                PRIMARY KEY (session_id, seq)
-            ) WITHOUT ROWID;
-            CREATE TABLE IF NOT EXISTS archived (
-                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS session_unseen (
-                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                unseen     TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS session_queues (
-                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-                paused     INTEGER NOT NULL,
-                prompts    TEXT NOT NULL  -- JSON array of QueuedPrompt
-            );
-            -- The agent session IDs of deleted sessions, which an import skips.
-            CREATE TABLE IF NOT EXISTS deleted_agent_sessions (
-                agent_session_id TEXT PRIMARY KEY
-            );",
+            PRAGMA foreign_keys = ON;",
         )?;
+        migrate(&mut connection)?;
         let connection = Arc::new(Mutex::new(connection));
         let (writer, queue) = mpsc::channel();
         let target = connection.clone();
@@ -472,8 +427,103 @@ impl Store {
     }
 }
 
+/// The steps that bring a database to the schema this build writes. Step
+/// `i` takes a database from schema version `i` to `i + 1`; the schema
+/// version, kept in `PRAGMA user_version`, is the number of steps applied.
+///
+/// Stored JSON is schema: changing how `EventKind`, `QueuedPrompt` or a
+/// session's command serializes either keeps reading every older shape or
+/// comes with a step that rewrites the rows. Each schema version has a
+/// fixture in `tests/fixtures`, which every later build opens.
+const MIGRATIONS: &[fn(&Transaction<'_>) -> rusqlite::Result<()>] = &[create_tables];
+
+/// The schema version this build writes.
+fn schema_version() -> i64 {
+    i64::try_from(MIGRATIONS.len()).expect("the migrations are few")
+}
+
+/// Applies the steps the database has not had and records its new version,
+/// in one transaction. Fails, changing nothing, if a step fails or the
+/// database's version is newer than this build's.
+fn migrate(connection: &mut Connection) -> rusqlite::Result<()> {
+    let transaction = connection.transaction()?;
+    let version: i64 = transaction.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let latest = schema_version();
+    if version > latest {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+            Some(format!(
+                "the database is schema version {version}; this oxd reads up to {latest}"
+            )),
+        ));
+    }
+    if version == latest {
+        return Ok(());
+    }
+    let applied = usize::try_from(version).expect("schema versions are not negative");
+    for step in &MIGRATIONS[applied..] {
+        step(&transaction)?;
+    }
+    transaction.pragma_update(None, "user_version", latest)?;
+    transaction.commit()
+}
+
+/// Schema version 1: the tables as they were before the schema had versions,
+/// which databases of that time already hold.
+fn create_tables(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workspaces (
+            id   TEXT PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE
+        );
+        CREATE TABLE IF NOT EXISTS worktrees (
+            id             TEXT PRIMARY KEY,
+            path           TEXT NOT NULL,
+            branch         TEXT NOT NULL,
+            base           TEXT NOT NULL,
+            created_branch INTEGER NOT NULL,
+            common_dir     TEXT NOT NULL,
+            compare        TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            number           INTEGER PRIMARY KEY AUTOINCREMENT,
+            id               TEXT NOT NULL UNIQUE,
+            workspace_id     TEXT NOT NULL REFERENCES workspaces(id),
+            command          TEXT NOT NULL,  -- JSON array
+            cwd              TEXT NOT NULL,
+            title            TEXT,
+            agent_session_id TEXT,
+            worktree_id      TEXT REFERENCES worktrees(id) ON DELETE SET NULL,
+            created_at       INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            session_id  TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            seq         INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            kind        TEXT    NOT NULL,  -- JSON of EventKind
+            PRIMARY KEY (session_id, seq)
+        ) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS archived (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS session_unseen (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            unseen     TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS session_queues (
+            session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+            paused     INTEGER NOT NULL,
+            prompts    TEXT NOT NULL  -- JSON array of QueuedPrompt
+        );
+        -- The agent session IDs of deleted sessions, which an import skips.
+        CREATE TABLE IF NOT EXISTS deleted_agent_sessions (
+            agent_session_id TEXT PRIMARY KEY
+        );",
+    )
+}
+
 fn insert_worktree(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     worktree: &SavedWorktree,
 ) -> rusqlite::Result<()> {
     transaction.execute(
@@ -493,10 +543,7 @@ fn insert_worktree(
 }
 
 /// Inserts events, dropping those of a session that is not saved.
-fn insert_events(
-    transaction: &rusqlite::Transaction<'_>,
-    events: &[Event],
-) -> rusqlite::Result<()> {
+fn insert_events(transaction: &Transaction<'_>, events: &[Event]) -> rusqlite::Result<()> {
     let mut insert = transaction.prepare_cached(
         "INSERT INTO events (session_id, seq, recorded_at, kind)
         SELECT ?1, ?2, ?3, ?4
@@ -1010,5 +1057,152 @@ mod tests {
         // A session without an agent session ID adds nothing.
         store.remove_session("two").unwrap();
         assert_eq!(count(&store, "deleted_agent_sessions"), 1);
+    }
+
+    const TABLES: [&str; 8] = [
+        "workspaces",
+        "worktrees",
+        "sessions",
+        "events",
+        "archived",
+        "session_unseen",
+        "session_queues",
+        "deleted_agent_sessions",
+    ];
+
+    fn user_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// An in-memory database loaded from a fixture's SQL.
+    fn database(sql: &str) -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(sql).unwrap();
+        connection
+    }
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    #[test]
+    fn a_new_database_has_every_table_at_the_latest_version() {
+        let store = store();
+        assert_eq!(user_version(&store.lock()), schema_version());
+        for table in TABLES {
+            assert_eq!(count(&store, table), 0, "{table}");
+        }
+    }
+
+    #[test]
+    fn a_database_from_before_versions_opens_at_version_one_with_its_rows() {
+        let sql = std::fs::read_to_string(fixtures().join("schema-1.sql")).unwrap();
+        let connection = database(&sql);
+        connection.pragma_update(None, "user_version", 0).unwrap();
+        let store = Store::with(connection).unwrap();
+        assert_eq!(user_version(&store.lock()), 1);
+        assert_eq!(store.workspaces().unwrap().len(), 1);
+        assert_eq!(store.sessions().unwrap().len(), 2);
+        assert_eq!(count(&store, "events"), 34);
+    }
+
+    #[test]
+    fn a_database_of_a_newer_schema_is_refused() {
+        let connection = Connection::open_in_memory().unwrap();
+        let newer = schema_version() + 1;
+        connection
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+        let Err(error) = Store::with(connection) else {
+            panic!("a newer database opened");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the database is schema version {newer}; this oxd reads up to {}",
+                schema_version()
+            )
+        );
+    }
+
+    /// What a fixture holds.
+    #[derive(Debug, PartialEq)]
+    struct Contents {
+        workspaces: usize,
+        worktrees: usize,
+        sessions: usize,
+        archived: usize,
+        unseen: usize,
+        queued: usize,
+        events: usize,
+        deleted_agent_sessions: usize,
+    }
+
+    /// Every fixture, each a database of a schema version some build wrote,
+    /// opens with this build and reads back whole.
+    #[test]
+    fn every_schema_fixture_opens_and_reads_back() {
+        let expected = [(
+            "schema-1.sql",
+            Contents {
+                workspaces: 1,
+                worktrees: 1,
+                sessions: 2,
+                archived: 1,
+                unseen: 1,
+                queued: 1,
+                events: 34,
+                deleted_agent_sessions: 1,
+            },
+        )];
+        let mut names: Vec<String> = std::fs::read_dir(fixtures())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with("schema-"))
+            .collect();
+        names.sort();
+        let listed: Vec<_> = expected.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, listed, "each fixture has its expected contents");
+
+        for (name, contents) in expected {
+            let sql = std::fs::read_to_string(fixtures().join(name)).unwrap();
+            let store =
+                Store::with(database(&sql)).unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(user_version(&store.lock()), schema_version(), "{name}");
+            let sessions = store.sessions().unwrap();
+            let mut events = 0;
+            for session in &sessions {
+                let read = store
+                    .events(&session.id)
+                    .unwrap_or_else(|error| panic!("{name}: {}: {error}", session.id));
+                assert_eq!(
+                    read.last().map_or(0, |event| event.seq),
+                    session.last_seq,
+                    "{name}: {}",
+                    session.id
+                );
+                events += read.len();
+            }
+            let read = Contents {
+                workspaces: store.workspaces().unwrap().len(),
+                worktrees: store.worktrees().unwrap().len(),
+                sessions: sessions.len(),
+                archived: sessions.iter().filter(|session| session.archived).count(),
+                unseen: sessions
+                    .iter()
+                    .filter(|session| session.unseen.is_some())
+                    .count(),
+                queued: sessions
+                    .iter()
+                    .map(|session| session.queue.prompts.len())
+                    .sum(),
+                events,
+                deleted_agent_sessions: usize::try_from(count(&store, "deleted_agent_sessions"))
+                    .unwrap(),
+            };
+            assert_eq!(read, contents, "{name}");
+        }
     }
 }

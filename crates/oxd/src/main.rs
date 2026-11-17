@@ -1,12 +1,18 @@
 //! oxd: a per-user daemon that owns ACP agent sessions on behalf of Ox UIs.
 //!
-//! Usage: `oxd [--socket PATH] [--idle-exit-ms MS] [--park-after-ms MS]`
+//! Usage: `oxd [--socket PATH] [--idle-exit-ms MS] [--park-after-ms MS]`,
+//! or `oxd --stop [--socket PATH]`.
 //!
 //! Workspaces and sessions are saved in `<socket>.db`, and their worktrees
 //! are added in `worktrees` beside the socket.
 //!
 //! The daemon prints `ready` on stdout once a daemon is listening on the
 //! socket: itself, or one that was already running, in which case it exits.
+//!
+//! `oxd --stop` asks the daemon on the socket to stop with `daemon.stop`,
+//! and exits 0 once it has stopped or if none is running. It exits 1,
+//! printing the daemon's answer, if the daemon refuses because a session is
+//! busy.
 
 mod branches;
 mod conn;
@@ -30,7 +36,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::daemon::Daemon;
@@ -55,12 +62,15 @@ const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct Args {
     socket: PathBuf,
+    /// Stops the running daemon instead of running one.
+    stop: bool,
     idle_exit: Duration,
     park_after: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut socket = None;
+    let mut stop = false;
     let mut idle_exit = DEFAULT_IDLE_EXIT;
     let mut park_after = DEFAULT_PARK_AFTER;
     let mut args = std::env::args_os().skip(1);
@@ -71,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
         };
         match arg.to_str() {
             Some("--socket") => socket = Some(PathBuf::from(value()?)),
+            Some("--stop") => stop = true,
             Some("--idle-exit-ms") => {
                 let value = value()?;
                 idle_exit = value
@@ -92,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
     }
     Ok(Args {
         socket: socket.unwrap_or_else(ox_protocol::default_socket_path),
+        stop,
         idle_exit,
         park_after,
     })
@@ -106,6 +118,9 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.stop {
+        return stop(&args.socket).await;
+    }
     match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -171,6 +186,8 @@ async fn run(args: Args) -> io::Result<()> {
     let uid = unsafe { libc::geteuid() };
     let idle = daemon.idle(args.idle_exit);
     tokio::pin!(idle);
+    let stop_requested = daemon.stop_requested();
+    tokio::pin!(stop_requested);
     let (stopping, stopping_rx) = tokio::sync::watch::channel(false);
     let mut connections = tokio::task::JoinSet::new();
     loop {
@@ -194,6 +211,7 @@ async fn run(args: Args) -> io::Result<()> {
             },
             Some(_) = connections.join_next() => {}
             () = &mut idle => break,
+            () = &mut stop_requested => break,
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
@@ -217,6 +235,55 @@ async fn run(args: Args) -> io::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// Asks the daemon on `socket` to stop, speaking `daemon.stop` without
+/// `hello`, so that it works with a daemon of any later build.
+async fn stop(socket: &Path) -> ExitCode {
+    let not_running = || {
+        println!("oxd is not running");
+        ExitCode::SUCCESS
+    };
+    let stream = match UnixStream::connect(socket).await {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return not_running();
+        }
+        Err(error) => {
+            eprintln!("oxd: connecting to {}: {error}", socket.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    if write
+        .write_all(b"{\"id\":1,\"method\":\"daemon.stop\"}\n")
+        .await
+        .is_err()
+    {
+        return not_running();
+    }
+    // A daemon that closes the connection without answering is exiting.
+    let Ok(Some(answer)) = lines.next_line().await else {
+        return not_running();
+    };
+    let answer: serde_json::Value = serde_json::from_str(&answer).unwrap_or_default();
+    if let Some(error) = answer.get("error") {
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the daemon refused to stop");
+        eprintln!("oxd: {message}");
+        return ExitCode::FAILURE;
+    }
+    // The daemon closes the connection once it has stopped.
+    while let Ok(Some(_)) = lines.next_line().await {}
+    ExitCode::SUCCESS
 }
 
 /// Waits [`ACCEPT_RETRY_DELAY`] before accepting again.

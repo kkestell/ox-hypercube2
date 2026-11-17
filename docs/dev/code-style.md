@@ -32,6 +32,10 @@ required behavior and everyday use.
   once.
 - Implement required semantics correctly and completely.
 - Measure before optimizing, and optimize demonstrated problems.
+- Change a stored type, or the database's tables, so that every schema
+  fixture in `crates/oxd/tests/fixtures` still opens and reads back: read the
+  older shapes, or add a migration step that rewrites them and a fixture of
+  the new schema version.
 
 ## UI
 

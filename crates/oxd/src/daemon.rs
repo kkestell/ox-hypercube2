@@ -14,7 +14,7 @@ use ox_protocol::{
     SessionRequest, SessionState, WorkspaceInfo, code,
 };
 use serde_json::Value;
-use tokio::sync::{OwnedMutexGuard, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, watch};
 
 use crate::branches;
 use crate::directories::Directories;
@@ -51,6 +51,8 @@ pub struct Daemon {
     directories: Arc<Directories>,
     /// The `ox` MCP server each session's agent is given.
     ox_server: Arc<OxServer>,
+    /// Notified when a client asks the daemon to stop.
+    stop: Notify,
 }
 
 /// What a watch has sent: the workspaces, as of a version of the registry,
@@ -179,6 +181,7 @@ impl Daemon {
             changed,
             directories,
             ox_server,
+            stop: Notify::new(),
         })
     }
 
@@ -192,6 +195,37 @@ impl Daemon {
     /// `exited`, is saved and does not keep the daemon alive.
     pub async fn idle(&self, idle_exit: Duration) {
         idle_for(self.changed.subscribe(), idle_exit, || self.is_idle()).await;
+    }
+
+    /// Asks the daemon to stop, as `daemon.stop` does. Refused, listing
+    /// each busy session as `<title or id> (<state>)`, while a session is in
+    /// a state other than `idle` or `exited`.
+    pub fn stop(&self) -> Result<(), ErrorBody> {
+        let sessions: Vec<_> = self.lock().sessions.values().cloned().collect();
+        let mut busy: Vec<String> = sessions
+            .iter()
+            .filter_map(|session| {
+                let state = session.state();
+                (!matches!(state, SessionState::Idle | SessionState::Exited)).then(|| {
+                    let name = session.title().unwrap_or_else(|| session.id.clone());
+                    format!("{name} ({})", state.as_str())
+                })
+            })
+            .collect();
+        if !busy.is_empty() {
+            busy.sort();
+            return Err(invalid_state(&format!(
+                "oxd has busy sessions: {}",
+                busy.join(", ")
+            )));
+        }
+        self.stop.notify_one();
+        Ok(())
+    }
+
+    /// Resolves once a client has asked the daemon to stop.
+    pub async fn stop_requested(&self) {
+        self.stop.notified().await;
     }
 
     fn is_idle(&self) -> bool {
@@ -454,6 +488,7 @@ impl Daemon {
                 Ok(Value::Null)
             }
             Method::Hello { .. }
+            | Method::DaemonStop
             | Method::SessionSubscribe { .. }
             | Method::Watch
             | Method::DirectoryWatch { .. }

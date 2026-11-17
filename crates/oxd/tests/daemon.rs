@@ -904,9 +904,99 @@ async fn version_mismatch() {
     let response = send(json!({"id": 1, "method": "session.list"})).await;
     assert_eq!(response["error"]["code"], code::INVALID_REQUEST);
     let response =
-        send(json!({"id": 2, "method": "hello", "params": {"protocol_version": 999}})).await;
+        send(json!({"id": 2, "method": "hello", "params": {"protocol_version": "0"}})).await;
     assert_eq!(response["id"], 2);
     assert_eq!(response["error"]["code"], code::PROTOCOL_MISMATCH);
+}
+
+/// Sends `daemon.stop` as the first message of a connection and returns the
+/// answer with the rest of the connection.
+async fn request_stop(daemon: &Daemon) -> (Value, Lines<BufReader<OwnedReadHalf>>) {
+    let stream = UnixStream::connect(&daemon.socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    write
+        .write_all(b"{\"id\": 1, \"method\": \"daemon.stop\"}\n")
+        .await
+        .unwrap();
+    let line = timeout(TIMEOUT, lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("the daemon answers");
+    (serde_json::from_str(&line).unwrap(), lines)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_daemon_stops_when_asked_before_hello() {
+    let mut daemon = Daemon::start().await;
+    let (answer, mut lines) = request_stop(&daemon).await;
+    assert_eq!(answer, json!({"id": 1, "result": null}));
+    let closed = timeout(TIMEOUT, lines.next_line()).await.unwrap().unwrap();
+    assert_eq!(closed, None);
+    assert!(daemon.wait_for_exit().await.success());
+    assert!(!daemon.socket.exists());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_daemon_with_a_running_turn_refuses_to_stop() {
+    let daemon = Daemon::start().await;
+    let gate = tempfile::tempdir().unwrap();
+    mkfifos(gate.path());
+    let gated = format!(
+        "shell {}",
+        json!(format!(
+            "echo blocked > '{0}/blocked'; read _ < '{0}/release'",
+            gate.path().display()
+        ))
+    );
+    let client = daemon.client().await;
+    let (session, _) = daemon.new_session(&client).await;
+    client.prompt(&session.id, text(&gated)).await.unwrap();
+    blocked(gate.path()).await;
+    let running = info(&client, &session.id).await.unwrap();
+    assert_eq!(running.state, SessionState::Running);
+
+    let (answer, _) = request_stop(&daemon).await;
+    assert_eq!(answer["error"]["code"], code::INVALID_STATE);
+    let name = running.title.unwrap_or(session.id.clone());
+    let message = answer["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("{name} (running)")), "{message}");
+
+    assert_eq!(sessions(&client).await.len(), 1);
+    release(gate.path()).await;
+    until_turn_ended(&client, &session.id, 0).await;
+}
+
+/// Runs `oxd --stop` on `socket` and returns its status and output.
+async fn oxd_stop(socket: &Path) -> std::process::Output {
+    let stop = tokio::process::Command::new(OXD)
+        .arg("--stop")
+        .arg("--socket")
+        .arg(socket)
+        .output();
+    timeout(TIMEOUT, stop).await.unwrap().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oxd_stop_succeeds_with_no_daemon_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = oxd_stop(&dir.path().join("oxd.sock")).await;
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "oxd is not running\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn oxd_stop_returns_once_an_idle_daemon_has_stopped() {
+    let mut daemon = Daemon::start().await;
+    let output = oxd_stop(&daemon.socket).await;
+    assert!(output.status.success(), "{output:?}");
+    // The daemon removes its socket before it closes connections.
+    assert!(!daemon.socket.exists());
+    assert!(daemon.wait_for_exit().await.success());
 }
 
 #[tokio::test(flavor = "multi_thread")]

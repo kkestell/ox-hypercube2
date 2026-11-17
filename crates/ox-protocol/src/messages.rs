@@ -9,8 +9,10 @@ use agent_client_protocol::v2::schema::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Version of the client–daemon protocol, exchanged in `hello`.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version of the client–daemon protocol, exchanged in `hello`: a hash of
+/// this crate's source, so a client and a daemon built from different
+/// protocol source refuse each other.
+pub const PROTOCOL_VERSION: &str = env!("OX_PROTOCOL_VERSION");
 
 /// A client request: `{"id": n, "method": "...", "params": {...}}`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -23,8 +25,20 @@ pub struct Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
 pub enum Method {
+    /// The first message of a connection. A daemon refuses a client whose
+    /// `protocol_version` differs from its own with `PROTOCOL_MISMATCH`.
     #[serde(rename = "hello")]
-    Hello { protocol_version: u32 },
+    Hello { protocol_version: String },
+    /// Stops the daemon if no session is busy, that is, in a state other
+    /// than `idle` or `exited`; otherwise it fails with `INVALID_STATE`,
+    /// listing the busy sessions, and the daemon keeps serving. It is the
+    /// one method accepted before `hello`. Its wire form,
+    /// `{"id": n, "method": "daemon.stop"}`, and its answer stay the same
+    /// in every build, so any build's `oxd --stop` stops any later build's
+    /// daemon. After answering success, the daemon shuts down as on
+    /// SIGTERM and closes the connection.
+    #[serde(rename = "daemon.stop")]
+    DaemonStop,
     /// Starts a watch: after the answer, the daemon sends every workspace,
     /// worktree, and session at once, then each one that is added,
     /// changes, or is removed. A workspace's info is worked out again each
@@ -543,7 +557,7 @@ pub enum ConfigValue {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResult {
-    pub protocol_version: u32,
+    pub protocol_version: String,
     pub daemon_version: String,
 }
 
@@ -687,6 +701,10 @@ pub struct Event {
     pub kind: EventKind,
 }
 
+/// What happened in a session. oxd stores each event as this type's JSON, so
+/// its serialization, and that of the ACP types inside it, is part of the
+/// database schema: a change either still reads every shape stored before it
+/// or comes with a migration step in `oxd`'s store that rewrites the rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[allow(
@@ -1148,14 +1166,22 @@ mod tests {
         let value = serde_json::to_value(Request {
             id: 1,
             method: Method::Hello {
-                protocol_version: 1,
+                protocol_version: "0123456789abcdef".into(),
             },
         })
         .unwrap();
         assert_eq!(
             value,
-            json!({"id": 1, "method": "hello", "params": {"protocol_version": 1}})
+            json!({"id": 1, "method": "hello", "params": {"protocol_version": "0123456789abcdef"}})
         );
+        let value = serde_json::to_value(Request {
+            id: 2,
+            method: Method::DaemonStop,
+        })
+        .unwrap();
+        assert_eq!(value, json!({"id": 2, "method": "daemon.stop"}));
+        let request: Request = serde_json::from_value(value).unwrap();
+        assert!(matches!(request.method, Method::DaemonStop));
     }
 
     #[test]

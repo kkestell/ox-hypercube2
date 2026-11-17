@@ -25,6 +25,28 @@ make dev
 runs the app against its own `oxd` on `target/dev/oxd.sock`, which it stops
 before building and after the app exits.
 
+## Installing a build
+
+```sh
+make install
+```
+
+`make install` builds and signs `Ox.app`, quits the installed app, stops the
+running `oxd` with `oxd --stop`, replaces `~/Applications/Ox.app`, and opens
+it, which starts the new `oxd` on the existing database. When a session is
+busy, `oxd` refuses to stop; the install then reopens the app and fails with
+the busy sessions' names, leaving the old installation in place.
+
+```sh
+make install-ui
+```
+
+`make install-ui` rebuilds only the app, keeps the installed `oxd`, `ox-mcp`,
+and bridges, and replaces and reopens the app while `oxd` and its sessions
+keep running. It suits changes outside `ox-protocol` and the daemon crates. A
+change to `ox-protocol` changes the protocol version, so it needs
+`make install`.
+
 ## UI mock mode
 
 ```sh

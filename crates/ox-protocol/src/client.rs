@@ -286,7 +286,7 @@ impl Client {
         };
         let _: HelloResult = client
             .call(Method::Hello {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION.into(),
             })
             .await?;
         Ok(client)
@@ -913,7 +913,7 @@ mod tests {
                 _dir: dir,
             };
             let hello = HelloResult {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: PROTOCOL_VERSION.into(),
                 daemon_version: "test".into(),
             };
             daemon.answer(serde_json::to_value(hello).unwrap()).await;
