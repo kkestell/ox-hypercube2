@@ -89,7 +89,7 @@ Each session's dot in the sidebar shows what it needs from the user, the first t
 ### History and service restarts
 
 - Conversations, including reported tool output and images, remain readable until the session is deleted. Reading history does not require a running agent.
-- Workspaces, session identities, titles, archive status, unseen finishes and errors (red and green dots), and worktree associations survive a session-service restart. Agents do not: saved sessions return Exited and must be resumed to continue work.
+- Workspaces, session identities, titles, archive status, unseen finishes and errors (red and green dots), queued messages, and worktree associations survive a session-service restart. Queued messages belong to the session, and the session service sends them as turns end. Agents do not: saved sessions return Exited and must be resumed to continue work.
 - Graceful service shutdown stops active agents and retains their sessions. If a crash leaves a turn unfinished, the recovered conversation ends it with oxd stopped during the turn and cancels unanswered requests. The most recent output may be lost after an abrupt crash.
 - A session that never successfully started is cleaned up after a service restart. If its worktree cannot safely be removed, it is retained for deletion rather than resumed.
 - Agent-specific retention may prevent continuing a conversation that Ox can still display; see [Claude Code continuation](claude.md#continue-and-replay-conversations).

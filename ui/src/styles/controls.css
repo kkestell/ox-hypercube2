@@ -349,6 +349,7 @@ textarea.text-field {
 }
 
 .prompt .attachment,
+.queue .attachment,
 .tool-call .label,
 .session-closed,
 .request-panel legend,

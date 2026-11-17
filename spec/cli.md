@@ -32,7 +32,12 @@ If a newly created session's agent fails to open it, `new` deletes that failed s
 
 | Command | Result |
 | --- | --- |
-| `prompt SESSION TEXT [--image PATH ...] [--file PATH ...]` | Sends text and any attachments, returning after Ox accepts the prompt rather than after the turn ends. Each attachment option may be repeated. |
+| `prompt SESSION TEXT [--image PATH ...] [--file PATH ...]` | Sends text and any attachments, returning after Ox accepts the prompt rather than after the turn ends. During a turn it steers the turn. Each attachment option may be repeated. |
+| `queue add SESSION TEXT` | Queues a text prompt and prints its ID. |
+| `queue ls SESSION` | Prints each queued prompt's ID and text, tab-separated, in order. |
+| `queue edit SESSION PROMPT TEXT` | Replaces a queued prompt's text in its place. |
+| `queue rm SESSION PROMPT` | Removes a queued prompt. |
+| `queue send SESSION PROMPT` | Takes a prompt out of the queue and sends it now, as `prompt` does. |
 | `config SESSION` | Prints each option's ID, current value, and comma-separated allowed values, tab-separated. |
 | `config SESSION OPTION VALUE` | Sets an option, then prints the resulting configuration. Boolean options require `true` or `false`; selects take a value ID. |
 | `permit SESSION REQUEST OPTION` | Answers the pending permission request with its offered option ID. |

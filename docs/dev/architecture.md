@@ -106,7 +106,8 @@ session's first prompt.
 
 - Shared persistent state: workspaces, sessions, workflow runs, and
   conversation history.
-- Agent processes and work that must continue when a client disconnects.
+- Agent processes and work that must continue when a client disconnects,
+  including each session's [queue](glossary.md) of prompts.
 - State updates and pending requests that every connected client must see.
 - Each connection's [focus](glossary.md) and the unseen outcome of each
   session and run, which a focus clears and a turn or run ending out of
@@ -142,7 +143,8 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, conversation events, and workflow runs. A
+comparison refs, archive state, each session's queue, conversation events,
+and workflow runs. A
 run's steps, with their commands, are saved as one JSON column of its row,
 rewritten whenever the run changes.
 Each conversation event is saved with the time `oxd` recorded it, and a run
@@ -155,7 +157,8 @@ events; a failed batch is logged and dropped, leaving gaps in saved history.
 
 Saved history includes tool output and images and can be read without
 starting an agent. It is loaded on demand after a daemon restart, with
-interrupted turns ended as errors and unresolved requests cancelled.
+interrupted turns ended as errors, unresolved requests cancelled, and steered
+prompts the agent had not taken in dropped.
 
 Ox's saved conversation and the agent's resumable conversation are separate.
 Continuing a Claude session requires its native transcript even when Ox still
@@ -185,6 +188,18 @@ session, before the agent or worktree exists. Once the agent starts, the
 daemon sets the option values the agent reports differently and then sends
 the prompt. A session whose agent or worktree fails to start ends the prompt's
 turn with the error.
+
+A prompt sent during a turn steers it: the daemon sends it to the agent at
+once, records it as steered, and records it as taken when the agent answers
+it, or dropped when the agent refuses it, drops it on cancellation, or exits
+first. A steered prompt still pending when the turn ends starts a turn of the
+agent's own.
+
+Each session keeps a queue of prompts. Whenever the session's agent is idle,
+with no pending request and no steered prompt pending, the daemon starts the
+queue's first prompt as a turn, whether or not a client is connected. A
+cancelled turn, or one that ends other than with `end_turn`, holds the queue
+until a client sends a prompt or sends a queued one now.
 
 ### Loading and stopping agents
 

@@ -430,6 +430,7 @@ async fn load_session(app: State<'_, App>, session_id: String) -> Result<(), Str
         .map_err(message)
 }
 
+/// Sends a prompt now: it starts a turn, or steers the running one.
 #[tauri::command]
 async fn prompt(
     app: State<'_, App>,
@@ -441,6 +442,66 @@ async fn prompt(
     app.client()
         .await?
         .prompt(&session_id, prompt)
+        .await
+        .map_err(message)
+}
+
+/// Appends a prompt to the session's queue and returns its ID.
+#[tauri::command]
+async fn queue_add(
+    app: State<'_, App>,
+    session_id: String,
+    text: String,
+    attachments: Vec<PathBuf>,
+) -> Result<String, String> {
+    let prompt = prompt_blocks(text, &attachments)?;
+    app.client()
+        .await?
+        .queue_add(&session_id, prompt)
+        .await
+        .map_err(message)
+}
+
+/// Replaces a queued prompt in place.
+#[tauri::command]
+async fn queue_edit(
+    app: State<'_, App>,
+    session_id: String,
+    prompt_id: String,
+    text: String,
+    attachments: Vec<PathBuf>,
+) -> Result<(), String> {
+    let prompt = prompt_blocks(text, &attachments)?;
+    app.client()
+        .await?
+        .queue_edit(&session_id, &prompt_id, prompt)
+        .await
+        .map_err(message)
+}
+
+#[tauri::command]
+async fn queue_remove(
+    app: State<'_, App>,
+    session_id: String,
+    prompt_id: String,
+) -> Result<(), String> {
+    app.client()
+        .await?
+        .queue_remove(&session_id, &prompt_id)
+        .await
+        .map_err(message)
+}
+
+/// Takes a queued prompt out of the queue and sends it now.
+#[tauri::command]
+async fn queue_send(
+    app: State<'_, App>,
+    session_id: String,
+    prompt_id: String,
+) -> Result<(), String> {
+    app.client()
+        .await?
+        .queue_send(&session_id, &prompt_id)
         .await
         .map_err(message)
 }
@@ -676,6 +737,10 @@ pub fn run() {
             agent_controls,
             load_session,
             prompt,
+            queue_add,
+            queue_edit,
+            queue_remove,
+            queue_send,
             cancel,
             permit,
             respond_elicitation,

@@ -80,6 +80,31 @@ describe("A session", () => {
     await expect(dot).toHaveAttribute("aria-label", "Idle");
   });
 
+  it("queues prompts during a turn, then edits, deletes and sends them", async () => {
+    await send("take");
+    await expect(sessionEntry(cwd).$('[aria-label="Running"]')).toBeDisplayed();
+    for (const name of ["first", "second", "third"]) await send(`text "${name}"`);
+    const queue = $(".composer .queue");
+    await expect(queue.$$("li")).toBeElementsArrayOfSize(3);
+    const action = async (name: string, label: string) => {
+      const row = queue.$(`li*=${name}`);
+      await row.moveTo();
+      await row.$(`button[aria-label="${label}"]`).click();
+    };
+
+    await action("first", "Edit");
+    await expect(composer()).toHaveValue('text "first"');
+    await send('text "edited"');
+    await expect(queue.$("li*=edited")).toBeDisplayed();
+    await action("second", "Delete");
+    await expect(queue.$$("li")).toBeElementsArrayOfSize(2);
+    // Sent now, the third is taken into the turn, which ends; the edited
+    // prompt starts the next.
+    await action("third", "Send Now");
+    await expect(agentText()[0]).toHaveText("edited");
+    await expect(queue).not.toBeExisting();
+  });
+
   it("is viewed again after oxd restarts", async () => {
     await send("say 1 0");
     await expect(agentText()[0]).toHaveText("chunk-1");

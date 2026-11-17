@@ -34,7 +34,7 @@ Changing settings is refused while Starting or Exited. Whether a change is allow
 
 ### Turn behavior
 
-- A prompt accepted by Ox makes the session Running immediately. A second prompt is refused until the turn ends and no unanswered request prevents the session becoming Idle.
+- A prompt accepted by Ox makes the session Running immediately. A prompt sent during a turn steers it: the agent takes it in at its next opportunity, or runs it as a turn of its own after the current one.
 - The agent reports when work starts or finishes. Receiving text is not itself a promise that the turn is finished.
 - A prompt the agent rejects before reporting work ends with that error, allowing a corrected prompt. A repeated old Idle report does not prematurely end a newly submitted prompt.
 - An agent can report background work while Idle. Idle means another prompt is allowed, not that all background activity has ended.

@@ -177,6 +177,27 @@ describe("A turn", () => {
     expect(tool.querySelector("img")).toHaveAttribute("src", "data:image/png;base64,AAAA");
   });
 
+  it("shows a steered prompt dimmed after the rest until it is taken in", async () => {
+    const steered: ConversationUpdate = {
+      type: "steered",
+      recorded_at: 0,
+      key: "5",
+      text: "Also this",
+      attachments: [],
+    };
+    const { core, task, transcript } = await conversation(work[0]!, steered, work[1]!);
+    core.update(task.id, text("progress", "Checking the tests"));
+    expect(children(transcript)).toEqual(["prompt", "thought", "text markdown", "prompt steered"]);
+    expect(transcript.lastElementChild).toHaveTextContent("Also this");
+    core.update(
+      task.id,
+      { type: "removed", recorded_at: 0, key: "5" },
+      { type: "prompt", recorded_at: 0, key: "8", text: "Also this", attachments: [] },
+    );
+    expect(children(transcript)).toEqual(["prompt", "thought", "text markdown", "prompt"]);
+    expect(transcript.querySelector(".steered")).toBeNull();
+  });
+
   it("reports that the agent exited", async () => {
     await conversation({ type: "agent_exited", recorded_at: 0, key: "exit", error: "status 3" });
     expect(screen.getByText("The agent exited: status 3")).toBeInTheDocument();

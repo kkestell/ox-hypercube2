@@ -54,6 +54,7 @@ class Listing {
       archived: false,
       created_at: this.tick(),
       unseen: null,
+      queue: [],
     };
     this.sessions.push(session);
     return session;
@@ -177,6 +178,23 @@ function sidebar(): Scenario {
   listing.session("Explain the event store", "idle").unseen = "finished";
   listing.session("Which bugs next?", "awaiting_input");
   const working = listing.session("Fix sidebar colors", "running");
+  working.queue = [
+    {
+      id: "queued-1",
+      prompt: [{ type: "text", text: "Then check the run view's dots match." }],
+    },
+    {
+      id: "queued-2",
+      prompt: [
+        { type: "text", text: "Add a screenshot of both themes to the pull request." },
+        {
+          type: "resource_link",
+          name: "tokens.css",
+          uri: "file:///src/ox/ui/src/styles/tokens.css",
+        },
+      ],
+    },
+  ];
   return {
     changes: listing.changes(),
     conversations: {
@@ -250,6 +268,13 @@ function sidebar(): Scenario {
           key: "text:3",
           text: "Both states use `--success`. ",
           replace: false,
+        },
+        {
+          recorded_at: listing.tick(),
+          type: "steered",
+          key: "12",
+          text: "Keep the failed colour as it is.",
+          attachments: [],
         },
       ],
     },

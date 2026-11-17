@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-/** A composer's text and attached files, not yet sent. */
-export type Unsent = { text: string; attachments: string[] };
+/** A message being written: its text and the paths of its attachments. */
+export type Message = { text: string; attachments: string[] };
+
+/**
+ * A composer's message, not yet sent. While a queued prompt is being edited,
+ * it is that prompt, and `editing.held` is the message it replaced until the
+ * edit is saved.
+ */
+export type Unsent = Message & { editing?: { promptId: string; held: Message } };
 const emptyUnsent: Unsent = { text: "", attachments: [] };
 
 const key = "unsent";
@@ -14,8 +21,8 @@ function load(): Record<string, Unsent> {
 /**
  * Keeps each session's and each draft's unsent text in local storage, so it
  * survives switching views and restarting the app. Once connected, entries of
- * IDs not in `ids` are dropped. The result changes only when an
- * entry does.
+ * IDs not in `ids` are dropped. An entry with no content is dropped unless it
+ * is an edit. The result changes only when an entry does.
  */
 export function useUnsent(ids: ReadonlySet<string>, connected: boolean) {
   const [unsent, setUnsent] = useState(load);
@@ -37,7 +44,7 @@ export function useUnsent(ids: ReadonlySet<string>, connected: boolean) {
         const previous = current[id] ?? emptyUnsent;
         const next = change(previous);
         if (next === previous) return current;
-        if (next && (next.text !== "" || next.attachments.length > 0)) {
+        if (next && (next.text !== "" || next.attachments.length > 0 || next.editing)) {
           return { ...current, [id]: next };
         }
         if (!(id in current)) return current;

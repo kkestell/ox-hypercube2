@@ -15,7 +15,8 @@ export function CommandInput({
   disabled: boolean;
   canSend: boolean;
   onChange: (value: string) => void;
-  onSubmit: () => void;
+  /** Sends the message; `steer` is set for Cmd+Enter. */
+  onSubmit: (steer: boolean) => void;
 }) {
   const editor = useRef<HTMLTextAreaElement>(null);
   const selected = useRef<HTMLButtonElement>(null);
@@ -96,7 +97,7 @@ export function CommandInput({
             event.preventDefault();
           } else if (event.key === "Enter" && !event.shiftKey) {
             event.preventDefault();
-            if (canSend) onSubmit();
+            if (canSend) onSubmit(event.metaKey);
           }
         }}
       />

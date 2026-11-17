@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 
 use crate::messages::{
     Branches, Checkout, ConfigSetting, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind,
-    FileContent, Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo,
-    ServerMessage, SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
+    FileContent, Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, QueueAdded, Request,
+    RunInfo, ServerMessage, SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -375,6 +375,53 @@ impl Client {
         self.ack(Method::SessionPrompt {
             session_id: session_id.into(),
             prompt,
+        })
+        .await
+    }
+
+    /// Appends a prompt to the session's queue and returns its ID.
+    pub async fn queue_add(
+        &self,
+        session_id: &str,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<String, Error> {
+        let added: QueueAdded = self
+            .call(Method::SessionQueueAdd {
+                session_id: session_id.into(),
+                prompt,
+            })
+            .await?;
+        Ok(added.prompt_id)
+    }
+
+    /// Replaces a queued prompt in place.
+    pub async fn queue_edit(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<(), Error> {
+        self.ack(Method::SessionQueueEdit {
+            session_id: session_id.into(),
+            prompt_id: prompt_id.into(),
+            prompt,
+        })
+        .await
+    }
+
+    pub async fn queue_remove(&self, session_id: &str, prompt_id: &str) -> Result<(), Error> {
+        self.ack(Method::SessionQueueRemove {
+            session_id: session_id.into(),
+            prompt_id: prompt_id.into(),
+        })
+        .await
+    }
+
+    /// Removes a queued prompt and sends it now.
+    pub async fn queue_send(&self, session_id: &str, prompt_id: &str) -> Result<(), Error> {
+        self.ack(Method::SessionQueueSend {
+            session_id: session_id.into(),
+            prompt_id: prompt_id.into(),
         })
         .await
     }

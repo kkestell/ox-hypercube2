@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ox_protocol::schema::{ContentBlock, PromptCapabilities};
 use ox_protocol::{
     Branches, Checkout, CommandState, ConfigSetting, ConfigValue, Deleted, ErrorBody, Focus,
-    Harness, ListingChange, Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo,
-    StepState, Unseen, WorkspaceInfo, code,
+    Harness, ListingChange, Method, QueueAdded, RunInfo, RunState, SessionInfo, SessionState,
+    StepInfo, StepState, Unseen, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -19,7 +19,7 @@ use crate::instructions::StepRole;
 use crate::mcp::OxServer;
 use crate::run::{Run, RunFocus};
 use crate::session::{self, Opening, Session, SessionFocus};
-use crate::state::{self, Change, State};
+use crate::state::{self, Change, Queue, State};
 use crate::store::{SavedRun, SavedSession, SavedWorkspace, SessionWorktree, Store};
 use crate::workflow;
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
@@ -201,8 +201,11 @@ impl Daemon {
                     saved.title.clone(),
                     agent_session_id,
                     saved.last_seq,
+                    saved.queue.clone(),
                 ),
-                None => State::unstarted(saved.id.clone(), saved.title.clone()),
+                None => {
+                    State::unstarted(saved.id.clone(), saved.title.clone(), saved.queue.clone())
+                }
             };
             let run_focused = worktree.as_ref().and_then(|worktree| {
                 runs.values()
@@ -308,6 +311,23 @@ impl Daemon {
             .ok_or_else(|| not_found("session", id))
     }
 
+    /// Calls `send` on a session, which may start a turn, unless its
+    /// checkout's branch is moving. The registry stays locked throughout, so
+    /// no move starts in between.
+    fn send_unmoved<R>(
+        &self,
+        id: &str,
+        send: impl FnOnce(&Session) -> Result<R, ErrorBody>,
+    ) -> Result<R, ErrorBody> {
+        let registry = self.lock();
+        let session = registry
+            .sessions
+            .get(id)
+            .ok_or_else(|| not_found("session", id))?;
+        registry.refuse_moving(session.cwd())?;
+        send(session)
+    }
+
     /// Counts a connection's focus on a session or a run while the guard
     /// lives, and clears its unseen outcome: a run's, then its child
     /// sessions'. Refused for an unknown ID.
@@ -398,13 +418,34 @@ impl Daemon {
                 Ok(to_value(session.info()))
             }
             Method::SessionPrompt { session_id, prompt } => {
-                let registry = self.lock();
-                let session = registry
-                    .sessions
-                    .get(&session_id)
-                    .ok_or_else(|| not_found("session", &session_id))?;
-                registry.refuse_moving(session.cwd())?;
-                session.prompt(prompt)?;
+                self.send_unmoved(&session_id, |session| session.prompt(prompt))?;
+                Ok(Value::Null)
+            }
+            Method::SessionQueueAdd { session_id, prompt } => {
+                let prompt_id =
+                    self.send_unmoved(&session_id, |session| session.queue_add(prompt))?;
+                Ok(to_value(QueueAdded { prompt_id }))
+            }
+            Method::SessionQueueEdit {
+                session_id,
+                prompt_id,
+                prompt,
+            } => {
+                self.session(&session_id)?.queue_edit(prompt_id, prompt)?;
+                Ok(Value::Null)
+            }
+            Method::SessionQueueRemove {
+                session_id,
+                prompt_id,
+            } => {
+                self.session(&session_id)?.queue_remove(prompt_id)?;
+                Ok(Value::Null)
+            }
+            Method::SessionQueueSend {
+                session_id,
+                prompt_id,
+            } => {
+                self.send_unmoved(&session_id, |session| session.queue_send(prompt_id))?;
                 Ok(Value::Null)
             }
             Method::SessionSetConfigOption {
@@ -774,7 +815,7 @@ impl Daemon {
                         .set_title(&title)
                         .expect("a title from a prompt is not empty");
                 }
-                let seq = session.queue_prompt(prompt.clone());
+                let seq = session.record_first_prompt(prompt.clone());
                 opening.prompt = Some((prompt, seq));
             }
             match (session.worktree(), worktree.take()) {
@@ -846,6 +887,7 @@ impl Daemon {
             archived: false,
             created_at,
             unseen: None,
+            queue: Queue::default(),
         };
         let session = Session::new(
             self.store.clone(),

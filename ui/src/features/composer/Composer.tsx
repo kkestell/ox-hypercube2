@@ -1,13 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
-import { memo } from "react";
+import { memo, useEffect, useRef } from "react";
 import { HarnessLogo, sessionAgent } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import type {
   Command,
   ConfigOption,
   Controls,
+  QueuedPrompt,
   Request,
   RunInfo,
   SessionInfo,
@@ -17,6 +18,7 @@ import type { AgentId } from "../sessions/useAgents";
 import { CommandInput } from "./CommandInput";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { OpenRequest } from "./OpenRequest";
+import { QueuedPrompts, queuedMessage } from "./QueuedPrompts";
 import type { Unsents } from "./useUnsent";
 
 /** Runs `action`, shows its error if it fails, and resolves to whether it succeeded. */
@@ -31,11 +33,15 @@ async function attempt(action: () => Promise<unknown>) {
 }
 
 /**
- * A composer: the entry with its attachments and slash commands, and the
- * agent's config options. `unsentId` names the unsent text it edits. The
- * entry and attachments are disabled while `disabled`, Send is enabled
- * while `idle` and there is something to send, and Stop shows while
- * `running`.
+ * A composer: the entry with its attachments and slash commands, the queued
+ * prompts of `queue`, and the agent's config options. `unsentId` names the
+ * unsent text it edits. The entry and attachments are disabled while
+ * `disabled`. Send is enabled while there is something to send and the
+ * composer is `idle` or `running` and not `disabled`; `onSend` gets `steer`
+ * set for Cmd+Enter. While `running`, the form's button sends a message that
+ * has content and stops otherwise, and Escape stops. While a queued prompt is
+ * edited, Enter saves it in its place with `onSaveEdit` and brings back the
+ * message it replaced.
  */
 export function Composer({
   unsentId,
@@ -44,11 +50,13 @@ export function Composer({
   configOptions,
   commands,
   request,
+  queue,
   running,
   disabled,
   idle,
   optionsDisabled = false,
   onSend,
+  onSaveEdit,
   onStop,
   onSetOption,
 }: {
@@ -59,26 +67,65 @@ export function Composer({
   commands: Command[];
   /** The session's oldest unanswered permission request or form. */
   request?: Request;
+  queue?: QueuedPrompt[];
   running: boolean;
   disabled: boolean;
   idle: boolean;
   /** Whether the config options show without being settable. */
   optionsDisabled?: boolean;
-  onSend: (text: string, attachments: string[]) => Promise<unknown>;
+  onSend: (text: string, attachments: string[], steer: boolean) => Promise<unknown>;
+  onSaveEdit?: (promptId: string, text: string, attachments: string[]) => Promise<unknown>;
   onStop?: () => Promise<unknown>;
   onSetOption: (option: ConfigOption, value: string | boolean) => Promise<unknown>;
 }) {
   const current = unsent.get(unsentId);
   const { text, attachments } = current;
-  const canSend = idle && (text.trim() !== "" || attachments.length > 0);
+  // An edit of a prompt that has left the queue is sent as a new message.
+  const editing = queue?.some(({ id }) => id === current.editing?.promptId)
+    ? current.editing
+    : undefined;
+  const hasContent = text.trim() !== "" || attachments.length > 0;
+  const canSend = (idle || (running && !disabled)) && hasContent;
+  const showStop = running && !hasContent;
 
-  const send = () =>
+  const send = (steer: boolean) =>
     attempt(async () => {
-      await onSend(text.trim(), attachments);
-      unsent.update(unsentId, (latest) => (latest === current ? undefined : latest));
+      if (editing) await onSaveEdit?.(editing.promptId, text.trim(), attachments);
+      else await onSend(text.trim(), attachments, steer);
+      unsent.update(unsentId, (latest) =>
+        latest === current ? (current.editing?.held ?? undefined) : latest,
+      );
     });
 
   const stop = () => attempt(() => onStop?.() ?? Promise.resolve());
+
+  // Escape stops the work, unless something else handled it first or it
+  // closes an open popover, such as the model menu, or a dialog.
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
+  useEffect(() => {
+    if (!running) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key === "Escape" &&
+        !event.defaultPrevented &&
+        !document.querySelector(":popover-open, dialog[open]")
+      ) {
+        stopRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [running]);
+
+  const edit = (queued: QueuedPrompt) =>
+    unsent.update(unsentId, (latest) => ({
+      ...queuedMessage(queued.prompt),
+      editing: {
+        promptId: queued.id,
+        held: latest.editing?.held ?? { text: latest.text, attachments: latest.attachments },
+      },
+    }));
 
   const setOption = (option: ConfigOption, value: string | boolean) =>
     attempt(() => onSetOption(option, value));
@@ -106,13 +153,14 @@ export function Composer({
     <div className="composer">
       <div className="stack">
         {request && <OpenRequest key={request.request_id} item={request} sessionId={unsentId} />}
+        {queue && <QueuedPrompts sessionId={unsentId} queue={queue} onEdit={edit} />}
         <div className="entry">
           <form
             className="box"
             onSubmit={(event) => {
               event.preventDefault();
-              if (running) stop();
-              else if (canSend) send();
+              if (showStop) stop();
+              else if (canSend) send(false);
             }}
           >
             {attachments.length > 0 && (
@@ -159,11 +207,11 @@ export function Composer({
               <button
                 type="submit"
                 className="icon-button"
-                title={running ? "Stop" : "Send"}
-                aria-label={running ? "Stop" : "Send"}
-                disabled={!running && !canSend}
+                title={showStop ? "Stop" : "Send"}
+                aria-label={showStop ? "Stop" : "Send"}
+                disabled={!showStop && !canSend}
               >
-                {running ? <Square /> : <ArrowUp />}
+                {showStop ? <Square /> : <ArrowUp />}
               </button>
             </div>
           </form>
@@ -195,8 +243,10 @@ export function Composer({
 }
 
 /**
- * A session's composer. While the run a child session belongs to is running,
- * the entry and attachments are disabled and Stop cancels the run. A new
+ * A session's composer. On an idle session, Enter and Cmd+Enter send the
+ * message. While the agent works, Enter queues it and Cmd+Enter steers the
+ * running turn with it. While the run a child session belongs to is running,
+ * the entry and attachments are disabled and Stop and Escape cancel the run. A new
  * session whose agent is starting shows `starting`, the controls it was sent
  * with, disabled, until its agent reports its own.
  */
@@ -228,11 +278,21 @@ export const SessionComposer = memo(function SessionComposer({
       configOptions={starting?.config_options ?? session.config_options}
       commands={starting?.available_commands ?? session.available_commands}
       request={request}
-      running={running}
+      queue={session.queue}
+      running={running || runRunning}
       disabled={session.state === "exited" || runRunning}
       idle={session.state === "idle" && !runRunning}
       optionsDisabled={starting !== undefined}
-      onSend={(text, attachments) => invoke("prompt", { sessionId: session.id, text, attachments })}
+      onSend={(text, attachments, steer) =>
+        invoke(steer || !running ? "prompt" : "queue_add", {
+          sessionId: session.id,
+          text,
+          attachments,
+        })
+      }
+      onSaveEdit={(promptId, text, attachments) =>
+        invoke("queue_edit", { sessionId: session.id, promptId, text, attachments })
+      }
       onStop={() =>
         runRunning
           ? invoke("cancel_run", { runId: parent.id })

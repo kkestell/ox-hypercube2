@@ -54,8 +54,14 @@ enum Command {
         /// The session's id, as `ls` shows it
         session: String,
     },
-    /// Send a text prompt
+    /// Send a text prompt now: it starts a turn on an idle session and
+    /// steers a running one
     Prompt { session: String, text: String },
+    /// Add, list, edit, remove, and send a session's queued prompts
+    Queue {
+        #[command(subcommand)]
+        command: QueueCommand,
+    },
     /// Set a session's select option and print its current value
     Config {
         session: String,
@@ -133,6 +139,24 @@ enum RunCommand {
 }
 
 #[derive(Subcommand)]
+enum QueueCommand {
+    /// Queue a text prompt and print its id
+    Add { session: String, text: String },
+    /// List queued prompts as their id and text
+    Ls { session: String },
+    /// Replace a queued prompt's text
+    Edit {
+        session: String,
+        prompt: String,
+        text: String,
+    },
+    /// Remove a queued prompt
+    Rm { session: String, prompt: String },
+    /// Take a prompt out of the queue and send it now
+    Send { session: String, prompt: String },
+}
+
+#[derive(Subcommand)]
 enum WorkspaceCommand {
     /// Add a directory as a workspace and print its id
     Add { path: PathBuf },
@@ -140,6 +164,10 @@ enum WorkspaceCommand {
     Ls,
     /// Remove a workspace that has no sessions
     Rm { workspace: String },
+}
+
+fn text_prompt(text: String) -> Vec<ContentBlock> {
+    vec![ContentBlock::Text(TextContent::new(text))]
 }
 
 #[tokio::main]
@@ -212,10 +240,42 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             client.load_session(&session, utf8_env()).await?;
             println!("{}", loaded(&client, &session).await?);
         }
-        Command::Prompt { session, text } => {
-            let prompt = vec![ContentBlock::Text(TextContent::new(text))];
-            client.prompt(&session, prompt).await?;
-        }
+        Command::Prompt { session, text } => client.prompt(&session, text_prompt(text)).await?,
+        Command::Queue { command } => match command {
+            QueueCommand::Add { session, text } => {
+                println!("{}", client.queue_add(&session, text_prompt(text)).await?);
+            }
+            QueueCommand::Ls { session } => {
+                for change in listing(&client).await? {
+                    if let ListingChange::Session { session: info } = change
+                        && info.id == session
+                    {
+                        for queued in info.queue {
+                            let text: Vec<&str> = queued
+                                .prompt
+                                .iter()
+                                .filter_map(|block| match block {
+                                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            println!("{}\t{}", queued.id, text.join(" ").replace('\n', " "));
+                        }
+                    }
+                }
+            }
+            QueueCommand::Edit {
+                session,
+                prompt,
+                text,
+            } => {
+                client
+                    .queue_edit(&session, &prompt, text_prompt(text))
+                    .await?;
+            }
+            QueueCommand::Rm { session, prompt } => client.queue_remove(&session, &prompt).await?,
+            QueueCommand::Send { session, prompt } => client.queue_send(&session, &prompt).await?,
+        },
         Command::Config {
             session,
             option,

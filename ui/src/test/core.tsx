@@ -183,6 +183,7 @@ export function session(
     archived: false,
     created_at: ++ids,
     unseen: null,
+    queue: [],
     ...fields,
   };
 }

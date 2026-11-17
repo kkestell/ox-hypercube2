@@ -10,7 +10,7 @@ use agent_client_protocol::v2::schema::{
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
     SessionUpdate, StateUpdate, ToolCallId,
 };
-use ox_protocol::{ErrorBody, Event, EventKind, SessionState, Unseen, code};
+use ox_protocol::{ErrorBody, Event, EventKind, QueuedPrompt, SessionState, Unseen, code};
 use tokio::sync::oneshot;
 
 /// Events a subscriber is handed at a time.
@@ -40,7 +40,19 @@ impl Agent {
 /// What a client asks of a session. The session refuses a request its state
 /// does not allow.
 pub enum Request {
+    /// A prompt to send now: it starts a turn on an idle session and steers
+    /// a running one.
     Prompt(Vec<ContentBlock>),
+    QueueAdd(QueuedPrompt),
+    /// Replaces the queued prompt with the same ID.
+    QueueEdit(QueuedPrompt),
+    QueueRemove {
+        id: String,
+    },
+    /// Takes a queued prompt out of the queue and sends it now.
+    QueueSend {
+        id: String,
+    },
     Permit {
         request_id: String,
         option_id: String,
@@ -87,10 +99,16 @@ pub enum Change {
     /// The agent was told to cancel the turn. Pending permission requests
     /// are cancelled; elicitations stay open until the agent withdraws them.
     Cancelled,
+    /// The agent answered `session/prompt` successfully: it inserted the
+    /// prompt that the `PromptStarted` or `PromptSteered` event at seq
+    /// `prompt` records. The turn runs and ends on the agent's
+    /// `state_update`s, so only a steered prompt's acceptance is recorded.
+    PromptAccepted {
+        prompt: u64,
+    },
     /// The agent answered `session/prompt` with an error: it did not insert
-    /// the prompt, which is the one its `PromptStarted` event at seq `prompt`
-    /// records. A successful answer changes nothing, since the turn runs and
-    /// ends on the agent's `state_update`s.
+    /// the prompt that the `PromptStarted` or `PromptSteered` event at seq
+    /// `prompt` records.
     PromptRejected {
         prompt: u64,
         error: String,
@@ -180,16 +198,23 @@ struct Live {
     agent: Agent,
     turn: Option<Turn>,
     pending: Vec<Pending>,
+    /// The seqs of the `PromptSteered` events whose prompts the agent has
+    /// not answered. A steered prompt still pending when the turn ends
+    /// starts a turn of the agent's own.
+    steered: Vec<u64>,
     /// The background work the agent last reported. `None` when it does not
     /// report any.
     background: Option<Vec<BackgroundWork>>,
 }
 
 impl Live {
-    /// No turn, no pending request, and the agent reports no background
-    /// work.
+    /// No turn, no pending request or steered prompt, and the agent reports
+    /// no background work.
     fn quiet(&self) -> bool {
-        self.turn.is_none() && self.pending.is_empty() && self.background.as_deref() == Some(&[])
+        self.turn.is_none()
+            && self.pending.is_empty()
+            && self.steered.is_empty()
+            && self.background.as_deref() == Some(&[])
     }
 
     fn state(&self) -> SessionState {
@@ -241,9 +266,15 @@ impl Live {
     }
 
     /// Ends what the agent left open: every pending request is cancelled,
-    /// and a running turn ends with `error`.
+    /// every steered prompt it had not taken in is dropped, and a running
+    /// turn ends with `error`.
     fn end(mut self, error: &str) -> (Agent, Vec<EventKind>) {
         let mut events = self.cancel_pending(|_| true);
+        events.extend(
+            self.steered
+                .drain(..)
+                .map(|prompt| EventKind::SteeredPromptDropped { prompt }),
+        );
         if let Some(Turn::Prompted(_) | Turn::Working { recorded: true }) = self.turn {
             events.push(EventKind::TurnEnded {
                 stop_reason: None,
@@ -322,6 +353,7 @@ impl Phase {
                     agent,
                     turn,
                     pending: Vec::new(),
+                    steered: Vec::new(),
                     background,
                 };
                 (Self::Live(live), events)
@@ -462,6 +494,24 @@ impl Phase {
                 let events = live.cancel_pending(Pending::is_permission);
                 (Self::Live(live), events)
             }
+            (Self::Live(mut live), Change::PromptAccepted { prompt })
+                if live.steered.contains(&prompt) =>
+            {
+                live.steered.retain(|steered| *steered != prompt);
+                (
+                    Self::Live(live),
+                    vec![EventKind::SteeredPromptTaken { prompt }],
+                )
+            }
+            (Self::Live(mut live), Change::PromptRejected { prompt, .. })
+                if live.steered.contains(&prompt) =>
+            {
+                live.steered.retain(|steered| *steered != prompt);
+                (
+                    Self::Live(live),
+                    vec![EventKind::SteeredPromptDropped { prompt }],
+                )
+            }
             // The agent rejected the prompt, so no turn began. After the
             // agent reported work for it, the turn ends at the agent's `idle`.
             (Self::Live(mut live), Change::PromptRejected { prompt, error })
@@ -500,9 +550,13 @@ impl Phase {
                 | Change::ElicitationRequested { .. }
                 | Change::ElicitationWithdrawn
                 | Change::Cancelled
+                | Change::PromptAccepted { .. }
                 | Change::PromptRejected { .. },
             )
-            | (phase @ Self::Live(_), Change::Started(_) | Change::PromptRejected { .. })
+            | (
+                phase @ Self::Live(_),
+                Change::Started(_) | Change::PromptAccepted { .. } | Change::PromptRejected { .. },
+            )
             | (
                 phase @ Self::Exited(_),
                 Change::Started(_)
@@ -512,6 +566,7 @@ impl Phase {
                 | Change::ElicitationRequested { .. }
                 | Change::ElicitationWithdrawn
                 | Change::Cancelled
+                | Change::PromptAccepted { .. }
                 | Change::PromptRejected { .. }
                 | Change::Exited(_)
                 | Change::Parked,
@@ -522,11 +577,21 @@ impl Phase {
     }
 }
 
-/// A session's phase and every event it has recorded. `SessionClosed` ends a
-/// session's subscriptions and is not stored. Each `PromptStarted` and `TurnStarted` is
-/// followed by one `TurnEnded`, each `PermissionRequested` by one
-/// `PermissionResolved`, and each `ElicitationRequested` by one
-/// `ElicitationResolved`.
+/// A session's queue: the prompts waiting to start a turn each, in order.
+/// `paused` holds them after a cancelled turn or one that did not end
+/// normally, until a prompt is sent.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Queue {
+    pub prompts: Vec<QueuedPrompt>,
+    pub paused: bool,
+}
+
+/// A session's phase, its queue, and every event it has recorded.
+/// `SessionClosed` ends a session's subscriptions and is not stored. Each
+/// `PromptStarted` and `TurnStarted` is followed by one `TurnEnded`, each
+/// `PromptSteered` by one `SteeredPromptTaken` or `SteeredPromptDropped`,
+/// each `PermissionRequested` by one `PermissionResolved`, and each
+/// `ElicitationRequested` by one `ElicitationResolved`.
 ///
 /// A session restored from the database knows its last seq but holds no
 /// events until `fill` gives it the stored history, and records none before.
@@ -544,6 +609,9 @@ pub struct State {
     /// The ID of the next permission request or elicitation. Request IDs
     /// stay unique for the session's lifetime, across every agent it loads.
     next_request: u64,
+    queue: Queue,
+    /// Whether the queue changed since `take_changed_queue`.
+    queue_changed: bool,
 }
 
 #[derive(Debug)]
@@ -590,16 +658,19 @@ impl State {
             last_seq: 0,
             unlogged: Vec::new(),
             next_request: 1,
+            queue: Queue::default(),
+            queue_changed: false,
         }
     }
 
     /// A session saved in the database: exited, with no agent and its
-    /// history, which ends at `last_seq`, not yet read.
+    /// history, which ends at `last_seq`, not yet read, and its saved queue.
     pub fn restored(
         session_id: String,
         title: Option<String>,
         agent_session_id: String,
         last_seq: u64,
+        queue: Queue,
     ) -> Self {
         Self {
             session_id,
@@ -609,12 +680,14 @@ impl State {
             last_seq,
             unlogged: Vec::new(),
             next_request: 1,
+            queue,
+            queue_changed: false,
         }
     }
 
     /// A saved session whose agent never started: exited, with no events and
-    /// nothing to load.
-    pub fn unstarted(session_id: String, title: Option<String>) -> Self {
+    /// nothing to load, and its saved queue.
+    pub fn unstarted(session_id: String, title: Option<String>, queue: Queue) -> Self {
         Self {
             session_id,
             phase: Phase::Exited(None),
@@ -623,6 +696,8 @@ impl State {
             last_seq: 0,
             unlogged: Vec::new(),
             next_request: 1,
+            queue,
+            queue_changed: false,
         }
     }
 
@@ -632,11 +707,13 @@ impl State {
     }
 
     /// Gives a restored session its stored history. What a crash left open is
-    /// closed: a running turn ends with an error, and a pending permission
-    /// request or elicitation is cancelled. Request IDs continue after the
-    /// history's.
+    /// closed: a pending permission request or elicitation is cancelled, a
+    /// steered prompt the agent had not taken in is dropped, and a running
+    /// turn ends with an error, which holds the queue. Request IDs continue
+    /// after the history's.
     pub fn fill(&mut self, history: Vec<Event>) {
         let mut turn_open = false;
+        let mut steered = Vec::new();
         // Each open request's ID, and whether it is a permission request.
         let mut pending: Vec<(&str, bool)> = Vec::new();
         let mut last_request = 0;
@@ -644,6 +721,11 @@ impl State {
             match &event.kind {
                 EventKind::PromptStarted { .. } | EventKind::TurnStarted => turn_open = true,
                 EventKind::TurnEnded { .. } => turn_open = false,
+                EventKind::PromptSteered { .. } => steered.push(event.seq),
+                EventKind::SteeredPromptTaken { prompt }
+                | EventKind::SteeredPromptDropped { prompt } => {
+                    steered.retain(|seq| seq != prompt);
+                }
                 EventKind::PermissionRequested { request_id, .. }
                 | EventKind::ElicitationRequested { request_id, .. } => {
                     let permission = matches!(event.kind, EventKind::PermissionRequested { .. });
@@ -679,6 +761,9 @@ impl State {
         for event in cancelled {
             self.append(event);
         }
+        for prompt in steered {
+            self.append(EventKind::SteeredPromptDropped { prompt });
+        }
         // TODO: a turn a crash cut off gets its unseen error only here, when
         // the session's history is first read, not when oxd restarts.
         if turn_open {
@@ -686,12 +771,64 @@ impl State {
                 stop_reason: None,
                 error: Some("oxd stopped during the turn".into()),
             });
+            self.pause();
         }
     }
 
     /// The events recorded since the last call, in order, for the database.
     pub fn take_unlogged(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.unlogged)
+    }
+
+    /// The queue, if it changed since the last call, for the database.
+    pub fn take_changed_queue(&mut self) -> Option<Queue> {
+        std::mem::take(&mut self.queue_changed).then(|| self.queue.clone())
+    }
+
+    /// The prompts waiting to start a turn each, in order.
+    pub fn queued(&self) -> &[QueuedPrompt] {
+        &self.queue.prompts
+    }
+
+    fn pause(&mut self) {
+        if !self.queue.paused {
+            self.queue.paused = true;
+            self.queue_changed = true;
+        }
+    }
+
+    fn resume(&mut self) {
+        if self.queue.paused {
+            self.queue.paused = false;
+            self.queue_changed = true;
+        }
+    }
+
+    /// Starts a turn with the queue's first prompt when the agent is idle,
+    /// has no steered prompt to take in, and the queue is not held. Returns
+    /// the prompt to send and the seq of its `PromptStarted` event.
+    // TODO: a queued prompt can start while the session's branch is moving,
+    // which `session.prompt` refuses.
+    pub fn start_queued(&mut self) -> Option<(Vec<ContentBlock>, u64)> {
+        let Phase::Live(live) = &mut self.phase else {
+            return None;
+        };
+        if live.turn.is_some()
+            || !live.pending.is_empty()
+            || !live.steered.is_empty()
+            || self.queue.paused
+            || self.queue.prompts.is_empty()
+        {
+            return None;
+        }
+        let seq = self.last_seq + 1;
+        live.turn = Some(Turn::Prompted(seq));
+        let prompt = self.queue.prompts.remove(0).prompt;
+        self.queue_changed = true;
+        self.append(EventKind::PromptStarted {
+            prompt: prompt.clone(),
+        });
+        Some((prompt, seq))
     }
 
     /// Starts a load: the session goes from `exited` to `starting` and
@@ -803,27 +940,53 @@ impl State {
     /// Records a new session's first prompt while its agent starts and
     /// returns the seq of its `PromptStarted` event. The prompt's turn runs
     /// once the agent starts.
-    pub fn queue_prompt(&mut self, prompt: Vec<ContentBlock>) -> u64 {
+    pub fn record_first_prompt(&mut self, prompt: Vec<ContentBlock>) -> u64 {
         let seq = self.last_seq() + 1;
-        let Phase::Starting { prompt: queued, .. } = &mut self.phase else {
-            unreachable!("a first prompt is queued while the agent starts");
+        let Phase::Starting { prompt: first, .. } = &mut self.phase else {
+            unreachable!("a first prompt is recorded while the agent starts");
         };
-        *queued = Some(seq);
+        *first = Some(seq);
         self.append(EventKind::PromptStarted { prompt });
         seq
     }
 
-    pub fn request(&mut self, request: Request) -> Result<(), ErrorBody> {
-        let seq = self.last_seq() + 1;
+    /// Applies a client's request. A prompt it sends now is returned, with
+    /// the seq of the `PromptStarted` or `PromptSteered` event that records
+    /// it.
+    pub fn request(
+        &mut self,
+        request: Request,
+    ) -> Result<Option<(Vec<ContentBlock>, u64)>, ErrorBody> {
         let event = match (&mut self.phase, request) {
-            (Phase::Live(live), Request::Prompt(prompt)) => {
-                let state = live.state();
-                if state != SessionState::Idle {
-                    return Err(invalid_state(state));
-                }
-                check_prompt(&prompt, &live.agent.prompt_capabilities)?;
-                live.turn = Some(Turn::Prompted(seq));
-                EventKind::PromptStarted { prompt }
+            (_, Request::Prompt(prompt)) => return self.send_now(prompt).map(Some),
+            (Phase::Closed, Request::QueueAdd(_) | Request::QueueEdit(_)) => {
+                return Err(invalid_state(SessionState::Exited));
+            }
+            (_, Request::QueueAdd(queued)) => {
+                self.check_queued(&queued.prompt)?;
+                self.queue.prompts.push(queued);
+                self.queue_changed = true;
+                return Ok(None);
+            }
+            (_, Request::QueueEdit(queued)) => {
+                self.check_queued(&queued.prompt)?;
+                let index = self.queued_index(&queued.id)?;
+                self.queue.prompts[index] = queued;
+                self.queue_changed = true;
+                return Ok(None);
+            }
+            (_, Request::QueueRemove { id }) => {
+                let index = self.queued_index(&id)?;
+                self.queue.prompts.remove(index);
+                self.queue_changed = true;
+                return Ok(None);
+            }
+            (_, Request::QueueSend { id }) => {
+                let index = self.queued_index(&id)?;
+                let sent = self.send_now(self.queue.prompts[index].prompt.clone())?;
+                self.queue.prompts.remove(index);
+                self.queue_changed = true;
+                return Ok(Some(sent));
             }
             (
                 Phase::Live(live),
@@ -881,24 +1044,75 @@ impl State {
                 resolve_elicitation(request_id, answer, action)
             }
             (
-                phase @ (Phase::Starting { .. } | Phase::Exited(_) | Phase::Closed),
-                Request::Prompt(_),
-            ) => {
-                return Err(invalid_state(phase.state()));
-            }
-            (
                 Phase::Starting { .. } | Phase::Exited(_) | Phase::Closed,
                 Request::Permit { request_id, .. } | Request::Respond { request_id, .. },
             ) => return Err(not_pending(&request_id)),
         };
         self.append(event);
-        Ok(())
+        Ok(None)
     }
 
+    /// Sends a prompt now: on an idle session it starts a turn, and during a
+    /// turn it steers it. Either resumes a held queue. Returns the prompt and
+    /// the seq of the event that records it.
+    fn send_now(
+        &mut self,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<(Vec<ContentBlock>, u64), ErrorBody> {
+        let seq = self.last_seq + 1;
+        let Phase::Live(live) = &mut self.phase else {
+            return Err(invalid_state(self.phase.state()));
+        };
+        check_prompt(&prompt, &live.agent.prompt_capabilities)?;
+        let event = if live.turn.is_some() {
+            live.steered.push(seq);
+            EventKind::PromptSteered {
+                prompt: prompt.clone(),
+            }
+        } else if live.state() == SessionState::Idle {
+            live.turn = Some(Turn::Prompted(seq));
+            EventKind::PromptStarted {
+                prompt: prompt.clone(),
+            }
+        } else {
+            return Err(invalid_state(live.state()));
+        };
+        self.resume();
+        self.append(event);
+        Ok((prompt, seq))
+    }
+
+    /// Checks a prompt for the queue, against the prompt capabilities of the
+    /// agent when it is running.
+    fn check_queued(&self, prompt: &[ContentBlock]) -> Result<(), ErrorBody> {
+        match &self.phase {
+            Phase::Live(live) => check_prompt(prompt, &live.agent.prompt_capabilities),
+            _ if prompt.is_empty() => Err(invalid_request("the prompt is empty".into())),
+            _ => Ok(()),
+        }
+    }
+
+    fn queued_index(&self, id: &str) -> Result<usize, ErrorBody> {
+        self.queue
+            .prompts
+            .iter()
+            .position(|queued| queued.id == id)
+            .ok_or_else(|| ErrorBody {
+                code: code::NOT_FOUND,
+                message: format!("prompt {id} is not queued"),
+            })
+    }
+
+    /// Records a change. A cancelled turn, and a turn that ends other than
+    /// normally, holds the queue.
     pub fn record(&mut self, change: Change) {
+        let cancelled = matches!(change, Change::Cancelled);
         let phase = std::mem::replace(&mut self.phase, Phase::Closed);
         let (phase, events) = phase.after(change, &mut self.next_request);
         self.phase = phase;
+        if cancelled || events.iter().any(ends_abnormally) {
+            self.pause();
+        }
         for event in events {
             self.append(event);
         }
@@ -928,6 +1142,16 @@ impl State {
         }
         events.push(event);
     }
+}
+
+/// Whether an event is a turn's end other than a normal one: an error, or a
+/// stop reason other than `end_turn`.
+fn ends_abnormally(event: &EventKind) -> bool {
+    matches!(
+        event,
+        EventKind::TurnEnded { stop_reason, error }
+            if error.is_some() || !matches!(stop_reason, None | Some(StopReason::EndTurn))
+    )
 }
 
 /// Checks a prompt against what the agent accepts. Every agent accepts text
@@ -1127,9 +1351,11 @@ mod tests {
     }
 
     fn prompt(state: &mut State) -> Result<(), ErrorBody> {
-        state.request(Request::Prompt(vec![ContentBlock::Text(TextContent::new(
-            "hello",
-        ))]))
+        state.request(Request::Prompt(text("hello"))).map(|_| ())
+    }
+
+    fn text(text: &str) -> Vec<ContentBlock> {
+        vec![ContentBlock::Text(TextContent::new(text))]
     }
 
     /// Records a permission request with the option `allow` and returns the
@@ -1180,6 +1406,9 @@ mod tests {
             .map(|event| match event.kind {
                 EventKind::AgentStarted { .. } => "agent_started",
                 EventKind::PromptStarted { .. } => "prompt_started",
+                EventKind::PromptSteered { .. } => "prompt_steered",
+                EventKind::SteeredPromptTaken { .. } => "steered_prompt_taken",
+                EventKind::SteeredPromptDropped { .. } => "steered_prompt_dropped",
                 EventKind::TurnStarted => "turn_started",
                 EventKind::Update(_) => "update",
                 EventKind::PermissionRequested { .. } => "permission_requested",
@@ -1204,7 +1433,6 @@ mod tests {
         assert_eq!(state.state(), SessionState::Idle);
         prompt(&mut state).unwrap();
         assert_eq!(state.state(), SessionState::Running);
-        assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
         state.record(running());
 
         let mut outcome = request_permission(&mut state);
@@ -1249,7 +1477,7 @@ mod tests {
     #[test]
     fn a_first_prompt_is_recorded_while_starting_and_runs_once_started() {
         let mut state = State::new("s".into());
-        let seq = state.queue_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
+        let seq = state.record_first_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
         assert_eq!(seq, 1);
         assert_eq!(state.state(), SessionState::Starting);
         assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
@@ -1273,7 +1501,7 @@ mod tests {
             (None, "the agent exited before the prompt"),
         ] {
             let mut state = State::new("s".into());
-            state.queue_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
+            state.record_first_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
             state.record(Change::Exited(error.clone()));
             assert_eq!(state.state(), SessionState::Exited);
             let events = state.events_after(1);
@@ -1322,7 +1550,6 @@ mod tests {
 
         state.record(running());
         assert_eq!(state.state(), SessionState::Running);
-        assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
         state.record(running());
 
         let mut outcome = request_permission(&mut state);
@@ -1471,6 +1698,276 @@ mod tests {
         );
     }
 
+    /// Queues a prompt with the ID `id`.
+    fn enqueue(state: &mut State, id: &str) {
+        state
+            .request(Request::QueueAdd(QueuedPrompt {
+                id: id.into(),
+                prompt: text(id),
+            }))
+            .unwrap();
+    }
+
+    fn queued_ids(state: &State) -> Vec<&str> {
+        state
+            .queued()
+            .iter()
+            .map(|queued| queued.id.as_str())
+            .collect()
+    }
+
+    /// The text of the prompt `start_queued` starts, if any.
+    fn start_queued(state: &mut State) -> Option<String> {
+        state.start_queued().map(|(prompt, _)| match &prompt[0] {
+            ContentBlock::Text(text) => text.text.clone(),
+            _ => unreachable!("queued prompts are text"),
+        })
+    }
+
+    /// The seq of the last `PromptSteered` event.
+    fn last_steered(state: &State) -> u64 {
+        state
+            .events_after(0)
+            .iter()
+            .rev()
+            .find(|event| matches!(event.kind, EventKind::PromptSteered { .. }))
+            .map(|event| event.seq)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_prompt_during_a_turn_is_steered_and_taken_when_the_agent_accepts_it() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        let (_, seq) = state
+            .request(Request::Prompt(text("also")))
+            .unwrap()
+            .unwrap();
+        assert_eq!(seq, last_steered(&state));
+        state.record(running());
+        state.record(Change::PromptAccepted { prompt: seq });
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(
+            kinds(&state, 1),
+            [
+                "prompt_started",
+                "prompt_steered",
+                "update",
+                "steered_prompt_taken",
+                "update",
+                "turn_ended"
+            ]
+        );
+        assert_eq!(
+            state.events_after(4)[0].kind,
+            EventKind::SteeredPromptTaken { prompt: seq }
+        );
+        assert_eq!(state.state(), SessionState::Idle);
+    }
+
+    #[test]
+    fn queued_prompts_start_one_turn_each_in_order_after_normal_ends() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        enqueue(&mut state, "second");
+        assert_eq!(start_queued(&mut state), None, "a turn is running");
+        state.record(running());
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
+        assert_eq!(start_queued(&mut state), None, "one prompt per turn");
+        assert_eq!(queued_ids(&state), ["second"]);
+        state.record(running());
+        state.record(idle(None));
+        assert_eq!(start_queued(&mut state).as_deref(), Some("second"));
+        assert!(state.queued().is_empty());
+        assert_eq!(state.state(), SessionState::Running);
+    }
+
+    #[test]
+    fn a_prompt_queued_on_an_idle_session_starts_at_once() {
+        let mut state = started();
+        enqueue(&mut state, "first");
+        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
+        assert_eq!(kinds(&state, 1), ["prompt_started"]);
+    }
+
+    #[test]
+    fn cancelling_holds_the_queue_until_a_prompt_is_sent() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        enqueue(&mut state, "second");
+        state.record(running());
+        state.record(Change::Cancelled);
+        state.record(idle(Some(StopReason::Cancelled)));
+        assert_eq!(start_queued(&mut state), None);
+        prompt(&mut state).unwrap();
+        state.record(running());
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn turns_that_end_other_than_normally_hold_the_queue_until_one_is_sent_now() {
+        let ends: [(&str, Change); 3] = [
+            ("max tokens", idle(Some(StopReason::MaxTokens))),
+            ("refusal", idle(Some(StopReason::Refusal))),
+            (
+                "error",
+                state_change(StateUpdate::Idle(
+                    IdleStateUpdate::new().stop_reason(StopReason::Error(ErrorStopReason::new())),
+                )),
+            ),
+        ];
+        for (name, end) in ends {
+            let mut state = started();
+            prompt(&mut state).unwrap();
+            enqueue(&mut state, "first");
+            enqueue(&mut state, "second");
+            state.record(running());
+            state.record(end);
+            assert_eq!(start_queued(&mut state), None, "{name}");
+            state
+                .request(Request::QueueSend {
+                    id: "second".into(),
+                })
+                .unwrap();
+            assert_eq!(queued_ids(&state), ["first"], "{name}");
+            state.record(running());
+            state.record(idle(Some(StopReason::EndTurn)));
+            assert_eq!(start_queued(&mut state).as_deref(), Some("first"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_rejected_prompt_holds_the_queue() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        state.record(rejected(&state, "not inserted"));
+        assert_eq!(state.state(), SessionState::Idle);
+        assert_eq!(start_queued(&mut state), None);
+    }
+
+    #[test]
+    fn a_refused_send_leaves_the_prompt_queued() {
+        let mut state = State::new("s".into());
+        enqueue(&mut state, "first");
+        let refused = state.request(Request::QueueSend { id: "first".into() });
+        assert_eq!(refused.unwrap_err().code, code::INVALID_STATE);
+        assert_eq!(queued_ids(&state), ["first"]);
+    }
+
+    #[test]
+    fn steered_prompts_the_agent_does_not_take_are_dropped() {
+        // Rejected.
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        prompt(&mut state).unwrap();
+        let steered = last_steered(&state);
+        state.record(Change::PromptRejected {
+            prompt: steered,
+            error: "cancelled".into(),
+        });
+        assert_eq!(
+            state.events_after(3)[0].kind,
+            EventKind::SteeredPromptDropped { prompt: steered }
+        );
+        assert_eq!(state.state(), SessionState::Running);
+
+        // Left when the agent exits.
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        prompt(&mut state).unwrap();
+        state.record(Change::Exited(None));
+        assert_eq!(
+            kinds(&state, 3),
+            ["steered_prompt_dropped", "turn_ended", "agent_exited"]
+        );
+
+        // Left when oxd stopped.
+        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
+        state.fill(stored(vec![
+            agent_started(),
+            EventKind::PromptStarted {
+                prompt: text("hello"),
+            },
+            EventKind::PromptSteered {
+                prompt: text("also"),
+            },
+        ]));
+        assert_eq!(
+            state.events_after(3)[0].kind,
+            EventKind::SteeredPromptDropped { prompt: 3 }
+        );
+        assert_eq!(kinds(&state, 4), ["turn_ended"]);
+        assert_eq!(
+            state.take_changed_queue().map(|queue| queue.paused),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_steered_prompt_pending_at_a_turn_end_runs_before_the_queue() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        prompt(&mut state).unwrap();
+        let steered = last_steered(&state);
+        state.record(running());
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(state.state(), SessionState::Idle);
+        assert!(!state.quiet());
+        assert_eq!(start_queued(&mut state), None);
+        // The agent starts a turn of its own with the steered prompt.
+        state.record(running());
+        state.record(Change::PromptAccepted { prompt: steered });
+        assert_eq!(start_queued(&mut state), None);
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn queued_prompts_are_edited_in_place_and_removed_by_id() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        enqueue(&mut state, "second");
+        state
+            .request(Request::QueueEdit(QueuedPrompt {
+                id: "first".into(),
+                prompt: text("edited"),
+            }))
+            .unwrap();
+        assert_eq!(queued_ids(&state), ["first", "second"]);
+        assert_eq!(state.queued()[0].prompt, text("edited"));
+        state
+            .request(Request::QueueRemove { id: "first".into() })
+            .unwrap();
+        assert_eq!(queued_ids(&state), ["second"]);
+        for unknown in [
+            Request::QueueEdit(QueuedPrompt {
+                id: "first".into(),
+                prompt: text("again"),
+            }),
+            Request::QueueRemove { id: "first".into() },
+            Request::QueueSend { id: "first".into() },
+        ] {
+            assert_eq!(state.request(unknown).unwrap_err().code, code::NOT_FOUND);
+        }
+        assert_eq!(
+            state
+                .request(Request::QueueEdit(QueuedPrompt {
+                    id: "second".into(),
+                    prompt: Vec::new(),
+                }))
+                .unwrap_err()
+                .code,
+            code::INVALID_REQUEST
+        );
+    }
+
     #[test]
     fn states_other_than_idle_are_work() {
         let unknown = || {
@@ -1486,7 +1983,6 @@ mod tests {
             state.record(change);
             assert_eq!(state.state(), SessionState::Running);
             assert_eq!(kinds(&state, 1), ["update", "turn_started"]);
-            assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
             // An unknown state is never taken for idle.
             state.record(running());
             state.record(idle(None));
@@ -1563,8 +2059,13 @@ mod tests {
     }
 
     fn restored() -> State {
-        let mut state =
-            State::restored("s".into(), Some("Fix the build".into()), "agent".into(), 0);
+        let mut state = State::restored(
+            "s".into(),
+            Some("Fix the build".into()),
+            "agent".into(),
+            0,
+            Queue::default(),
+        );
         state.fill(Vec::new());
         state
     }
@@ -1614,7 +2115,7 @@ mod tests {
 
     #[test]
     fn a_restored_session_holds_no_events_until_it_is_filled() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 3);
+        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
         assert!(!state.loaded());
         assert_eq!(state.last_seq(), 3);
         assert!(state.events_after(0).is_empty());
@@ -1625,7 +2126,7 @@ mod tests {
 
     #[test]
     fn fill_closes_the_turn_and_the_permission_request_a_stop_left_open() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 6);
+        let mut state = State::restored("s".into(), None, "agent".into(), 6, Queue::default());
         state.fill(stored(vec![
             agent_started(),
             EventKind::TurnStarted,
@@ -1663,7 +2164,7 @@ mod tests {
 
     #[test]
     fn fill_leaves_a_finished_history_as_it_is() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 4);
+        let mut state = State::restored("s".into(), None, "agent".into(), 4, Queue::default());
         state.fill(stored(vec![
             agent_started(),
             EventKind::TurnStarted,
@@ -1679,7 +2180,7 @@ mod tests {
 
     #[test]
     fn permission_request_ids_continue_after_the_history() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 2);
+        let mut state = State::restored("s".into(), None, "agent".into(), 2, Queue::default());
         state.fill(stored(vec![agent_started(), requested("5")]));
         state.load().unwrap();
         state.record(Change::Started(Agent {
@@ -1823,7 +2324,6 @@ mod tests {
         resumed(&mut state, running());
         assert_eq!(state.state(), SessionState::Running);
         assert_eq!(kinds(&state, 0), ["update", "update", "agent_started"]);
-        assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
         state.record(idle(Some(StopReason::Cancelled)));
         assert_eq!(state.state(), SessionState::Idle);
         assert_eq!(
@@ -2011,10 +2511,12 @@ mod tests {
         request_id: &str,
         action: ElicitationAction,
     ) -> Result<(), ErrorBody> {
-        state.request(Request::Respond {
-            request_id: request_id.into(),
-            action,
-        })
+        state
+            .request(Request::Respond {
+                request_id: request_id.into(),
+                action,
+            })
+            .map(|_| ())
     }
 
     #[test]
@@ -2124,7 +2626,7 @@ mod tests {
 
     #[test]
     fn fill_cancels_an_open_elicitation_and_ids_continue_past_it() {
-        let mut state = State::restored("s".into(), None, "agent".into(), 3);
+        let mut state = State::restored("s".into(), None, "agent".into(), 3, Queue::default());
         state.fill(stored(vec![
             agent_started(),
             requested("1"),

@@ -15,6 +15,8 @@ keep working when the app closes.
 - Streaming responses, thinking, tool calls, and background-task updates. A
   completed turn's work folds under Worked, leaving its prompt and reply.
 - File attachments on prompts.
+- Prompts queued while an agent works, sent one per turn by the daemon, and
+  prompts that steer the running turn.
 - Conversations and tool output saved by the daemon, so sessions survive app
   and daemon restarts.
 - Archiving, which removes a session's worktree and keeps its conversation and

@@ -16,7 +16,7 @@ use agent_client_protocol::v2::schema::{
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use ox_protocol::{
-    ConfigValue, ErrorBody, Event, EventKind, SessionInfo, SessionState, Unseen, code,
+    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, SessionInfo, SessionState, Unseen, code,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -43,7 +43,7 @@ pub struct Opening {
     /// Option values the agent is set to where it reports others.
     pub options: Vec<(String, SessionConfigOptionValue)>,
     /// The first prompt, with the seq of the `PromptStarted` event that
-    /// `queue_prompt` recorded for it, sent after the options.
+    /// `record_first_prompt` recorded for it, sent after the options.
     pub prompt: Option<(Vec<ContentBlock>, u64)>,
 }
 
@@ -279,8 +279,8 @@ impl Session {
 
     /// Records the first prompt of a session that is still `starting` and
     /// returns the seq of its `PromptStarted` event. `start` sends it.
-    pub fn queue_prompt(&self, prompt: Vec<ContentBlock>) -> u64 {
-        self.update(|state| state.queue_prompt(prompt))
+    pub fn record_first_prompt(&self, prompt: Vec<ContentBlock>) -> u64 {
+        self.update(|state| state.record_first_prompt(prompt))
     }
 
     /// Records that the session's worktree could not be added: the session
@@ -433,6 +433,7 @@ impl Session {
             archived: *self.archived.lock().unwrap(),
             created_at: self.created_at,
             unseen: *self.unseen.lock().unwrap(),
+            queue: state.queued().to_vec(),
         }
     }
 
@@ -523,12 +524,48 @@ impl Session {
         self.lock().events_after(after_seq)
     }
 
-    /// Sends a prompt and returns the seq of the `PromptStarted` event that
-    /// records it, which the turn's events follow.
+    /// Sends a prompt now, starting a turn or steering the running one, and
+    /// returns the seq of the `PromptStarted` or `PromptSteered` event that
+    /// records it.
     pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<u64, ErrorBody> {
+        self.send_prompt(Request::Prompt(prompt))
+    }
+
+    /// Appends a prompt to the queue and returns its ID.
+    pub fn queue_add(&self, prompt: Vec<ContentBlock>) -> Result<String, ErrorBody> {
+        let id = uuid::Uuid::new_v4().to_string();
         self.update(|state| {
-            state.request(Request::Prompt(prompt.clone()))?;
-            let seq = state.last_seq();
+            state.request(Request::QueueAdd(QueuedPrompt {
+                id: id.clone(),
+                prompt,
+            }))
+        })?;
+        Ok(id)
+    }
+
+    /// Replaces a queued prompt in place.
+    pub fn queue_edit(&self, id: String, prompt: Vec<ContentBlock>) -> Result<(), ErrorBody> {
+        self.update(|state| state.request(Request::QueueEdit(QueuedPrompt { id, prompt })))?;
+        Ok(())
+    }
+
+    pub fn queue_remove(&self, id: String) -> Result<(), ErrorBody> {
+        self.update(|state| state.request(Request::QueueRemove { id }))?;
+        Ok(())
+    }
+
+    /// Takes a queued prompt out of the queue and sends it now.
+    pub fn queue_send(&self, id: String) -> Result<u64, ErrorBody> {
+        self.send_prompt(Request::QueueSend { id })
+    }
+
+    /// Applies a request that sends a prompt, sends it to the agent, and
+    /// returns the seq of the event that records it.
+    fn send_prompt(&self, request: Request) -> Result<u64, ErrorBody> {
+        self.update(|state| {
+            let (prompt, seq) = state
+                .request(request)?
+                .expect("a prompt request sends a prompt");
             self.send(Command::Prompt { prompt, seq });
             Ok(seq)
         })
@@ -576,7 +613,8 @@ impl Session {
                 request_id: request_id.into(),
                 option_id: option_id.into(),
             })
-        })
+        })?;
+        Ok(())
     }
 
     pub fn respond_elicitation(
@@ -589,7 +627,8 @@ impl Session {
                 request_id: request_id.into(),
                 action,
             })
-        })
+        })?;
+        Ok(())
     }
 
     /// The agent withdrew the elicitation whose answer `answer` receives.
@@ -647,15 +686,24 @@ impl Session {
         let _ = self.commands.lock().unwrap().send(command);
     }
 
-    /// Changes the state, publishes the seq of its last event, records the
-    /// unseen outcome its new events give, queues them for the database,
-    /// saves a changed title, agent session ID or unseen outcome, signals
-    /// the daemon if the session's `SessionInfo` changed, and asks the
-    /// worktree for its comparison again when a turn ended.
+    /// Changes the state, starts the queue's next prompt if the session can
+    /// take it, publishes the seq of its last event, records the unseen
+    /// outcome its new events give, queues them for the database, saves a
+    /// changed title, agent session ID, unseen outcome or queue, signals the
+    /// daemon if the session's `SessionInfo` changed, and asks the worktree
+    /// for its comparison again when a turn ended.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.lock();
         let before = self.info_of(&state);
         let result = change(&mut state);
+        if let Some((prompt, seq)) = state.start_queued() {
+            self.send(Command::Prompt { prompt, seq });
+        }
+        if let Some(queue) = state.take_changed_queue()
+            && let Err(error) = self.store.set_session_queue(&self.id, &queue)
+        {
+            eprintln!("oxd: saving the queue of session {}: {error}", self.id);
+        }
         self.last_seq.send_replace(state.last_seq());
         let events = state.take_unlogged();
         self.note_unseen(&events);
@@ -965,16 +1013,16 @@ impl Session {
                                         prompt,
                                     ))
                                     .on_receiving_result(async move |result| {
-                                        // The turn runs and ends on the
-                                        // agent's `state_update`s. An error
-                                        // answer means the prompt was not
-                                        // inserted.
-                                        if let Err(error) = result {
-                                            session.record(Change::PromptRejected {
+                                        // The answer says whether the agent
+                                        // inserted the prompt; the turn runs
+                                        // and ends on its `state_update`s.
+                                        session.record(match result {
+                                            Ok(_) => Change::PromptAccepted { prompt: seq },
+                                            Err(error) => Change::PromptRejected {
                                                 prompt: seq,
                                                 error: error.to_string(),
-                                            });
-                                        }
+                                            },
+                                        });
                                         Ok(())
                                     })?;
                             }
