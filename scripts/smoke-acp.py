@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Run opt-in smoke checks against an ACP bridge through oxd and oxctl."""
+"""Run opt-in smoke checks against an ACP bridge through oxd."""
 
 import argparse
+import contextlib
 import json
 import os
 import select
@@ -130,32 +131,77 @@ def turn_result(stop_reason):
     return {"stop_reason": {"stopReason": stop_reason}, "error": None}
 
 
-class Attachment:
-    def __init__(self, args, env, stderr, log):
-        self.process = subprocess.Popen(
-            args, env=env, stdout=subprocess.PIPE, stderr=stderr, bufsize=0
-        )
+class Connection:
+    """A connection to oxd's socket. Each message is one line of JSON: a
+    request is answered by the message with its `id`, and a stream's messages
+    name the request that started it as `subscription`."""
+
+    def __init__(self, path, timeout):
+        self.timeout = timeout
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.socket.connect(str(path))
         self.buffer = b""
-        self.log = log
+        self.next_id = 1
+        self.call("hello", protocol_version=1)
 
     def read(self, deadline):
         while b"\n" not in self.buffer:
             remaining = deadline - time.monotonic()
-            check(remaining > 0, "Timed out waiting for an agent event")
-            ready, _, _ = select.select([self.process.stdout], [], [], remaining)
-            check(ready, "Timed out waiting for an agent event")
-            data = os.read(self.process.stdout.fileno(), 65536)
-            check(data, "Attachment exited; see attach.stderr.log")
+            check(remaining > 0, "Timed out waiting for the daemon")
+            ready, _, _ = select.select([self.socket], [], [], remaining)
+            check(ready, "Timed out waiting for the daemon")
+            data = self.socket.recv(65536)
+            check(data, "The daemon closed the connection")
             self.buffer += data
         line, self.buffer = self.buffer.split(b"\n", 1)
-        event = json.loads(line)
+        return json.loads(line)
+
+    def call(self, method, **params):
+        """Sends a request and returns its result."""
+        id = self.next_id
+        self.next_id += 1
+        request = {"id": id, "method": method}
+        if params:
+            request["params"] = params
+        self.socket.sendall(json.dumps(request).encode() + b"\n")
+        deadline = time.monotonic() + self.timeout
+        while True:
+            reply = self.read(deadline)
+            if reply.get("id") == id:
+                check("error" not in reply, f"{method} failed: {reply.get('error')}")
+                return reply["result"]
+
+    def changes(self, deadline):
+        """The next changes of the connection's watch."""
+        while True:
+            message = self.read(deadline)
+            if "changes" in message:
+                return message["changes"]
+
+    def close(self):
+        self.socket.close()
+
+
+class Attachment:
+    """A subscription to a session's events after `after`, which logs each
+    event it reads to `log`."""
+
+    def __init__(self, path, session, after, timeout, log):
+        self.connection = Connection(path, timeout)
+        self.connection.call("session.subscribe", session_id=session, after_seq=after)
+        self.log = log
+
+    def read(self, deadline):
+        message = self.connection.read(deadline)
+        while "event" not in message:
+            message = self.connection.read(deadline)
+        event = message["event"]
         self.log.write(json.dumps(event) + "\n")
         self.log.flush()
         return event
 
     def close(self):
-        stop(self.process)
-        self.process.stdout.close()
+        self.connection.close()
 
 
 class Watch:
@@ -165,36 +211,14 @@ class Watch:
     def __init__(self, path, session, timeout):
         self.session = session
         self.timeout = timeout
-        self.socket = socket.socket(socket.AF_UNIX)
-        self.socket.connect(str(path))
-        self.buffer = b""
-        self.send({"id": 1, "method": "hello", "params": {"protocol_version": 1}})
-        self.send({"id": 2, "method": "watch"})
-        for id in (1, 2):
-            reply = self.read(time.monotonic() + timeout)
-            check(reply.get("id") == id and "result" in reply, f"Watch failed: {reply}")
-
-    def send(self, message):
-        self.socket.sendall(json.dumps(message).encode() + b"\n")
-
-    def read(self, deadline):
-        while b"\n" not in self.buffer:
-            remaining = deadline - time.monotonic()
-            check(remaining > 0, "Timed out waiting for the session's state to change")
-            ready, _, _ = select.select([self.socket], [], [], remaining)
-            check(ready, "Timed out waiting for the session's state to change")
-            data = self.socket.recv(65536)
-            check(data, "The daemon closed the watch")
-            self.buffer += data
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return json.loads(line)
+        self.connection = Connection(path, timeout)
+        self.connection.call("watch")
 
     def session_changes(self, deadline):
         """The session's info from each of the next listing changes that
         names it."""
         while True:
-            message = self.read(deadline)
-            for change in message.get("changes", []):
+            for change in self.connection.changes(deadline):
                 if (
                     change["type"] == "session"
                     and change["session"]["id"] == self.session
@@ -215,11 +239,11 @@ class Watch:
                 return states
 
     def close(self):
-        self.socket.close()
+        self.connection.close()
 
 
 class SmokeRun:
-    def __init__(self, args, directory, binaries, events, stderr, daemon_args=()):
+    def __init__(self, args, directory, binaries, events, daemon_args=()):
         self.args = args
         self.daemon_args = list(daemon_args)
         self.directory = directory
@@ -227,10 +251,8 @@ class SmokeRun:
         self.project.mkdir()
         self.write_project()
         self.socket = directory / "oxd.sock"
-        self.cli = [str(binaries / "oxctl"), "--socket", str(self.socket)]
         self.binaries = binaries
         self.events = events
-        self.stderr = stderr
         self.env = os.environ.copy()
         self.agent = [str(binaries / self.bridge)]
         self.daemon = None
@@ -249,45 +271,153 @@ class SmokeRun:
         )
         print(json.dumps(result), flush=True)
 
-    def ctl(self, *args):
-        return command(self.cli + list(args), env=self.env, timeout=self.args.timeout)
+    def call(self, method, **params):
+        """Sends one request on a connection of its own and returns its
+        result."""
+        connection = Connection(self.socket, self.args.timeout)
+        try:
+            return connection.call(method, **params)
+        finally:
+            connection.close()
+
+    def listing(self):
+        """Every workspace, worktree, session and run, as a watch's first
+        changes list them."""
+        connection = Connection(self.socket, self.args.timeout)
+        try:
+            connection.call("watch")
+            return connection.changes(time.monotonic() + self.args.timeout)
+        finally:
+            connection.close()
+
+    def workspaces(self):
+        return [c["workspace"] for c in self.listing() if c["type"] == "workspace"]
+
+    def sessions(self):
+        return [c["session"] for c in self.listing() if c["type"] == "session"]
+
+    def session_info(self):
+        """The session's info, or None once it is not listed."""
+        return next((s for s in self.sessions() if s["id"] == self.session), None)
+
+    def add_workspace(self, path):
+        return self.call("workspace.add", path=str(path))["id"]
+
+    def remove_workspace(self, workspace):
+        self.call("workspace.remove", workspace_id=workspace)
+
+    def start_session(self, workspace):
+        """Starts a session of the bridge in `workspace`, waits for its agent
+        to start, and returns the session's id. A session whose agent fails
+        to start is deleted."""
+        session = self.call(
+            "session.new", workspace_id=workspace, command=self.agent, env=self.env
+        )["id"]
+        connection = Connection(self.socket, self.args.timeout)
+        try:
+            connection.call("session.subscribe", session_id=session, after_seq=0)
+            deadline = time.monotonic() + self.args.timeout
+            while True:
+                event = connection.read(deadline).get("event")
+                if event is None:
+                    continue
+                if kind(event) == "agent_started":
+                    return session
+                if kind(event) == "agent_exited":
+                    self.call(
+                        "session.delete", session_id=session, discard=True, env=self.env
+                    )
+                    raise RuntimeError(f"The session did not start: {event}")
+        finally:
+            connection.close()
+
+    def load_session(self):
+        """Restarts the session's agent and waits for it to start."""
+        self.call("session.load", session_id=self.session, env=self.env)
+        watch = Watch(self.socket, self.session, self.args.timeout)
+        try:
+            deadline = time.monotonic() + self.args.timeout
+            for session in watch.session_changes(deadline):
+                check(session["state"] != "exited", "The loaded agent did not start")
+                if session["state"] != "starting":
+                    return
+        finally:
+            watch.close()
+
+    def delete_session(self):
+        self.call("session.delete", session_id=self.session, env=self.env)
+
+    def prompt(self, text):
+        self.call(
+            "session.prompt",
+            session_id=self.session,
+            prompt=[{"type": "text", "text": text}],
+        )
+
+    def queue_add(self, text):
+        self.call(
+            "session.queue_add",
+            session_id=self.session,
+            prompt=[{"type": "text", "text": text}],
+        )
+
+    def set_option(self, option, value):
+        """Sets a select option and returns the agent's resulting value."""
+        options = self.call(
+            "session.set_config_option",
+            session_id=self.session,
+            config_id=option,
+            value=value,
+        )
+        return next(o for o in options if o["configId"] == option)["currentValue"]
+
+    def permit(self, request_id, option_id):
+        self.call(
+            "permission.respond",
+            session_id=self.session,
+            request_id=request_id,
+            option_id=option_id,
+        )
+
+    def cancel(self):
+        self.call("session.cancel", session_id=self.session)
 
     def answer(self, request_id, content):
-        """Accepts the session's form `request_id` with `content` over oxd's
-        socket, as the app does."""
-        with socket.socket(socket.AF_UNIX) as connection:
-            connection.settimeout(self.args.timeout)
-            connection.connect(str(self.socket))
-            stream = connection.makefile("rw")
-            requests = [
-                ("hello", {"protocol_version": 1}),
-                (
-                    "elicitation.respond",
-                    {
-                        "session_id": self.session,
-                        "request_id": request_id,
-                        "action": "accept",
-                        "content": content,
-                    },
-                ),
-            ]
-            for id, (method, params) in enumerate(requests, 1):
-                request = {"id": id, "method": method, "params": params}
-                stream.write(json.dumps(request) + "\n")
-                stream.flush()
-                reply = json.loads(stream.readline())
-                while reply.get("id") != id:
-                    reply = json.loads(stream.readline())
-                check("error" not in reply, f"{method} failed: {reply}")
+        """Accepts the session's form `request_id` with `content`."""
+        self.call(
+            "elicitation.respond",
+            session_id=self.session,
+            request_id=request_id,
+            action="accept",
+            content=content,
+        )
+
+    def wait_run(self, run, timeout):
+        """Waits until a run is not running and returns it."""
+        connection = Connection(self.socket, self.args.timeout)
+        try:
+            connection.call("watch")
+            deadline = time.monotonic() + timeout
+            while True:
+                for change in connection.changes(deadline):
+                    check(
+                        change != {"type": "run_removed", "run_id": run},
+                        "The run was removed",
+                    )
+                    if (
+                        change["type"] == "run"
+                        and change["run"]["id"] == run
+                        and change["run"]["state"] != "running"
+                    ):
+                        return change["run"]
+        finally:
+            connection.close()
 
     def attach(self, after):
         if self.attachment is not None:
             self.attachment.close()
         self.attachment = Attachment(
-            self.cli + ["attach", self.session, "--after", str(after)],
-            self.env,
-            self.stderr,
-            self.events,
+            self.socket, self.session, after, self.args.timeout, self.events
         )
 
     def disconnect(self):
@@ -357,12 +487,12 @@ class SmokeRun:
     def run(self, daemon_log):
         self.daemon_log = daemon_log
         self.start_daemon()
-        self.workspace = self.ctl("workspace", "add", str(self.project))
-        self.session = self.ctl("new", "--workspace", self.workspace, "--", *self.agent)
-        self.ctl("config", self.session, "model", self.args.model)
+        self.workspace = self.add_workspace(self.project)
+        self.session = self.start_session(self.workspace)
+        self.set_option("model", self.args.model)
         self.remember_agents()
         check(self.agent_pids, "Could not find the daemon's ACP agent process")
-        check("\tidle\t" in self.ctl("ls"), "New session is not idle")
+        check(self.session_info()["state"] == "idle", "New session is not idle")
         self.report(
             "real_session_created",
             session_id=self.session,
@@ -395,11 +525,11 @@ class SmokeRun:
         self.report("all_event_sequences_contiguous", event_count=self.seq)
 
         self.disconnect()
-        self.ctl("delete", self.session)
+        self.delete_session()
         self.session = None
-        check(self.ctl("ls") == "", "Deleted session is still listed")
-        self.ctl("workspace", "rm", self.workspace)
-        check(self.ctl("workspace", "ls") == "", "Removed workspace is still listed")
+        check(self.sessions() == [], "Deleted session is still listed")
+        self.remove_workspace(self.workspace)
+        check(self.workspaces() == [], "Removed workspace is still listed")
         self.workspace = None
         check(self.daemon.wait(timeout=15) == 0, "Daemon did not exit successfully")
         check(not self.socket.exists(), "Daemon left its socket behind")
@@ -436,9 +566,7 @@ class SmokeRun:
     def check_reconnect(self):
         token = self.directory.name
         self.attach(0)
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             f"Remember this token for my next message: {token}. Do not use tools. "
             "Write a numbered list of 100 short factual sentences about arithmetic.",
         )
@@ -446,8 +574,7 @@ class SmokeRun:
         cursor = self.seq
         self.disconnect()
         time.sleep(6)  # Longer than oxd's default five-second idle exit.
-        listing = self.ctl("ls")
-        check(self.session in listing, "Session disappeared without a client")
+        check(self.session_info(), "Session disappeared without a client")
         self.attach(cursor)
         rest = self.finish()
         self.report(
@@ -457,9 +584,7 @@ class SmokeRun:
             text_characters=len(text(first + rest)),
             survived_without_clients_seconds=6,
         )
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "What exact token did I ask you to remember? Reply with only that token. "
             "Do not use tools.",
         )
@@ -467,16 +592,10 @@ class SmokeRun:
         check(token in response, f"Conversation token was not retained: {response}")
         self.report("followup_retains_conversation", response=response)
 
-    def session_row(self):
-        """The fields of the session's row in `oxctl ls`: id, workspace id,
-        state, directory, command, title, and agent session id."""
-        row = next(r for r in self.ctl("ls").splitlines() if r.startswith(self.session))
-        return row.split("\t")
-
     def check_load_after_restart(self):
         token = self.directory.name
-        title = self.session_row()[5]
-        check(title != "-", "The session has no title")
+        title = self.session_info()["title"]
+        check(title is not None, "The session has no title")
         stored = self.seq
         self.disconnect()
         self.remember_agents()
@@ -486,19 +605,20 @@ class SmokeRun:
 
         self.start_daemon()
         check(
-            self.ctl("workspace", "ls") == f"{self.workspace}\t{self.project}",
+            [(w["id"], w["path"]) for w in self.workspaces()]
+            == [(self.workspace, str(self.project))],
             "The workspace was not saved",
         )
-        row = self.session_row()
-        check(row[2] == "exited", f"Saved session is not exited: {row}")
-        check(row[1] == self.workspace, f"Saved session lost its workspace: {row}")
-        check(row[5] == title, f"Saved session lost its title: {row}")
+        info = self.session_info()
+        check(info["state"] == "exited", f"Saved session is not exited: {info}")
+        check(
+            info["workspace_id"] == self.workspace,
+            f"Saved session lost its workspace: {info}",
+        )
+        check(info["title"] == title, f"Saved session lost its title: {info}")
         self.report("saved_session_listed_after_daemon_restart", title=title)
 
-        check(
-            self.ctl("load", self.session) == self.session,
-            "Load started another session",
-        )
+        self.load_session()
         self.remember_agents()
         self.seq = 0
         self.attach(0)
@@ -528,9 +648,7 @@ class SmokeRun:
             session_id=self.session,
             history_events=len(replay),
         )
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "What exact token did I ask you to remember at the start of this "
             "conversation? Reply with only that token. Do not use tools.",
         )
@@ -554,12 +672,10 @@ class SmokeRun:
                 for o in permission["options"]
                 if o["kind"] == "allow_once"
             )
-            self.ctl("permit", self.session, permission["request_id"], option)
+            self.permit(permission["request_id"], option)
 
     def check_steer(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "New task: use your shell tool to run `sleep 15; echo slept`. When it "
             "finishes, reply with only the word done.",
         )
@@ -569,9 +685,7 @@ class SmokeRun:
                 and update(e).get("status") in ("pending", "in_progress")
             )
         )
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Also include the word steered in your reply. Do not use tools.",
         )
         steered = self.permitting(lambda e: kind(e) == "steered_prompt_taken")
@@ -589,14 +703,12 @@ class SmokeRun:
         self.report("steered_prompt_taken_into_turn", reply=reply.strip())
 
     def check_queue(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "New task: use your shell tool to run `sleep 5`. Then reply with only "
             "the word first.",
         )
         queued = "Reply with only the word queued. Do not use tools."
-        self.ctl("queue", "add", self.session, queued)
+        self.queue_add(queued)
         first = self.permitting(lambda e: kind(e) == "turn_ended")
         check(
             first[-1]["kind"]["data"] == turn_result("end_turn"),
@@ -608,20 +720,18 @@ class SmokeRun:
         reply = text(self.finish()).strip()
         check("queued" in reply.lower(), f"The queued prompt was not answered: {reply}")
         check(
-            self.ctl("queue", "ls", self.session) == "",
+            self.session_info()["queue"] == [],
             "The sent prompt is still queued",
         )
         self.report("queued_prompt_starts_next_turn", reply=reply)
 
     def check_cancel_generation(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Do not use tools. Write a numbered list of 200 short factual sentences "
             "about geometry.",
         )
         self.until(message)
-        self.ctl("cancel", self.session)
+        self.cancel()
         self.finish("cancelled")
         self.report("cancel_running_generation", stop_reason="cancelled")
 
@@ -633,15 +743,14 @@ class SmokeRun:
             directory,
             self.binaries,
             self.events,
-            self.stderr,
             ["--park-after-ms", str(delay * 1000)],
         )
         run.daemon_log = self.daemon_log
         try:
             run.start_daemon()
-            workspace = run.ctl("workspace", "add", str(run.project))
-            run.session = run.ctl("new", "--workspace", workspace, "--", *run.agent)
-            run.ctl("config", run.session, "model", self.args.model)
+            workspace = run.add_workspace(run.project)
+            run.session = run.start_session(workspace)
+            run.set_option("model", self.args.model)
             run.remember_agents()
             run.attach(0)
             return run
@@ -688,27 +797,19 @@ class SmokeRun:
             "    prompt: Your input is a token. Reply with only that token. "
             "Do not use tools.\n"
         )
-        workspace = self.ctl("workspace", "add", str(project))
+        workspace = self.add_workspace(project)
         token = f"{self.directory.name}-workflow"
-        run = self.ctl(
-            "run", "start", "--workspace", workspace, "smoke", f"The token is {token}."
-        )
-        waited = None
+        run = self.call(
+            "run.start",
+            workspace_id=workspace,
+            workflow="smoke",
+            input=f"The token is {token}.",
+            env=self.env,
+        )["id"]
+        info = None
         try:
-            waited = subprocess.run(
-                self.cli + ["run", "wait", run],
-                env=self.env,
-                capture_output=True,
-                text=True,
-                timeout=self.args.timeout * 2,
-                check=False,
-            )
-            check(
-                waited.returncode == 0,
-                f"The workflow did not succeed: {waited.stdout.strip()} "
-                f"{waited.stderr.strip()}",
-            )
-            info = json.loads(waited.stdout)
+            info = self.wait_run(run, self.args.timeout * 2)
+            check(info["state"] == "succeeded", f"The workflow did not succeed: {info}")
             output = info["steps"][1]["output"]
             check(token in output, f"The token did not reach step 2: {info}")
             self.report(
@@ -719,18 +820,14 @@ class SmokeRun:
         finally:
             self.remember_agents()
             if self.daemon.poll() is None:
-                if waited is None:
+                if info is None:
                     # A run still going is cancelled, and removed once it ends.
-                    for args in (["run", "cancel", run], ["run", "wait", run]):
-                        subprocess.run(
-                            self.cli + args,
-                            env=self.env,
-                            capture_output=True,
-                            timeout=self.args.timeout,
-                            check=False,
-                        )
-                self.ctl("run", "rm", run, "--discard")
-                self.ctl("workspace", "rm", workspace)
+                    # Cancelling a run that has ended is refused.
+                    with contextlib.suppress(RuntimeError):
+                        self.call("run.cancel", run_id=run)
+                    self.wait_run(run, self.args.timeout)
+                self.call("run.delete", run_id=run, discard=True, env=self.env)
+                self.remove_workspace(workspace)
 
     def cleanup(self):
         try:
@@ -739,7 +836,7 @@ class SmokeRun:
             if self.daemon is not None and self.daemon.poll() is None:
                 self.remember_agents()
                 if self.session is not None:
-                    self.ctl("delete", self.session)
+                    self.delete_session()
         finally:
             try:
                 if self.daemon is not None:
@@ -759,15 +856,13 @@ class SmokeRun:
         """Has the agent retitle the session with the `ox` MCP server's
         `set_title` tool. A permission request would stall the turn."""
         title = f"Smoke {self.directory.name}"
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             f"Call the set_title tool of the ox MCP server with the title {title} "
             "and do nothing else.",
         )
         self.finish()
-        row = self.session_row()
-        check(row[5] == title, f"The title tool did not set the title: {row}")
+        info = self.session_info()
+        check(info["title"] == title, f"The title tool did not set the title: {info}")
         self.report("agent_set_title_through_ox_mcp", title=title)
 
 
@@ -825,17 +920,17 @@ class ClaudeRun(SmokeRun):
 
     def check_effort(self):
         """Sets the effort of the session's running Claude."""
-        effort = self.ctl("config", self.session, "effort", "low")
+        effort = self.set_option("effort", "low")
         check(effort == "low", f"Effort was not set: {effort}")
         self.report("effort_set_on_running_claude", effort=effort)
 
     def check_commands(self):
         """Invokes a native skill through the same content blocks the app sends."""
-        self.ctl("prompt", self.session, "/ox-command-probe ARGUMENTS")
+        self.prompt("/ox-command-probe ARGUMENTS")
         response = text(self.finish()).strip()
         check(response == "OX_NATIVE_COMMAND_ARGUMENTS", response)
         self.report("native_skill_invoked_with_arguments", response=response)
-        self.ctl("prompt", self.session, "/model")
+        self.prompt("/model")
         response = text(self.finish()).strip()
         check(
             "Current model:" in response,
@@ -844,9 +939,7 @@ class ClaudeRun(SmokeRun):
         self.report("native_local_command_completed", response=response)
 
     def check_permission(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Use your file write or patch tool to create approved.txt in the current "
             "working directory containing exactly permission-ok followed by a newline. "
             "Do not use shell commands. Then say done.",
@@ -856,7 +949,7 @@ class ClaudeRun(SmokeRun):
         self.disconnect()
         time.sleep(2)
         check(
-            "\tawaiting_permission\t" in self.ctl("ls"),
+            self.session_info()["state"] == "awaiting_permission",
             "Permission did not survive disconnect",
         )
         check(not (self.project / "approved.txt").exists(), "Write ran before approval")
@@ -866,7 +959,7 @@ class ClaudeRun(SmokeRun):
         option = next(
             o["optionId"] for o in permission["options"] if o["kind"] == "allow_once"
         )
-        self.ctl("permit", self.session, permission["request_id"], option)
+        self.permit(permission["request_id"], option)
         events = self.finish()
         check(
             any(kind(e) == "permission_resolved" for e in events),
@@ -884,9 +977,7 @@ class ClaudeRun(SmokeRun):
     def check_question(self):
         """Claude's AskUserQuestion call becomes a form that the app
         answers, and the answer reaches Claude."""
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Use the AskUserQuestion tool to ask me one question with header Color, "
             "question 'Which color?', and options Red and Blue. After I answer, "
             "reply with only the color I chose.",
@@ -894,7 +985,7 @@ class ClaudeRun(SmokeRun):
         requested = self.until(lambda e: kind(e) == "elicitation_requested")[-1]
         elicitation = requested["kind"]["data"]
         check(
-            "\tawaiting_input\t" in self.ctl("ls"),
+            self.session_info()["state"] == "awaiting_input",
             "The session is not awaiting input",
         )
         self.disconnect()
@@ -922,9 +1013,7 @@ class ClaudeRun(SmokeRun):
 
     def check_background_wake(self):
         token = f"woke-{self.directory.name}"
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Use the Bash tool with run_in_background set to true to run "
             "`sleep 8; echo finished`. Then reply with only the word started and "
             "end your turn without waiting for the command. When you are later "
@@ -942,7 +1031,7 @@ class ClaudeRun(SmokeRun):
                 for o in permission["options"]
                 if o["kind"] == "allow_once"
             )
-            self.ctl("permit", self.session, permission["request_id"], option)
+            self.permit(permission["request_id"], option)
         check(
             events[-1]["kind"]["data"] == turn_result("end_turn"),
             f"Unexpected turn result: {events[-1]}",
@@ -998,7 +1087,9 @@ class ClaudeRun(SmokeRun):
             f"Unexpected end of Claude's own turn: {woke[-1]}",
         )
         check(token in text(woke), f"Claude did not answer: {text(woke)}")
-        check("\tidle\t" in self.ctl("ls"), "Session is not idle after the turn")
+        check(
+            self.session_info()["state"] == "idle", "Session is not idle after the turn"
+        )
         self.report(
             "background_task_wakes_claude",
             tool_output=output[-1].strip(),
@@ -1006,14 +1097,12 @@ class ClaudeRun(SmokeRun):
         )
 
     def check_cancel_permission(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Use your file write or patch tool to create cancelled.txt containing "
             "cancelled. Do not use shell commands.",
         )
         self.permission()
-        self.ctl("cancel", self.session)
+        self.cancel()
         events = self.finish("cancelled")
         check(
             any(
@@ -1034,7 +1123,9 @@ class ClaudeRun(SmokeRun):
             self.env.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude"))
         )
         transcript = next(
-            (claude_dir / "projects").glob(f"*/{self.session_row()[6]}.jsonl")
+            (claude_dir / "projects").glob(
+                f"*/{self.session_info()['agent_session_id']}.jsonl"
+            )
         )
         models = set()
         for line in transcript.read_text().splitlines():
@@ -1057,9 +1148,7 @@ class ClaudeRun(SmokeRun):
         watch = None
         try:
             token = f"parked-{self.directory.name}"
-            run.ctl(
-                "prompt",
-                run.session,
+            run.prompt(
                 "Use the Bash tool with run_in_background set to true to run "
                 f"`sleep {delay * 2 + 5}; echo finished`. Then reply with only the "
                 "word started and end your turn without waiting for the command. "
@@ -1078,7 +1167,7 @@ class ClaudeRun(SmokeRun):
                     for o in permission["options"]
                     if o["kind"] == "allow_once"
                 )
-                run.ctl("permit", run.session, permission["request_id"], option)
+                run.permit(permission["request_id"], option)
             # Following the session through the watch leaves it unviewed.
             run.disconnect()
             watch = Watch(run.socket, run.session, self.args.timeout)
@@ -1166,27 +1255,25 @@ class PiRun(SmokeRun):
         return {"harness": "pi", "model": self.args.model, "effort": "low"}
 
     def check_thinking(self):
-        thinking = self.ctl("config", self.session, "thinking", "low")
+        thinking = self.set_option("thinking", "low")
         check(thinking == "low", f"Thinking was not set: {thinking}")
         self.report("thinking_set_on_running_pi", thinking=thinking)
 
     def check_commands(self):
-        self.ctl("prompt", self.session, "/skill:ox-command-probe copper-lantern")
+        self.prompt("/skill:ox-command-probe copper-lantern")
         response = text(self.finish()).strip()
         check(response == "OX_NATIVE_COMMAND_copper-lantern", response)
         self.report("native_skill_invoked_with_arguments", response=response)
 
     def check_dialog(self):
-        self.ctl(
-            "prompt",
-            self.session,
+        self.prompt(
             "Run exactly `echo ox-color` with the bash tool, then reply with only "
             "the command's output.",
         )
         requested = self.until(lambda e: kind(e) == "elicitation_requested")[-1]
         elicitation = requested["kind"]["data"]
         check(
-            "\tawaiting_input\t" in self.ctl("ls"),
+            self.session_info()["state"] == "awaiting_input",
             "The session is not awaiting input",
         )
         self.disconnect()
@@ -1219,7 +1306,9 @@ class PiRun(SmokeRun):
             self.env.get("PI_CODING_AGENT_DIR", str(Path.home() / ".pi" / "agent"))
         )
         transcript = next(
-            (agent_dir / "sessions").glob(f"*/*_{self.session_row()[6]}.jsonl")
+            (agent_dir / "sessions").glob(
+                f"*/*_{self.session_info()['agent_session_id']}.jsonl"
+            )
         )
         models = set()
         for line in transcript.read_text().splitlines():
@@ -1238,7 +1327,7 @@ class PiRun(SmokeRun):
         run = self.parking_run(delay)
         watch = None
         try:
-            run.ctl("prompt", run.session, "Reply with only ready. Do not use tools.")
+            run.prompt("Reply with only ready. Do not use tools.")
             run.finish()
             run.disconnect()
             watch = Watch(run.socket, run.session, self.args.timeout)
@@ -1280,7 +1369,7 @@ def main():
         shutil.which(agent.harness),
         f"{agent.harness} is not installed or is not on PATH",
     )
-    packages = ["oxd", "ox-mcp", "oxctl", agent.bridge]
+    packages = ["oxd", "ox-mcp", agent.bridge]
     subprocess.run(
         ["cargo", "build", *[flag for p in packages for flag in ("-p", p)]],
         cwd=REPO,
@@ -1294,10 +1383,9 @@ def main():
     print(f"Artifacts: {directory}", flush=True)
     with (
         (directory / "events.jsonl").open("w") as events,
-        (directory / "attach.stderr.log").open("w") as stderr,
         (directory / "oxd.log").open("w") as daemon_log,
     ):
-        run = agent(args, directory, binaries, events, stderr)
+        run = agent(args, directory, binaries, events)
         try:
             try:
                 run.run(daemon_log)

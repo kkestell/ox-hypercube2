@@ -40,4 +40,3 @@ Users add local project directories as workspaces and browse their sessions in t
 
 - [Sessions](sessions.md): starting and managing the sessions shown here.
 - [Git tasks](git.md): task creation and branch-status indicators.
-- [Command-line access](cli.md): workspace management outside the app.

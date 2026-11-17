@@ -16,11 +16,9 @@ Sessions let users keep independent agent conversations in their projects, conti
 
 Each New Session opens its own draft. A draft keeps its message while other sessions are viewed. A draft with no message goes when something else is viewed, and Delete Draft on its row discards one. Drafts survive restarting the app.
 
-The command line also allows choosing a different compatible agent and additional worktree branch options; see [command-line access](cli.md).
-
 ### Resume a session
 
-1. Select a non-archived Exited session that previously started successfully, or load it from the command line.
+1. Select a non-archived Exited session that previously started successfully.
 2. The session goes through Starting and resumes with the same identity, workspace, directory, and conversation. Resuming does not duplicate its existing conversation.
 3. A resumed agent may report ongoing work; the session remains Running until that work ends.
 4. A failed resume leaves the session Exited and available for another attempt.
@@ -31,13 +29,13 @@ Resuming is refused while the session's agent is already active, while it is arc
 
 - Closing the desktop app, disconnecting a client, or switching to another session does not cancel a running turn or an unanswered request.
 - An agent may start another turn without a new user prompt, for example when background work reports back. Its output and requests appear in the same conversation.
-- After 15 uninterrupted minutes idle and unviewed, with no pending requests and an explicit report of no background work, Ox parks the session's agent. A conversation subscription, including `oxctl attach`, counts as viewing; merely listing sessions does not.
+- After 15 uninterrupted minutes idle and unviewed, with no pending requests and an explicit report of no background work, Ox parks the session's agent. A conversation subscription counts as viewing; merely listing sessions does not.
 - Becoming active, receiving a request, reporting background work, or being viewed restarts that idle period. An agent that does not report whether background work exists is not parked.
 - Parking changes the session to Exited but keeps its conversation, worktree, and branch. Resume it as above.
 
 ### Archive and restore
 
-1. Choose Archive Session on the row, or archive it from the command line.
+1. Choose Archive Session on the row.
 2. Ox applies the [cleanup safety rules](git.md#protect-work-during-cleanup), stops the agent, removes the session's Ox-managed worktree if any, and keeps its branch and conversation. A session in the workspace directory leaves that directory untouched.
 3. The session moves to the workspace's Archived group. Its conversation remains readable, but it cannot take prompts or resume while archived.
 4. Choose Unarchive Session to restore its worktree on its retained branch and return it to the active list. Restoring does not start the agent; selecting the session resumes it.
@@ -46,7 +44,7 @@ If Git cannot restore the worktree, including when its branch is missing or chec
 
 ### Delete a session
 
-1. Choose Delete Session in the session row's context menu, in the post-merge dialog, or from the command line.
+1. Choose Delete Session in the session row's context menu or in the post-merge dialog.
 2. Ox applies the [cleanup safety rules](git.md#protect-work-during-cleanup). If unsaved work would be lost, the app lists the reason and offers Cancel or Discard and Delete. Archiving offers the corresponding Discard and Archive action.
 3. Deletion stops the agent and its work, removes an Ox-managed worktree, and removes the conversation and session from all clients. It does not delete the workspace directory for a session running there.
 4. A retained session branch is named in a Branch kept dialog in the app. Branch retention follows the [branch cleanup rule](git.md#retain-or-delete-the-branch).
@@ -66,7 +64,7 @@ The app treats a session another client already deleted as successfully deleted.
 | Awaiting input | At least one question form, but no permission request, is unanswered. |
 | Exited | The agent is not active; the saved conversation can still be read. |
 
-Archiving is separate from these states. The command line displays archived in place of the state for an archived session.
+Archiving is separate from these states.
 
 ### Status dots
 

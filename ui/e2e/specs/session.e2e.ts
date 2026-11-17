@@ -2,7 +2,7 @@ import {
   agentText,
   composer,
   openSession,
-  oxctl,
+  prompt,
   reload,
   send,
   sendButton,
@@ -73,7 +73,7 @@ describe("A session", () => {
 
   it("shows a turn that ended out of view until it is viewed", async () => {
     const other = await startSession();
-    await oxctl("prompt", await sessionId(other), 'text "done"');
+    await prompt(await sessionId(other), 'text "done"');
     const dot = sessionEntry(other).$(".status");
     await expect(dot).toHaveAttribute("aria-label", "Finished");
     await openSession(other);

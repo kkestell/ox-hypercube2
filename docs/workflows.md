@@ -314,7 +314,8 @@ steps:
 
 In the desktop, the New Session menu of a workspace in a Git working tree lists
 the workflows below Session in Worktree and Session in Checkout. Choosing one asks for
-the run's input. Run, or Command-Return, starts the run and opens it.
+the run's input. Run, or Command-Return, starts the run and opens it. The run's worktree and
+branch are created as for [Session in Worktree](worktrees.md#choosing-a-checkout).
 
 The run's row is titled with its input, or with the workflow's name when the
 input is blank, and is listed among the workspace's sessions, newest first by
@@ -363,14 +364,6 @@ Selecting a child opens its session view. While the run is running, the
 child's text entry and attachments are disabled, and Stop cancels the run.
 Once the run has ended, the child takes prompts like any other session.
 
-`oxctl run start --workspace <workspace id> <workflow> <input>` starts a run
-and prints its ID. The run's worktree and branch are created as for
-[Session in Worktree](worktrees.md#choosing-a-checkout).
-`oxctl run wait <run id>` prints the run as JSON once it ends, and unless
-the run succeeded fails with its state and error, such as
-`the run failed: a postcondition exited with status 1 after the repair turn`.
-`oxctl run ls` lists each run's ID, state and workflow name.
-
 The run continues when every client disconnects. Each child session is an
 ordinary session of the workspace: a client can follow it and answer its
 permission requests and questions.
@@ -392,17 +385,15 @@ In the desktop, Cancel Run in a running run's context menu, or Cancel in the
 run view's header, cancels the run. Delete Run, in the context menu of a run that
 has ended, removes it, and asks before discarding unsaved work.
 
-`oxctl run cancel <run id>` cancels the active step's turn, or stops its
-running command: the command's process group gets `SIGTERM`, and `SIGKILL`
+Cancelling a run cancels the active step's turn, or stops its running command: the command's process group gets `SIGTERM`, and `SIGKILL`
 if the command has not exited 5 seconds later. The step and the run end
 `cancelled`, and later steps stay pending. The child session's agent
 stays running, so the session can be prompted, and the worktree keeps its
 changes.
 
-`oxctl run rm <run id>` removes a run that has ended. It stops the child
-sessions' agents, deletes the child sessions, and removes the worktree and
-its branch under the [deletion rules](worktrees.md#deleting-and-archiving).
-`--discard` removes a worktree that has unsaved work.
+Deleting a run stops the child sessions' agents, deletes the child sessions,
+and removes the worktree and its branch under the
+[deletion rules](worktrees.md#deleting-and-archiving).
 
 Deleting or archiving a child session leaves the run's worktree and its
 other child sessions. The step keeps its state and output.

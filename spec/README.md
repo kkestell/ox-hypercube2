@@ -1,6 +1,6 @@
 # Ox
 
-Ox is a desktop app and command-line tool for people who run coding agents on local projects. It groups conversations by workspace, supports parallel sessions in a shared checkout or isolated Git worktrees, and lets users follow work, answer requests, and merge completed tasks. Conversations remain available after the app closes and after the session service restarts.
+Ox is a desktop app for people who run coding agents on local projects. It groups conversations by workspace, supports parallel sessions in a shared checkout or isolated Git worktrees, and lets users follow work, answer requests, and merge completed tasks. Conversations remain available after the app closes and after the session service restarts.
 
 ## Areas
 
@@ -10,7 +10,6 @@ Ox is a desktop app and command-line tool for people who run coding agents on lo
 - [Permissions and questions](requests.md): tool decisions, question forms, validation, and cancellation.
 - [Git tasks](git.md): isolated checkouts, branch selection, comparison, local merge, and cleanup safety.
 - [Agents and settings](agents.md): compatible agents, supported prompt content, and session controls.
-- [Command-line access](cli.md): commands, arguments, output, and operating the session service.
 - [Claude Code bridge](claude.md): subscription authentication, standalone ACP use, session discovery, replay, and background work.
 
 ## Terms
@@ -25,11 +24,11 @@ Ox is a desktop app and command-line tool for people who run coding agents on lo
 - **Turn:** A period of agent work, started by a prompt or by the agent itself, ending when the agent reports it has finished or stopped.
 - **Tool call:** An action the agent reports, with a title, status, and any reported arguments and output.
 - **Permission request:** An agent's request for a decision about an action, with a set of offered answers.
-- **Elicitation:** A question form requested by an agent; the command line calls it an elicitation.
+- **Elicitation:** A question form requested by an agent.
 - **Comparison ref:** A Git reference or commit against which a worktree session's branch is compared.
 - **Parked session:** A session whose idle agent Ox has stopped automatically, without removing its conversation or worktree.
 - **Archived session:** A session set aside with its agent stopped and its Ox-managed worktree removed, retaining its conversation and branch.
-- **Client:** The desktop app, `oxctl`, or another application connected to the session service.
+- **Client:** The desktop app or another application connected to the session service.
 - **Session service:** The per-user service, `oxd`, through which clients share workspaces and sessions.
 - **ACP:** Agent Client Protocol, the interface through which Ox and other clients communicate with compatible agents.
 - **Claude Code bridge:** The `claude-code-acp` agent, which makes an installed Claude Code available through ACP.

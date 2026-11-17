@@ -22,7 +22,7 @@ ownership and lifecycle.
   bridges the Claude Code CLI to ACP.
 - **Harness**: The coding-agent CLI a bridge drives, `claude` or `pi`.
 - **Daemon**: `oxd`, the per-user process that owns sessions and agent processes.
-- **Client**: The desktop app or `oxctl` when discussing the daemon protocol;
+- **Client**: The desktop app when discussing the daemon protocol;
   `oxd` when discussing ACP. Qualify as daemon client or ACP client when ambiguous.
 - **Checkout**: A Git working tree, either the workspace's existing checkout or
   a worktree created for a session or a run.

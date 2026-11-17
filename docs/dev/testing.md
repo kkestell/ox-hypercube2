@@ -24,7 +24,7 @@ in [Code style](code-style.md#implementation) applies to tests too.
 | Layer | Where | Proves |
 | --- | --- | --- |
 | Rust unit tests | beside the code in `crates/` | Logic in one module, including durations on tokio's paused clock |
-| Daemon integration tests | `crates/*/tests` | `oxd`, `oxctl` and the bridges over their real protocols, with `oxd-fake-agent` and real git |
+| Daemon integration tests | `crates/*/tests` | `oxd` and the bridges over their real protocols, with `oxd-fake-agent` and real git |
 | UI tests | `ui/src/**/*.test.ts(x)` | The UI's behavior: the real `App` in jsdom against a fake desktop core |
 | End-to-end tests | `ui/e2e/specs` | The built app, its desktop core and `oxd` working together in the real webview |
 | Live checks | `scripts/smoke-acp.py` | Compatibility with the real Claude and Pi agents |
@@ -196,14 +196,14 @@ and sessions of `oxd-fake-agent`; `ui/e2e/wdio.conf.ts` and
 `ui/e2e/helpers.ts` set up their environment. For other UI changes,
 `make check-ui` is the evidence.
 
-The live checks run real models through `oxd` and `oxctl`, separately from
+The live checks run real models through `oxd`, separately from
 `cargo test`, and each run spends paid model requests. Run them only for
 changes whose correctness depends on a real agent: after changing
 `claude-code-acp`, run `make smoke-claude`; after changing `pi-acp`, run
 `make smoke-pi`; after changing how `oxd` launches agents or exchanges ACP
 messages with them, or changing `scripts/smoke-acp.py`, run both. Run each
 check once and report its result. For other changes to `oxd`, `ox-protocol`,
-and `oxctl`, the integration tests against `oxd-fake-agent` are the evidence.
+the integration tests against `oxd-fake-agent` are the evidence.
 The Claude check requires an installed, authenticated Claude Code CLI, and the
 Pi check an installed Pi CLI authenticated with OpenRouter. The Makefile's
 `CLAUDE_MODEL` and `PI_MODEL` set their models. See

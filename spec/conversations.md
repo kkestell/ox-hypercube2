@@ -64,5 +64,4 @@ Tool-call titles support inline code. Separate terminal views and diff output ar
 ## Related areas
 
 - [Sessions](sessions.md): retained history and session availability.
-- [Command-line access](cli.md): prompting, image uploads, and following events without the app.
 - [Claude Code bridge](claude.md): Claude-specific replay and subagent activity.

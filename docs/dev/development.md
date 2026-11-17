@@ -11,7 +11,6 @@
 | `crates/acp-bridge/`      | Shared parts of the ACP bridges               |
 | `crates/claude-code-acp/` | ACP bridge for the Claude Code CLI            |
 | `crates/pi-acp/`          | ACP bridge for the Pi CLI                     |
-| `crates/oxctl/`           | Daemon client agents use to test oxd          |
 | `ui/`                     | Ox frontend (TypeScript, Vite)                |
 
 ## Running the app

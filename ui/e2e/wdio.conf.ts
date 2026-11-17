@@ -46,7 +46,7 @@ export const config: WebdriverIO.Config = {
   onPrepare() {
     rmSync(binDir(), { recursive: true, force: true });
     mkdirSync(binDir(), { recursive: true });
-    for (const name of ["ox", "oxd", "ox-mcp", "oxctl", "claude-code-acp", "oxd-fake-agent"]) {
+    for (const name of ["ox", "oxd", "ox-mcp", "claude-code-acp", "oxd-fake-agent"]) {
       linkSync(built(name), binary(name));
     }
     linkSync(built("oxd-fake-agent"), binary("pi-acp"));

@@ -2,8 +2,7 @@
 
 Ox separates the desktop interface from session execution. The desktop app,
 Ox's only user interface, is a client of `oxd`, a per-user daemon that owns
-session state and agent processes. `oxctl` is a second client, for agents
-and integration tests. Closing a client leaves its sessions running. Saved
+session state and agent processes. Closing a client leaves its sessions running. Saved
 sessions and conversations also survive a daemon restart.
 
 ## Processes and communication
@@ -11,7 +10,6 @@ sessions and conversations also survive a daemon restart.
 ```mermaid
 flowchart TB
     ox["ox"]
-    oxctl["oxctl"]
     oxd["oxd"]
     bridge["claude-code-acp<br/>(one per session)"]
     pibridge["pi-acp<br/>(one per session)"]
@@ -20,7 +18,6 @@ flowchart TB
     oxmcp["ox-mcp<br/>(one per session)"]
 
     ox -.-> oxd
-    oxctl -.-> oxd
     oxd --> bridge
     oxd --> pibridge
     pibridge --> pi
@@ -40,14 +37,13 @@ The socket is `$OX_SOCKET` when set. Otherwise it is `oxd.sock` in
 `~/.local/share/ox`. The database is `<socket>.db`, and the daemon appends its
 stderr to `oxd.log` beside the socket.
 
-### Desktop and command-line clients
+### Desktop client
 
 The desktop app uses Tauri 2. Its React webview calls the Rust core through
 Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
 streams updates back over Tauri channels. The core keeps one conversation
 view per channel, so the run view follows every child session of a run at
-once. `oxctl` uses the same daemon client to give agents and the integration
-tests the same operations, and follows the daemon protocol as it changes.
+once.
 
 The app offers an agent for each [harness](glossary.md) on the `PATH` it
 passes to sessions, and checks again each time its window gains focus.

@@ -25,7 +25,7 @@ The desktop uses appropriate controls for email, URL, date, and date-time fields
 
 ### Stop work
 
-1. Choose Stop or press Escape while a session is Running, Awaiting permission, or Awaiting input, or cancel it from the command line. Escape that dismisses command suggestions, a menu, or a dialog does not stop the turn.
+1. Choose Stop or press Escape while a session is Running, Awaiting permission, or Awaiting input. Escape that dismisses command suggestions, a menu, or a dialog does not stop the turn.
 2. Ox asks the agent to interrupt the current turn and cancels pending permission requests. The turn ends when the agent reports it stopped. Steered messages the agent has not taken in are discarded, and the session's [queue](conversations.md#queue-and-steer-while-the-agent-works) is held until a message is sent.
 3. A form withdrawn by the agent disappears and ends as cancelled. Until the agent withdraws it or a client answers it, a form remains pending.
 
@@ -35,8 +35,8 @@ Stopping also applies to a turn the agent started without a user prompt. It is n
 
 - The desktop presents one request at a time in arrival order, regardless of whether it is a permission request or form. Session state prioritizes permission requests over forms, independently of presentation order.
 - Accepted form answers must use declared field names, satisfy required fields, have the right value types, use offered choices, and meet declared text-length, number-range, and choice-count limits. Rejected answers do not resolve the request.
-- The desktop additionally checks text patterns and supported formats before submission. A pattern matches anywhere in the value unless the pattern itself requires a full match. An invalid pattern is not enforced. Command-line form answers do not enforce text patterns or formats, but must satisfy the shared answer checks above.
-- Declining or cancelling a form does not require filling required fields. The command line can explicitly cancel a form as well as decline it.
+- The desktop additionally checks text patterns and supported formats before submission. A pattern matches anywhere in the value unless the pattern itself requires a full match. An invalid pattern is not enforced.
+- Declining or cancelling a form does not require filling required fields.
 - Only session-scoped forms are supported, not URL-based or request-scoped questions. A form that gives a text field both plain and titled alternatives is refused.
 - Agent exit, parking, session closure, and recovery after a service interruption cancel unresolved requests. A cancelled or already-answered request cannot be answered again.
 - Request identities remain distinct through resuming and service restarts, so an old answer cannot resolve a new request.
@@ -45,4 +45,3 @@ Stopping also applies to a turn the agent started without a user prompt. It is n
 
 - [Agents and settings](agents.md): agents determine permission options and question contents.
 - [Claude Code bridge](claude.md#claude-questions-and-permissions): Claude's tool decisions and question forms.
-- [Command-line access](cli.md): request identities, permission answers, and JSON form answers.
