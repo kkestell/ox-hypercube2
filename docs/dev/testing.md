@@ -35,13 +35,19 @@ in [Code style](code-style.md#implementation) applies to tests too.
   answers commands with `core.on`, and asserts on the commands the app
   invoked with `core.invoked`. Native menus and dialogs are answered at the
   same boundary.
-- End-to-end tests cover what only the assembled app shows: each Tauri
-  command reaching `oxd` with the arguments the desktop core expects, the
-  desktop core's reconnection to a restarted `oxd`, live file watches, and
-  webview behavior such as the content security policy. A UI rule belongs in
-  a UI test, and a daemon rule in a daemon integration test; an end-to-end
-  test adds a case only for a new command, a new kind of channel, or webview
-  behavior.
+- Keep the end-to-end suite to representative flows through the built app
+  and behavior that needs a real webview. It starts a session
+  from the UI and follows the conversation across a daemon restart, watches
+  live changes to a directory and open file, and loads an agent's tool image
+  under the webview's content security policy.
+- Add an end-to-end case when it catches a specific failure that the UI and
+  daemon suites cannot see. For a new Tauri command, the UI test can assert the
+  command and its arguments, and the daemon integration test can establish the
+  operation's behavior.
+- Give each end-to-end case a fresh workspace and use the app for the flow
+  under test. The fixture adds the workspace through the desktop command to
+  bypass the native folder picker. The run has its own daemon socket and
+  stops that daemon when it finishes.
 - Check layout, colour, spacing and alignment by looking at the running app,
   as [Ox tests and fixtures](#ox-tests-and-fixtures) describes. Tests assert
   on behavior.
@@ -97,9 +103,8 @@ not it failed today.
 - Assert an order only where the system orders it. Output from independent
   tasks, processes, pipes, or file watchers arrives in either order, so a test
   checks each item's presence, or orders them through an event.
-- In end-to-end tests, read state after the element or attribute that shows
-  it, and after a reload wait for the new document (`reload` in
-  `ui/e2e/helpers.ts`).
+- In end-to-end tests, wait for the element or attribute that shows the
+  expected state.
 - Before delivering a test change, name the event behind each wait in it.
 
 Clippy rejects `tokio::time::sleep`, `sleep_until`, and `std::thread::sleep`
@@ -192,7 +197,7 @@ with `cargo test`, run `cargo build -p ox-mcp`.
 After changing `crates/ox`, the app's Tauri configuration, a command the UI
 invokes or the channel messages it reads, or `ui/e2e`, also run `make e2e`
 and report its result. It drives the tests in `ui/e2e` against the built app
-and sessions of `oxd-fake-agent`; `ui/e2e/wdio.conf.ts` and
+and the scripted `oxd-fake-agent`. `ui/e2e/wdio.conf.ts` and
 `ui/e2e/helpers.ts` set up their environment. For other UI changes,
 `make check-ui` is the evidence.
 

@@ -58,11 +58,9 @@ fix:
 	$(RUFF) check --fix scripts
 	$(RUFF) format scripts
 
-# The app is built with the embedded WebDriver server and the UI bundled
-# into it, beside the oxd, Claude bridge, and fake agent binaries the
-# tests link into target/debug/e2e-bin.
+# Build the app with the embedded WebDriver server and bundled UI.
 e2e:
-	cargo build -p oxd -p ox-mcp -p claude-code-acp
+	cargo build -p oxd -p ox-mcp
 	cd ui && npm run tauri -- build --debug --no-bundle --features webdriver
 	cd ui && npm run e2e
 

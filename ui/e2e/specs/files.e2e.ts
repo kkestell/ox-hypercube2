@@ -1,28 +1,20 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { openSession, startSession } from "../helpers.ts";
+import { startSession, workspace } from "../helpers.ts";
 
-/** The right sidebar's row for the entry `name`. */
-function treeRow(name: string) {
-  return $(
-    `//aside[@class="panel right"]//div[contains(@class, "tree-row")][.//span[@class="title"][.="${name}"]]`,
-  );
-}
+it("shows a new file and updates its open contents as it changes on disk", async () => {
+  const cwd = await workspace();
+  await writeFile(join(cwd, "existing.txt"), "existing\n");
+  await startSession(cwd, 'text "hello"');
+  const tree = $("aside.panel.right");
+  await expect(tree.$("button=existing.txt")).toBeDisplayed();
 
-describe("The file tree and viewer", () => {
-  it("follow the session's folder and open file on disk", async () => {
-    const cwd = await startSession();
-    await mkdir(join(cwd, "sub"));
-    await writeFile(join(cwd, "sub", "main.rs"), "fn main() {}\n");
-    await openSession(cwd);
+  const file = join(cwd, "notes.txt");
+  await writeFile(file, "first\n");
+  await tree.$("button=notes.txt").click();
+  const contents = $(".file-body pre");
+  await expect(contents).toHaveText("first");
 
-    await treeRow("sub").$("button.select").click();
-    await treeRow("main.rs").$("button.select").click();
-    await expect($(".file-body pre")).toHaveText("fn main() {}");
-    await writeFile(join(cwd, "sub", "main.rs"), "fn main() { let value = 1; }\n");
-    await expect($(".file-body pre")).toHaveText("fn main() { let value = 1; }");
-
-    await writeFile(join(cwd, "b.txt"), "b\n");
-    await expect(treeRow("b.txt")).toBeDisplayed();
-  });
+  await writeFile(file, "second\n");
+  await expect(contents).toHaveText("second");
 });
