@@ -19,9 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
-    Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo, ServerMessage,
-    SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
+    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind,
+    FileContent, Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, Request, RunInfo,
+    ServerMessage, SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -345,12 +345,16 @@ impl Client {
         command: Vec<String>,
         env: BTreeMap<String, String>,
         checkout: Checkout,
+        config: Vec<ConfigSetting>,
+        prompt: Option<Vec<ContentBlock>>,
     ) -> Result<SessionInfo, Error> {
         self.call(Method::SessionNew {
             workspace_id: workspace_id.into(),
             command,
             env,
             checkout,
+            prompt,
+            config,
         })
         .await
     }

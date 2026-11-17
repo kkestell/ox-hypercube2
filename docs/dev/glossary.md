@@ -6,6 +6,9 @@ ownership and lifecycle.
 - **Workspace**: A directory the user adds to Ox, under which sessions are grouped.
 - **Session**: A saved conversation and its execution context, belonging to a
   workspace. A session can outlive its agent process and the daemon.
+- **Draft**: A new session the desktop app holds before its first message is
+  sent: its workspace, agent, checkout, and chosen option values. Sending the
+  first message creates the session.
 - **Turn**: One period of agent work within a session, started by a prompt or by
   the agent itself.
 - **Agent**: The ACP-speaking process that `oxd` runs for a session.

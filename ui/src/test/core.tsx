@@ -63,6 +63,8 @@ export class Core {
           return [];
         case "workspace_branches":
           return { head: "main" };
+        case "agent_controls":
+          return { config_options: [], available_commands: [] };
         case "plugin:menu|new":
           this.menu = (payload.options as { items: MenuItem[] }).items;
           return [1, "menu"];

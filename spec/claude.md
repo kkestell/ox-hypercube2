@@ -13,6 +13,13 @@ The Claude Code bridge lets Ox and other ACP clients use an installed, authentic
 
 Inherited `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` do not override the subscription authentication path. The bridge does not offer ACP login/logout, provider switching, or audio prompts.
 
+### Describe a new session
+
+- `claude-code-acp --describe <dir>` prints one JSON object, `{"configOptions": [...], "availableCommands": [...]}` in ACP's schema, for a new session in `<dir>`, and exits. `<dir>` is an existing absolute directory.
+- The options are the [models, effort, and modes](#models-effort-and-modes) at their defaults. The commands are the catalog Claude reports when it initializes in `<dir>`.
+- Claude starts without saving a conversation and stops once it has answered. No prompt is sent.
+- A Claude that fails to start or refuses to initialize makes the bridge exit non-zero with the error on standard error.
+
 ### Discover and open conversations
 
 - A standalone client can list bridge-created sessions and native Claude Code conversations, optionally restricted to a working directory. Results are ordered by most recent update, with session ID breaking ties, and contain up to 50 entries per page. An invalid continuation cursor is rejected.

@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -279,34 +279,16 @@ impl acp_bridge::Bridge for Bridge {
 }
 
 impl Bridge {
-    /// Sends all description queries before returning, so later requests do
-    /// not overtake their submission to Pi.
+    /// Sends all description queries to the session's Pi before returning,
+    /// so later requests do not overtake their submission to Pi.
     fn describe(
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
-        let queries = (|| {
-            let mut open = self.require(id)?;
-            let pi = open_session(&mut open).pi.as_ref().expect("started pi");
-            Ok::<_, Error>([
-                pi.request(json!({"type":"get_state"})),
-                pi.request(json!({"type":"get_available_models"})),
-                pi.request(json!({"type":"get_available_thinking_levels"})),
-                pi.request(json!({"type":"get_commands"})),
-            ])
-        })();
-        async move {
-            let [state, models, levels, catalog] = queries?;
-            let state = answer(state).await?;
-            let models = answer(models).await?;
-            let levels = answer(levels).await?;
-            let catalog = answer(catalog).await?;
-            Ok(Description {
-                config_options: options::build(&state, &models["models"], &levels["levels"]),
-                available_commands: commands::catalog(&catalog["commands"]),
-                state,
-            })
-        }
+        let description = self
+            .require(id)
+            .map(|mut open| description(open_session(&mut open).pi.as_ref().expect("started pi")));
+        async move { description?.await }
     }
 
     fn publish_description(&self, id: &str, connection: &ConnectionTo<Client>) {
@@ -347,7 +329,7 @@ impl Bridge {
         }
         let pi = Pi::start(
             &session.cwd,
-            id,
+            Some(id),
             session.instructions.as_deref(),
             &session.mcp_servers,
             Updates::new(connection.clone(), id),
@@ -365,6 +347,49 @@ impl Bridge {
         } else {
             Err(acp::Error::session_not_found(id.to_owned()).into())
         }
+    }
+}
+
+/// What a new session in `dir` offers, as `--describe` prints it: the
+/// config options and commands Pi reports. Pi starts in `dir` without saving
+/// a session and stops once it answers.
+pub async fn describe(dir: &Path) -> Result<Value, String> {
+    let pi = Pi::start(
+        &acp_bridge::cwd(dir)?,
+        None,
+        None,
+        &[],
+        Updates::without_client(),
+    )?;
+    let description = description(&pi).await.map_err(|error| error.message)?;
+    Ok(json!({
+        "configOptions": description.config_options,
+        "availableCommands": description.available_commands,
+    }))
+}
+
+/// Sends `pi` the description queries and returns the future of their
+/// answers.
+fn description(
+    pi: &Pi,
+) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
+    let queries = [
+        pi.request(json!({"type":"get_state"})),
+        pi.request(json!({"type":"get_available_models"})),
+        pi.request(json!({"type":"get_available_thinking_levels"})),
+        pi.request(json!({"type":"get_commands"})),
+    ];
+    async move {
+        let [state, models, levels, catalog] = queries;
+        let state = answer(state).await?;
+        let models = answer(models).await?;
+        let levels = answer(levels).await?;
+        let catalog = answer(catalog).await?;
+        Ok(Description {
+            config_options: options::build(&state, &models["models"], &levels["levels"]),
+            available_commands: commands::catalog(&catalog["commands"]),
+            state,
+        })
     }
 }
 

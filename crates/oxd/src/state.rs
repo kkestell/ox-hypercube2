@@ -258,12 +258,15 @@ enum Phase {
     /// The agent is starting. `replay` buffers updates until the agent starts
     /// when recovering missing history. On resume, `busy` and `background`
     /// track the state the agent reports before it starts. `previous` holds
-    /// the saved agent session ID.
+    /// the saved agent session ID. `prompt` is the seq of the `PromptStarted`
+    /// event of a new session's first prompt, which is sent once the agent
+    /// starts.
     Starting {
         replay: Option<Vec<SessionUpdate>>,
         busy: bool,
         background: Option<Vec<BackgroundWork>>,
         previous: Option<Agent>,
+        prompt: Option<u64>,
     },
     Live(Live),
     /// The agent is gone. It holds what the agent reported if it started,
@@ -292,6 +295,7 @@ impl Phase {
                     replay,
                     busy,
                     background,
+                    prompt,
                     ..
                 },
                 Change::Started(agent),
@@ -308,10 +312,15 @@ impl Phase {
                     available_commands: agent.available_commands.clone(),
                 });
                 // A resumed agent that is working has a turn the session did
-                // not see start.
+                // not see start, and a new session's first prompt is sent
+                // as it starts.
+                let turn = match prompt {
+                    Some(seq) => Some(Turn::Prompted(seq)),
+                    None => busy.then_some(Turn::Working { recorded: false }),
+                };
                 let live = Live {
                     agent,
-                    turn: busy.then_some(Turn::Working { recorded: false }),
+                    turn,
                     pending: Vec::new(),
                     background,
                 };
@@ -323,6 +332,7 @@ impl Phase {
                     mut busy,
                     mut background,
                     previous,
+                    prompt,
                 },
                 Change::Update(update),
             ) => {
@@ -339,14 +349,31 @@ impl Phase {
                         busy,
                         background,
                         previous,
+                        prompt,
                     },
                     Vec::new(),
                 )
             }
-            (Self::Starting { previous, .. }, Change::Exited(error)) => (
-                Self::Exited(previous),
-                vec![EventKind::AgentExited { error }],
-            ),
+            (
+                Self::Starting {
+                    previous, prompt, ..
+                },
+                Change::Exited(error),
+            ) => {
+                let mut events = Vec::new();
+                if prompt.is_some() {
+                    events.push(EventKind::TurnEnded {
+                        stop_reason: None,
+                        error: Some(
+                            error
+                                .clone()
+                                .unwrap_or_else(|| "the agent exited before the prompt".into()),
+                        ),
+                    });
+                }
+                events.push(EventKind::AgentExited { error });
+                (Self::Exited(previous), events)
+            }
             (Self::Starting { .. } | Self::Exited(_), Change::Closed) => {
                 (Self::Closed, vec![EventKind::SessionClosed])
             }
@@ -556,6 +583,7 @@ impl State {
                 busy: false,
                 background: None,
                 previous: None,
+                prompt: None,
             },
             title: None,
             events: Some(Vec::new()),
@@ -700,6 +728,7 @@ impl State {
             background: None,
             replay: replay.then(Vec::new),
             previous: Some(Agent::saved(id.clone())),
+            prompt: None,
         };
         Ok(Resume {
             session_id: id,
@@ -769,6 +798,19 @@ impl State {
             .unwrap_or(usize::MAX)
             .min(events.len());
         events[start..].iter().take(BATCH).cloned().collect()
+    }
+
+    /// Records a new session's first prompt while its agent starts and
+    /// returns the seq of its `PromptStarted` event. The prompt's turn runs
+    /// once the agent starts.
+    pub fn queue_prompt(&mut self, prompt: Vec<ContentBlock>) -> u64 {
+        let seq = self.last_seq() + 1;
+        let Phase::Starting { prompt: queued, .. } = &mut self.phase else {
+            unreachable!("a first prompt is queued while the agent starts");
+        };
+        *queued = Some(seq);
+        self.append(EventKind::PromptStarted { prompt });
+        seq
     }
 
     pub fn request(&mut self, request: Request) -> Result<(), ErrorBody> {
@@ -890,7 +932,10 @@ impl State {
 
 /// Checks a prompt against what the agent accepts. Every agent accepts text
 /// and resource links.
-fn check_prompt(prompt: &[ContentBlock], accepts: &PromptCapabilities) -> Result<(), ErrorBody> {
+pub fn check_prompt(
+    prompt: &[ContentBlock],
+    accepts: &PromptCapabilities,
+) -> Result<(), ErrorBody> {
     if prompt.is_empty() {
         return Err(invalid_request("the prompt is empty".into()));
     }
@@ -1199,6 +1244,50 @@ mod tests {
                 error: None
             }
         );
+    }
+
+    #[test]
+    fn a_first_prompt_is_recorded_while_starting_and_runs_once_started() {
+        let mut state = State::new("s".into());
+        let seq = state.queue_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
+        assert_eq!(seq, 1);
+        assert_eq!(state.state(), SessionState::Starting);
+        assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
+        state.record(Change::Started(Agent::saved("agent".into())));
+        assert_eq!(state.state(), SessionState::Running);
+        state.record(Change::PromptRejected {
+            prompt: seq,
+            error: "refused".into(),
+        });
+        assert_eq!(state.state(), SessionState::Idle);
+        assert_eq!(
+            kinds(&state, 0),
+            ["prompt_started", "agent_started", "turn_ended"]
+        );
+    }
+
+    #[test]
+    fn a_first_prompt_ends_when_the_agent_exits_while_starting() {
+        for (error, ended) in [
+            (Some("no agent".to_string()), "no agent"),
+            (None, "the agent exited before the prompt"),
+        ] {
+            let mut state = State::new("s".into());
+            state.queue_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
+            state.record(Change::Exited(error.clone()));
+            assert_eq!(state.state(), SessionState::Exited);
+            let events = state.events_after(1);
+            assert_eq!(
+                events.iter().map(|event| &event.kind).collect::<Vec<_>>(),
+                [
+                    &EventKind::TurnEnded {
+                        stop_reason: None,
+                        error: Some(ended.into()),
+                    },
+                    &EventKind::AgentExited { error },
+                ]
+            );
+        }
     }
 
     #[test]

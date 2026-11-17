@@ -67,41 +67,6 @@ describe("The session list", () => {
     expect(dot("Break")).toEqual({ className: "status", label: "Failed" });
   });
 
-  it("starts a session in the checkout, or in a worktree compared with the checkout's branch", async () => {
-    const plain = workspace({ path: "/src/plain" });
-    const repo = workspace({ path: "/src/repo", git_working_tree: true });
-    const core = await renderApp(
-      { type: "workspace", workspace: plain },
-      { type: "workspace", workspace: repo },
-    );
-    const menu = (name: string) =>
-      within(screen.getByRole("region", { name })).getByRole("menu", { hidden: true });
-    const items = (name: string) =>
-      within(menu(name))
-        .getAllByRole("menuitem", { hidden: true })
-        .map((item) => item.textContent);
-    expect(items("plain")).toEqual(["Session in Checkout"]);
-    expect(items("repo")).toEqual(["Session in Worktree", "Session in Checkout"]);
-
-    const started = session(repo, { title: "Started" });
-    core.on("new_session", () => started);
-    await userEvent.click(within(menu("repo")).getByText("Session in Worktree"));
-    expect(core.invoked("new_session")).toEqual([
-      { agent: "claude", workspaceId: repo.id, checkout: { type: "worktree", compare: "main" } },
-    ]);
-    await userEvent.click(within(menu("plain")).getByText("Session in Checkout"));
-    expect(core.invoked("new_session")[1]).toEqual({
-      agent: "claude",
-      workspaceId: plain.id,
-      checkout: { type: "workspace" },
-    });
-    core.list({ type: "session", session: started });
-    expect(sidebarRow("Started").querySelector("button.select")).toHaveAttribute(
-      "aria-current",
-      "true",
-    );
-  });
-
   it("offers a choice of harness only while more than one is installed", async () => {
     const project = workspace();
     const core = await renderApp({ type: "workspace", workspace: project });

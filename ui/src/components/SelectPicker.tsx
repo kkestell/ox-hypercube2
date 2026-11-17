@@ -6,11 +6,13 @@ export function SelectPicker({
   label,
   value,
   options,
+  disabled = false,
   onChange,
 }: {
   label: string;
   value: string;
   options: SelectOption[] | SelectGroup[];
+  disabled?: boolean;
   onChange: (value: string) => void;
 }) {
   const choice = (entry: SelectOption) => (
@@ -25,6 +27,7 @@ export function SelectPicker({
         aria-label={label}
         title={label}
         value={value}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
       >
         {options.map((entry) =>

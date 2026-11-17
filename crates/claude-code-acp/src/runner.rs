@@ -9,10 +9,11 @@ use crate::{commands, updates::Updates};
 use acp_bridge::McpServer;
 use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
-    ContentBlock, ErrorStopReason, PromptResponse, StateUpdate, StopReason,
+    AvailableCommand, ContentBlock, ErrorStopReason, PromptResponse, StateUpdate, StopReason,
 };
 use serde_json::{Value, json};
 use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{mpsc, oneshot},
     task::AbortHandle,
@@ -67,12 +68,19 @@ pub enum RunError {
     Failed(String),
 }
 
+/// The Claude session a claude process runs.
+pub enum Conversation<'a> {
+    /// A new session with this ID, which is also the ACP session ID.
+    New(&'a str),
+    /// The session with this ID, whose transcript Claude continues.
+    Resume(&'a str),
+    /// A session Claude does not save, as `--describe` starts.
+    Unsaved,
+}
+
 pub struct StartRequest<'a> {
     pub cwd: &'a Path,
-    /// The Claude session ID, which is also the ACP session ID.
-    pub session_id: &'a str,
-    /// Claude has a transcript of the session to continue.
-    pub resume: bool,
+    pub conversation: Conversation<'a>,
     pub model: &'a str,
     pub effort: &'a str,
     pub mode: &'a str,
@@ -140,68 +148,7 @@ pub struct Claude {
 
 impl Claude {
     pub fn start(request: &StartRequest<'_>, updates: Updates) -> Result<Self, String> {
-        let mut command = Command::new("claude");
-        command
-            .arg("-p")
-            .args([
-                "--output-format",
-                "stream-json",
-                "--input-format",
-                "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--replay-user-messages",
-            ])
-            .args(["--model", request.model])
-            .args(["--effort", request.effort]);
-        // Claude uses every tool of the client's MCP servers without asking.
-        if !request.mcp_servers.is_empty() {
-            command.arg("--allowedTools").args(
-                request
-                    .mcp_servers
-                    .iter()
-                    .map(|server| format!("mcp__{}", server.name)),
-            );
-        }
-        command.args([
-            "--permission-mode",
-            request.mode,
-            "--permission-prompt-tool",
-            "stdio",
-        ]);
-        if let Some(instructions) = request.instructions {
-            command.arg("--append-system-prompt").arg(instructions);
-        }
-        if request.resume {
-            command.arg("--resume").arg(request.session_id);
-        } else {
-            command.arg("--session-id").arg(request.session_id);
-        }
-        if !request.mcp_servers.is_empty() {
-            let servers: BTreeMap<_, _> = request
-                .mcp_servers
-                .iter()
-                .map(|server| (server.name.clone(), server.config()))
-                .collect();
-            command
-                .arg("--mcp-config")
-                .arg(json!({"mcpServers": servers}).to_string());
-        }
-        let mut child = command
-            .current_dir(request.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_remove("ANTHROPIC_API_KEY")
-            .env_remove("ANTHROPIC_AUTH_TOKEN")
-            // Claude reports when it starts and stops working only if asked.
-            .env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
-            // Claude reports `idle` at a turn's end while background tasks run,
-            // and `running` when the turn they start begins.
-            .env("CLAUDE_CODE_BG_TASKS_REPORT_RUNNING", "0")
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("failed to start claude: {e}"))?;
+        let mut child = spawn(request)?;
         let (input, messages) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(State {
             initializing: true,
@@ -222,11 +169,7 @@ impl Claude {
             unclaimed_error: None,
         };
         tokio::spawn(output.read(child));
-        let _ = input.send(json!({
-            "type": "control_request",
-            "request_id": "initialize",
-            "request": {"subtype": "initialize"}
-        }));
+        let _ = input.send(initialize_request());
         Ok(Self {
             input,
             state,
@@ -239,7 +182,7 @@ impl Claude {
         self.updates.state()
     }
 
-    pub fn commands(&self) -> Vec<agent_client_protocol::v2::schema::AvailableCommand> {
+    pub fn commands(&self) -> Vec<AvailableCommand> {
         self.updates.commands()
     }
 
@@ -327,6 +270,128 @@ impl Claude {
         }
         answer
     }
+}
+
+/// Starts claude as `request` says, with its pipes open.
+fn spawn(request: &StartRequest<'_>) -> Result<Child, String> {
+    let mut command = Command::new("claude");
+    command
+        .arg("-p")
+        .args([
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--replay-user-messages",
+        ])
+        .args(["--model", request.model])
+        .args(["--effort", request.effort]);
+    // Claude uses every tool of the client's MCP servers without asking.
+    if !request.mcp_servers.is_empty() {
+        command.arg("--allowedTools").args(
+            request
+                .mcp_servers
+                .iter()
+                .map(|server| format!("mcp__{}", server.name)),
+        );
+    }
+    command.args([
+        "--permission-mode",
+        request.mode,
+        "--permission-prompt-tool",
+        "stdio",
+    ]);
+    if let Some(instructions) = request.instructions {
+        command.arg("--append-system-prompt").arg(instructions);
+    }
+    match request.conversation {
+        Conversation::New(id) => command.arg("--session-id").arg(id),
+        Conversation::Resume(id) => command.arg("--resume").arg(id),
+        Conversation::Unsaved => command.arg("--no-session-persistence"),
+    };
+    if !request.mcp_servers.is_empty() {
+        let servers: BTreeMap<_, _> = request
+            .mcp_servers
+            .iter()
+            .map(|server| (server.name.clone(), server.config()))
+            .collect();
+        command
+            .arg("--mcp-config")
+            .arg(json!({"mcpServers": servers}).to_string());
+    }
+    command
+        .current_dir(request.cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        // Claude reports when it starts and stops working only if asked.
+        .env("CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS", "1")
+        // Claude reports `idle` at a turn's end while background tasks run,
+        // and `running` when the turn they start begins.
+        .env("CLAUDE_CODE_BG_TASKS_REPORT_RUNNING", "0")
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to start claude: {e}"))
+}
+
+fn initialize_request() -> Value {
+    json!({
+        "type": "control_request",
+        "request_id": "initialize",
+        "request": {"subtype": "initialize"}
+    })
+}
+
+/// The commands of claude's answer to the initialize request, or why claude
+/// refused it.
+fn initialized(response: &Value) -> Result<Vec<AvailableCommand>, String> {
+    if response["subtype"] == "error" {
+        return Err(response["error"]
+            .as_str()
+            .unwrap_or("claude refused to initialize")
+            .to_owned());
+    }
+    Ok(commands::catalog(&response["response"]["commands"]))
+}
+
+/// Starts claude as `request` says and returns the commands of its answer to
+/// the initialize request, stopping claude once it answers.
+pub async fn commands(request: &StartRequest<'_>) -> Result<Vec<AvailableCommand>, String> {
+    let mut child = spawn(request)?;
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stderr = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes).await;
+        bytes
+    });
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut line = initialize_request().to_string().into_bytes();
+    line.push(b'\n');
+    // A claude that exits before reading it says why on stderr.
+    let _ = stdin.write_all(&line).await;
+    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if value["type"] == "control_response" && value["response"]["request_id"] == "initialize" {
+            // Dropping `child` stops claude.
+            return initialized(&value["response"]);
+        }
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| format!("claude process failed: {error}"))?;
+    let stderr = stderr.await.unwrap_or_default();
+    Err(format!(
+        "claude exited with {status}: {}",
+        String::from_utf8_lossy(&stderr).trim()
+    ))
 }
 
 /// Claude's output, translated as it arrives.
@@ -430,17 +495,10 @@ impl Output {
                 let response = &event["response"];
                 if response["request_id"] == "initialize" {
                     self.state.lock().unwrap().initializing = false;
-                    if response["subtype"] == "error" {
+                    match initialized(response) {
+                        Ok(commands) => self.updates.set_commands(commands),
                         // Prompts that fail once claude exits report why.
-                        self.unclaimed_error = Some(
-                            response["error"]
-                                .as_str()
-                                .unwrap_or("claude refused to initialize")
-                                .to_owned(),
-                        );
-                    } else {
-                        self.updates
-                            .set_commands(commands::catalog(&response["response"]["commands"]));
+                        Err(error) => self.unclaimed_error = Some(error),
                     }
                     return;
                 }

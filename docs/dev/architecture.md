@@ -68,6 +68,11 @@ stream-json messages and control requests with it.
 Claude authenticates with the user's subscription. The bridge can restart
 an exited Claude process on the same session.
 
+Each bridge's `--describe <dir>` mode prints the config options and slash
+commands its harness offers a new session in `<dir>`, starting the harness
+briefly with no prompt and no saved session. The desktop core runs it to show
+a draft's controls.
+
 `pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
 project's settings, skills, and extensions, and an extension of its own that
 registers the client's MCP servers with Pi. The bridge exchanges JSONL commands
@@ -111,8 +116,9 @@ session's first prompt.
 Clients own presentation and workflow choices: which branch to use, which
 comparison ref to select, and which daemon operations to request in what
 order. The daemon exposes repository operations without choosing the user's
-workflow. Local presentation state, such as file-tree expansion and scroll
-position, stays in the webview's storage.
+workflow. Local presentation state stays in the webview's storage: file-tree
+expansion and scroll position, drafts, unsent messages, and the controls each
+agent last reported for each workspace.
 
 Clients pass their environment when starting an agent and requesting Git
 operations. The daemon does not persist that environment. For Git operations
@@ -172,6 +178,13 @@ with the new value. Agent state updates drive the turn lifecycle; the prompt
 response acknowledges insertion rather than turn completion. Permission
 requests and form elicitations are recorded with the session and can be
 answered by clients.
+
+A new session can carry its first prompt and config option values. The daemon
+records the prompt and titles the session from its text when it creates the
+session, before the agent or worktree exists. Once the agent starts, the
+daemon sets the option values the agent reports differently and then sends
+the prompt. A session whose agent or worktree fails to start ends the prompt's
+turn with the error.
 
 ### Loading and stopping agents
 

@@ -7,12 +7,14 @@ Users send prompts to a session, follow the agent's streaming responses, and ins
 ### Compose and send
 
 1. Enter a message. Enter sends it; Shift+Enter inserts a newline. Text composition is not submitted while an input method is composing characters.
-2. Choose Attach Files to select one or more local files. Selected names appear above the message; hover for the full path, or remove an attachment before sending. Selecting the same path again does not duplicate it in the draft.
-3. Send is enabled only while the session is Idle and the draft has non-whitespace text or at least one attachment. Leading and trailing whitespace is removed from submitted message text.
-4. A successful submission clears the draft and attachment list. A failed submission shows its error and leaves them available to correct or retry.
+2. Choose Attach Files to select one or more local files. Selected names appear above the message; hover for the full path, or remove an attachment before sending. Selecting the same path again does not duplicate it in the message.
+3. Send is enabled only while the session is Idle and the message has non-whitespace text or at least one attachment. Leading and trailing whitespace is removed from submitted message text.
+4. A successful submission clears the message and attachment list. A failed submission shows its error and leaves them available to correct or retry.
 5. The prompt appears in the conversation with attachment labels, and the session becomes Running. Sending accepts the prompt for processing; it does not wait for the agent's completed reply.
 
-The message editor and attachment button are disabled for an Exited session. During a turn the user can compose a draft but cannot send another prompt. The send button becomes Stop; see [stopping work](requests.md#stop-work).
+The message editor and attachment button are disabled for an Exited session. During a turn the user can compose a message but cannot send another prompt. The send button becomes Stop; see [stopping work](requests.md#stop-work).
+
+Each session keeps its unsent message and attachments while other sessions are viewed and across restarts of the app.
 
 Desktop attachments, including images and PDFs, give the agent references to local files it can open; their contents are not embedded in the prompt. The referenced paths must still exist when sending, or submission fails. The conversation shows attachment labels rather than previews of the attached files.
 
@@ -21,7 +23,7 @@ Desktop attachments, including images and PDFs, give the agent references to loc
 1. At the start of a message, optionally after whitespace, type `/` while the caret is in the command name. Matching commands appear with their descriptions and any text argument hints.
 2. Matching is a case-insensitive name prefix search over the selected session's current command catalog.
 3. Use Up and Down to choose a suggestion, then Enter or Tab to insert it; clicking a suggestion also inserts it. Completion preserves existing arguments and leaves the editor focused. It does not submit the prompt.
-4. Add arguments and submit normally. Escape dismisses suggestions without changing the draft; editing the draft allows suggestions again.
+4. Add arguments and submit normally. Escape dismisses suggestions without changing the message; editing the message allows suggestions again.
 
 No completion appears for ordinary prose, an unmatched command, or a caret in the command's arguments. Unknown command text can still be submitted. Command catalogs belong to individual sessions and can be replaced or cleared by the agent.
 

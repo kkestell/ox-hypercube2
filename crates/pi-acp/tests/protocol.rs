@@ -7,7 +7,9 @@ use std::{
     process::Stdio,
 };
 
-use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
+use acp_bridge::testing::{
+    TIMEOUT, finish, is_state, receive, response, send, until_method, update,
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -298,6 +300,62 @@ async fn a_new_session_starts_pi_and_reports_idle() {
     assert_eq!(session_id.matches('-').count(), 4, "{calls:?}");
     assert_eq!(calls[1], project.display().to_string());
     child.kill().await.unwrap();
+}
+
+/// Runs the bridge's `--describe` in `project`, with the pi in `bin`.
+async fn describe(bin: &Path, project: &Path) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_pi-acp"))
+        .arg("--describe")
+        .arg(project)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(TIMEOUT, output)
+        .await
+        .expect("timed out waiting for --describe")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn describe_prints_the_options_and_commands_pi_reports() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi(&bin, "");
+    let output = describe(&bin, &project).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let description: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let options = &description["configOptions"];
+    assert_eq!(options[0]["category"], "model", "{description}");
+    assert_eq!(options[0]["currentValue"], "first/one", "{description}");
+    assert_eq!(options[1]["category"], "thought_level", "{description}");
+    assert_eq!(options[1]["currentValue"], "high", "{description}");
+    assert_eq!(
+        description["availableCommands"],
+        json!([
+            {"type":"command","name":"template","description":"A template"},
+            {"type":"command","name":"extension","description":""},
+            {"type":"command","name":"skill:review","description":"Review"}
+        ])
+    );
+    let calls = lines(&project, "calls", 2);
+    assert_eq!(calls[0], "--mode rpc --approve --no-session");
+    assert_eq!(calls[1], project.display().to_string());
+}
+
+#[tokio::test]
+async fn describe_fails_with_the_error_of_a_pi_that_does_not_start() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_pi_script(&bin, "echo 'no models configured' >&2\nexit 3");
+    let output = describe(&bin, &project).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("no models configured"), "{stderr}");
+    assert!(output.stdout.is_empty());
 }
 
 #[tokio::test]
