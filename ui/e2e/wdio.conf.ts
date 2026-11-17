@@ -41,8 +41,8 @@ export const config: WebdriverIO.Config = {
   // The app and every oxd of the run start from `binDir()`: hard links to
   // the binaries just built, with the fake agent as `pi-acp`, so workflow
   // steps on the `pi` harness run the fake agent while the app's sessions
-  // run the Claude bridge. `harnesses/` holds a `claude` stub unless a test
-  // changes it with `setHarnesses`.
+  // run the Claude bridge. `harnesses/` holds a `claude` stub, so the app
+  // offers Claude.
   onPrepare() {
     rmSync(binDir(), { recursive: true, force: true });
     mkdirSync(binDir(), { recursive: true });

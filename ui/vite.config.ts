@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 // @ts-expect-error type error without @types/node package
 import process from "node:process";
 import react from "@vitejs/plugin-react";
@@ -25,5 +26,11 @@ export default defineConfig(() => ({
           port: 1421,
         }
       : undefined,
+  },
+
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
+    setupFiles: ["src/test/setup.ts"],
   },
 }));

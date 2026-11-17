@@ -1,102 +1,12 @@
-import { writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import {
-  composer,
-  defineWorkflow,
-  gitWorkspace,
-  openMenu,
-  rowAction,
-  send,
-  startCheckoutSession,
-  workspaceGroup,
-} from "../helpers.ts";
-
-/** A fake agent directive that takes a JSON string, such as `text "done"`. */
-function directive(name: string, text: string) {
-  return `${name} ${JSON.stringify(text)}`;
-}
-
-/** `text` as a YAML double-quoted scalar, which JSON's strings are. */
-function yaml(text: string) {
-  return JSON.stringify(text);
-}
-
-/** An agent step of the fake agent, which runs `prompt` as its script. */
-function agentStep(name: string, prompt: string, checks = "") {
-  return `  - name: ${name}\n    agent: {harness: pi}\n    prompt: ${yaml(prompt)}\n${checks}`;
-}
-
-/** The run children's rows of the workspace in `cwd`. */
-function childRows(cwd: string) {
-  return workspaceGroup(cwd).$$(`./ul/li[contains(concat(" ", @class, " "), " child ")]`);
-}
+import { defineWorkflow, gitWorkspace, openMenu, rowAction, workspaceGroup } from "../helpers.ts";
 
 function runRow(cwd: string) {
   return workspaceGroup(cwd).$(`./ul/li[contains(concat(" ", @class, " "), " run ")]`);
 }
 
-function childRow(cwd: string, step: string) {
-  return workspaceGroup(cwd).$(
-    `./ul/li[contains(concat(" ", @class, " "), " child ")][.//span[@class="title"][.="${step}"]]`,
-  );
-}
-
-/** Step `name` in the run view's list of steps. */
-function statusStep(name: string) {
-  return $(`.run-status-step[aria-label="${name}"]`);
-}
-
-/** A time as the run view shows it, `HH:MM`. */
-const clockText = /^\d{2}:\d{2}$/;
-
-/** The status icon of step `name` in the run view, labelled `label`. */
+/** Step `name` in the run view, with the status `label`. */
 function stepStatus(name: string, label: string) {
-  return statusStep(name).$(`.status[aria-label="${label}"]`);
-}
-
-/** The last text item of the session view's conversation. */
-function lastReply() {
-  return $('//div[@class="conversation"]/div[contains(@class, "text")][last()]');
-}
-
-/** The request panel below the run view's or the session view's transcript. */
-function requestPanel() {
-  return $(".composer .request-panel");
-}
-
-/**
- * Chooses workflow `name` from the New Session menu and runs it with `input`,
- * then expands its row to show its steps.
- */
-async function startRun(cwd: string, name: string, input: string) {
-  await (await openMenu(cwd)).$(`button=${name}`).click();
-  const dialog = $("dialog[open]");
-  await expect(dialog.$("h2")).toHaveText(name);
-  await dialog.$("textarea").setValue(input);
-  await dialog.$("button=Run").click();
-  await expect(dialog).not.toBeExisting();
-  const select = runRow(cwd).$("button.select");
-  await expect(select).toHaveAttribute("aria-current", "true");
-  await expect(select).toHaveAttribute("aria-expanded", "false");
-  await runRow(cwd).$(".disclosure").click();
-  await expect(select).toHaveAttribute("aria-expanded", "true");
-}
-
-async function viewRun(cwd: string) {
-  const select = runRow(cwd).$("button.select");
-  await select.click();
-  await expect(select).toHaveAttribute("aria-current", "true");
-}
-
-/**
- * Views the session of `step`. Until the session exists, the step's row has
- * no title and selects the run.
- */
-async function viewChild(cwd: string, step: string) {
-  const select = childRow(cwd, step).$("button.select");
-  await expect(select).toHaveAttribute("title");
-  await select.click();
-  await expect(select).toHaveAttribute("aria-current", "true");
+  return $(`.run-status-step[aria-label="${name}"] .status[aria-label="${label}"]`);
 }
 
 // A test that fails with a dialog open leaves it to the next test.
@@ -105,277 +15,35 @@ afterEach(async () => {
 });
 
 describe("A workflow run", () => {
-  it("starts from the New Session menu and follows its steps", async () => {
-    const { cwd, workspace } = await gitWorkspace();
-    await startCheckoutSession(workspace);
-    await defineWorkflow(
-      "follow",
-      `name: Follow
-steps:
-${agentStep("First", directive("shell", "while [ ! -f go ]; do sleep 0.1; done"))}  - name: Build
-    shell: "true"
-${agentStep("Second", directive("text", "second"), '    postconditions:\n      - shell: "true"\n')}`,
-    );
-    await startRun(cwd, "Follow", '  text "Fix   the build"\n');
-    await startCheckoutSession(workspace);
-
-    await expect(runRow(cwd).$(".title")).toHaveText('text "Fix the build"');
-    await expect(childRows(cwd)).toBeElementsArrayOfSize(3);
-    await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
-    await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
-    await expect(runRow(cwd).$('.status[aria-label="Running"]')).toBeExisting();
-    const first = childRow(cwd, "First").$("button.select");
-    await expect(first).toHaveAttribute("title");
-    const worktree = (await first.getAttribute("title"))!;
-    await writeFile(join(worktree.replace(/\/$/, ""), "go"), "");
-
-    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-    await expect(
-      workspaceGroup(cwd).$$(`./ul/li[button[@class="select"][@title="${cwd}"]]`),
-    ).toBeElementsArrayOfSize(2);
-    const kinds = await browser.execute(
-      (group) =>
-        [...group.querySelectorAll(":scope > ul")].map((list) =>
-          [...list.children].map((row) =>
-            row.classList.contains("run")
-              ? "run"
-              : row.classList.contains("child")
-                ? "child"
-                : "session",
-          ),
-        ),
-      await workspaceGroup(cwd),
-    );
-    expect(kinds).toEqual([["session", "run", "child", "child", "child", "session"]]);
-    await expect(childRow(cwd, "First").$(".tree-branch.first")).toBeExisting();
-    await expect(childRow(cwd, "Second").$(".tree-branch.last")).toBeExisting();
-    // The run ended in view, so nothing about it is unseen.
-    await expect(runRow(cwd).$(".status")).toHaveAttribute("class", "status");
-    for (const step of ["First", "Build", "Second"]) {
-      await expect(childRow(cwd, step).$(".status")).toHaveAttribute("class", "status");
-    }
-
-    await expect($$(".run-status-step .title")).toHaveText(["First", "Build", "Second"]);
-    for (const step of ["First", "Build", "Second"]) {
-      await expect(stepStatus(step, "Succeeded")).toHaveAttribute("class", "status finished");
-      await expect(statusStep(step).$(".run-status-time")).toHaveText(clockText);
-    }
-    await browser.saveScreenshot(join(process.env.OX_E2E_DIR!, "run-view.png"));
-  });
-
-  it("follows the active step's latest agent message and collapses the step once a later step reports", async () => {
+  it("starts from the New Session menu, takes a step's answer, and is deleted", async () => {
     const { cwd } = await gitWorkspace();
-    const report = [
-      directive("messages 1", "Reading the code"),
-      directive("shell", "while [ ! -f report ]; do sleep 0.1; done"),
-      directive("messages 1", "Writing the fix"),
-      directive("shell", "while [ ! -f go ]; do sleep 0.1; done"),
-    ].join("\n");
-    const later = Array.from(
-      { length: 40 },
-      (_, index) => `  - name: Later ${index + 1}\n    shell: "true"\n`,
-    ).join("");
-    const check = [
-      directive("shell", "while [ ! -f check ]; do sleep 0.1; done"),
-      directive("messages 1", "Checking the fix"),
-    ].join("\n");
-    // The shell step between the agent steps gives the second an empty input.
-    await defineWorkflow(
-      "report",
-      `name: Report\nsteps:\n${agentStep("Report", report)}  - name: Between\n    shell: "true"\n${agentStep("Check", check)}${later}`,
-    );
-    await startRun(cwd, "Report", "");
-
-    await expect(statusStep("Report").$(".run-status-messages li p")).toHaveText(
-      "Reading the code",
-    );
-    const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
-    await writeFile(join(worktree, "report"), "");
-
-    const messages = ["Reading the code", "Writing the fix"];
-    await expect(statusStep("Report").$$(".run-status-messages li")).toBeElementsArrayOfSize(2);
-    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
-    await expect(statusStep("Report").$(".run-status-time")).toHaveText(clockText);
-    await expect(statusStep("Later 1").$(".run-status-time")).not.toBeExisting();
-    const latest = await statusStep("Report").$(".run-status-messages li:last-child");
-    expect(
-      await browser.execute((element) => {
-        const message = element.getBoundingClientRect();
-        const view = element.closest(".run-status-messages")!.getBoundingClientRect();
-        return message.top >= view.top && message.bottom <= view.bottom;
-      }, latest),
-    ).toBe(true);
-
-    await writeFile(join(worktree, "go"), "");
-    // The step stays expanded after it succeeds, until a later step reports.
-    await expect(stepStatus("Check", "Running")).toBeExisting();
-    await expect(stepStatus("Report", "Succeeded")).toBeExisting();
-    const toggle = statusStep("Report").$(".run-status-toggle");
-    await expect(toggle).toHaveAttribute("aria-expanded", "true");
-    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
-
-    await writeFile(join(worktree, "check"), "");
-    await expect(statusStep("Check").$(".run-status-messages li p")).toHaveText("Checking the fix");
-    await expect(toggle).toHaveAttribute("aria-expanded", "false");
-    await expect(statusStep("Report").$(".run-status-messages")).not.toBeExisting();
-    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-    // The last step to report stays expanded once the run ends.
-    await expect(statusStep("Check").$(".run-status-toggle")).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
-    await toggle.click();
-    await expect(statusStep("Report").$$(".run-status-messages li p")).toHaveText(messages);
-  });
-
-  it("keeps the end of the active step's growing message in view", async () => {
-    const { cwd } = await gitWorkspace();
-    const lines = "for i in $(seq 60); do printf '\\n\\nLine %s' $i; done";
-    const report = [
-      directive("text", "Reading the code"),
-      directive("shell", `while [ ! -f grow ]; do sleep 0.1; done; ${lines}`),
-      directive("shell", "while [ ! -f go ]; do sleep 0.1; done"),
-    ].join("\n");
-    await defineWorkflow("grow", `name: Grow\nsteps:\n${agentStep("Report", report)}`);
-    await startRun(cwd, "Grow", "");
-
-    await expect(statusStep("Report").$(".run-status-messages li p")).toHaveText(
-      "Reading the code",
-    );
-    const worktree = (await childRow(cwd, "Report").$("button.select").getAttribute("title"))!;
-    await writeFile(join(worktree, "grow"), "");
-
-    const message = await statusStep("Report").$(".run-status-messages li");
-    await expect(message).toHaveText(expect.stringContaining("Line 60"));
-    expect(
-      await browser.execute((element) => {
-        const end = element.getBoundingClientRect().bottom;
-        const view = element.closest(".run-status-messages")!.getBoundingClientRect();
-        return end > view.top && end <= view.bottom + 1;
-      }, message),
-    ).toBe(true);
-
-    await writeFile(join(worktree, "go"), "");
-    await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-  });
-
-  it("fits its steps in the view, sharing the height among expanded steps", async () => {
-    const { cwd } = await gitWorkspace();
-    // The shell step between the agent steps gives the second an empty input.
-    const steps = ["First", "Second"]
-      .map((name) => agentStep(name, directive("messages 30", `${name} message`)))
-      .join('  - name: Between\n    shell: "true"\n');
-    await defineWorkflow("share", `name: Share\nsteps:\n${steps}`);
-    await startRun(cwd, "Share", "");
-    await expect(stepStatus("Second", "Succeeded")).toBeExisting();
-    // Only the last step to report stays expanded once the run ends.
-    await expect(statusStep("Second").$$(".run-status-messages > li")).toBeElementsArrayOfSize(30);
-    await expect($$(".run-status-messages")).toBeElementsArrayOfSize(1);
-
-    /** Whether the view scrolls, and each expanded list's height and scrolling. */
-    const layout = () =>
-      browser.execute(() => {
-        const view = document.querySelector(".conversation")!;
-        return {
-          viewScrolls: view.scrollHeight > view.clientHeight + 1,
-          lists: [...document.querySelectorAll(".run-status-messages")].map((list) => ({
-            height: list.clientHeight,
-            scrolls: list.scrollHeight > list.clientHeight,
-            atEnd: list.scrollHeight - list.scrollTop - list.clientHeight < 1,
-          })),
-        };
-      });
-    const expand = async (name: string) => {
-      await statusStep(name).$(".run-status-toggle").click();
-      await expect(statusStep(name).$$(".run-status-messages > li")).toBeElementsArrayOfSize(30);
-    };
-
-    const one = await layout();
-    expect(one.viewScrolls).toBe(false);
-    expect(one.lists).toHaveLength(1);
-    expect(one.lists[0]!.scrolls && one.lists[0]!.atEnd).toBe(true);
-
-    await expand("First");
-    const both = await layout();
-    expect(both.viewScrolls).toBe(false);
-    expect(both.lists).toHaveLength(2);
-    expect(both.lists.every((list) => list.scrolls && list.atEnd)).toBe(true);
-    expect(Math.abs(both.lists[0]!.height - both.lists[1]!.height)).toBeLessThanOrEqual(1);
-    expect(one.lists[0]!.height).toBeGreaterThan(both.lists[1]!.height);
-
-    await statusStep("First").$(".run-status-toggle").click();
-    await expect(statusStep("First").$(".run-status-toggle")).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
-    await expect(statusStep("First").$(".run-status-messages")).not.toBeExisting();
-    expect((await layout()).lists[0]!.height).toBe(one.lists[0]!.height);
-  });
-
-  it("takes an answer to a child's request from the run view or the child's view", async () => {
-    const { cwd } = await gitWorkspace();
+    // Agent steps on the `pi` harness run the fake agent; their prompt and the
+    // run's input are its script.
     await defineWorkflow(
       "ask",
       `name: Ask
 steps:
-${agentStep("First", "permission")}  - name: Between
+  - name: Ask
+    agent: {harness: pi}
+    prompt: permission
+  - name: Build
     shell: "true"
-${agentStep("Second", "permission")}`,
+`,
     );
-    await startRun(cwd, "Ask", "");
-    await expect(runRow(cwd).$(".title")).toHaveText("Ask");
+    await (await openMenu(cwd)).$("button=Ask").click();
+    const dialog = $("dialog[open]");
+    await dialog.$("textarea").setValue('text "Fixed"');
+    await dialog.$("button=Run").click();
+    await expect(runRow(cwd).$(".title")).toHaveText('text "Fixed"');
+    await expect(runRow(cwd).$("button.select")).toHaveAttribute("aria-current", "true");
 
-    await requestPanel().$('button[data-kind="allow_once"]').click();
-    await expect(stepStatus("First", "Succeeded")).toBeExisting();
-
-    await expect(runRow(cwd).$('.status[aria-label="Awaiting permission"]')).toBeExisting();
-    await viewChild(cwd, "Second");
-    await requestPanel().$('button[data-kind="allow_once"]').click();
-    await expect($(".conversation > .text")).toHaveText("allowed");
-
-    await viewRun(cwd);
-    await expect(stepStatus("Second", "Succeeded")).toBeExisting();
-    await expect(requestPanel()).not.toBeExisting();
+    await $(".composer .request-panel").$('button[data-kind="allow_once"]').click();
+    await expect(stepStatus("Ask", "Succeeded")).toBeExisting();
+    await expect(stepStatus("Build", "Succeeded")).toBeExisting();
     await expect(runRow(cwd).$('.status[aria-label="Succeeded"]')).toBeExisting();
-  });
-
-  it("disables a child's entry while it runs, and takes prompts once it has ended", async () => {
-    const { cwd } = await gitWorkspace();
-    await defineWorkflow("hold", `name: Hold\nsteps:\n${agentStep("Hold", "wait")}`);
-    await startRun(cwd, "Hold", "");
-    await viewChild(cwd, "Hold");
-    await expect(composer()).toBeDisabled();
-    await expect($('button[aria-label="Attach Files"]')).toBeDisabled();
-    await $('.composer button[aria-label="Stop"]').click();
-    await expect(runRow(cwd).$('.status[aria-label="Cancelled"]')).toBeExisting();
-
-    await expect(composer()).toBeEnabled();
-    await send(directive("text", "after"));
-    await expect(lastReply()).toHaveText("after");
-    await viewRun(cwd);
-    await expect(stepStatus("Hold", "Cancelled")).toBeExisting();
 
     await rowAction(runRow(cwd), "Delete Run");
     await $("dialog[open]").$("button=Discard and Delete").click();
     await expect(runRow(cwd)).not.toBeExisting();
-    await expect(childRows(cwd)).toBeElementsArrayOfSize(0);
-  });
-
-  it("shows a failed precondition's error under its step", async () => {
-    const { cwd } = await gitWorkspace();
-    await defineWorkflow(
-      "guarded",
-      `name: Guarded
-steps:
-${agentStep("Guarded", directive("text", "never"), "    preconditions:\n      - shell: echo not ready; exit 3\n")}`,
-    );
-    await startRun(cwd, "Guarded", "");
-    await expect(runRow(cwd).$('.status[aria-label="Failed"]')).toBeExisting();
-    await expect(childRow(cwd, "Guarded").$('.status[aria-label="Failed"]')).toBeExisting();
-
-    await expect(stepStatus("Guarded", "Failed")).toHaveAttribute("class", "status error");
-    await expect(statusStep("Guarded").$(".run-status-error")).toHaveText(
-      expect.stringContaining("a precondition exited with status 3"),
-    );
   });
 });

@@ -1603,6 +1603,28 @@ async fn a_move_keeps_uncommitted_and_untracked_work() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_move_keeps_an_ignored_file_it_would_overwrite() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    std::fs::write(repo.path().join(".gitignore"), "added\n").unwrap();
+    git(repo.path(), &["add", ".gitignore"]);
+    git(repo.path(), &["commit", "--quiet", "-m", "ignore"]);
+    let first = commit_of(repo.path(), "HEAD");
+    let topic = commit_beside(repo.path(), &first, "added");
+    std::fs::write(repo.path().join("added"), "mine\n").unwrap();
+
+    let refused = refusal(move_branch(&client, repo.path(), "main", &topic, &first).await);
+    assert_eq!(refused.code, code::UNSAVED_WORK, "{refused:?}");
+    assert!(refused.message.contains("added"), "{refused:?}");
+    assert_eq!(commit_of(repo.path(), "main"), first);
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("added")).unwrap(),
+        "mine\n"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_move_waits_for_an_agent_in_the_checkout_to_end_its_turn() {
     let repo = repo();
     let daemon = Daemon::start().await;

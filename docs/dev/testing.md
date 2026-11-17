@@ -10,15 +10,41 @@ in [Code style](code-style.md#implementation) applies to tests too.
   Choose representative cases that establish the rule being tested.
 - Verify straightforward, reversible changes by inspection. Add a test when it
   would catch a meaningful failure.
-- Test observable results through the closest stable boundary. Use unit tests
-  for tricky logic and integration or end-to-end tests for behavior that depends
-  on components working together.
+- Test observable results through the closest stable boundary, at the lowest
+  layer of [Test layers](#test-layers) that can observe them.
 - Repeat an assertion at different layers only when those layers have distinct
   failure modes. A broader test should prove something the focused test cannot.
 - Assert on the actual contract, so a refactor that keeps observable behavior
   keeps its tests passing.
 - Cover each rule with the cases that establish it. A deferred edge case gets
   tests when it is handled.
+
+## Test layers
+
+| Layer | Where | Proves |
+| --- | --- | --- |
+| Rust unit tests | beside the code in `crates/` | Logic in one module, including durations on tokio's paused clock |
+| Daemon integration tests | `crates/*/tests` | `oxd`, `oxctl` and the bridges over their real protocols, with `oxd-fake-agent` and real git |
+| UI tests | `ui/src/**/*.test.ts(x)` | The UI's behavior: the real `App` in jsdom against a fake desktop core |
+| End-to-end tests | `ui/e2e/specs` | The built app, its desktop core and `oxd` working together in the real webview |
+| Live checks | `scripts/smoke-acp.py` | Compatibility with the real Claude and Pi agents |
+
+- UI tests render `App` with `renderApp` from `ui/src/test/core.tsx`, which
+  fakes the desktop core at the Tauri IPC boundary. A test sends listing
+  changes and conversation updates through the channels the app opened,
+  answers commands with `core.on`, and asserts on the commands the app
+  invoked with `core.invoked`. Native menus and dialogs are answered at the
+  same boundary.
+- End-to-end tests cover what only the assembled app shows: each Tauri
+  command reaching `oxd` with the arguments the desktop core expects, the
+  desktop core's reconnection to a restarted `oxd`, live file watches, and
+  webview behavior such as the content security policy. A UI rule belongs in
+  a UI test, and a daemon rule in a daemon integration test; an end-to-end
+  test adds a case only for a new command, a new kind of channel, or webview
+  behavior.
+- Check layout, colour, spacing and alignment by looking at the running app,
+  as [Ox tests and fixtures](#ox-tests-and-fixtures) describes. Tests assert
+  on behavior.
 
 ## Writing tests
 
@@ -79,9 +105,8 @@ not it failed today.
 Clippy rejects `tokio::time::sleep`, `sleep_until`, and `std::thread::sleep`
 (`clippy.toml`), and Biome rejects `browser.pause`, `setTimeout`, and
 `setInterval` in `ui/e2e` (`ui/biome.json`). A delay that is itself the
-behavior, such as the park delay or the stall probe in `stress.e2e.ts`, sits
-in a small function or line marked with an `expect` or `biome-ignore` that
-gives the reason.
+behavior, such as the park delay, sits in a small function marked with an
+`expect` that gives the reason.
 
 ## Maintaining the suite
 
@@ -124,13 +149,11 @@ gives the reason.
 - When a native boundary cannot be driven, simulate only that boundary in
   test code, preserve the real application path around it, and restore any
   interception after use. Document and report what the test cannot verify.
-- `ui/e2e/specs/stress.e2e.ts` holds the app to time budgets with hundreds of
-  sessions and a transcript of thousands of long Markdown replies, far beyond
-  everyday use. It measures inside the webview and waits on the daemon through
-  `oxctl`, because finding thousands of elements through the driver occupies
-  the webview's main thread. A change whose work grows with the session list
-  or the transcript fails it. [Performance](performance.md) describes the
-  design it checks.
+- `ui/src/performance.test.tsx` holds the UI to
+  [Performance](performance.md): with hundreds of sessions and replies, it
+  counts the Markdown parses, Markdown block renders and session row renders
+  each change causes. A change whose work grows with the session list or the
+  transcript fails it by hundreds.
 - Isolate a failure with the smallest relevant test before rerunning a broad
   suite. Distinguish fixture and driver failures from product failures, and
   fix the cause.
@@ -156,7 +179,7 @@ Run commands from the repository root for the parts that changed:
 | Changed area | Required check |
 | --- | --- |
 | Rust | `make check-rust` — formatting, clippy with warnings as errors, and workspace tests |
-| UI | `make check-ui` — Biome and TypeScript checks |
+| UI | `make check-ui` — Biome, TypeScript checks, and the UI tests |
 | `scripts/` | `make check-scripts` — ruff lint and formatting checks |
 | All three | `make check` |
 
@@ -166,11 +189,12 @@ Run commands from the repository root for the parts that changed:
 integration tests launch it beside `oxd`. Before running those tests directly
 with `cargo test`, run `cargo build -p ox-mcp`.
 
-After changing behavior in `crates/ox` or the UI's TypeScript, also run
-`make e2e` and report its result. It drives the tests in `ui/e2e` against the
-built app and sessions of `oxd-fake-agent`; `ui/e2e/wdio.conf.ts` and
-`ui/e2e/helpers.ts` set up their environment. A change only to
-`ui/src/styles/` requires `make check-ui`.
+After changing `crates/ox`, the app's Tauri configuration, a command the UI
+invokes or the channel messages it reads, or `ui/e2e`, also run `make e2e`
+and report its result. It drives the tests in `ui/e2e` against the built app
+and sessions of `oxd-fake-agent`; `ui/e2e/wdio.conf.ts` and
+`ui/e2e/helpers.ts` set up their environment. For other UI changes,
+`make check-ui` is the evidence.
 
 The live checks run real models through `oxd` and `oxctl`, separately from
 `cargo test`, and each run spends paid model requests. Run them only for

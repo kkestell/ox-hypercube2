@@ -43,6 +43,10 @@
   "plugins": ["./e2e/wait-for-conditions.grit"],
   "overrides": [
     {
+      "includes": ["src/**", "!src/**/*.test.{ts,tsx}"],
+      "linter": { "rules": { "suspicious": { "noFocusedTests": "off" } } }
+    },
+    {
       "includes": ["e2e/**"],
       "linter": {
         "rules": {

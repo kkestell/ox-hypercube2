@@ -11,11 +11,15 @@
     "check": "biome check --error-on-warnings . && tsc && tsc -p e2e",
     "fix": "biome check --write .",
     "tauri": "TAURI_APP_PATH=../crates/ox TAURI_FRONTEND_PATH=. tauri",
+    "test": "vitest run",
     "e2e": "wdio run e2e/wdio.conf.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "2.6.6",
     "@tauri-apps/cli": "^2",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.12",
     "@types/hast": "^3.0.5",
     "@types/mdast": "^4.0.4",
     "@types/node": "^22.20.5",
@@ -28,8 +32,10 @@
     "@wdio/mocha-framework": "^9.32.0",
     "@wdio/spec-reporter": "^9.32.0",
     "@wdio/tauri-service": "^1.5.1",
+    "jsdom": "^31.0.1",
     "typescript": "^7.0.2",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vitest": "^5.1.0"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",

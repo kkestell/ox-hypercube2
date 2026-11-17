@@ -46,7 +46,7 @@ check-rust:
 	cargo test --workspace
 
 check-ui:
-	cd ui && npm run check
+	cd ui && npm run check && npm test
 
 check-scripts:
 	$(RUFF) check scripts

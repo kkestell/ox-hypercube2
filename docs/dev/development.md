@@ -39,6 +39,15 @@ scenario's fixed state: `?scenario=<name>` picks one of the scenarios in
 state do nothing. Context menus, native dialogs, and file contents come from
 the desktop core and are absent.
 
+## UI tests
+
+```sh
+cd ui && npx vitest
+```
+
+`npx vitest` runs the UI tests in jsdom and runs the affected tests again on
+each save; `npm test` runs them once. `npx vitest run <path>` runs one file.
+
 ## UI changes
 
 - Develop and show UI changes in mock mode, on a scenario that has the states
