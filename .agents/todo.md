@@ -49,6 +49,21 @@
      final stored sequence if it differs. The subscription waits even though
      event 7 is already in the database.
 
+## Scale
+
+Imported Claude Code sessions could put a very large number of archived
+sessions in one workspace. Measure where each of these breaks before
+designing a change.
+
+- [ ] **The daemon holds every session in memory.** It loads every saved
+  session at startup, archived ones included.
+  [Saved sessions](../crates/oxd/src/store.rs)
+- [ ] **Every client receives every session.** Clients get archived sessions
+  like any other, flagged `archived`, so each client update and the archive
+  list grow with them. Archived sessions would need to be paged rather than
+  sent in full.
+  [Session info](../crates/ox-protocol/src/messages.rs)
+
 ## Open questions
 
 The functional spec describes current behavior. Investigate these before
