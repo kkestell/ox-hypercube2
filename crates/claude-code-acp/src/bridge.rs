@@ -157,27 +157,12 @@ impl acp_bridge::Bridge for Bridge {
     /// the session first, then `start_new` starts claude, whose commands
     /// follow as an update.
     fn new_session(
-        &self,
+        self: &Arc<Self>,
         request: acp::NewSessionRequest,
-    ) -> std::result::Result<acp::NewSessionResponse, Error> {
-        let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
-        let servers = parse_mcp(request.mcp_servers)?;
-        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
-        let mut open = self.session.lock().unwrap();
-        if open.is_some() {
-            return Err(acp_bridge::already_open());
-        }
-        let session = Session::new(
-            Uuid::new_v4().to_string(),
-            cwd,
-            servers,
-            instructions,
-            false,
-        );
-        let response =
-            acp::NewSessionResponse::new(session.id.clone()).config_options(session.options());
-        *open = Some(session);
-        Ok(response)
+        _connection: &ConnectionTo<Client>,
+    ) -> impl Future<Output = std::result::Result<acp::NewSessionResponse, Error>> + Send + 'static
+    {
+        std::future::ready(self.open_new(request))
     }
 
     /// Starts a new session's claude once the client knows the session. A
@@ -334,6 +319,31 @@ impl acp_bridge::Bridge for Bridge {
 }
 
 impl Bridge {
+    /// Opens a new session without starting its claude.
+    fn open_new(
+        &self,
+        request: acp::NewSessionRequest,
+    ) -> std::result::Result<acp::NewSessionResponse, Error> {
+        let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
+        let servers = parse_mcp(request.mcp_servers)?;
+        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
+        let mut open = self.session.lock().unwrap();
+        if open.is_some() {
+            return Err(acp_bridge::already_open());
+        }
+        let session = Session::new(
+            Uuid::new_v4().to_string(),
+            cwd,
+            servers,
+            instructions,
+            false,
+        );
+        let response =
+            acp::NewSessionResponse::new(session.id.clone()).config_options(session.options());
+        *open = Some(session);
+        Ok(response)
+    }
+
     pub fn new(claude_dir: &Path) -> Arc<Self> {
         Arc::new(Self {
             history: History::new(claude_dir),

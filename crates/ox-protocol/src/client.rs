@@ -19,9 +19,10 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind,
-    FileContent, Focus, HelloResult, ListingChange, Method, PROTOCOL_VERSION, QueueAdded, Request,
-    RunInfo, ServerMessage, SessionInfo, WorkflowInfo, WorkspaceInfo, WorktreeInfo,
+    Branches, Checkout, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, ErrorBody, Event,
+    EventKind, FileContent, Focus, Harness, HelloResult, ListingChange, MessageSent, Method,
+    PROTOCOL_VERSION, QueueAdded, Request, RunInfo, ServerMessage, SessionInfo, TranscriptPage,
+    WorkflowInfo, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -109,6 +110,29 @@ pub fn default_socket_path() -> PathBuf {
 /// The daemon binary: `oxd` beside the current executable.
 pub fn daemon_binary() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?.with_file_name("oxd"))
+}
+
+/// The controls the agent of `bridge` offers a new session in `cwd`, which
+/// the bridge's `--describe` mode reports. The bridge runs with `env` over
+/// this process's environment. A bridge that fails gives its standard error.
+pub async fn describe(
+    bridge: &Path,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+) -> Result<Controls, String> {
+    let output = tokio::process::Command::new(bridge)
+        .arg("--describe")
+        .arg(cwd)
+        .envs(env)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| format!("running {}: {error}", bridge.display()))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|error| error.to_string())
 }
 
 /// What a client shares with its reader and its subscriptions.
@@ -444,6 +468,65 @@ impl Client {
     pub async fn cancel(&self, session_id: &str) -> Result<(), Error> {
         self.ack(Method::SessionCancel {
             session_id: session_id.into(),
+        })
+        .await
+    }
+
+    /// Sends a peer message from session `session_id` to session `to`.
+    pub async fn send_message(
+        &self,
+        session_id: &str,
+        to: &str,
+        text: &str,
+    ) -> Result<MessageSent, Error> {
+        self.call(Method::SessionSendMessage {
+            session_id: session_id.into(),
+            to: to.into(),
+            text: text.into(),
+        })
+        .await
+    }
+
+    /// A page of the session's compact transcript, before seq `before`.
+    pub async fn transcript(
+        &self,
+        session_id: &str,
+        before: Option<u64>,
+    ) -> Result<TranscriptPage, Error> {
+        self.call(Method::SessionTranscript {
+            session_id: session_id.into(),
+            before,
+        })
+        .await
+    }
+
+    /// Asks the user, through session `session_id`, to start a new session
+    /// with `prompt`. Resolves to the new session, or `None` when the user
+    /// declines.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the method's parameters, most of them optional"
+    )]
+    pub async fn request_session(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        workspace: Option<PathBuf>,
+        worktree: bool,
+        branch: Option<String>,
+        harness: Option<Harness>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<Option<SessionInfo>, Error> {
+        self.call(Method::SessionRequest {
+            session_id: session_id.into(),
+            prompt: prompt.into(),
+            workspace,
+            worktree,
+            branch,
+            harness,
+            model,
+            effort,
         })
         .await
     }

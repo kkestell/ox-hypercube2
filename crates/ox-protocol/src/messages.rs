@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_client_protocol::v2::schema::{
     AvailableCommand, ContentBlock, ElicitationAction, ElicitationSchema, PermissionOption,
@@ -52,9 +52,9 @@ pub enum Method {
     /// Starts an agent in the workspace's directory or in a new worktree of
     /// its Git repository, as `checkout` says. The result is the session in
     /// state `starting`; its `agent_started` or `agent_exited` event
-    /// follows. A worktree's branch is checked, and created unless it is a
-    /// local branch already, before the answer, and the worktree is added
-    /// during the session's startup. Git runs with `env` over the daemon's
+    /// follows. A worktree's branch is checked, and created unless the
+    /// checkout names an existing local branch, before the answer, and the
+    /// worktree is added during the session's startup. Git runs with `env` over the daemon's
     /// environment, as the agent does.
     #[serde(rename = "session.new")]
     SessionNew {
@@ -137,6 +137,59 @@ pub enum Method {
     },
     #[serde(rename = "session.cancel")]
     SessionCancel { session_id: String },
+    /// Sends a peer message from standalone session `session_id` to
+    /// standalone session `to`. It starts a turn or steers the running one as
+    /// `session.prompt` does, recorded with its sender in `from`, but leaves
+    /// a held queue held. The agent gets the text after a header that names
+    /// the sender. An `exited` recipient is loaded first, with the sender's
+    /// environment, and the message is sent once its agent has started.
+    /// Refused for a run's child session, the sender itself, an archived
+    /// session, and one whose agent never started. The result is
+    /// [`MessageSent`].
+    #[serde(rename = "session.send_message")]
+    SessionSendMessage {
+        session_id: String,
+        to: String,
+        text: String,
+    },
+    /// A page of session `session_id`'s compact transcript: its prompts,
+    /// agent messages, tool calls and turn ends, each an entry, latest
+    /// last. The page holds the latest entries before seq `before`, or
+    /// before the end, up to 40,000 characters. The result is
+    /// [`TranscriptPage`].
+    #[serde(rename = "session.transcript")]
+    SessionTranscript {
+        session_id: String,
+        #[serde(default)]
+        before: Option<u64>,
+    },
+    /// Asks the user, through a permission request on standalone session
+    /// `session_id`, to start a new session with `prompt` as its first
+    /// prompt. `workspace` is a workspace's directory and defaults to the
+    /// requester's; `worktree` runs it in a new worktree on `branch`, an
+    /// existing local branch, or a new branch at `HEAD`; otherwise in the
+    /// workspace's checkout, whose branch must be `branch` if given.
+    /// `harness` defaults to the requester's; `model` and `effort` must be
+    /// values the harness offers. Everything is checked before the request.
+    /// The session starts with the requester's environment. The result is
+    /// its [`SessionInfo`], or `null` when the user declines or the request
+    /// is cancelled.
+    #[serde(rename = "session.request")]
+    SessionRequest {
+        session_id: String,
+        prompt: String,
+        #[serde(default)]
+        workspace: Option<PathBuf>,
+        worktree: bool,
+        #[serde(default)]
+        branch: Option<String>,
+        #[serde(default)]
+        harness: Option<Harness>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+    },
     /// Starts a subscription: after the answer, the daemon sends the
     /// session's events with `seq > after_seq`, from the daemon's database
     /// for a session restored after an `oxd` restart, then each later event. The
@@ -357,6 +410,23 @@ impl Harness {
             Harness::Pi => "pi-acp",
         }
     }
+
+    /// The harness whose bridge `command` runs.
+    pub fn of_command(command: &[String]) -> Option<Harness> {
+        let name = Path::new(command.first()?).file_name()?;
+        Self::ALL
+            .into_iter()
+            .find(|harness| name == harness.bridge())
+    }
+}
+
+/// The config options and slash commands an agent offers a new session, as
+/// its bridge's `--describe` mode reports them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
+pub struct Controls {
+    pub config_options: Vec<SessionConfigOption>,
+    pub available_commands: Vec<AvailableCommand>,
 }
 
 /// Where a new session runs.
@@ -367,13 +437,17 @@ pub enum Checkout {
     #[default]
     Workspace,
     /// A new worktree of the workspace's repository, in the same
-    /// subdirectory the workspace is of its checkout, on a new branch
-    /// `ox/<first 8 digits of the worktree ID>` that starts at `HEAD`. With
-    /// `compare`, a ref such as `main` that must name a commit, the worktree
-    /// publishes how its branch compares with the ref.
+    /// subdirectory the workspace is of its checkout. With `branch`, a local
+    /// branch checked out in no worktree, the worktree is on that branch and
+    /// starts at its tip; otherwise on a new branch `ox/<first 8 digits of
+    /// the worktree ID>` that starts at `HEAD`. With `compare`, a ref such
+    /// as `main` that must name a commit, the worktree publishes how its
+    /// branch compares with the ref.
     Worktree {
         #[serde(default)]
         compare: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
 }
 
@@ -429,6 +503,31 @@ pub struct Deleted {
 pub struct ConfigSetting {
     pub config_id: String,
     pub value: ConfigValue,
+}
+
+/// The result of `session.send_message`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageSent {
+    /// Whether the message steered the recipient's running turn, rather
+    /// than starting one.
+    pub steered: bool,
+}
+
+/// The result of `session.transcript`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptPage {
+    /// The page's entries, separated by blank lines.
+    pub text: String,
+    /// The seq to pass as `before` for the page of earlier entries, unset
+    /// when there are none.
+    pub before: Option<u64>,
+}
+
+/// The session that sent a peer message, with its title as of sending.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sender {
+    pub session_id: String,
+    pub title: Option<String>,
 }
 
 /// The result of `session.queue_add`.
@@ -743,13 +842,20 @@ pub enum EventKind {
         config_options: Vec<SessionConfigOption>,
         available_commands: Vec<AvailableCommand>,
     },
+    /// A prompt that started a turn. `from` is the sender of a peer
+    /// message, whose text `prompt` holds without the header the agent got.
     PromptStarted {
         prompt: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Sender>,
     },
     /// A prompt sent during a turn. The agent takes it in at its next
-    /// opportunity, or starts a turn of its own with it.
+    /// opportunity, or starts a turn of its own with it. `from` is as for
+    /// `prompt_started`.
     PromptSteered {
         prompt: Vec<ContentBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Sender>,
     },
     /// The agent took in the steered prompt recorded at seq `prompt`.
     SteeredPromptTaken {
@@ -970,15 +1076,29 @@ mod tests {
         assert!(matches!(
             request.method,
             Method::SessionNew {
-                checkout: Checkout::Worktree { compare: None },
+                checkout: Checkout::Worktree {
+                    compare: None,
+                    branch: None
+                },
                 ..
             }
         ));
         let checkout = Checkout::Worktree {
             compare: Some("main".into()),
+            branch: None,
         };
         let value = serde_json::to_value(&checkout).unwrap();
         assert_eq!(value, json!({"type": "worktree", "compare": "main"}));
+        assert_eq!(serde_json::from_value::<Checkout>(value).unwrap(), checkout);
+        let checkout = Checkout::Worktree {
+            compare: None,
+            branch: Some("topic".into()),
+        };
+        let value = serde_json::to_value(&checkout).unwrap();
+        assert_eq!(
+            value,
+            json!({"type": "worktree", "compare": null, "branch": "topic"})
+        );
         assert_eq!(serde_json::from_value::<Checkout>(value).unwrap(), checkout);
         let method = Method::BranchMove {
             workspace_id: "w".into(),
@@ -1275,6 +1395,48 @@ mod tests {
             value,
             json!({"id": 1, "method": "hello", "params": {"protocol_version": 1}})
         );
+    }
+
+    #[test]
+    fn a_stored_prompt_without_a_sender_still_reads() {
+        let kind: EventKind = serde_json::from_value(json!({
+            "type": "prompt_started",
+            "data": {"prompt": [{"type": "text", "text": "hi"}]}
+        }))
+        .unwrap();
+        assert!(matches!(kind, EventKind::PromptStarted { from: None, .. }));
+        let from = Sender {
+            session_id: "s".into(),
+            title: Some("Fix the build".into()),
+        };
+        let kind = EventKind::PromptSteered {
+            prompt: Vec::new(),
+            from: Some(from.clone()),
+        };
+        let value = serde_json::to_value(&kind).unwrap();
+        assert_eq!(
+            value["data"]["from"],
+            json!({"session_id": "s", "title": "Fix the build"})
+        );
+        assert_eq!(serde_json::from_value::<EventKind>(value).unwrap(), kind);
+    }
+
+    #[test]
+    fn a_harness_is_named_by_its_bridge() {
+        for (command, harness) in [
+            (
+                vec!["/app/claude-code-acp".to_owned()],
+                Some(Harness::Claude),
+            ),
+            (
+                vec!["/app/pi-acp".to_owned(), "-v".to_owned()],
+                Some(Harness::Pi),
+            ),
+            (vec!["/bin/agent".to_owned()], None),
+            (Vec::new(), None),
+        ] {
+            assert_eq!(Harness::of_command(&command), harness, "{command:?}");
+        }
     }
 
     /// An elicitation's events, delivered to subscription 6.

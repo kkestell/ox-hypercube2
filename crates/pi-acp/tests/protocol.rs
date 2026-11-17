@@ -167,7 +167,8 @@ async fn initialize(child: &mut Child, reader: &mut BufReader<ChildStdout>, capa
     );
 }
 
-/// Opens a session, which reports itself idle with nothing running.
+/// Opens a session, which reports itself idle with nothing running, and
+/// returns the `session/new` result.
 async fn new_session(
     child: &mut Child,
     reader: &mut BufReader<ChildStdout>,
@@ -182,15 +183,7 @@ async fn new_session(
     assert!(is_state(&snapshot, "idle"), "{snapshot}");
     assert_eq!(update(&snapshot)["background"], json!([]), "{snapshot}");
     assert_eq!(snapshot["params"]["sessionId"], session, "{snapshot}");
-    session
-}
-
-async fn startup_catalog(reader: &mut BufReader<ChildStdout>) -> [Value; 2] {
-    let options = receive(reader).await;
-    assert_eq!(kind(&options), "config_option_update", "{options}");
-    let commands = receive(reader).await;
-    assert_eq!(kind(&commands), "available_commands_update", "{commands}");
-    [options, commands]
+    new["result"].clone()
 }
 
 /// Starts the bridge with a fake pi running `script`, and opens a session.
@@ -208,8 +201,7 @@ async fn session(
     fake_pi(&bin, script);
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    startup_catalog(&mut reader).await;
+    let session = new_session(&mut child, &mut reader, 2, &project).await["sessionId"].clone();
     (temp, project, child, reader, session)
 }
 
@@ -268,28 +260,19 @@ fn statuses(updates: &[&Value]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn a_new_session_starts_pi_and_reports_idle() {
+async fn a_new_session_starts_pi_and_answers_with_its_options_and_commands() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
     fake_pi(&bin, "");
     let (mut child, mut reader) = start(&bin);
     initialize(&mut child, &mut reader, json!({"elicitation":{"form":{}}})).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    let [options, commands] = startup_catalog(&mut reader).await;
-    assert_eq!(options["params"]["sessionId"], session);
-    assert_eq!(commands["params"]["sessionId"], session);
-    assert_eq!(update(&options)["configOptions"][0]["category"], "model");
+    let opened = new_session(&mut child, &mut reader, 2, &project).await;
+    assert_eq!(opened["configOptions"][0]["category"], "model", "{opened}");
+    assert_eq!(opened["configOptions"][0]["currentValue"], "first/one");
+    assert_eq!(opened["configOptions"][1]["category"], "thought_level");
+    assert_eq!(opened["configOptions"][1]["currentValue"], "high");
     assert_eq!(
-        update(&options)["configOptions"][0]["currentValue"],
-        "first/one"
-    );
-    assert_eq!(
-        update(&options)["configOptions"][1]["category"],
-        "thought_level"
-    );
-    assert_eq!(update(&options)["configOptions"][1]["currentValue"], "high");
-    assert_eq!(
-        update(&commands)["availableCommands"],
+        opened["availableCommands"],
         json!([
             {"type":"command","name":"template","description":"A template"},
             {"type":"command","name":"extension","description":""},
@@ -1335,7 +1318,6 @@ async fn mcp_servers_reach_every_pi_through_the_extension() {
     assert!(session.is_string(), "{new}");
     let snapshot = receive(&mut reader).await;
     assert!(is_state(&snapshot, "idle"), "{snapshot}");
-    startup_catalog(&mut reader).await;
     child.kill().await.unwrap();
 
     let (mut child, mut reader) = start(&bin);
@@ -1591,7 +1573,6 @@ async fn appends_the_client_system_prompt_to_pi() {
     assert!(new["result"]["sessionId"].is_string(), "{new}");
     let snapshot = receive(&mut reader).await;
     assert!(is_state(&snapshot, "idle"), "{snapshot}");
-    startup_catalog(&mut reader).await;
     child.kill().await.unwrap();
     let args = fs::read_to_string(project.join("args.txt")).unwrap();
     let args: Vec<&str> = args.lines().collect();

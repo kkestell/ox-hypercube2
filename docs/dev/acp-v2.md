@@ -27,7 +27,7 @@ relays the update or acts on it as the protocol requires.
 | `providers/list` (unstable) | ❌ | ❌ | ❌ | |
 | `providers/set` (unstable) | ❌ | ❌ | ❌ | |
 | `providers/disable` (unstable) | ❌ | ❌ | ❌ | |
-| `session/new` | ✅ | ✅ | ✅ | Both bridges start their harness asynchronously; a successful response does not guarantee the harness has started. A bridge process serves one session and refuses a second `session/new` or `session/resume`. See `session.mcp.stdio` for MCP support. |
+| `session/new` | ✅ | ✅ | ✅ | Claude's bridge starts Claude after answering; a successful response does not guarantee it has started. Pi's bridge starts Pi before answering and answers with Pi's config options and commands. A bridge process serves one session and refuses a second `session/new` or `session/resume`. See `session.mcp.stdio` for MCP support. |
 | `session/list` | ❌ | ❌ | ❌ | |
 | `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |

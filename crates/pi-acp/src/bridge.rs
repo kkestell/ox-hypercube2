@@ -71,43 +71,51 @@ impl acp_bridge::Bridge for Bridge {
         )
     }
 
+    /// Opens the session and starts its Pi, whose config options and
+    /// commands the response carries. A Pi that fails to start or to
+    /// describe itself is logged and the response has neither; the first
+    /// prompt starts Pi again.
     fn new_session(
-        &self,
+        self: &Arc<Self>,
         request: acp::NewSessionRequest,
-    ) -> Result<acp::NewSessionResponse, Error> {
-        let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
-        let mcp_servers = acp_bridge::parse_mcp(request.mcp_servers)?;
-        check_pi_names(&mcp_servers)?;
-        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
-        let mut open = self.session.lock().unwrap();
-        if open.is_some() {
-            return Err(acp_bridge::already_open());
+        connection: &ConnectionTo<Client>,
+    ) -> impl Future<Output = Result<acp::NewSessionResponse, Error>> + Send + 'static {
+        let opened = self.open_new(request);
+        let description = opened
+            .as_ref()
+            .ok()
+            .and_then(|id| match self.start_pi(id, connection) {
+                Ok(_) => Some(self.describe(id)),
+                Err(error) => {
+                    eprintln!("failed to start pi for session {id}: {}", error.message);
+                    None
+                }
+            });
+        async move {
+            let id = opened?;
+            let response = acp::NewSessionResponse::new(id.clone());
+            let Some(description) = description else {
+                return Ok(response);
+            };
+            Ok(match description.await {
+                Ok(description) => response
+                    .config_options(description.config_options)
+                    .available_commands(description.available_commands),
+                Err(error) => {
+                    eprintln!("failed to describe pi for session {id}: {}", error.message);
+                    response
+                }
+            })
         }
-        let id = Uuid::new_v4().to_string();
-        *open = Some(Session {
-            id: id.clone(),
-            cwd,
-            instructions,
-            mcp_servers,
-            titled: false,
-            pi: None,
-        });
-        Ok(acp::NewSessionResponse::new(id))
     }
 
-    /// A Pi that fails to start is started again by the session's first
-    /// prompt.
+    /// Reports the new session idle.
     fn start_new(self: &Arc<Self>, id: &str, connection: &ConnectionTo<Client>) {
         notify(
             connection,
             id,
             SessionUpdate::StateUpdate(updates::idle_state()),
         );
-        match self.start_pi(id, connection) {
-            Ok(true) => self.publish_description(id, connection),
-            Ok(false) => {}
-            Err(error) => eprintln!("failed to start pi for session {id}: {}", error.message),
-        }
     }
 
     /// Stops the session's run, whether a prompt or Pi started it.
@@ -279,6 +287,28 @@ impl acp_bridge::Bridge for Bridge {
 }
 
 impl Bridge {
+    /// Opens a new session, without its Pi, and returns its ID.
+    fn open_new(&self, request: acp::NewSessionRequest) -> Result<String, Error> {
+        let cwd = acp_bridge::cwd(&request.cwd.0).map_err(invalid)?;
+        let mcp_servers = acp_bridge::parse_mcp(request.mcp_servers)?;
+        check_pi_names(&mcp_servers)?;
+        let instructions = acp_bridge::system_prompt(request.system_prompt)?;
+        let mut open = self.session.lock().unwrap();
+        if open.is_some() {
+            return Err(acp_bridge::already_open());
+        }
+        let id = Uuid::new_v4().to_string();
+        *open = Some(Session {
+            id: id.clone(),
+            cwd,
+            instructions,
+            mcp_servers,
+            titled: false,
+            pi: None,
+        });
+        Ok(id)
+    }
+
     /// Sends all description queries to the session's Pi before returning,
     /// so later requests do not overtake their submission to Pi.
     fn describe(

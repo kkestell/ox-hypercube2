@@ -67,7 +67,8 @@ an exited Claude process on the same session.
 Each bridge's `--describe <dir>` mode prints the config options and slash
 commands its harness offers a new session in `<dir>`, starting the harness
 briefly with no prompt and no saved session. The desktop core runs it to show
-a draft's controls.
+a draft's controls, and the daemon runs it to check the model and effort of a
+session an agent asks to start.
 
 `pi-acp` runs one `pi --mode rpc --approve` process per session, loading the
 project's settings, skills, and extensions, and an extension of its own that
@@ -81,7 +82,19 @@ can restart an exited Pi on the same session.
 
 `oxd` supplies each compatible agent with a session-scoped `ox-mcp` stdio
 server. The agent launches it. Its tools call back into the daemon for that
-session: `set_title` sets the session title.
+session:
+
+| Tool | Daemon method | Does |
+| --- | --- | --- |
+| `set_title` | `session.set_title` | Sets the session title |
+| `read_transcript` | `session.transcript` | Reads a page of any session's compact transcript |
+| `list_sessions` | `watch` | Lists the workspaces and the sessions the agent can message |
+| `send_message` | `session.send_message` | Sends a [peer message](glossary.md) to another session |
+| `start_session` | `session.request` | Asks the user to start a new session |
+
+A run's child session gets `ox-mcp --child`, which has only `set_title` and
+`read_transcript`. Messaging and session requests are between standalone
+sessions.
 
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
@@ -190,6 +203,22 @@ once, records it as steered, and records it as taken when the agent answers
 it, or dropped when the agent refuses it, drops it on cancellation, or exits
 first. A steered prompt still pending when the turn ends starts a turn of the
 agent's own.
+
+A peer message starts a turn or steers the running one as a prompt does,
+recorded with its sender's ID and title. The agent gets its text after a
+header that names the sender. A peer message leaves a held queue held. A
+recipient whose agent is not running, parked or restored after a daemon
+restart, is loaded first with the sender's environment, and the message is
+sent once its agent has started.
+
+An agent asks to start a session through a permission request the daemon
+records on the agent's own session, titled with the workspace and describing
+the harness, model, effort, checkout, branch and prompt. The daemon checks the
+request before asking: the workspace, the harness's bridge, the checkout and
+branch, and the model and effort against the values the bridge's
+`--describe` reports. Starting it creates the session as a client's
+`session.new` would, with the requester's environment; declining it, or
+stopping the requester's turn, creates nothing.
 
 Each session keeps a queue of prompts. Whenever the session's agent is idle,
 with no pending request and no steered prompt pending, the daemon starts the

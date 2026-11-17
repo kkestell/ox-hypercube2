@@ -82,6 +82,14 @@
   opacity: var(--dimmed-opacity);
 }
 
+/* A peer message: the sending session above the prompt's bubble. */
+.peer-message {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--spacing);
+}
+
 .thought {
   color: var(--muted-foreground);
 }

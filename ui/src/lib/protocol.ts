@@ -227,6 +227,9 @@ export type Field = {
     }
 );
 
+/** The session that sent a peer message, with its title as of sending. */
+export type Sender = { session_id: string; title: string | null };
+
 export type ToolCallStatus = "pending" | "in_progress" | "completed" | "failed";
 
 export type ToolContent =
@@ -238,9 +241,16 @@ export type ToolContent =
  * in milliseconds since the Unix epoch.
  */
 export type Item = { recorded_at: number } & (
-  | { type: "prompt"; key: string; text: string; attachments: string[] }
+  | {
+      type: "prompt";
+      key: string;
+      text: string;
+      attachments: string[];
+      /** The session that sent the prompt as a peer message. */
+      from?: Sender;
+    }
   /** A prompt sent during a turn that the agent has not taken in yet. */
-  | { type: "steered"; key: string; text: string; attachments: string[] }
+  | { type: "steered"; key: string; text: string; attachments: string[]; from?: Sender }
   | { type: "text"; key: string; text: string; replace: boolean }
   | { type: "thought"; key: string; text: string; replace: boolean }
   | {
@@ -257,6 +267,7 @@ export type Item = { recorded_at: number } & (
       key: string;
       request_id: string;
       title: string;
+      description?: string;
       options: PermissionOption[];
     }
   | {

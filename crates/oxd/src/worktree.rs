@@ -248,6 +248,9 @@ pub struct WorktreePlan {
     /// workspace is of its checkout.
     pub cwd: PathBuf,
     branch: String,
+    /// Whether the branch is new, created by `create_branch`, rather than an
+    /// existing local branch.
+    pub created_branch: bool,
     /// The commit the worktree starts at.
     base: String,
     /// The ref the branch is compared with.
@@ -262,22 +265,25 @@ impl WorktreePlan {
             path: self.path.clone(),
             branch: self.branch.clone(),
             base: self.base.clone(),
-            created_branch: true,
+            created_branch: self.created_branch,
             compare: self.compare.clone(),
             common_dir: self.common_dir.clone(),
         }
     }
 }
 
-/// Resolves worktree `worktree_id` of `workspace`, on a new branch named for
-/// the worktree that starts at `HEAD`, compared with `compare`. Refuses,
-/// having changed nothing, a workspace outside a Git working tree, a
-/// repository with no commits, a comparison ref that is not a commit, or a
-/// worktree directory in `worktrees_dir` that exists already.
+/// Resolves worktree `worktree_id` of `workspace`, on local branch `branch`
+/// at its tip, or on a new branch named for the worktree that starts at
+/// `HEAD`, compared with `compare`. Refuses, having changed nothing, a
+/// workspace outside a Git working tree, a repository with no commits, a
+/// `branch` that is not a local branch or is checked out in a worktree, a
+/// comparison ref that is not a commit, or a worktree directory in
+/// `worktrees_dir` that exists already.
 pub async fn plan(
     git: &Git,
     workspace: &Path,
     compare: Option<String>,
+    branch: Option<String>,
     worktrees_dir: &Path,
     worktree_id: &str,
 ) -> Result<WorktreePlan, ErrorBody> {
@@ -316,11 +322,30 @@ pub async fn plan(
         )));
     }
 
-    let branch = format!("ox/{id8}");
-    let base = git
-        .commit(&top, "HEAD")
-        .await
-        .ok_or_else(|| invalid_request("the repository has no commits".into()))?;
+    let created_branch = branch.is_none();
+    let (branch, base) = match branch {
+        Some(branch) => {
+            let base = git
+                .commit(&top, &format!("refs/heads/{branch}"))
+                .await
+                .ok_or_else(|| invalid_request(format!("{branch} is not a local branch")))?;
+            if let Some(checkout) =
+                checked_out_at(&Repository::new(git, &common_dir), &branch).await?
+            {
+                return Err(invalid_request(format!(
+                    "{branch} is checked out at {checkout}"
+                )));
+            }
+            (branch, base)
+        }
+        None => {
+            let base = git
+                .commit(&top, "HEAD")
+                .await
+                .ok_or_else(|| invalid_request("the repository has no commits".into()))?;
+            (format!("ox/{id8}"), base)
+        }
+    };
     if let Some(compare) = &compare
         && git.commit(&top, compare).await.is_none()
     {
@@ -343,6 +368,7 @@ pub async fn plan(
         common_dir,
         path,
         branch,
+        created_branch,
         base,
         compare,
     })
@@ -468,9 +494,9 @@ async fn restore(git: &Git, worktree: &SavedWorktree) -> Result<(), ErrorBody> {
 }
 
 /// Undoes `create_branch`, and a failed `add` when `added` says it ran:
-/// removes the worktree if git registered it, and deletes the branch if it
-/// still points at its base and no worktree has it checked out. Returns what
-/// could not be undone.
+/// removes the worktree if git registered it, and deletes a branch the plan
+/// created if it still points at its base and no worktree has it checked
+/// out. Returns what could not be undone.
 pub async fn roll_back(git: &Git, plan: &WorktreePlan, added: bool) -> Result<(), String> {
     let mut failures = Vec::new();
     if added
@@ -483,14 +509,16 @@ pub async fn roll_back(git: &Git, plan: &WorktreePlan, added: bool) -> Result<()
     }
     // Another worktree may have checked the branch out meanwhile, which is
     // what made `add` fail.
-    match checked_out_at(&Repository::new(git, &plan.common_dir), &plan.branch).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            if let Err(error) = delete_branch(git, plan).await {
-                failures.push(error);
+    if plan.created_branch {
+        match checked_out_at(&Repository::new(git, &plan.common_dir), &plan.branch).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Err(error) = delete_branch(git, plan).await {
+                    failures.push(error);
+                }
             }
+            Err(error) => failures.push(error.to_string()),
         }
-        Err(error) => failures.push(error.to_string()),
     }
     if failures.is_empty() {
         Ok(())

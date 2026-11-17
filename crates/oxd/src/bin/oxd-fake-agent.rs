@@ -1,6 +1,8 @@
 //! A scripted ACP v2 agent for testing oxd.
 //!
-//! Each prompt's text is a script, one directive per line. The agent
+//! Each prompt's text is a script, one directive per line, after a first
+//! line starting `Message from Ox session`, the header of a peer message,
+//! if it has one. The agent
 //! answers the prompt when it inserts it, echoing it as a `user_message`,
 //! then runs the script as a turn: `running`, the directives' output, and
 //! `idle` with a stop reason.
@@ -68,9 +70,9 @@
 //!   the line, which means the agent did not insert it
 //! - `deferred-reject`: report `running` and `idle` without inserting the
 //!   prompt, and answer it with an error only when the next prompt arrives
-//! - `mcp-title <text>`: start the session's stdio MCP server named `ox`,
-//!   call its `set_title` tool with the rest of the line, and send the tool
-//!   result's text, or the error, as one chunk
+//! - `mcp <tool> <JSON object>`: start the session's stdio MCP server named
+//!   `ox`, call its tool `<tool>` with the object as its arguments, and send
+//!   the tool result's text, or the error, as one chunk
 //! - `shell <JSON string>`: run the decoded text with `sh -c` in the
 //!   session's cwd and append its standard output to the turn's message. A
 //!   non-zero exit ends the turn with the stop reason `error` and the
@@ -119,6 +121,8 @@
 //!   response
 //! - `--hold <path>`: open `path`, a FIFO, for writing and keep it open
 //!   until the process exits, so its reader sees end of file then
+//! - `--describe <dir>`: print the config options and commands a new
+//!   session offers, as a bridge's `--describe` does, and exit
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -471,6 +475,14 @@ async fn main() -> agent_client_protocol::Result<()> {
         next: Mutex::default(),
         instructions: Mutex::default(),
     });
+    if value("--describe").is_some() {
+        let description = serde_json::json!({
+            "configOptions": state.config_options(),
+            "availableCommands": *state.commands.lock().unwrap(),
+        });
+        println!("{description}");
+        return Ok(());
+    }
     agent_client_protocol::Agent
         .v2()
         .name("oxd-fake-agent")
@@ -820,7 +832,7 @@ enum Directive {
     Tool(String),
     /// A call to the `ox` MCP server's tool `name` with `arguments`.
     McpTool {
-        name: &'static str,
+        name: String,
         arguments: serde_json::Value,
     },
     Shell(String),
@@ -835,8 +847,12 @@ enum Directive {
 /// The directives of a script, or the error that answers its prompt.
 fn parse(script: &str) -> Result<Vec<Directive>, Error> {
     let mut directives = Vec::new();
-    for line in script.lines() {
+    let header = |line: &str| line.starts_with("Message from Ox session");
+    for (index, line) in script.lines().enumerate() {
         let line = line.trim();
+        if index == 0 && header(line) {
+            continue;
+        }
         let rest = |name: &str| line.strip_prefix(name).unwrap().trim().to_owned();
         let words: Vec<&str> = line.split_whitespace().collect();
         directives.push(match words.as_slice() {
@@ -883,9 +899,9 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
             ["touch"] => Directive::Touch,
             ["tool", ..] => Directive::Tool(rest("tool")),
             ["instructions"] => Directive::Instructions,
-            ["mcp-title", ..] => Directive::McpTool {
-                name: "set_title",
-                arguments: serde_json::json!({"title": rest("mcp-title")}),
+            ["mcp", name, ..] => Directive::McpTool {
+                name: (*name).to_owned(),
+                arguments: json_after(line, 2)?,
             },
             ["shell", ..] => Directive::Shell(json_after(line, 1)?),
             ["next", ..] => Directive::Next(json_after(line, 1)?),
@@ -1193,7 +1209,7 @@ async fn run(
                         _ => None,
                     });
                 let text = match server {
-                    Some(server) => call_tool(&server, name, arguments)
+                    Some(server) => call_tool(&server, &name, arguments)
                         .await
                         .unwrap_or_else(|error| error.to_string()),
                     None => "no ox MCP server".to_owned(),
@@ -1413,7 +1429,7 @@ fn order(session_id: acp::SessionId) -> acp::CreateElicitationRequest {
 }
 
 /// The JSON string that follows a line's first `words` words, decoded.
-fn json_after(line: &str, words: usize) -> Result<String, Error> {
+fn json_after<T: serde::de::DeserializeOwned>(line: &str, words: usize) -> Result<T, Error> {
     let json = line
         .splitn(words + 1, char::is_whitespace)
         .nth(words)

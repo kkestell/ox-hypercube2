@@ -182,8 +182,8 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
   if (!shown(item)) return null;
   switch (item.type) {
     case "prompt":
-    case "steered":
-      return (
+    case "steered": {
+      const prompt = (
         <div className={item.type === "steered" ? "prompt steered" : "prompt"}>
           <Markdown text={item.text} />
           {item.attachments.map((name, index) => (
@@ -194,6 +194,16 @@ export const ItemView = memo(function ItemView({ item }: { item: Item }) {
           ))}
         </div>
       );
+      if (!item.from) return prompt;
+      return (
+        <div className="peer-message">
+          <p className="sender">
+            {item.from.title ?? `Session ${item.from.session_id.slice(0, 8)}`}
+          </p>
+          {prompt}
+        </div>
+      );
+    }
     case "text":
       return <Markdown text={item.text} />;
     case "thought":

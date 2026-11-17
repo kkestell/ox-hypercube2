@@ -1,14 +1,19 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ox_protocol::schema::{ContentBlock, PromptCapabilities};
+use ox_protocol::schema::{
+    ContentBlock, PermissionOption, PermissionOptionKind, PromptCapabilities,
+    RequestPermissionOutcome, SessionConfigKind, SessionConfigOptionCategory,
+    SessionConfigSelectOptions, TextContent,
+};
 use ox_protocol::{
     Branches, Checkout, CommandState, ConfigSetting, ConfigValue, Deleted, ErrorBody, Focus,
-    Harness, ListingChange, Method, QueueAdded, RunInfo, RunState, SessionInfo, SessionState,
-    StepInfo, StepState, Unseen, WorkspaceInfo, code,
+    Harness, ListingChange, MessageSent, Method, QueueAdded, RunInfo, RunState, Sender,
+    SessionInfo, SessionState, StepInfo, StepState, Unseen, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -457,6 +462,38 @@ impl Daemon {
                 self.session(&session_id)?.cancel();
                 Ok(Value::Null)
             }
+            Method::SessionSendMessage {
+                session_id,
+                to,
+                text,
+            } => Ok(to_value(self.send_message(&session_id, &to, text).await?)),
+            Method::SessionTranscript { session_id, before } => Ok(to_value(
+                self.session(&session_id)?.transcript(before).await?,
+            )),
+            Method::SessionRequest {
+                session_id,
+                prompt,
+                workspace,
+                worktree,
+                branch,
+                harness,
+                model,
+                effort,
+            } => Ok(to_value(
+                self.request_session(
+                    &session_id,
+                    SessionRequest {
+                        prompt,
+                        workspace,
+                        worktree,
+                        branch,
+                        harness,
+                        model,
+                        effort,
+                    },
+                )
+                .await?,
+            )),
             Method::PermissionRespond {
                 session_id,
                 request_id,
@@ -728,33 +765,44 @@ impl Daemon {
             prompt: None,
         };
         let id = uuid::Uuid::new_v4().to_string();
-        let Checkout::Worktree { compare } = checkout else {
+        let Checkout::Worktree { compare, branch } = checkout else {
             return self.add_session(id, workspace_id, command, env, &mut None, opening, prompt);
         };
         let git = Git::for_client(env.clone());
-        self.with_new_worktree(workspace_id, compare, git, "session", |worktree| {
+        self.with_new_worktree(workspace_id, compare, branch, git, "session", |worktree| {
             self.add_session(id, workspace_id, command, env, worktree, opening, prompt)
         })
         .await
     }
 
-    /// Plans a new worktree of the workspace on a new branch at `HEAD`,
-    /// compared with `compare`, creates the branch, and gives `add` the
-    /// worktree to take once it is saved. The branch of a worktree `add` does
-    /// not take, a `what` that was not saved, is deleted again.
+    /// Plans a new worktree of the workspace on local branch `branch`, or on
+    /// a new branch at `HEAD`, which it creates, compared with `compare`,
+    /// and gives `add` the worktree to take once it is saved. A branch
+    /// created for a worktree `add` does not take, a `what` that was not
+    /// saved, is deleted again.
     async fn with_new_worktree<T>(
         &self,
         workspace_id: &str,
         compare: Option<String>,
+        branch: Option<String>,
         git: Git,
         what: &str,
         add: impl FnOnce(&mut Option<(Git, WorktreePlan)>) -> Result<T, ErrorBody>,
     ) -> Result<T, ErrorBody> {
         let workspace = self.workspace_path(workspace_id)?;
         let worktree_id = uuid::Uuid::new_v4().to_string();
-        let plan =
-            worktree::plan(&git, &workspace, compare, &self.worktrees_dir, &worktree_id).await?;
-        worktree::create_branch(&git, &plan).await?;
+        let plan = worktree::plan(
+            &git,
+            &workspace,
+            compare,
+            branch,
+            &self.worktrees_dir,
+            &worktree_id,
+        )
+        .await?;
+        if plan.created_branch {
+            worktree::create_branch(&git, &plan).await?;
+        }
         let mut pending = Some((git, plan));
         let added = add(&mut pending);
         if let Some((git, plan)) = pending
@@ -952,7 +1000,7 @@ impl Daemon {
     ) -> Result<RunInfo, ErrorBody> {
         let definition = workflow::load(&self.workflows_dir, workflow)?;
         let git = Git::for_client(env.clone());
-        self.with_new_worktree(workspace_id, None, git, "run", |pending| {
+        self.with_new_worktree(workspace_id, None, None, git, "run", |pending| {
             self.update(|registry| {
                 if !registry
                     .workspaces
@@ -1009,6 +1057,199 @@ impl Daemon {
         .await
     }
 
+    /// The ACP bridge of `harness`, beside the daemon's executable.
+    fn bridge(harness: Harness) -> Result<PathBuf, ErrorBody> {
+        Ok(std::env::current_exe()
+            .map_err(|error| ErrorBody {
+                code: code::INVALID_STATE,
+                message: format!("finding the daemon's executable: {error}"),
+            })?
+            .with_file_name(harness.bridge()))
+    }
+
+    /// Sends a peer message from standalone session `sender_id` to
+    /// standalone session `to`. An exited recipient is loaded first, with
+    /// the sender's environment, and the message waits for its agent to
+    /// start.
+    async fn send_message(
+        &self,
+        sender_id: &str,
+        to: &str,
+        text: String,
+    ) -> Result<MessageSent, ErrorBody> {
+        let sender = self.session(sender_id)?;
+        if sender.is_child() {
+            return Err(invalid_request(
+                "a workflow run's session cannot send messages".into(),
+            ));
+        }
+        if to == sender_id {
+            return Err(invalid_request("a session cannot message itself".into()));
+        }
+        if text.trim().is_empty() {
+            return Err(invalid_request("the message is empty".into()));
+        }
+        let recipient = self.session(to)?;
+        if recipient.is_child() {
+            return Err(invalid_request(format!(
+                "session {to} belongs to a workflow run"
+            )));
+        }
+        if recipient.archived() {
+            return Err(invalid_state(&format!("session {to} is archived")));
+        }
+        if recipient.state() == SessionState::Exited {
+            let _lifecycle = self.lifecycle(&recipient).await?;
+            recipient.history().await?;
+            if recipient.state() == SessionState::Exited {
+                let registry = self.lock();
+                registry.refuse_moving(recipient.cwd())?;
+                recipient.load(sender.env())?;
+            }
+        }
+        recipient.started().await?;
+        let from = Sender {
+            session_id: sender.id.clone(),
+            title: sender.title(),
+        };
+        let steered = self.send_unmoved(to, |session| session.message(text, from))?;
+        Ok(MessageSent { steered })
+    }
+
+    /// Asks the user, through a permission request on standalone session
+    /// `requester_id`, to start the session `request` describes, once it is
+    /// checked. Starting it, the new session gets the requester's
+    /// environment. Resolves to `None` when the user does not start it.
+    async fn request_session(
+        self: &Arc<Self>,
+        requester_id: &str,
+        request: SessionRequest,
+    ) -> Result<Option<SessionInfo>, ErrorBody> {
+        let requester = self.session(requester_id)?;
+        if requester.is_child() {
+            return Err(invalid_request(
+                "a workflow run's session cannot request sessions".into(),
+            ));
+        }
+        if request.prompt.trim().is_empty() {
+            return Err(invalid_request("the prompt is empty".into()));
+        }
+        let (workspace_id, workspace) = match &request.workspace {
+            Some(path) => {
+                let wanted = resolved(path);
+                self.lock()
+                    .workspaces
+                    .iter()
+                    .find(|workspace| resolved(&workspace.path) == wanted)
+                    .map(|workspace| (workspace.id.clone(), workspace.path.clone()))
+                    .ok_or_else(|| {
+                        invalid_request(format!("{} is not an Ox workspace", path.display()))
+                    })?
+            }
+            None => {
+                let id = requester.workspace_id().to_owned();
+                let path = self.workspace_path(&id)?;
+                (id, path)
+            }
+        };
+        let harness = match request.harness {
+            Some(harness) => harness,
+            None => Harness::of_command(requester.command()).ok_or_else(|| {
+                invalid_request("this session's harness is not known; name one".into())
+            })?,
+        };
+        let bridge = Self::bridge(harness)?;
+        if !bridge.is_file() {
+            return Err(invalid_state(&format!(
+                "the {} bridge is not installed at {}",
+                harness.executable(),
+                bridge.display()
+            )));
+        }
+        let env = requester.env();
+        let git = Git::for_client(env.clone());
+        let (checkout, branch_line) = if request.worktree {
+            let worktree_id = uuid::Uuid::new_v4().to_string();
+            worktree::plan(
+                &git,
+                &workspace,
+                None,
+                request.branch.clone(),
+                &self.worktrees_dir,
+                &worktree_id,
+            )
+            .await?;
+            let head = branches::list(&git, &workspace).await?.head;
+            let branch_line = match &request.branch {
+                Some(branch) => branch.clone(),
+                None => format!("New branch from {}", head.as_deref().unwrap_or("HEAD")),
+            };
+            let checkout = Checkout::Worktree {
+                compare: head,
+                branch: request.branch.clone(),
+            };
+            (checkout, Some(branch_line))
+        } else {
+            let head = match &request.branch {
+                Some(branch) => {
+                    let head = branches::list(&git, &workspace).await?.head;
+                    if head.as_ref() != Some(branch) {
+                        return Err(invalid_request(format!(
+                            "the workspace's checkout is on {}, not {branch}",
+                            head.as_deref().unwrap_or("no branch")
+                        )));
+                    }
+                    head
+                }
+                None => branches::list(&git, &workspace)
+                    .await
+                    .ok()
+                    .and_then(|b| b.head),
+            };
+            (Checkout::Workspace, head)
+        };
+        let config = settings(&bridge, harness, &workspace, &env, &request).await?;
+
+        let name = workspace.file_name().map_or_else(
+            || workspace.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let default = || "Default".to_owned();
+        let mut description = format!(
+            "Harness: {}\nModel: {}\nEffort: {}\nCheckout: {}\n",
+            harness.executable(),
+            request.model.clone().unwrap_or_else(default),
+            request.effort.clone().unwrap_or_else(default),
+            if request.worktree {
+                "New worktree"
+            } else {
+                "Workspace checkout"
+            },
+        );
+        if let Some(branch) = branch_line {
+            let _ = writeln!(description, "Branch: {branch}");
+        }
+        let _ = write!(description, "\n{}", request.prompt);
+        let options = vec![
+            PermissionOption::new("start", "Start Session", PermissionOptionKind::AllowOnce),
+            PermissionOption::new("decline", "Decline", PermissionOptionKind::RejectOnce),
+        ];
+        let outcome = requester
+            .ask(format!("Start a session in {name}?"), description, options)
+            .await;
+        let RequestPermissionOutcome::Selected(selected) = outcome else {
+            return Ok(None);
+        };
+        if *selected.option_id.0 != *"start" {
+            return Ok(None);
+        }
+        let command = vec![bridge.to_string_lossy().into_owned()];
+        let prompt = vec![ContentBlock::Text(TextContent::new(request.prompt))];
+        self.new_session(&workspace_id, command, env, checkout, Some(prompt), config)
+            .await
+            .map(Some)
+    }
+
     /// Saves, registers and starts the child session of step `position` of
     /// `run`, which runs `role`: the bridge of `harness` beside the daemon's
     /// executable, in `cwd` in the run's worktree, with `env` over the
@@ -1022,12 +1263,7 @@ impl Daemon {
         cwd: &Path,
         env: BTreeMap<String, String>,
     ) -> Result<Arc<Session>, ErrorBody> {
-        let bridge = std::env::current_exe()
-            .map_err(|error| ErrorBody {
-                code: code::INVALID_STATE,
-                message: format!("finding the daemon's executable: {error}"),
-            })?
-            .with_file_name(harness.bridge());
+        let bridge = Self::bridge(harness)?;
         let command = vec![bridge.to_string_lossy().into_owned()];
         let id = uuid::Uuid::new_v4().to_string();
         self.update(|registry| {
@@ -1325,7 +1561,84 @@ impl Daemon {
     }
 }
 
-/// The current time in milliseconds since the Unix epoch.
+/// A session that one asks the user to start, as `session.request` gives it.
+struct SessionRequest {
+    prompt: String,
+    workspace: Option<PathBuf>,
+    worktree: bool,
+    branch: Option<String>,
+    harness: Option<Harness>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// The settings of the requested model and effort, each checked against
+/// the values of the option of its category that the bridge's `--describe`
+/// reports in `workspace`.
+async fn settings(
+    bridge: &Path,
+    harness: Harness,
+    workspace: &Path,
+    env: &BTreeMap<String, String>,
+    request: &SessionRequest,
+) -> Result<Vec<ConfigSetting>, ErrorBody> {
+    let wanted = [
+        (SessionConfigOptionCategory::Model, "model", &request.model),
+        (
+            SessionConfigOptionCategory::ThoughtLevel,
+            "effort",
+            &request.effort,
+        ),
+    ];
+    if wanted.iter().all(|(_, _, value)| value.is_none()) {
+        return Ok(Vec::new());
+    }
+    let harness = harness.executable();
+    let controls = ox_protocol::describe(bridge, workspace, env)
+        .await
+        .map_err(|error| ErrorBody {
+            code: code::AGENT,
+            message: format!("asking {harness} for its options: {error}"),
+        })?;
+    let mut settings = Vec::new();
+    for (category, label, value) in wanted {
+        let Some(value) = value else {
+            continue;
+        };
+        let option = controls
+            .config_options
+            .iter()
+            .find(|option| option.category.as_ref() == Some(&category))
+            .ok_or_else(|| invalid_request(format!("{harness} has no {label} option")))?;
+        let values: Vec<String> = match &option.kind {
+            SessionConfigKind::Select(select) => match &select.options {
+                SessionConfigSelectOptions::Ungrouped(options) => options
+                    .iter()
+                    .map(|option| option.value.to_string())
+                    .collect(),
+                SessionConfigSelectOptions::Grouped(groups) => groups
+                    .iter()
+                    .flat_map(|group| &group.options)
+                    .map(|option| option.value.to_string())
+                    .collect(),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if !values.contains(value) {
+            return Err(invalid_request(format!(
+                "{value} is not a {label} {harness} offers; it offers {}",
+                values.join(", ")
+            )));
+        }
+        settings.push(ConfigSetting {
+            config_id: option.config_id.to_string(),
+            value: ConfigValue::Id(value.clone()),
+        });
+    }
+    Ok(settings)
+}
+
 /// The text blocks of a prompt, joined by newlines.
 fn prompt_text(prompt: &[ContentBlock]) -> String {
     prompt
@@ -1338,6 +1651,7 @@ fn prompt_text(prompt: &[ContentBlock]) -> String {
         .join("\n")
 }
 
+/// The current time in milliseconds since the Unix epoch.
 pub fn now() -> u64 {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)

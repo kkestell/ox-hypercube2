@@ -208,10 +208,15 @@ pub async fn serve(
             },
             // Creating a session in a worktree, starting a run, deleting a
             // session or a run, listing or moving branches and comparing a
-            // worktree's branch wait on git, so each runs in its own task and
-            // the connection keeps serving other requests. A client that
+            // worktree's branch wait on git, and messaging a session, reading
+            // its transcript and requesting a session wait on agents, the
+            // database or the user, so each runs in its own task and the
+            // connection keeps serving other requests. A client that
             // disconnects does not cancel it; oxd stopping does.
             method @ (Method::SessionNew { .. }
+            | Method::SessionSendMessage { .. }
+            | Method::SessionTranscript { .. }
+            | Method::SessionRequest { .. }
             | Method::SessionDelete { .. }
             | Method::RunStart { .. }
             | Method::RunDelete { .. }

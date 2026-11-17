@@ -19,7 +19,7 @@ mod messages;
 #[cfg(unix)]
 pub use client::{
     Client, End, Error, Stream, Subscription, config_dir, daemon_binary, data_dir,
-    default_socket_path,
+    default_socket_path, describe,
 };
 #[cfg(unix)]
 pub mod content;

@@ -17,6 +17,9 @@ ownership and lifecycle.
 - **Steered prompt**: A prompt sent during a turn, which the agent takes into
   that turn at its next opportunity. Distinct from a queued prompt, which
   waits for the turn to end.
+- **Peer message**: A message one standalone session's agent sends another
+  through the `ox` tools, recorded with its sender. It starts a turn or steers
+  like a prompt sent now, without resuming a held queue.
 - **Agent**: The ACP-speaking process that `oxd` runs for a session.
 - **Bridge**: An ACP agent that adapts another tool's interface. `claude-code-acp`
   bridges the Claude Code CLI to ACP.

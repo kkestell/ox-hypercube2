@@ -13,6 +13,10 @@ starting at the workspace checkout's `HEAD`. Session in Worktree is offered
 for workspaces in a Git working tree and requires a checked-out branch with a
 commit when the message is sent.
 
+A session an agent asks the user to start can also run in a worktree on an
+existing local branch that no worktree has checked out, starting at the
+branch's tip.
+
 ## Worktrees
 
 Each worktree is the directory `worktrees/<checkout name>-<first 8 digits of
@@ -58,10 +62,10 @@ Submodule checkouts stay at their current commits when the branch moves.
 The sidebar hides archived sessions until **Show Archived** is checked in the
 workspace name's context menu.
 
-Ox creates the branch for every worktree session. Delete removes the branch
-when no worktree has it checked out and every commit on it outside the
-ancestry of the session's starting commit is reachable from another branch, a
-remote branch, or a tag.
+Delete keeps a branch the session's worktree was added on. It removes a
+branch Ox created for the session when no worktree has it checked out and
+every commit on it outside the ancestry of the session's starting commit is
+reachable from another branch, a remote branch, or a tag.
 If those conditions fail or the repository is missing, Ox keeps the branch
 and reports its name.
 

@@ -8,18 +8,21 @@ use ox_protocol::schema::{
     MessageId, PermissionOption, RequestPermissionSubject, SessionUpdate, StopReason,
     ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
 };
-use ox_protocol::{Event, EventKind, MaybeUndefined};
+use ox_protocol::{Event, EventKind, MaybeUndefined, Sender};
 use serde::Serialize;
 
 /// An item for the UI to insert or update by key, or a request to remove.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Item {
-    /// A prompt: its text and the names of its attachments.
+    /// A prompt: its text and the names of its attachments, and the
+    /// session that sent it as a peer message.
     Prompt {
         key: String,
         text: String,
         attachments: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<Sender>,
     },
     /// Agent message text for block `key`: appended to it, or replacing it
     /// when `replace` is set.
@@ -43,11 +46,13 @@ pub enum Item {
         raw_input: Option<serde_json::Value>,
         content: Vec<ToolContent>,
     },
-    /// A permission request, with its Markdown title.
+    /// A permission request, with its Markdown title and its description.
     Permission {
         key: String,
         request_id: String,
         title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         options: Vec<PermissionOption>,
     },
     /// A form the agent asks the user to fill in, with its message and fields.
@@ -57,11 +62,14 @@ pub enum Item {
         message: String,
         fields: Vec<Field>,
     },
-    /// A prompt sent during a turn that the agent has not taken in yet.
+    /// A prompt sent during a turn that the agent has not taken in yet, as
+    /// for `Prompt`.
     Steered {
         key: String,
         text: String,
         attachments: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        from: Option<Sender>,
     },
     /// The item with `key` is gone: a resolved request, or a steered prompt
     /// the agent took in or dropped.
@@ -187,11 +195,14 @@ impl Call {
     }
 }
 
-/// A user message replayed outside a turn, with what it holds so far.
+/// A user message replayed outside a turn, with what it holds so far, or a
+/// prompt's.
 #[derive(Default)]
 struct UserMessage {
     text: String,
     attachments: Vec<String>,
+    /// The sender of a peer message.
+    from: Option<Sender>,
 }
 
 /// The fold of a session's events, from its first.
@@ -228,20 +239,22 @@ impl Conversation {
                 Vec::new()
             }
             EventKind::TurnStarted | EventKind::AgentParked => Vec::new(),
-            EventKind::PromptStarted { prompt } => {
-                let prompt = prompt_message(prompt);
+            EventKind::PromptStarted { prompt, from } => {
+                let prompt = prompt_message(prompt, from.as_ref());
                 vec![Item::Prompt {
                     key,
                     text: prompt.text,
                     attachments: prompt.attachments,
+                    from: prompt.from,
                 }]
             }
-            EventKind::PromptSteered { prompt } => {
-                let prompt = prompt_message(prompt);
+            EventKind::PromptSteered { prompt, from } => {
+                let prompt = prompt_message(prompt, from.as_ref());
                 let item = Item::Steered {
                     key,
                     text: prompt.text.clone(),
                     attachments: prompt.attachments.clone(),
+                    from: prompt.from.clone(),
                 };
                 self.steered.insert(event.seq, prompt);
                 vec![item]
@@ -258,6 +271,7 @@ impl Conversation {
                             key,
                             text: message.text,
                             attachments: message.attachments,
+                            from: message.from,
                         },
                     ],
                     None => vec![removed],
@@ -273,9 +287,9 @@ impl Conversation {
             EventKind::PermissionRequested {
                 request_id,
                 title,
+                description,
                 subject,
                 options,
-                ..
             } => {
                 // A tool call subject carries the tool call's details.
                 let mut items = match subject {
@@ -288,6 +302,7 @@ impl Conversation {
                     key: format!("request:{request_id}"),
                     request_id: request_id.clone(),
                     title: title.clone(),
+                    description: description.clone(),
                     options: options.clone(),
                 });
                 items
@@ -457,8 +472,9 @@ fn texts(content: &[ContentBlock]) -> String {
         .collect()
 }
 
-/// A prompt's text blocks, joined, and the names of its attachments.
-fn prompt_message(prompt: &[ContentBlock]) -> UserMessage {
+/// A prompt's text blocks, joined, the names of its attachments, and its
+/// sender.
+fn prompt_message(prompt: &[ContentBlock], from: Option<&Sender>) -> UserMessage {
     let mut text = Vec::new();
     let mut attachments = Vec::new();
     for block in prompt {
@@ -467,6 +483,7 @@ fn prompt_message(prompt: &[ContentBlock]) -> UserMessage {
     UserMessage {
         text: text.join("\n\n"),
         attachments,
+        from: from.cloned(),
     }
 }
 
@@ -475,6 +492,7 @@ fn user_item(id: &MessageId, message: &UserMessage) -> Item {
         key: format!("user:{id}"),
         text: message.text.clone(),
         attachments: message.attachments.clone(),
+        from: None,
     }
 }
 
@@ -651,6 +669,7 @@ mod tests {
                 text(prompt),
                 ContentBlock::ResourceLink(ResourceLink::new("a.rs", "file:///a.rs")),
             ],
+            from: None,
         }
     }
 
@@ -834,6 +853,7 @@ mod tests {
             key: format!("user:{id}"),
             text: text.into(),
             attachments: Vec::new(),
+            from: None,
         };
         assert_eq!(
             items,
@@ -846,6 +866,7 @@ mod tests {
                     key: "6".into(),
                     text: "live".into(),
                     attachments: vec!["a.rs".into()],
+                    from: None,
                 },
                 Item::TurnCompleted { key: "9".into() },
             ]
@@ -867,6 +888,7 @@ mod tests {
                 text(prompt),
                 ContentBlock::ResourceLink(ResourceLink::new("a.rs", "file:///a.rs")),
             ],
+            from: None,
         }
     }
 
@@ -885,6 +907,7 @@ mod tests {
                     key: "2".into(),
                     text: "also".into(),
                     attachments: vec!["a.rs".into()],
+                    from: None,
                 },
                 item_text("text:m", "working", false),
                 Item::Removed { key: "2".into() },
@@ -892,7 +915,46 @@ mod tests {
                     key: "4".into(),
                     text: "also".into(),
                     attachments: vec!["a.rs".into()],
+                    from: None,
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_peer_message_keeps_its_sender_when_steered_and_taken() {
+        let from = Sender {
+            session_id: "s2".into(),
+            title: Some("Fix the build".into()),
+        };
+        let started = EventKind::PromptStarted {
+            prompt: vec![text("hello")],
+            from: Some(from.clone()),
+        };
+        let steered = EventKind::PromptSteered {
+            prompt: vec![text("also")],
+            from: Some(from.clone()),
+        };
+        let items = fold(vec![
+            started,
+            steered,
+            EventKind::SteeredPromptTaken { prompt: 2 },
+        ]);
+        let senders: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Prompt { key, from, .. } | Item::Steered { key, from, .. } => {
+                    Some((key.as_str(), from.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            senders,
+            [
+                ("1", Some(from.clone())),
+                ("2", Some(from.clone())),
+                ("3", Some(from)),
             ]
         );
     }
@@ -1096,7 +1158,7 @@ mod tests {
         let items = fold(vec![EventKind::PermissionRequested {
             request_id: "1".into(),
             title: "Allow Read?".into(),
-            description: None,
+            description: Some("Reads a.rs".into()),
             subject: Some(RequestPermissionSubject::ToolCall(Box::new(
                 ToolCallPermissionSubject::new(details),
             ))),
@@ -1104,8 +1166,10 @@ mod tests {
         }]);
         assert!(matches!(
             &items[..],
-            [first, Item::Permission { title, .. }]
-                if *first == tool(ToolCallStatus::Pending, Vec::new()) && title == "Allow Read?"
+            [first, Item::Permission { title, description: Some(description), .. }]
+                if *first == tool(ToolCallStatus::Pending, Vec::new())
+                    && title == "Allow Read?"
+                    && description == "Reads a.rs"
         ));
     }
 
@@ -1175,6 +1239,7 @@ mod tests {
             key: format!("request:{request_id}"),
             request_id: request_id.into(),
             title: "Allow?".into(),
+            description: None,
             options: Vec::new(),
         };
         let resolved = |request_id: &str| Item::Removed {

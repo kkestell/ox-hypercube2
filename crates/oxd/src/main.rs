@@ -21,6 +21,7 @@ mod session;
 mod shell;
 mod state;
 mod store;
+mod transcript;
 mod workflow;
 mod worktree;
 

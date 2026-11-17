@@ -94,7 +94,10 @@ async fn branches(client: &Client, path: &Path) -> Result<Branches, Error> {
 
 /// A new worktree on the session's `ox/<id8>` branch.
 fn on_ox_branch() -> Checkout {
-    Checkout::Worktree { compare: None }
+    Checkout::Worktree {
+        compare: None,
+        branch: None,
+    }
 }
 
 /// Asks for a session of the fake agent in a workspace for `path`.
@@ -350,6 +353,58 @@ async fn a_session_runs_in_a_new_worktree_on_a_new_branch() {
         git(repo.path(), &["status", "--porcelain", "--ignored"]),
         status
     );
+}
+
+/// A worktree on an existing local branch starts at the branch's tip, and
+/// deleting its session keeps the branch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_runs_in_a_worktree_on_an_existing_branch() {
+    let repo = repo();
+    git(repo.path(), &["checkout", "--quiet", "-b", "topic"]);
+    commit_file(repo.path(), "topic.txt");
+    let tip = git(repo.path(), &["rev-parse", "HEAD"]);
+    git(repo.path(), &["checkout", "--quiet", "main"]);
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let on_topic = Checkout::Worktree {
+        compare: None,
+        branch: Some("topic".into()),
+    };
+
+    let session = new_session(&client, repo.path(), on_topic.clone())
+        .await
+        .unwrap();
+    let session = started(&client, &session).await;
+    let worktree = worktree_of(&client, &session).await;
+    assert_eq!(
+        (
+            worktree.branch.as_str(),
+            worktree.base.as_str(),
+            worktree.created_branch
+        ),
+        ("topic", tip.as_str(), false)
+    );
+    assert_eq!(git(&worktree.path, &["branch", "--show-current"]), "topic");
+
+    // The branch is checked out in the session's worktree now.
+    let refused = refusal(new_session(&client, repo.path(), on_topic).await);
+    assert_eq!(refused.code, code::INVALID_REQUEST);
+    assert!(
+        refused.message.starts_with("topic is checked out at "),
+        "{refused:?}"
+    );
+    let missing = Checkout::Worktree {
+        compare: None,
+        branch: Some("missing".into()),
+    };
+    let refused = refusal(new_session(&client, repo.path(), missing).await);
+    assert_eq!(refused.message, "missing is not a local branch");
+    assert_eq!(sessions(&client).await.len(), 1);
+
+    let deleted = delete(&client, &session.id, false).await.unwrap();
+    assert_eq!(deleted, Deleted { kept_branch: None });
+    assert_removed(repo.path(), &worktree);
+    assert_eq!(git(repo.path(), &["rev-parse", "topic"]), tip);
 }
 
 /// A watch lists a session's worktree as its own entry, before the session
@@ -1505,6 +1560,7 @@ async fn deleting_an_archived_session_removes_it_and_applies_the_branch_rule() {
 fn compared_with(reference: &str) -> Checkout {
     Checkout::Worktree {
         compare: Some(reference.into()),
+        branch: None,
     }
 }
 

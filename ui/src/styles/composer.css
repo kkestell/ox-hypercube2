@@ -288,6 +288,11 @@
   border-radius: var(--radius-2xl);
 }
 
+/* A request's description keeps its lines. */
+.request-panel .description {
+  white-space: pre-wrap;
+}
+
 /* The panel's content scrolls inside its padding, above the actions. */
 .request-panel .scroll {
   min-height: 0;

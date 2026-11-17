@@ -602,22 +602,6 @@ impl StepContext<'_> {
                 }
             }
         }
-        let sets_options = [&agent.model, &agent.effort, &agent.permission_mode]
-            .iter()
-            .any(|value| value.is_some());
-        if sets_options && session.info().config_options.is_empty() {
-            // Pi's bridge reports its options in an update once Pi starts,
-            // after the session opens.
-            // TODO: An agent that never reports options leaves the step
-            // waiting until the run is cancelled.
-            'reported: loop {
-                for event in next_events(&session, &mut cursor, cancel).await? {
-                    if let EventKind::Update(SessionUpdate::ConfigOptionUpdate(_)) = event.kind {
-                        break 'reported;
-                    }
-                }
-            }
-        }
         configure(&session, agent, cancel).await?;
         Ok(session)
     }

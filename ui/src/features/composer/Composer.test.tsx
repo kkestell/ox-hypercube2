@@ -261,6 +261,27 @@ describe("A permission request", () => {
   });
 });
 
+describe("A session request", () => {
+  it("shows its description under its title", async () => {
+    const task = session(project, { title: "Task", state: "awaiting_permission" });
+    const core = await viewSession(task);
+    core.update(task.id, {
+      type: "permission",
+      recorded_at: 0,
+      key: "request:1",
+      request_id: "1",
+      title: "Start a session in ox?",
+      description: "Harness: claude\nCheckout: New worktree\n\nReview the change.",
+      options: [{ optionId: "start", name: "Start Session", kind: "allow_once" }],
+    });
+    const panel = document.querySelector(".request-panel")!;
+    expect(panel.querySelector(".title")).toHaveTextContent("Start a session in ox?");
+    expect(panel.querySelector(".title + .description")!.textContent).toBe(
+      "Harness: claude\nCheckout: New worktree\n\nReview the change.",
+    );
+  });
+});
+
 describe("An agent's form", () => {
   const fields: Field[] = [
     {

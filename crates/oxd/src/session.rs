@@ -9,14 +9,16 @@ use agent_client_protocol::v2::schema::{
     CancelSessionNotification, CancelledPermissionOutcome, ClientCapabilities, ContentBlock,
     CreateElicitationRequest, CreateElicitationResponse, ElicitationAction,
     ElicitationCapabilities, ElicitationFormCapabilities, Implementation, InitializeRequest,
-    NewSessionRequest, PromptRequest, ReplayFrom, ReplayFromStart, RequestPermissionRequest,
-    RequestPermissionResponse, ResumeSessionRequest, SessionConfigOption, SessionConfigOptionValue,
+    NewSessionRequest, PermissionOption, PromptRequest, ReplayFrom, ReplayFromStart,
+    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
+    ResumeSessionRequest, SessionConfigOption, SessionConfigOptionValue,
     SetSessionConfigOptionRequest, SystemPrompt, TextContent, UpdateSessionNotification,
 };
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use ox_protocol::{
-    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, SessionInfo, SessionState, Unseen, code,
+    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo, SessionState,
+    TranscriptPage, Unseen, code,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -25,6 +27,7 @@ use crate::instructions::{self, StepRole};
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, Store};
+use crate::transcript;
 use crate::worktree::Worktree;
 
 type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
@@ -72,6 +75,8 @@ pub struct Session {
     created_at: u64,
     command: Vec<String>,
     cwd: PathBuf,
+    /// The environment the agent was last launched with, over the daemon's.
+    env: Mutex<BTreeMap<String, String>>,
     /// The worktree the session runs in. Unset when it could not be added.
     worktree: Mutex<Option<Arc<Worktree>>>,
     /// Whether the session is archived.
@@ -226,6 +231,7 @@ impl Session {
             created_at: saved.created_at,
             command: saved.command,
             cwd: saved.cwd,
+            env: Mutex::default(),
             worktree: Mutex::new(worktree),
             archived: Mutex::new(saved.archived),
             lifecycle: Arc::default(),
@@ -300,6 +306,7 @@ impl Session {
         env: BTreeMap<String, String>,
         mut launch: Launch,
     ) {
+        self.env.lock().unwrap().clone_from(&env);
         let (commands, commands_rx) = mpsc::unbounded_channel();
         if let Launch::New(opening) = &mut launch
             && let Some((prompt, seq)) = opening.prompt.take()
@@ -379,6 +386,30 @@ impl Session {
     /// The directory the session's agent runs in.
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    /// The command that runs the session's agent.
+    pub fn command(&self) -> &[String] {
+        &self.command
+    }
+
+    /// The environment the agent was last launched with, over the daemon's:
+    /// empty for a session restored from the database that has not loaded.
+    pub fn env(&self) -> BTreeMap<String, String> {
+        self.env.lock().unwrap().clone()
+    }
+
+    pub fn title(&self) -> Option<String> {
+        self.lock().title().map(String::from)
+    }
+
+    /// Whether the session is a run's child session.
+    pub fn is_child(&self) -> bool {
+        self.run_focused.is_some()
     }
 
     pub fn worktree(&self) -> Option<Arc<Worktree>> {
@@ -529,6 +560,80 @@ impl Session {
     /// records it.
     pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<u64, ErrorBody> {
         self.send_prompt(Request::Prompt(prompt))
+    }
+
+    /// Sends a peer message from `from` now, starting a turn or steering the
+    /// running one, and returns whether it steered.
+    pub fn message(&self, text: String, from: Sender) -> Result<bool, ErrorBody> {
+        self.update(|state| {
+            let steered = state.in_turn();
+            let (prompt, seq) = state
+                .request(Request::Message { text, from })?
+                .expect("a message sends a prompt");
+            self.send(Command::Prompt { prompt, seq });
+            Ok(steered)
+        })
+    }
+
+    /// Waits until the session is not `starting`. A session whose agent
+    /// exits instead gives the agent's error.
+    pub async fn started(&self) -> Result<(), ErrorBody> {
+        // `update` sends on `last_seq` under the state lock, so the state is
+        // read here, after each change, not in a watch callback.
+        let mut changes = self.last_seq.subscribe();
+        loop {
+            match self.state() {
+                SessionState::Starting => {}
+                SessionState::Exited => {
+                    let state = self.lock();
+                    let error = state
+                        .events()
+                        .iter()
+                        .rev()
+                        .find_map(|event| match &event.kind {
+                            EventKind::AgentExited { error } => Some(error.clone()),
+                            _ => None,
+                        });
+                    return Err(ErrorBody {
+                        code: code::AGENT,
+                        message: match error.flatten() {
+                            Some(error) => format!("the agent did not start: {error}"),
+                            None => "the agent exited while starting".into(),
+                        },
+                    });
+                }
+                _ => return Ok(()),
+            }
+            changes
+                .changed()
+                .await
+                .expect("the session holds the sender");
+        }
+    }
+
+    /// Asks the session's user a permission request of the daemon's own,
+    /// with `title`, `description` and `options`, and waits for the answer.
+    /// A request the session cannot take, or that is cancelled, as stopping
+    /// the turn does, is answered `cancelled`.
+    pub async fn ask(
+        &self,
+        title: String,
+        description: String,
+        options: Vec<PermissionOption>,
+    ) -> RequestPermissionOutcome {
+        let (answer, outcome) = oneshot::channel();
+        let request =
+            RequestPermissionRequest::new(self.id.clone(), title, options).description(description);
+        self.record(Change::PermissionRequested { request, answer });
+        outcome
+            .await
+            .unwrap_or_else(|_| CancelledPermissionOutcome::new().into())
+    }
+
+    /// A page of the session's compact transcript, before seq `before`.
+    pub async fn transcript(&self, before: Option<u64>) -> Result<TranscriptPage, ErrorBody> {
+        self.history().await?;
+        Ok(transcript::page(self.lock().events(), before))
     }
 
     /// Appends a prompt to the queue and returns its ID.
@@ -872,7 +977,11 @@ impl Session {
                     // chapter), so every later update finds it live.
                     let prompt_capabilities = capabilities.prompt.unwrap_or_default();
                     let mcp_servers = if capabilities.mcp.is_some_and(|mcp| mcp.stdio.is_some()) {
-                        vec![session.ox_server.for_session(&session.id)]
+                        vec![
+                            session
+                                .ox_server
+                                .for_session(&session.id, session.is_child()),
+                        ]
                     } else {
                         Vec::new()
                     };

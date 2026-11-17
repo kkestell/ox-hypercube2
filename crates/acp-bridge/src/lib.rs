@@ -25,14 +25,17 @@ use serde_json::{Value, json};
 pub trait Bridge: Send + Sync + 'static {
     fn initialize(&self, request: &acp::InitializeRequest) -> acp::InitializeResponse;
 
-    /// Opens a new session without starting its native process.
+    /// Opens a new session. The returned future resolves to the response,
+    /// which carries the session's config options and commands where the
+    /// bridge knows them before answering.
     fn new_session(
-        &self,
+        self: &Arc<Self>,
         request: acp::NewSessionRequest,
-    ) -> std::result::Result<acp::NewSessionResponse, Error>;
+        connection: &ConnectionTo<Client>,
+    ) -> impl Future<Output = std::result::Result<acp::NewSessionResponse, Error>> + Send + 'static;
 
-    /// Reports a new session idle and starts its native process, once the
-    /// client knows the session.
+    /// Reports a new session idle, once the client knows the session, and
+    /// starts its native process if `new_session` did not.
     fn start_new(self: &Arc<Self>, id: &str, connection: &ConnectionTo<Client>);
 
     fn resume_session(
@@ -83,13 +86,18 @@ pub async fn serve<B: Bridge, H: HandleDispatchFrom<Client>>(
                 async move |request: acp::NewSessionRequest,
                             responder: Responder<acp::NewSessionResponse>,
                             connection: ConnectionTo<Client>| {
-                    let response = bridge.new_session(request);
-                    let id = response.as_ref().ok().map(|new| new.session_id.to_string());
-                    respond(responder, response)?;
-                    if let Some(id) = id {
-                        bridge.start_new(&id, &connection);
-                    }
-                    Ok(())
+                    let opening = bridge.new_session(request, &connection);
+                    let bridge = bridge.clone();
+                    let started = connection.clone();
+                    connection.spawn(async move {
+                        let response = opening.await;
+                        let id = response.as_ref().ok().map(|new| new.session_id.to_string());
+                        respond(responder, response)?;
+                        if let Some(id) = id {
+                            bridge.start_new(&id, &started);
+                        }
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),

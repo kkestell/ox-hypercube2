@@ -8,9 +8,9 @@ use agent_client_protocol::v2::schema::{
     ElicitationSchema, ElicitationScope, EmbeddedResourceResource, PermissionOption,
     PromptCapabilities, RequestPermissionOutcome, RequestPermissionRequest,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
-    SessionUpdate, StateUpdate, ToolCallId,
+    SessionUpdate, StateUpdate, TextContent, ToolCallId,
 };
-use ox_protocol::{ErrorBody, Event, EventKind, QueuedPrompt, SessionState, Unseen, code};
+use ox_protocol::{ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionState, Unseen, code};
 use tokio::sync::oneshot;
 
 /// Events a subscriber is handed at a time.
@@ -43,6 +43,13 @@ pub enum Request {
     /// A prompt to send now: it starts a turn on an idle session and steers
     /// a running one.
     Prompt(Vec<ContentBlock>),
+    /// A peer message from another session, sent now as a prompt is, but
+    /// leaving a held queue held. The agent gets `text` after a header that
+    /// names the sender.
+    Message {
+        text: String,
+        from: Sender,
+    },
     QueueAdd(QueuedPrompt),
     /// Replaces the queued prompt with the same ID.
     QueueEdit(QueuedPrompt),
@@ -827,6 +834,7 @@ impl State {
         self.queue_changed = true;
         self.append(EventKind::PromptStarted {
             prompt: prompt.clone(),
+            from: None,
         });
         Some((prompt, seq))
     }
@@ -910,6 +918,17 @@ impl State {
         self.last_seq
     }
 
+    /// Every event the session holds, in order. A session that has not
+    /// loaded its history holds none.
+    pub fn events(&self) -> &[Event] {
+        self.events.as_deref().unwrap_or_default()
+    }
+
+    /// Whether a turn is running, which a prompt sent now steers.
+    pub fn in_turn(&self) -> bool {
+        matches!(&self.phase, Phase::Live(live) if live.turn.is_some())
+    }
+
     /// Checks that a subscriber that has every event through `after_seq`
     /// has more to come, the last of them `SessionClosed`.
     pub fn subscribe(&self, after_seq: u64) -> Result<(), ErrorBody> {
@@ -946,19 +965,29 @@ impl State {
             unreachable!("a first prompt is recorded while the agent starts");
         };
         *first = Some(seq);
-        self.append(EventKind::PromptStarted { prompt });
+        self.append(EventKind::PromptStarted { prompt, from: None });
         seq
     }
 
-    /// Applies a client's request. A prompt it sends now is returned, with
-    /// the seq of the `PromptStarted` or `PromptSteered` event that records
-    /// it.
+    /// Applies a client's request. A prompt it sends now is returned as the
+    /// agent is to get it, with the seq of the `PromptStarted` or
+    /// `PromptSteered` event that records it.
     pub fn request(
         &mut self,
         request: Request,
     ) -> Result<Option<(Vec<ContentBlock>, u64)>, ErrorBody> {
         let event = match (&mut self.phase, request) {
-            (_, Request::Prompt(prompt)) => return self.send_now(prompt).map(Some),
+            (_, Request::Prompt(prompt)) => return self.send_now(prompt, None, true).map(Some),
+            (_, Request::Message { text, from }) => {
+                let header = message_header(&from);
+                let prompt = vec![ContentBlock::Text(TextContent::new(text.clone()))];
+                let (_, seq) = self.send_now(prompt, Some(from), false)?;
+                let agent_prompt = format!("{header}\n\n{text}");
+                return Ok(Some((
+                    vec![ContentBlock::Text(TextContent::new(agent_prompt))],
+                    seq,
+                )));
+            }
             (Phase::Closed, Request::QueueAdd(_) | Request::QueueEdit(_)) => {
                 return Err(invalid_state(SessionState::Exited));
             }
@@ -983,7 +1012,7 @@ impl State {
             }
             (_, Request::QueueSend { id }) => {
                 let index = self.queued_index(&id)?;
-                let sent = self.send_now(self.queue.prompts[index].prompt.clone())?;
+                let sent = self.send_now(self.queue.prompts[index].prompt.clone(), None, true)?;
                 self.queue.prompts.remove(index);
                 self.queue_changed = true;
                 return Ok(Some(sent));
@@ -1052,12 +1081,15 @@ impl State {
         Ok(None)
     }
 
-    /// Sends a prompt now: on an idle session it starts a turn, and during a
-    /// turn it steers it. Either resumes a held queue. Returns the prompt and
-    /// the seq of the event that records it.
+    /// Sends a prompt now, recorded with its sender `from`: on an idle
+    /// session it starts a turn, and during a turn it steers it. Either
+    /// resumes a held queue when `resume_queue` is set. Returns the prompt
+    /// and the seq of the event that records it.
     fn send_now(
         &mut self,
         prompt: Vec<ContentBlock>,
+        from: Option<Sender>,
+        resume_queue: bool,
     ) -> Result<(Vec<ContentBlock>, u64), ErrorBody> {
         let seq = self.last_seq + 1;
         let Phase::Live(live) = &mut self.phase else {
@@ -1068,16 +1100,20 @@ impl State {
             live.steered.push(seq);
             EventKind::PromptSteered {
                 prompt: prompt.clone(),
+                from,
             }
         } else if live.state() == SessionState::Idle {
             live.turn = Some(Turn::Prompted(seq));
             EventKind::PromptStarted {
                 prompt: prompt.clone(),
+                from,
             }
         } else {
             return Err(invalid_state(live.state()));
         };
-        self.resume();
+        if resume_queue {
+            self.resume();
+        }
         self.append(event);
         Ok((prompt, seq))
     }
@@ -1142,6 +1178,21 @@ impl State {
         }
         events.push(event);
     }
+}
+
+/// The line before a peer message's text that tells the agent who sent it
+/// and how to answer.
+fn message_header(from: &Sender) -> String {
+    let title = from
+        .title
+        .as_ref()
+        .map(|title| format!(" (\"{title}\")"))
+        .unwrap_or_default();
+    format!(
+        "Message from Ox session {}{title}. Your reply in this conversation does not reach it; \
+         answer with the ox tool send_message.",
+        from.session_id
+    )
 }
 
 /// Whether an event is a turn's end other than a normal one: an error, or a
@@ -1765,6 +1816,79 @@ mod tests {
         assert_eq!(state.state(), SessionState::Idle);
     }
 
+    fn message(state: &mut State, text: &str) -> Result<(Vec<ContentBlock>, u64), ErrorBody> {
+        state
+            .request(Request::Message {
+                text: text.into(),
+                from: Sender {
+                    session_id: "peer".into(),
+                    title: Some("Plan the work".into()),
+                },
+            })
+            .map(|sent| sent.expect("a message is sent"))
+    }
+
+    #[test]
+    fn a_peer_message_starts_a_turn_or_steers_with_its_sender_and_a_header_for_the_agent() {
+        let sender = Some(Sender {
+            session_id: "peer".into(),
+            title: Some("Plan the work".into()),
+        });
+        let mut state = started();
+        let (agent_prompt, seq) = message(&mut state, "hello").unwrap();
+        assert_eq!(
+            state.events_after(seq - 1)[0].kind,
+            EventKind::PromptStarted {
+                prompt: text("hello"),
+                from: sender.clone(),
+            }
+        );
+        assert_eq!(
+            agent_prompt,
+            text(
+                "Message from Ox session peer (\"Plan the work\"). Your reply in this \
+                 conversation does not reach it; answer with the ox tool send_message.\n\nhello"
+            )
+        );
+        assert!(state.in_turn());
+        let (_, seq) = message(&mut state, "also").unwrap();
+        assert_eq!(
+            state.events_after(seq - 1)[0].kind,
+            EventKind::PromptSteered {
+                prompt: text("also"),
+                from: sender,
+            }
+        );
+    }
+
+    #[test]
+    fn an_untitled_sender_is_named_by_its_id_alone() {
+        let header = message_header(&Sender {
+            session_id: "peer".into(),
+            title: None,
+        });
+        assert!(
+            header.starts_with("Message from Ox session peer. "),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn a_peer_message_after_a_cancelled_turn_leaves_the_queue_held() {
+        let mut state = started();
+        prompt(&mut state).unwrap();
+        enqueue(&mut state, "first");
+        state.record(running());
+        state.record(Change::Cancelled);
+        state.record(idle(Some(StopReason::Cancelled)));
+        message(&mut state, "hello").unwrap();
+        assert_eq!(state.state(), SessionState::Running);
+        state.record(running());
+        state.record(idle(Some(StopReason::EndTurn)));
+        assert_eq!(start_queued(&mut state), None);
+        assert_eq!(queued_ids(&state), ["first"]);
+    }
+
     #[test]
     fn queued_prompts_start_one_turn_each_in_order_after_normal_ends() {
         let mut state = started();
@@ -1892,9 +2016,11 @@ mod tests {
             agent_started(),
             EventKind::PromptStarted {
                 prompt: text("hello"),
+                from: None,
             },
             EventKind::PromptSteered {
                 prompt: text("also"),
+                from: None,
             },
         ]));
         assert_eq!(

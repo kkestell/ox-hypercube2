@@ -17,6 +17,8 @@ keep working when the app closes.
 - File attachments on prompts.
 - Prompts queued while an agent works, sent one per turn by the daemon, and
   prompts that steer the running turn.
+- Agent tools to message other sessions, read any session's transcript, and
+  ask the user to start a new session.
 - Conversations and tool output saved by the daemon, so sessions survive app
   and daemon restarts.
 - Archiving, which removes a session's worktree and keeps its conversation and

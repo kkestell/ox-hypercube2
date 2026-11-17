@@ -175,7 +175,9 @@ function sidebar(): Scenario {
   }
   listing.session("Old exploration", "exited");
   listing.session("Debug the parser crash", "exited").unseen = "error";
-  listing.session("Explain the event store", "idle").unseen = "finished";
+  const explainer = listing.session("Explain the event store", "idle");
+  explainer.unseen = "finished";
+  const reviewer = listing.session("Hand off the store review", "awaiting_permission");
   listing.session("Which bugs next?", "awaiting_input");
   const working = listing.session("Fix sidebar colors", "running");
   working.queue = [
@@ -275,6 +277,37 @@ function sidebar(): Scenario {
           key: "12",
           text: "Keep the failed colour as it is.",
           attachments: [],
+        },
+      ],
+      [reviewer.id]: [
+        {
+          recorded_at: listing.tick(),
+          type: "prompt",
+          key: "1",
+          text: "The event store change is ready. Can someone review it?",
+          attachments: [],
+          from: { session_id: explainer.id, title: "Explain the event store" },
+        },
+        {
+          recorded_at: listing.tick(),
+          type: "text",
+          key: "text:1",
+          text: "I'll ask for a review session.",
+          replace: false,
+        },
+        {
+          recorded_at: listing.tick(),
+          type: "permission",
+          key: "request:1",
+          request_id: "1",
+          title: "Start a session in ox?",
+          description:
+            "Harness: claude\nModel: Default\nEffort: Default\nCheckout: New worktree\n" +
+            "Branch: New branch from main\n\nReview the event store change on main.",
+          options: [
+            { optionId: "start", name: "Start Session", kind: "allow_once" },
+            { optionId: "decline", name: "Decline", kind: "reject_once" },
+          ],
         },
       ],
     },

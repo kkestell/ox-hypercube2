@@ -285,7 +285,7 @@ fn running(kind: &EventKind) -> bool {
 /// The prompt of a `prompt_started` event.
 fn started_prompt(event: &Event) -> &[ContentBlock] {
     match &event.kind {
-        EventKind::PromptStarted { prompt } => prompt,
+        EventKind::PromptStarted { prompt, .. } => prompt,
         other => panic!("expected prompt_started, got {other:?}"),
     }
 }
@@ -313,7 +313,8 @@ async fn a_prompt_sent_during_a_turn_is_taken_into_it() {
     assert_eq!(
         turn[0].kind,
         EventKind::PromptSteered {
-            prompt: text("also")
+            prompt: text("also"),
+            from: None,
         }
     );
     assert_eq!(
@@ -495,7 +496,8 @@ async fn queued_prompts_are_edited_and_removed_until_they_are_sent() {
     assert_eq!(
         steered.last().unwrap().kind,
         EventKind::PromptSteered {
-            prompt: text("text \"edited\"")
+            prompt: text("text \"edited\""),
+            from: None,
         }
     );
     let edit = client
@@ -1535,7 +1537,10 @@ async fn prompt_content_reaches_the_agent() {
     ];
     client.prompt(&session.id, prompt.clone()).await.unwrap();
     let turn = until(&mut events, turn_ended).await;
-    assert_eq!(turn[0].kind, EventKind::PromptStarted { prompt });
+    assert_eq!(
+        turn[0].kind,
+        EventKind::PromptStarted { prompt, from: None }
+    );
     assert_eq!(
         chunks(&turn),
         ["text image:image/png link:file:///a.rs resource:file:///b.md"]
@@ -1578,7 +1583,10 @@ async fn prompt_content_the_agent_does_not_accept_is_rejected() {
     client.prompt(&session.id, prompt.clone()).await.unwrap();
     let turn = until(&mut events, turn_ended).await;
     assert_eq!(turn[0].seq, started + 1);
-    assert_eq!(turn[0].kind, EventKind::PromptStarted { prompt });
+    assert_eq!(
+        turn[0].kind,
+        EventKind::PromptStarted { prompt, from: None }
+    );
     assert_eq!(chunks(&turn), ["text link:file:///a.rs"]);
 }
 
@@ -2232,7 +2240,8 @@ async fn a_new_sessions_first_prompt_shows_before_its_agent_starts() {
     assert_eq!(
         first.kind,
         EventKind::PromptStarted {
-            prompt: text("text \"hello\"\n  text   \"!\"")
+            prompt: text("text \"hello\"\n  text   \"!\""),
+            from: None,
         }
     );
     assert_eq!(
@@ -2496,7 +2505,10 @@ async fn agent_sets_title_through_ox_mcp_server() {
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     client
-        .prompt(&session.id, text("mcp-title Renamed  by\tagent"))
+        .prompt(
+            &session.id,
+            text(r#"mcp set_title {"title": "Renamed  by\tagent"}"#),
+        )
         .await
         .unwrap();
     let turn = until(&mut events, turn_ended).await;

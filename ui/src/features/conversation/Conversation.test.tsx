@@ -198,6 +198,35 @@ describe("A turn", () => {
     expect(transcript.querySelector(".steered")).toBeNull();
   });
 
+  it("shows a peer message's sender above it", async () => {
+    const { transcript } = await conversation(
+      {
+        type: "prompt",
+        recorded_at: 0,
+        key: "1",
+        text: "Are you done?",
+        attachments: [],
+        from: { session_id: "0123456789abcdef", title: "Plan the work" },
+      },
+      {
+        type: "steered",
+        recorded_at: 0,
+        key: "2",
+        text: "Still there?",
+        attachments: [],
+        from: { session_id: "0123456789abcdef", title: null },
+      },
+    );
+    const senders = [...transcript.querySelectorAll(".peer-message")].map((message) => [
+      message.querySelector(".sender")!.textContent,
+      message.querySelector(".prompt")!.textContent,
+    ]);
+    expect(senders).toEqual([
+      ["Plan the work", "Are you done?"],
+      ["Session 01234567", "Still there?"],
+    ]);
+  });
+
   it("reports that the agent exited", async () => {
     await conversation({ type: "agent_exited", recorded_at: 0, key: "exit", error: "status 3" });
     expect(screen.getByText("The agent exited: status 3")).toBeInTheDocument();

@@ -30,6 +30,7 @@ export function Permission({
         <p className="title">
           <CodeSpans text={item.title} />
         </p>
+        {item.description && <p className="description">{item.description}</p>}
       </div>
       <div className="actions">
         {item.options.map((option) => (

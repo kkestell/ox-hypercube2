@@ -7,15 +7,13 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ox_protocol::schema::{
-    AvailableCommand, ContentBlock, ElicitationAction, SessionConfigOption, TextContent,
-};
+use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigSetting, ConfigValue, Deleted, DirEntry, Error, FileContent,
-    Focus, Harness, ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code,
-    content, default_socket_path,
+    Branches, Checkout, Client, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, Error,
+    FileContent, Focus, Harness, ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo,
+    code, content, default_socket_path, describe,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
@@ -391,32 +389,11 @@ async fn new_session(
         .map_err(message)
 }
 
-/// The config options and slash commands an agent offers a new session.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all(deserialize = "camelCase"))]
-struct Controls {
-    config_options: Vec<SessionConfigOption>,
-    available_commands: Vec<AvailableCommand>,
-}
-
 /// The controls `agent` offers a new session in `cwd`, which its bridge's
 /// `--describe` mode reports. A bridge that fails gives its standard error.
 #[tauri::command]
 async fn agent_controls(agent: Harness, cwd: PathBuf) -> Result<Controls, String> {
-    let output = tokio::process::Command::new(bridge(agent)?)
-        .arg("--describe")
-        .arg(&cwd)
-        .env_clear()
-        .envs(utf8_env())
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .map_err(message)?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    serde_json::from_slice(&output.stdout).map_err(message)
+    describe(&bridge(agent)?, &cwd, &utf8_env()).await
 }
 
 /// Restarts the agent of an exited session, which replays its conversation.
