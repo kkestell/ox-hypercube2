@@ -25,7 +25,7 @@ install: export CARGO_TARGET_DIR := $(CURDIR)/target
 install:
 	@test "$$(uname -s)" = Darwin || { echo 'make install requires macOS' >&2; exit 1; }
 	cargo build --release -p oxd -p ox-mcp -p claude-code-acp -p pi-acp
-	cd ui && npm run tauri -- build --bundles app --no-sign
+	cd ui && npm install && npm run tauri -- build --bundles app --no-sign
 	cp target/release/oxd target/release/ox-mcp target/release/claude-code-acp target/release/pi-acp "$(APP_BUNDLE)/Contents/MacOS/"
 	for binary in oxd ox-mcp claude-code-acp pi-acp; do \
 		codesign --force --sign - "$(APP_BUNDLE)/Contents/MacOS/$$binary" || exit; \

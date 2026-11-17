@@ -28,6 +28,11 @@ export default defineConfig(() => ({
       : undefined,
   },
 
+  // The UI loads from disk inside the app, so bundle size has no download cost.
+  build: {
+    chunkSizeWarningLimit: 2000,
+  },
+
   test: {
     environment: "jsdom",
     include: ["src/**/*.test.{ts,tsx}"],
