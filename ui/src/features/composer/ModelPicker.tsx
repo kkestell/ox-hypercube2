@@ -19,10 +19,12 @@ function choices(option: SelectConfig): SelectOption[] {
 export function ModelPicker({
   model,
   effort,
+  disabled = false,
   onChange,
 }: {
   model: SelectConfig;
   effort: SelectConfig | undefined;
+  disabled?: boolean;
   /** Sets `option` to `value` and resolves to whether the agent accepted it. */
   onChange: (option: SelectConfig, value: string) => Promise<boolean>;
 }) {
@@ -67,6 +69,7 @@ export function ModelPicker({
         type="button"
         className="select-picker model-picker"
         aria-haspopup="dialog"
+        disabled={disabled}
         popoverTarget="model-menu"
         style={{ anchorName: "--model-picker" }}
       >

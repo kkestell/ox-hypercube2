@@ -29,11 +29,22 @@ use crate::worktree::Worktree;
 
 type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
 
-/// How an agent task opens its ACP session: a new one, for the workflow
-/// step a run's child session runs, or a resumed one.
+/// How an agent task opens its ACP session: a new one, or a resumed one.
 enum Launch {
-    New(Option<StepRole>),
+    New(Opening),
     Resume(Resume),
+}
+
+/// What a new session's agent is given once it opens its ACP session.
+#[derive(Default)]
+pub struct Opening {
+    /// The workflow step a run's child session runs.
+    pub step: Option<StepRole>,
+    /// Option values the agent is set to where it reports others.
+    pub options: Vec<(String, SessionConfigOptionValue)>,
+    /// The first prompt, with the seq of the `PromptStarted` event that
+    /// `queue_prompt` recorded for it, sent after the options.
+    pub prompt: Option<(Vec<ContentBlock>, u64)>,
 }
 
 enum Command {
@@ -253,17 +264,23 @@ impl Session {
         .await;
     }
 
-    /// Launches the agent of a session that is still `starting`, running the
-    /// workflow step `step` when it is a run's child. The session records
-    /// `AgentStarted` once the ACP session is open, or `AgentExited` if it
-    /// cannot be opened. A session closed before it started stays closed.
-    pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>, step: Option<StepRole>) {
+    /// Launches the agent of a session that is still `starting`, with what
+    /// `opening` gives it. The session records `AgentStarted` once the ACP
+    /// session is open, or `AgentExited` if it cannot be opened. A session
+    /// closed before it started stays closed.
+    pub fn start(self: &Arc<Self>, env: BTreeMap<String, String>, opening: Opening) {
         // Holding the task slot keeps a concurrent `close` from missing the
         // agent's task.
         let mut task = self.task.lock().unwrap();
         if self.state() == SessionState::Starting {
-            self.launch(&mut task, env, Launch::New(step));
+            self.launch(&mut task, env, Launch::New(opening));
         }
+    }
+
+    /// Records the first prompt of a session that is still `starting` and
+    /// returns the seq of its `PromptStarted` event. `start` sends it.
+    pub fn queue_prompt(&self, prompt: Vec<ContentBlock>) -> u64 {
+        self.update(|state| state.queue_prompt(prompt))
     }
 
     /// Records that the session's worktree could not be added: the session
@@ -275,14 +292,20 @@ impl Session {
         });
     }
 
-    /// Starts the agent task in `task`, which opens or resumes an ACP session.
+    /// Starts the agent task in `task`, which opens or resumes an ACP
+    /// session. A new session's first prompt is its task's first command.
     fn launch(
         self: &Arc<Self>,
         task: &mut Option<JoinHandle<()>>,
         env: BTreeMap<String, String>,
-        launch: Launch,
+        mut launch: Launch,
     ) {
         let (commands, commands_rx) = mpsc::unbounded_channel();
+        if let Launch::New(opening) = &mut launch
+            && let Some((prompt, seq)) = opening.prompt.take()
+        {
+            let _ = commands.send(Command::Prompt { prompt, seq });
+        }
         *self.commands.lock().unwrap() = commands;
         *task = Some(tokio::spawn(self.clone().run(commands_rx, env, launch)));
     }
@@ -524,10 +547,7 @@ impl Session {
         if matches!(state, SessionState::Starting | SessionState::Exited) {
             return Err(invalid_state(state));
         }
-        let value = match value {
-            ConfigValue::Boolean(value) => SessionConfigOptionValue::boolean(value),
-            ConfigValue::Id(id) => SessionConfigOptionValue::id(id),
-        };
+        let value = option_value(value);
         let (reply, result) = oneshot::channel();
         self.send(Command::SetConfigOption {
             config_id,
@@ -814,7 +834,7 @@ impl Session {
                     // TODO: A new session whose agent exits before its first
                     // prompt is resumed without them.
                     let step = match &launch {
-                        Launch::New(step) => step.as_ref(),
+                        Launch::New(opening) => opening.step.as_ref(),
                         Launch::Resume(_) => None,
                     };
                     let instructions = instructions::text(step, !mcp_servers.is_empty());
@@ -840,14 +860,12 @@ impl Session {
                             let _ = opened.send(result);
                         }
                     };
-                    let mut saved_options = Vec::new();
-                    match launch {
+                    let options = match launch {
                         Launch::Resume(Resume {
                             session_id,
                             replay,
                             options,
                         }) => {
-                            saved_options = options;
                             connection
                                 .prepare_request(
                                     ResumeSessionRequest::new(
@@ -869,31 +887,36 @@ impl Session {
                                     }));
                                     Ok(())
                                 })?;
+                            options
                         }
-                        Launch::New(_) => connection
-                            .prepare_request(
-                                NewSessionRequest::new(session.cwd.clone())
-                                    .mcp_servers(mcp_servers)
-                                    .system_prompt(system_prompt),
-                            )
-                            .on_receiving_result(async move |result| {
-                                start(result.map(|created| state::Agent {
-                                    session_id: created.session_id.to_string(),
-                                    prompt_capabilities,
-                                    config_options: created.config_options,
-                                    available_commands: created.available_commands,
-                                }));
-                                Ok(())
-                            })?,
-                    }
+                        Launch::New(opening) => {
+                            connection
+                                .prepare_request(
+                                    NewSessionRequest::new(session.cwd.clone())
+                                        .mcp_servers(mcp_servers)
+                                        .system_prompt(system_prompt),
+                                )
+                                .on_receiving_result(async move |result| {
+                                    start(result.map(|created| state::Agent {
+                                        session_id: created.session_id.to_string(),
+                                        prompt_capabilities,
+                                        config_options: created.config_options,
+                                        available_commands: created.available_commands,
+                                    }));
+                                    Ok(())
+                                })?;
+                            opening.options
+                        }
+                    };
                     let acp_session = open.await.map_err(|_| {
                         agent_client_protocol::Error::internal_error()
                             .data("the agent closed the connection before the session opened")
                     })??;
-                    // A resumed agent reports its own option values, and is
-                    // set to the session's where they differ.
+                    // The agent reports its own option values, and is set to
+                    // the resumed session's, or those a new session was
+                    // given, where they differ.
                     let reported = state::option_values(&session.info().config_options);
-                    for (config_id, value) in saved_options {
+                    for (config_id, value) in options {
                         if !reported
                             .iter()
                             .any(|(id, current)| *id == config_id && *current != value)
@@ -912,7 +935,7 @@ impl Session {
                                     Ok(response) => session
                                         .record(Change::ConfigOptionsSet(response.config_options)),
                                     Err(error) => eprintln!(
-                                        "oxd: restoring a config option of session {}: {error}",
+                                        "oxd: setting a config option of session {}: {error}",
                                         session.id
                                     ),
                                 }
@@ -992,6 +1015,14 @@ impl Session {
             )
             .await;
         self.record(Change::Exited(result.err().map(|error| error.to_string())));
+    }
+}
+
+/// The ACP value of an option value from a client.
+pub fn option_value(value: ConfigValue) -> SessionConfigOptionValue {
+    match value {
+        ConfigValue::Boolean(value) => SessionConfigOptionValue::boolean(value),
+        ConfigValue::Id(id) => SessionConfigOptionValue::id(id),
     }
 }
 

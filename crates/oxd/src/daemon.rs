@@ -4,10 +4,11 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ox_protocol::schema::{ContentBlock, PromptCapabilities};
 use ox_protocol::{
-    Branches, Checkout, CommandState, ConfigValue, Deleted, ErrorBody, Focus, Harness,
-    ListingChange, Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo, StepState,
-    Unseen, WorkspaceInfo, code,
+    Branches, Checkout, CommandState, ConfigSetting, ConfigValue, Deleted, ErrorBody, Focus,
+    Harness, ListingChange, Method, RunInfo, RunState, SessionInfo, SessionState, StepInfo,
+    StepState, Unseen, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -17,8 +18,8 @@ use crate::directories::Directories;
 use crate::instructions::StepRole;
 use crate::mcp::OxServer;
 use crate::run::{Run, RunFocus};
-use crate::session::{Session, SessionFocus};
-use crate::state::{Change, State};
+use crate::session::{self, Opening, Session, SessionFocus};
+use crate::state::{self, Change, State};
 use crate::store::{SavedRun, SavedSession, SavedWorkspace, SessionWorktree, Store};
 use crate::workflow;
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
@@ -187,6 +188,8 @@ impl Daemon {
                     .expect("a session's worktree is saved")
                     .clone()
             });
+            // TODO: A never-started session's first prompt is not shown
+            // after a restart.
             if saved.agent_session_id.is_none() && worktree.is_none() {
                 store.remove_session(&saved.id)?;
                 continue;
@@ -378,8 +381,10 @@ impl Daemon {
                 command,
                 env,
                 checkout,
+                prompt,
+                config,
             } => Ok(to_value(
-                self.new_session(&workspace_id, command, env, checkout)
+                self.new_session(&workspace_id, command, env, checkout, prompt, config)
                     .await?,
             )),
             Method::SessionLoad { session_id, env } => {
@@ -651,7 +656,8 @@ impl Daemon {
         })
     }
 
-    /// Creates a session in the workspace's directory or in a new worktree.
+    /// Creates a session in the workspace's directory or in a new worktree,
+    /// with its first prompt and the option values its agent is set to.
     /// For a worktree, the branch is resolved and created here, and the
     /// worktree is added before the session's agent starts.
     async fn new_session(
@@ -660,17 +666,32 @@ impl Daemon {
         command: Vec<String>,
         env: BTreeMap<String, String>,
         checkout: Checkout,
+        prompt: Option<Vec<ContentBlock>>,
+        config: Vec<ConfigSetting>,
     ) -> Result<SessionInfo, ErrorBody> {
         if command.is_empty() {
             return Err(invalid_request("command is empty".into()));
         }
+        // The agent's capabilities are unknown until it starts, so a first
+        // prompt holds what every agent accepts.
+        if let Some(prompt) = &prompt {
+            state::check_prompt(prompt, &PromptCapabilities::default())?;
+        }
+        let opening = Opening {
+            step: None,
+            options: config
+                .into_iter()
+                .map(|setting| (setting.config_id, session::option_value(setting.value)))
+                .collect(),
+            prompt: None,
+        };
         let id = uuid::Uuid::new_v4().to_string();
         let Checkout::Worktree { compare } = checkout else {
-            return self.add_session(id, workspace_id, command, env, &mut None);
+            return self.add_session(id, workspace_id, command, env, &mut None, opening, prompt);
         };
         let git = Git::for_client(env.clone());
         self.with_new_worktree(workspace_id, compare, git, "session", |worktree| {
-            self.add_session(id, workspace_id, command, env, worktree)
+            self.add_session(id, workspace_id, command, env, worktree, opening, prompt)
         })
         .await
     }
@@ -703,8 +724,13 @@ impl Daemon {
     }
 
     /// Saves and registers a session, with its worktree if it has one, and
-    /// starts it, taking the worktree to add. A session that cannot be saved
-    /// leaves the worktree where it is.
+    /// starts it with `opening`, taking the worktree to add. A first
+    /// `prompt` is recorded at once and titles the session. A session that
+    /// cannot be saved leaves the worktree where it is.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the session's saved parts and what its agent is given"
+    )]
     fn add_session(
         self: &Arc<Self>,
         id: String,
@@ -712,6 +738,8 @@ impl Daemon {
         command: Vec<String>,
         env: BTreeMap<String, String>,
         worktree: &mut Option<(Git, WorktreePlan)>,
+        mut opening: Opening,
+        prompt: Option<Vec<ContentBlock>>,
     ) -> Result<SessionInfo, ErrorBody> {
         self.update(|registry| {
             let workspace = registry
@@ -739,6 +767,15 @@ impl Daemon {
                 },
                 None,
             )?;
+            if let Some(prompt) = prompt {
+                if let Some(title) = acp_bridge::title(&prompt_text(&prompt)) {
+                    session
+                        .set_title(&title)
+                        .expect("a title from a prompt is not empty");
+                }
+                let seq = session.queue_prompt(prompt.clone());
+                opening.prompt = Some((prompt, seq));
+            }
             match (session.worktree(), worktree.take()) {
                 (Some(live_worktree), Some((git, plan))) => {
                     registry
@@ -752,9 +789,10 @@ impl Daemon {
                         git,
                         plan,
                         env,
+                        opening,
                     ));
                 }
-                _ => session.start(env, None),
+                _ => session.start(env, opening),
             }
             Ok(session.info())
         })
@@ -824,9 +862,14 @@ impl Daemon {
         Ok(session)
     }
 
-    /// Adds the session's worktree, then launches its agent in it. If the
-    /// worktree cannot be added, undoes the branch and the worktree, forgets
-    /// the worktree, and the session exits with git's error and no worktree.
+    /// Adds the session's worktree, then launches its agent in it with
+    /// `opening`. If the worktree cannot be added, undoes the branch and the
+    /// worktree, forgets the worktree, and the session exits with git's
+    /// error and no worktree.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the session, its worktree, and what its agent is given"
+    )]
     async fn start_in_worktree(
         self: Arc<Self>,
         session: Arc<Session>,
@@ -835,9 +878,10 @@ impl Daemon {
         git: Git,
         plan: WorktreePlan,
         env: BTreeMap<String, String>,
+        opening: Opening,
     ) {
         let Err(mut message) = worktree::add(&git, &plan).await else {
-            session.start(env, None);
+            session.start(env, opening);
             return;
         };
         if let Err(error) = self.store.remove_worktree(&live_worktree.id) {
@@ -953,7 +997,13 @@ impl Daemon {
                 || Some(run.worktree.clone()),
                 Some(run.focused()),
             )?;
-            session.start(env, Some(role));
+            session.start(
+                env,
+                Opening {
+                    step: Some(role),
+                    ..Opening::default()
+                },
+            );
             run.set_step_session(position, &session.id);
             Ok(session)
         })
@@ -1232,6 +1282,18 @@ impl Daemon {
 }
 
 /// The current time in milliseconds since the Unix epoch.
+/// The text blocks of a prompt, joined by newlines.
+fn prompt_text(prompt: &[ContentBlock]) -> String {
+    prompt
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn now() -> u64 {
     let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)

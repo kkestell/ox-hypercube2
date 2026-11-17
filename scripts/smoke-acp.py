@@ -406,6 +406,33 @@ class SmokeRun:
         check(not running_after(self.agent_pids, 10), "ACP agent did not exit")
         self.report("delete_and_idle_exit", agent_exited=True, socket_removed=True)
 
+    def check_describe(self):
+        """Reads a new session's controls with the bridge's `--describe`, as
+        the app does for a draft."""
+        description = json.loads(
+            command(
+                [*self.agent, "--describe", str(self.project)],
+                env=self.env,
+                timeout=self.args.timeout,
+            )
+        )
+        model = next(
+            (o for o in description["configOptions"] if o.get("category") == "model"),
+            None,
+        )
+        check(model is not None, f"Described no model option: {description}")
+        probe = next(
+            (c for c in description["availableCommands"] if c["name"] == self.probe),
+            None,
+        )
+        check(probe is not None, f"Described no probe command: {description}")
+        self.check_probe(probe)
+        self.report(
+            "describe_lists_options_and_commands",
+            model=model["currentValue"],
+            command=probe,
+        )
+
     def check_reconnect(self):
         token = self.directory.name
         self.attach(0)
@@ -691,6 +718,7 @@ class ClaudeRun(SmokeRun):
 
     def checks(self):
         return (
+            self.check_describe,
             self.check_reconnect,
             self.check_effort,
             self.check_commands,
@@ -1042,6 +1070,7 @@ class PiRun(SmokeRun):
 
     def checks(self):
         return (
+            self.check_describe,
             self.check_reconnect,
             self.check_thinking,
             self.check_commands,

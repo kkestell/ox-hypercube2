@@ -200,9 +200,13 @@ export async function openMenu(cwd: string) {
   return menu;
 }
 
-/** Starts a Session in Worktree in the workspace in `cwd`, and returns its worktree's path. */
+/**
+ * Starts a Session in Worktree in the workspace in `cwd` by sending its draft's
+ * first message, and returns its worktree's path.
+ */
 export async function newWorktreeSession(cwd: string): Promise<string> {
   await (await openMenu(cwd)).$("button=Session in Worktree").click();
+  await send("hello");
   const select = worktreeEntry().$("button.select");
   await expect(select).toHaveAttribute("aria-current", "true");
   return (await select.getAttribute("title"))!.replace(/\/$/, "");

@@ -7,7 +7,7 @@
  * per render). A change that renders or parses in proportion to the session
  * list or the transcript fails by hundreds.
  */
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { toHast } from "mdast-util-to-hast";
@@ -110,7 +110,18 @@ describe("Work", () => {
     });
   });
 
-  it("renders nothing in the transcript while a draft is typed", async () => {
+  it("renders no session row while a new session's draft is typed", async () => {
+    await bigWorkspace();
+    const menu = within(screen.getByRole("region", { name: "project" })).getByRole("menu", {
+      hidden: true,
+    });
+    await userEvent.click(within(menu).getByText("Session in Checkout"));
+    expect(
+      await work(() => userEvent.type(screen.getByRole("combobox", { name: "Message" }), "hi")),
+    ).toEqual({ parses: 0, blocks: 0, rows: 0 });
+  });
+
+  it("renders nothing in the transcript while a message is typed", async () => {
     await bigWorkspace();
     expect(
       await work(() => userEvent.type(screen.getByRole("combobox", { name: "Message" }), "hi")),

@@ -7,6 +7,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use ox_protocol::schema::{ContentBlock, SessionUpdate};
 use ox_protocol::{
     Branches, Checkout, Client, Comparison, Deleted, Error, EventKind, ListingChange, SessionInfo,
     SessionState, WorktreeInfo, code,
@@ -122,7 +123,9 @@ async fn new_session_running(
     command: Vec<String>,
 ) -> Result<SessionInfo, Error> {
     let workspace = workspace_id(client, path).await;
-    client.new_session(&workspace, command, env, checkout).await
+    client
+        .new_session(&workspace, command, env, checkout, Vec::new(), None)
+        .await
 }
 
 /// Starts a session of the fake agent holding `agent` in a new worktree of
@@ -478,6 +481,88 @@ async fn a_worktree_that_cannot_be_added_is_undone() {
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
     assert!(sessions(&client).await.is_empty());
+}
+
+/// Asks for a session of the fake agent in a new worktree of the
+/// repository at `path`, with git run with `env` and the first prompt
+/// `script`.
+async fn new_prompted_session(
+    client: &Client,
+    path: &Path,
+    env: BTreeMap<String, String>,
+    script: &str,
+) -> SessionInfo {
+    let workspace = workspace_id(client, path).await;
+    client
+        .new_session(
+            &workspace,
+            vec![FAKE_AGENT.into()],
+            env,
+            on_ox_branch(),
+            Vec::new(),
+            Some(text(script)),
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_sessions_first_prompt_runs_in_the_worktree_once_added() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let blocked = BlockedGit::new(" worktree add ");
+
+    let session = new_prompted_session(&client, repo.path(), blocked.env(), "shell \"pwd\"").await;
+    blocked.blocked().await;
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::PromptStarted { .. }
+    ));
+    blocked.release().await;
+
+    let turn = until(&mut events, turn_ended).await;
+    let output: String = turn
+        .iter()
+        .filter_map(|event| match &event.kind {
+            EventKind::Update(SessionUpdate::AgentMessageChunk(chunk)) => match &chunk.content {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        Path::new(output.trim()).canonicalize().unwrap(),
+        session.cwd.canonicalize().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worktree_that_cannot_be_added_ends_the_first_prompts_turn() {
+    let repo = repo();
+    let daemon = Daemon::start().await;
+    std::fs::create_dir(daemon.worktrees()).unwrap();
+    std::fs::set_permissions(daemon.worktrees(), PermissionsExt::from_mode(0o555)).unwrap();
+    let client = daemon.client().await;
+
+    let session = new_prompted_session(&client, repo.path(), BTreeMap::new(), "pid").await;
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::PromptStarted { .. }
+    ));
+    let ended = next(&mut events).await;
+    assert!(
+        matches!(&ended.kind, EventKind::TurnEnded { error: Some(error), .. } if error.contains("worktree add")),
+        "{ended:?}"
+    );
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::AgentExited { error: Some(_) }
+    ));
+    std::fs::set_permissions(daemon.worktrees(), PermissionsExt::from_mode(0o755)).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

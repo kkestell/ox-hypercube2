@@ -10,9 +10,9 @@ use ox_protocol::schema::{
     TextContent, TextResourceContents,
 };
 use ox_protocol::{
-    Checkout, Client, ConfigValue, DirEntry, End, EntryKind, Error, Event, EventKind, Focus,
-    Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream, Subscription,
-    Unseen, WorkspaceInfo, code,
+    Checkout, Client, ConfigSetting, ConfigValue, DirEntry, End, EntryKind, Error, Event,
+    EventKind, Focus, Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream,
+    Subscription, Unseen, WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -52,6 +52,8 @@ impl Daemon {
                 fake_agent(args),
                 BTreeMap::new(),
                 Checkout::Workspace,
+                Vec::new(),
+                None,
             )
             .await
             .unwrap();
@@ -805,6 +807,8 @@ async fn delete_while_starting() {
             fake_agent(&args),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1436,6 +1440,8 @@ async fn a_session_runs_in_its_workspace() {
             fake_agent(&[]),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1446,6 +1452,8 @@ async fn a_session_runs_in_its_workspace() {
             Vec::new(),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap_err();
@@ -1472,6 +1480,8 @@ async fn workspaces_and_sessions_survive_a_restart() {
             fake_agent(&["--hang-initialize"]),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1883,6 +1893,8 @@ async fn only_an_exited_session_that_started_can_be_loaded() {
             vec![daemon.cwd().join("missing").to_string_lossy().into()],
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1914,6 +1926,8 @@ async fn an_agent_without_session_capabilities_cannot_run_sessions() {
             fake_agent(&["--no-sessions"]),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1929,6 +1943,151 @@ async fn an_agent_without_session_capabilities_cannot_run_sessions() {
     );
 }
 
+impl Daemon {
+    /// Creates a session of the fake agent with `args`, given its first
+    /// prompt and option values.
+    async fn new_session_prompted(
+        &self,
+        client: &Client,
+        args: &[&str],
+        config: Vec<ConfigSetting>,
+        prompt: Vec<ContentBlock>,
+    ) -> Result<SessionInfo, Error> {
+        let workspace = self.workspace(client).await;
+        client
+            .new_session(
+                &workspace.id,
+                fake_agent(args),
+                BTreeMap::new(),
+                Checkout::Workspace,
+                config,
+                Some(prompt),
+            )
+            .await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_sessions_first_prompt_shows_before_its_agent_starts() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    // The agent blocks opening the FIFO for writing until the test opens it
+    // for reading.
+    let fifo = daemon.dir.path().join("start");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let session = daemon
+        .new_session_prompted(
+            &client,
+            &["--hold", fifo.to_str().unwrap()],
+            Vec::new(),
+            text("text \"hello\"\n  text   \"!\""),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session.state, SessionState::Starting);
+    assert_eq!(session.title.as_deref(), Some("text \"hello\" text \"!\""));
+    let listed = sessions(&client).await;
+    assert_eq!(
+        listed[0].title.as_deref(),
+        Some("text \"hello\" text \"!\"")
+    );
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    let first = next(&mut events).await;
+    assert_eq!(
+        first.kind,
+        EventKind::PromptStarted {
+            prompt: text("text \"hello\"\n  text   \"!\"")
+        }
+    );
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Starting
+    );
+
+    let reader = tokio::task::spawn_blocking(move || {
+        let mut held = std::fs::File::open(fifo).unwrap();
+        std::io::Read::read_to_end(&mut held, &mut Vec::new()).unwrap();
+    });
+    assert!(agent_started(&next(&mut events).await.kind));
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&turn).concat(), "hello!");
+    assert!(matches!(
+        turn.last().unwrap().kind,
+        EventKind::TurnEnded { error: None, .. }
+    ));
+    client
+        .delete(&session.id, false, BTreeMap::new())
+        .await
+        .unwrap();
+    reader.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_session_sets_its_options_before_its_first_prompt() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let session = daemon
+        .new_session_prompted(
+            &client,
+            &[],
+            vec![ConfigSetting {
+                config_id: "mode".into(),
+                value: ConfigValue::Id("code".into()),
+            }],
+            text("config mode"),
+        )
+        .await
+        .unwrap();
+    let turn = until_turn_ended(&client, &session.id, 0).await;
+    assert_eq!(chunks(&turn), ["code"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_prompt_ends_when_the_agent_does_not_start() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let session = daemon
+        .new_session_prompted(&client, &["--no-sessions"], Vec::new(), text("hello"))
+        .await
+        .unwrap();
+    let mut events = client.subscribe(&session.id, 0).await.unwrap();
+    assert!(matches!(
+        next(&mut events).await.kind,
+        EventKind::PromptStarted { .. }
+    ));
+    let ended = next(&mut events).await;
+    assert!(
+        matches!(&ended.kind, EventKind::TurnEnded { error: Some(error), .. } if error.contains("does not support sessions")),
+        "{ended:?}"
+    );
+    assert!(agent_exited(&next(&mut events).await.kind));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_prompt_with_content_beyond_text_and_links_is_refused() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let refused = refusal(
+        daemon
+            .new_session_prompted(
+                &client,
+                &[],
+                Vec::new(),
+                vec![
+                    ContentBlock::Text(TextContent::new("describe")),
+                    ContentBlock::Image(ImageContent::new("iVBORw0KGgo=", "image/png")),
+                ],
+            )
+            .await,
+    );
+    assert_eq!(refused.code, code::INVALID_REQUEST);
+    assert!(sessions(&client).await.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_idle() {
     let mut first = Daemon::start().await;
@@ -1940,6 +2099,8 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
             fake_agent(&["--busy-on-resume"]),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();
@@ -2247,6 +2408,8 @@ async fn parked_session(
             fake_agent(&args),
             BTreeMap::new(),
             Checkout::Workspace,
+            Vec::new(),
+            None,
         )
         .await
         .unwrap();

@@ -11,13 +11,14 @@ use agent_client_protocol::v2::schema::{
 };
 use agent_client_protocol::v2::{ConnectionTo, Responder};
 use agent_client_protocol::{Client, Error};
+use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{
     content,
     history::History,
-    runner::{Claude, StartRequest},
+    runner::{self, Claude, Conversation, StartRequest},
     updates::{self, Updates},
 };
 
@@ -85,6 +86,43 @@ impl Session {
                 .category(SessionConfigOptionCategory::Mode),
         ]
     }
+
+    /// How to start the session's claude on `conversation`.
+    fn start_request<'a>(
+        &'a self,
+        conversation: Conversation<'a>,
+        transcript: &'a [Value],
+    ) -> StartRequest<'a> {
+        StartRequest {
+            cwd: &self.cwd,
+            conversation,
+            model: &self.model,
+            effort: &self.effort,
+            mode: &self.mode,
+            mcp_servers: &self.mcp_servers,
+            instructions: self.instructions.as_deref(),
+            transcript,
+        }
+    }
+}
+
+/// What a new session in `dir` offers, as `--describe` prints it: its config
+/// options at their defaults and the commands of claude's answer to the
+/// initialize request. Claude starts in `dir` without saving a session and
+/// stops once it answers.
+pub async fn describe(dir: &Path) -> Result<Value, String> {
+    let session = Session::new(
+        String::new(),
+        acp_bridge::cwd(dir)?,
+        Vec::new(),
+        None,
+        false,
+    );
+    let commands = runner::commands(&session.start_request(Conversation::Unsaved, &[])).await?;
+    Ok(json!({
+        "configOptions": session.options(),
+        "availableCommands": commands,
+    }))
 }
 
 /// A bridge process serves one session, opened with `session/new` or
@@ -387,18 +425,13 @@ impl Bridge {
             return Ok(());
         }
         let transcript = self.history.entries(&session.id, &session.cwd);
+        let conversation = if self.history.find(&session.id, &session.cwd) {
+            Conversation::Resume(&session.id)
+        } else {
+            Conversation::New(&session.id)
+        };
         let claude = Claude::start(
-            &StartRequest {
-                cwd: &session.cwd,
-                session_id: &session.id,
-                resume: self.history.find(&session.id, &session.cwd),
-                model: &session.model,
-                effort: &session.effort,
-                mode: &session.mode,
-                mcp_servers: &session.mcp_servers,
-                instructions: session.instructions.as_deref(),
-                transcript: &transcript,
-            },
+            &session.start_request(conversation, &transcript),
             Updates::new(connection.clone(), &session.id),
         )
         .map_err(|error| Error::new(-32603, error))?;

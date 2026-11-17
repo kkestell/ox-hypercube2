@@ -7,13 +7,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
-use ox_protocol::{
-    Branches, Checkout, Client, ConfigValue, Deleted, DirEntry, Error, FileContent, Focus, Harness,
-    ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code, content,
-    default_socket_path,
+use ox_protocol::schema::{
+    AvailableCommand, ContentBlock, ElicitationAction, SessionConfigOption, TextContent,
 };
-use serde::Serialize;
+use ox_protocol::{
+    Branches, Checkout, Client, ConfigSetting, ConfigValue, Deleted, DirEntry, Error, FileContent,
+    Focus, Harness, ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo, code,
+    content, default_socket_path,
+};
+use serde::{Deserialize, Serialize};
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
@@ -342,22 +344,79 @@ async fn move_branch(
         .map_err(message)
 }
 
+/// The bridge executable of `agent`, beside the app's.
+fn bridge(agent: Harness) -> Result<PathBuf, String> {
+    Ok(std::env::current_exe()
+        .map_err(message)?
+        .with_file_name(agent.bridge()))
+}
+
+/// The ACP prompt of a message's text and attached files.
+fn prompt_blocks(text: String, attachments: &[PathBuf]) -> Result<Vec<ContentBlock>, String> {
+    let mut prompt = Vec::new();
+    if !text.is_empty() {
+        prompt.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    for path in attachments {
+        prompt.push(content::file_link(path).map_err(message)?);
+    }
+    Ok(prompt)
+}
+
+/// Creates a session of `agent` whose first prompt is the message, with
+/// its agent set to `config`.
 #[tauri::command]
 async fn new_session(
     app: State<'_, App>,
     agent: Harness,
     workspace_id: String,
     checkout: Checkout,
+    text: String,
+    attachments: Vec<PathBuf>,
+    config: Vec<ConfigSetting>,
 ) -> Result<SessionInfo, String> {
-    let bridge = std::env::current_exe()
-        .map_err(message)?
-        .with_file_name(agent.bridge());
-    let command = vec![bridge.to_string_lossy().into_owned()];
+    let command = vec![bridge(agent)?.to_string_lossy().into_owned()];
+    let prompt = prompt_blocks(text, &attachments)?;
     app.client()
         .await?
-        .new_session(&workspace_id, command, utf8_env(), checkout)
+        .new_session(
+            &workspace_id,
+            command,
+            utf8_env(),
+            checkout,
+            config,
+            Some(prompt),
+        )
         .await
         .map_err(message)
+}
+
+/// The config options and slash commands an agent offers a new session.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all(deserialize = "camelCase"))]
+struct Controls {
+    config_options: Vec<SessionConfigOption>,
+    available_commands: Vec<AvailableCommand>,
+}
+
+/// The controls `agent` offers a new session in `cwd`, which its bridge's
+/// `--describe` mode reports. A bridge that fails gives its standard error.
+#[tauri::command]
+async fn agent_controls(agent: Harness, cwd: PathBuf) -> Result<Controls, String> {
+    let output = tokio::process::Command::new(bridge(agent)?)
+        .arg("--describe")
+        .arg(&cwd)
+        .env_clear()
+        .envs(utf8_env())
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(message)?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    serde_json::from_slice(&output.stdout).map_err(message)
 }
 
 /// Restarts the agent of an exited session, which replays its conversation.
@@ -378,13 +437,7 @@ async fn prompt(
     text: String,
     attachments: Vec<PathBuf>,
 ) -> Result<(), String> {
-    let mut prompt = Vec::new();
-    if !text.is_empty() {
-        prompt.push(ContentBlock::Text(TextContent::new(text)));
-    }
-    for path in attachments {
-        prompt.push(content::file_link(&path).map_err(message)?);
-    }
+    let prompt = prompt_blocks(text, &attachments)?;
     app.client()
         .await?
         .prompt(&session_id, prompt)
@@ -620,6 +673,7 @@ pub fn run() {
             workspace_branches,
             move_branch,
             new_session,
+            agent_controls,
             load_session,
             prompt,
             cancel,

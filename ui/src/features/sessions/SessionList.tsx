@@ -8,8 +8,6 @@ import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
 import type {
-  Branches,
-  Checkout,
   RunInfo,
   SessionInfo,
   SessionState,
@@ -21,7 +19,8 @@ import type {
 } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { branchStatus, localMerge } from "./localMerge";
-import { type AgentId, agentNames, useAgents } from "./useAgents";
+import { type AgentId, agentNames } from "./useAgents";
+import type { Draft } from "./useDrafts";
 import type { SessionActions } from "./useSessionActions";
 
 export const stateLabels: Record<SessionState, string> = {
@@ -147,7 +146,7 @@ async function contextMenu(
 }
 
 /** The last component of a workspace's path. */
-function directoryName(path: string) {
+export function directoryName(path: string) {
   return path.split("/").filter(Boolean).pop() ?? path;
 }
 
@@ -172,27 +171,40 @@ function newestFirst(a: { created_at: number }, b: { created_at: number }) {
 }
 
 export const SessionList = memo(function SessionList({
+  agents,
   workspaces,
   worktrees,
   sessions,
   runs,
   parents,
+  drafts,
+  draftTitles,
   selected,
   onSelect,
+  onNewDraft,
+  onDeleteDraft,
   actions: { busy, deleteSession, archiveSession, unarchiveSession, cancelRun, deleteRun },
 }: {
+  /** The installed agents. */
+  agents: AgentId[];
   workspaces: WorkspaceInfo[];
   worktrees: Map<string, WorktreeInfo>;
   sessions: SessionInfo[];
   runs: RunInfo[];
   /** The run each child session belongs to, by session ID. */
   parents: Map<string, RunInfo>;
+  /** The drafts, newest first. */
+  drafts: Draft[];
+  /** Each draft's title, by draft ID. */
+  draftTitles: Map<string, string>;
   selected: string | null;
-  /** Views the session or run with this ID. */
+  /** Views the session, run or draft with this ID. */
   onSelect: (id: string) => void;
+  /** Adds a draft and views it. */
+  onNewDraft: (workspaceId: string, agent: AgentId, checkout: Draft["checkout"]) => void;
+  onDeleteDraft: (id: string) => void;
   actions: SessionActions;
 }) {
-  const agents = useAgents();
   // The agent the user chose, and the agent the New Session menus start: the
   // chosen one while it is installed, otherwise the first installed agent.
   const [chosen, setChosen] = useState<AgentId | null>(null);
@@ -219,33 +231,6 @@ export const SessionList = memo(function SessionList({
 
   const removeWorkspace = (workspaceId: string) =>
     run(() => invoke("remove_workspace", { workspaceId }));
-
-  const newSession = (workspaceId: string, agent: AgentId, checkout: Checkout) =>
-    run(async () => {
-      const session = await invoke<SessionInfo>("new_session", { agent, workspaceId, checkout });
-      onSelect(session.id);
-    });
-
-  // A session in a new worktree, on a new `ox/<id8>` branch named for the
-  // worktree's ID, from `HEAD`, compared with the branch the workspace's
-  // checkout is on.
-  const newWorktreeSession = (workspace: WorkspaceInfo, agent: AgentId) =>
-    run(async () => {
-      const { head } = await invoke<Branches>("workspace_branches", {
-        workspaceId: workspace.id,
-      });
-      if (head === null) {
-        await showError(`${directoryName(workspace.path)} is not on a branch`);
-        return;
-      }
-      const checkout: Checkout = { type: "worktree", compare: head };
-      const session = await invoke<SessionInfo>("new_session", {
-        agent,
-        workspaceId: workspace.id,
-        checkout,
-      });
-      onSelect(session.id);
-    });
 
   // Viewing a saved session whose agent is not running starts its agent, which
   // replays the conversation.
@@ -361,6 +346,18 @@ export const SessionList = memo(function SessionList({
         );
         const workspaceRuns = runs.filter((run) => run.workspace_id === workspace.id);
         const archivedShown = showArchived.has(workspace.id);
+        const draftRows = drafts
+          .filter((draft) => draft.workspaceId === workspace.id)
+          .map((draft) => (
+            <DraftRow
+              key={draft.id}
+              id={draft.id}
+              title={draftTitles.get(draft.id) ?? ""}
+              selected={draft.id === selected}
+              onSelect={onSelect}
+              onDelete={onDeleteDraft}
+            />
+          ));
         const rows = [
           ...workspaceSessions
             .filter((session) => !parents.has(session.id) && (archivedShown || !session.archived))
@@ -453,7 +450,7 @@ export const SessionList = memo(function SessionList({
                       role="menuitem"
                       popoverTarget={menu}
                       popoverTargetAction="hide"
-                      onClick={() => newWorktreeSession(workspace, agent)}
+                      onClick={() => onNewDraft(workspace.id, agent, "worktree")}
                     >
                       Session in Worktree
                     </button>
@@ -463,7 +460,7 @@ export const SessionList = memo(function SessionList({
                     role="menuitem"
                     popoverTarget={menu}
                     popoverTargetAction="hide"
-                    onClick={() => newSession(workspace.id, agent, { type: "workspace" })}
+                    onClick={() => onNewDraft(workspace.id, agent, "workspace")}
                   >
                     Session in Checkout
                   </button>
@@ -489,7 +486,12 @@ export const SessionList = memo(function SessionList({
                 </div>
               )}
             </div>
-            {open && <ul>{rows.flatMap((row) => row.rows)}</ul>}
+            {open && (
+              <ul>
+                {draftRows}
+                {rows.flatMap((row) => row.rows)}
+              </ul>
+            )}
           </section>
         );
       })}
@@ -636,6 +638,37 @@ const RunRow = memo(function RunRow({
           </span>
         </span>
         {branch && <BranchIcon status={branch} />}
+      </button>
+    </li>
+  );
+});
+
+const draftStatus: Status = { className: null, label: "Draft" };
+
+/** A draft's row, which renders again only when its props change. */
+const DraftRow = memo(function DraftRow({
+  id,
+  title,
+  selected,
+  onSelect,
+  onDelete,
+}: {
+  id: string;
+  title: string;
+  selected: boolean;
+  onSelect: (id: string) => void;
+  onDelete: (id: string) => void;
+}) {
+  return (
+    <li
+      className="sidebar-row session"
+      onContextMenu={(event) =>
+        contextMenu(event, [{ text: "Delete Draft", enabled: true, action: () => onDelete(id) }])
+      }
+    >
+      <button type="button" className="select" aria-current={selected} onClick={() => onSelect(id)}>
+        <StatusIcon status={draftStatus} />
+        <span className="title">{title}</span>
       </button>
     </li>
   );

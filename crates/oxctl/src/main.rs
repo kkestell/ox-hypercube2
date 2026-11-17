@@ -204,7 +204,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 Checkout::Workspace
             };
             let session = client
-                .new_session(&workspace, command, utf8_env(), checkout)
+                .new_session(&workspace, command, utf8_env(), checkout, Vec::new(), None)
                 .await?;
             println!("{}", started(&client, &session.id).await?);
         }

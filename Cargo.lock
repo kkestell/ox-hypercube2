@@ -3117,6 +3117,7 @@ dependencies = [
 name = "oxd"
 version = "0.1.0"
 dependencies = [
+ "acp-bridge",
  "agent-client-protocol",
  "libc",
  "notify",

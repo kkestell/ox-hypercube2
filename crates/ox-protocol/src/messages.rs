@@ -64,6 +64,17 @@ pub enum Method {
         env: BTreeMap<String, String>,
         #[serde(default)]
         checkout: Checkout,
+        /// The session's first prompt, of text and resource links only. Its
+        /// `prompt_started` event is recorded before the answer, and the
+        /// session's title is set from its text. The agent gets it once it
+        /// has started and `config` is applied.
+        #[serde(default)]
+        prompt: Option<Vec<ContentBlock>>,
+        /// Option values the agent is set to once it has started, in order,
+        /// each only where the agent reports a different value. A value the
+        /// agent refuses leaves the agent's own.
+        #[serde(default)]
+        config: Vec<ConfigSetting>,
     },
     /// Restarts the agent of an exited session that has an
     /// `agent_session_id`, from the session's command and directory, which
@@ -375,6 +386,13 @@ pub struct Deleted {
     pub kept_branch: Option<String>,
 }
 
+/// A config option value for `session.new` to set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigSetting {
+    pub config_id: String,
+    pub value: ConfigValue,
+}
+
 /// A value for a session config option: the value id of a select option, or
 /// a boolean.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -659,7 +677,8 @@ pub struct Event {
 )]
 pub enum EventKind {
     /// The agent answered `initialize` and `session/new`. It is the first
-    /// event of a session that starts.
+    /// event of a session that starts, after the `prompt_started` of a first
+    /// prompt given to `session.new`.
     AgentStarted {
         agent_session_id: String,
         prompt_capabilities: PromptCapabilities,

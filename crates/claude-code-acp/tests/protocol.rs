@@ -7,7 +7,9 @@ use std::{
     process::Stdio,
 };
 
-use acp_bridge::testing::{finish, is_state, receive, response, send, until_method, update};
+use acp_bridge::testing::{
+    TIMEOUT, finish, is_state, receive, response, send, until_method, update,
+};
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -310,6 +312,104 @@ next_message"#,
             "{failed}"
         );
         child.kill().await.unwrap();
+    }
+}
+
+/// Runs the bridge's `--describe` in `project`, with the claude in `bin`.
+async fn describe(bin: &Path, project: &Path) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_claude-code-acp"))
+        .arg("--describe")
+        .arg(project)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env(
+            "CLAUDE_CONFIG_DIR",
+            bin.parent().unwrap().join("empty-claude"),
+        )
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(TIMEOUT, output)
+        .await
+        .expect("timed out waiting for --describe")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn describe_prints_the_default_options_and_claudes_commands() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    // The bridge stops claude once it answers; claude does not exit itself.
+    fake_claude_with_init(
+        &bin,
+        r#"
+printf '%s\n' "$*" >> calls
+next_message
+case "$message" in *'"subtype":"initialize"'*) ;; *) exit 19;; esac
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"initialize","response":{"commands":[{"name":"review","description":"Review a file","argumentHint":"file"}]}}}'
+exec tail -f /dev/null
+"#,
+        "",
+    );
+    let output = describe(&bin, &project).await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let description: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let options: Vec<(&str, &str)> = description["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| {
+            (
+                option["configId"].as_str().unwrap(),
+                option["currentValue"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        options,
+        [
+            ("model", "claude-opus-5-5"),
+            ("effort", "high"),
+            ("mode", "manual")
+        ],
+        "{description}"
+    );
+    assert_eq!(
+        description["availableCommands"],
+        json!([{"type":"command","name":"review","description":"Review a file","input":{"type":"text","hint":"file"}}])
+    );
+    // The fake recorded its arguments in the directory claude ran in.
+    let calls = calls(&project);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(calls[0].contains("--no-session-persistence"), "{calls:?}");
+    assert!(!calls[0].contains("--session-id"), "{calls:?}");
+    assert!(!calls[0].contains("--resume"), "{calls:?}");
+}
+
+#[tokio::test]
+async fn describe_fails_with_the_error_of_a_claude_that_does_not_start() {
+    for (initialization, expected) in [
+        (
+            r#"next_message
+printf '%s\n' '{"type":"control_response","response":{"subtype":"error","request_id":"initialize","error":"initialization refused"}}'
+next_message"#,
+            "initialization refused",
+        ),
+        (
+            "printf '%s\\n' 'startup diagnostic' >&2\nexit 23",
+            "startup diagnostic",
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let (bin, project) = dirs(temp.path());
+        fake_claude_with_init(&bin, initialization, "");
+        let output = describe(&bin, &project).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert!(output.stdout.is_empty());
     }
 }
 

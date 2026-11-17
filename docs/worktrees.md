@@ -5,12 +5,13 @@ of the workspace's repository.
 
 ## Choosing a checkout
 
-In the workspace's **+** menu, **Session in Checkout** runs in the workspace's
-directory. **Session in Worktree** creates a worktree on a new branch
-`ox/<first 8 digits of the worktree's ID>`, starting at the workspace
-checkout's `HEAD`. Session in Worktree is offered for
-workspaces in a Git working tree and requires a checked-out branch with a
-commit.
+In the workspace's **+** menu, **Session in Checkout** and **Session in
+Worktree** open a draft. A Session in Checkout runs in the workspace's
+directory. When its draft's first message is sent, a Session in Worktree
+creates a worktree on a new branch `ox/<first 8 digits of the worktree's ID>`,
+starting at the workspace checkout's `HEAD`. Session in Worktree is offered
+for workspaces in a Git working tree and requires a checked-out branch with a
+commit when the message is sent.
 
 ## Worktrees
 

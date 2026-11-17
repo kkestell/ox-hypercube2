@@ -40,6 +40,18 @@ export interface Command {
   input?: { type: string; hint?: string } | null;
 }
 
+/** A config option value that a new session's agent is set to. */
+export interface ConfigSetting {
+  config_id: string;
+  value: string | boolean;
+}
+
+/** The config options and slash commands an agent offers a new session. */
+export interface Controls {
+  config_options: ConfigOption[];
+  available_commands: Command[];
+}
+
 export interface WorkspaceInfo {
   id: string;
   path: string;
