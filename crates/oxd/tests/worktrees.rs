@@ -2045,6 +2045,57 @@ async fn a_queued_prompt_waits_for_a_branch_move_in_its_checkout() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_session_imported_during_a_branch_move_refuses_loads_until_it_ends() {
+    let repo = repo();
+    std::fs::write(
+        repo.path().join(".git/info/exclude"),
+        "fake-transcripts.json\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.path().join("fake-transcripts.json"),
+        r#"[{"sessionId": "a", "startedAt": 1000, "title": "Session a", "updates": []}]"#,
+    )
+    .unwrap();
+    let daemon = Daemon::start_with(Options {
+        bridges: true,
+        ..Options::default()
+    })
+    .await;
+    let client = daemon.client().await;
+    let workspace = workspace_id(&client, repo.path()).await;
+    let first = commit_of(repo.path(), "HEAD");
+    let topic = commit_beside(repo.path(), &first, "added");
+
+    let blocked = BlockedGit::new(" update-ref ");
+    let moving = move_branch(&client, repo.path(), "main", &topic, &first, blocked.env());
+    let during = async {
+        blocked.blocked().await;
+        let imported = client
+            .import_claude_sessions(&workspace, BTreeMap::new())
+            .await
+            .unwrap();
+        assert_eq!(imported.imported, 1);
+        let session = sessions(&client).await.pop().unwrap();
+        client
+            .unarchive(&session.id, BTreeMap::new())
+            .await
+            .unwrap();
+        let refused = refusal(client.load_session(&session.id, BTreeMap::new()).await);
+        assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
+        assert!(refused.message.contains("branch move"), "{refused:?}");
+        blocked.release().await;
+        session
+    };
+    let (moved, session) = tokio::join!(moving, during);
+    moved.unwrap();
+    client
+        .load_session(&session.id, BTreeMap::new())
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_new_session_publishes_its_comparison() {
     let repo = repo();
     let daemon = Daemon::start().await;

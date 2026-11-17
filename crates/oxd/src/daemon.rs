@@ -74,35 +74,39 @@ impl Drop for ClientGuard {
     }
 }
 
-/// A branch move under way in a checkout, with the sessions in the checkout,
-/// which refuse turns and loads until it ends.
+/// A branch move under way in a checkout, whose sessions refuse turns and
+/// loads until it ends.
 struct CheckoutMove<'a> {
     daemon: &'a Daemon,
     checkout: PathBuf,
-    sessions: Vec<Arc<Session>>,
 }
 
 impl Drop for CheckoutMove<'_> {
     fn drop(&mut self) {
         let mut registry = self.daemon.lock();
         registry.moving_checkouts.remove(&self.checkout);
-        for session in &self.sessions {
-            session.end_move();
+        for session in registry.sessions.values() {
+            if resolved(session.cwd()).starts_with(&self.checkout) {
+                session.end_move();
+            }
         }
     }
 }
 
 impl Registry {
-    fn refuse_moving(&self, cwd: &Path) -> Result<(), ErrorBody> {
+    /// Whether a branch is moving in the checkout that holds `cwd`.
+    fn moving(&self, cwd: &Path) -> bool {
         if self.moving_checkouts.is_empty() {
-            return Ok(());
+            return false;
         }
         let cwd = resolved(cwd);
-        if self
-            .moving_checkouts
+        self.moving_checkouts
             .iter()
             .any(|checkout| cwd.starts_with(checkout))
-        {
+    }
+
+    fn refuse_moving(&self, cwd: &Path) -> Result<(), ErrorBody> {
+        if self.moving(cwd) {
             return Err(invalid_state(
                 "a branch move is in progress in this checkout",
             ));
@@ -1137,7 +1141,6 @@ impl Daemon {
         Ok(CheckoutMove {
             daemon: self,
             checkout,
-            sessions,
         })
     }
 
@@ -1228,8 +1231,6 @@ impl Daemon {
                 .iter()
                 .find(|workspace| workspace.id == workspace_id)
                 .ok_or_else(|| not_found("workspace", workspace_id))?;
-            // TODO: a session imported during a branch move in the
-            // workspace's checkout does not refuse loads until the move ends.
             let id = uuid::Uuid::new_v4().to_string();
             let events = import::events(&id, transcript.updates);
             let mut saved = SavedSession {
@@ -1252,7 +1253,12 @@ impl Daemon {
                 .store
                 .import_session(&saved, &events)
                 .map_err(|error| storage(&error))?;
-            let state = State::restored(&saved, None);
+            let mut state = State::restored(&saved, None);
+            if registry.moving(&saved.cwd) {
+                state
+                    .begin_move()
+                    .expect("a restored session is exited, which a move allows");
+            }
             let session = Session::new(
                 self.store.clone(),
                 self.changed.clone(),

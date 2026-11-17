@@ -26,8 +26,6 @@ required behavior and everyday use.
   control flow. Keep responsibilities clear with as few abstractions as the
   problem needs.
 - Handle invalid input and failures likely to occur in everyday use clearly.
-- If an edge case is unlikely to occur in everyday use, add a local `TODO`
-  comment naming the case and defer handling it until it actually occurs.
 - Trust internal invariants and fail clearly when they break, checking each
   once.
 - Implement required semantics correctly and completely.
