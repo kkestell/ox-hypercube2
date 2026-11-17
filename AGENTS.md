@@ -45,6 +45,19 @@ workflow.
   reconcile changed facts according to
   [Documentation](docs/dev/documentation.md#when-to-edit-documentation).
 
+## Installing changes
+
+When the user asks to commit and install, commit on `main`, then:
+
+- If the changes touch only `crates/ox/` and `ui/`, run `make install-ui`.
+  It rebuilds and relaunches the app. `oxd` and every session, including
+  this one, keep running.
+- Otherwise, do not run `make install`. End the turn by telling the user to
+  run `make install` in a terminal outside Ox once every session is idle.
+
+Both targets build the working tree. When it holds changes that are not
+committed, run the target in a temporary worktree of `HEAD`.
+
 ## Communication
 
 - Lead with the substantive result. Use plain language and concrete names.
