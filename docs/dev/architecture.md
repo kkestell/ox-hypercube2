@@ -142,8 +142,10 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, each session's queue, and conversation
-events. Each conversation event is saved with the time `oxd` recorded it.
+comparison refs, archive state, each session's queue, conversation events,
+and the agent session IDs of deleted sessions, which keep an import from
+bringing them back. Each conversation event is saved with the time `oxd`
+recorded it; an imported event, with the time its transcript gives.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence
@@ -205,6 +207,15 @@ branch, and the model and effort against the values the bridge's
 `--describe` reports. Starting it creates the session as a client's
 `session.new` would, with the requester's environment; declining it, or
 stopping the requester's turn, creates nothing.
+
+`workspace.import_claude_sessions` imports the Claude sessions started in a
+workspace's directory. The daemon runs the Claude bridge beside its executable
+with the client's environment: `--sessions` lists the sessions, and
+`--transcript` reads each one Ox has not had, newest first. The daemon turns
+each transcript's updates into turns, one for each user message, and saves the
+session archived and exited with that history, as a session restored after a
+restart is. A session whose history holds a prompt keeps it when it loads, so
+an imported session resumes without replay.
 
 Each session keeps a queue of prompts. Whenever the session's agent is idle,
 with no pending request and no steered prompt pending, the daemon starts the

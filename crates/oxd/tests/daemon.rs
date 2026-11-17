@@ -1638,7 +1638,7 @@ async fn workspace_add_refuses_what_is_not_a_new_directory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_workspace_with_sessions_cannot_be_removed() {
+async fn a_workspace_is_removed_once_its_sessions_are_archived() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
@@ -1657,12 +1657,14 @@ async fn a_workspace_with_sessions_cannot_be_removed() {
     assert_eq!(remote_code(error), code::INVALID_STATE);
     assert_eq!(workspaces(&client).await, std::slice::from_ref(&workspace));
 
+    // A workspace whose sessions are all archived is removed with them.
     client
-        .delete(&session.id, false, BTreeMap::new())
+        .archive(&session.id, false, BTreeMap::new())
         .await
         .unwrap();
     client.remove_workspace(&workspace.id).await.unwrap();
     assert!(workspaces(&client).await.is_empty());
+    assert!(sessions(&client).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]

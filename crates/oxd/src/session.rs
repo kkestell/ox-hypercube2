@@ -399,6 +399,11 @@ impl Session {
         self.lock().title().map(String::from)
     }
 
+    /// The ID of the agent's session, once the agent has opened one.
+    pub fn agent_session_id(&self) -> Option<String> {
+        self.lock().agent().map(|agent| agent.session_id.clone())
+    }
+
     pub fn worktree(&self) -> Option<Arc<Worktree>> {
         self.worktree.lock().unwrap().clone()
     }

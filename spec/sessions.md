@@ -42,6 +42,8 @@ Resuming is refused while the session's agent is already active, while it is arc
 
 If Git cannot restore the worktree, including when its branch is missing or checked out elsewhere, the operation fails and the session remains archived. Archiving an already-archived session or restoring a non-archived session fails.
 
+A Claude Code session [imported](workspaces.md#import-claude-code-sessions) into Ox starts archived. Once unarchived, it continues like any archived Claude session.
+
 ### Delete a session
 
 1. Choose Delete Session in the session row's context menu or in the post-merge dialog.

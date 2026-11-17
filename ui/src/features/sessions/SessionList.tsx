@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
-import { open } from "@tauri-apps/plugin-dialog";
+import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
 import { type MouseEvent, memo, useCallback, useState } from "react";
 import { HarnessLogo } from "../../components/HarnessLogo";
@@ -92,6 +92,12 @@ async function run(action: () => Promise<unknown>) {
   }
 }
 
+/** What an import of `count` Claude Code sessions reports. */
+function importedMessage(count: number) {
+  if (count === 0) return "No new Claude Code sessions";
+  return count === 1 ? "Imported 1 session" : `Imported ${count} sessions`;
+}
+
 /** `set` with `id` added, or removed when it holds it. */
 function toggled(set: ReadonlySet<string>, id: string): ReadonlySet<string> {
   const next = new Set(set);
@@ -143,14 +149,37 @@ export const SessionList = memo(function SessionList({
   // The workspaces whose rows are collapsed.
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set());
 
+  // Adding a workspace imports its Claude Code sessions in the background,
+  // without waiting for the import.
   const addWorkspace = async () => {
     const path = await open({ directory: true, title: "Add Workspace" });
     if (path === null) return;
-    await run(() => invoke("add_workspace", { path }));
+    await run(async () => {
+      const added = await invoke<WorkspaceInfo>("add_workspace", { path });
+      run(() => invoke("import_claude_sessions", { workspaceId: added.id }));
+    });
   };
 
-  const removeWorkspace = (workspaceId: string) =>
-    run(() => invoke("remove_workspace", { workspaceId }));
+  const importClaudeSessions = (workspaceId: string) =>
+    run(async () => {
+      const imported = await invoke<number>("import_claude_sessions", { workspaceId });
+      await message(importedMessage(imported), { kind: "info" });
+    });
+
+  // A workspace whose sessions are all archived is removed with them, once
+  // the user confirms.
+  const removeWorkspace = (workspaceId: string, archived: number) =>
+    run(async () => {
+      if (archived > 0) {
+        const sessions = archived === 1 ? "1 archived session" : `${archived} archived sessions`;
+        const confirmed = await ask(`Remove this workspace and delete its ${sessions}?`, {
+          kind: "warning",
+          okLabel: "Remove",
+        });
+        if (!confirmed) return;
+      }
+      await invoke("remove_workspace", { workspaceId });
+    });
 
   // Viewing a saved session whose agent is not running starts its agent, which
   // replays the conversation.
@@ -234,9 +263,14 @@ export const SessionList = memo(function SessionList({
                       action: () => setShowArchived((shown) => toggled(shown, workspace.id)),
                     },
                     {
+                      text: "Import Claude Code Sessions",
+                      enabled: true,
+                      action: () => importClaudeSessions(workspace.id),
+                    },
+                    {
                       text: "Remove Workspace",
-                      enabled: workspaceSessions.length === 0,
-                      action: () => removeWorkspace(workspace.id),
+                      enabled: workspaceSessions.every((session) => session.archived),
+                      action: () => removeWorkspace(workspace.id, workspaceSessions.length),
                     },
                   ])
                 }

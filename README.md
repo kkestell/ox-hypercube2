@@ -21,6 +21,8 @@ closes.
   and daemon restarts.
 - Archiving, which removes a session's worktree and keeps its conversation and
   branch. Archiving and deleting ask before discarding unsaved work.
+- Claude Code sessions run outside Ox imported into their workspace, archived,
+  with their history.
 
 ## Installation
 

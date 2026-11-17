@@ -118,6 +118,14 @@
 //!   until the process exits, so its reader sees end of file then
 //! - `--describe <dir>`: print the config options and commands a new
 //!   session offers, as a bridge's `--describe` does, and exit
+//! - `--sessions <dir>`: print the sessions of `<dir>/fake-transcripts.json`,
+//!   in its order, as `[{"sessionId", "startedAt"}]`, as the Claude bridge's
+//!   `--sessions` does, and exit. The file holds
+//!   `[{"sessionId", "startedAt", "title", "updates"}]`
+//! - `--transcript <dir> <id>`: print `{"title", "updates"}` of session
+//!   `<id>` of `<dir>/fake-transcripts.json`, as the Claude bridge's
+//!   `--transcript` does, and exit. A session with `"fail": true`, or one
+//!   the file does not have, exits with status 1
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -340,6 +348,14 @@ fn value(name: &str) -> Option<String> {
     args.next()
 }
 
+/// The sessions `dir/fake-transcripts.json` holds.
+fn transcripts(dir: &Path) -> Vec<serde_json::Value> {
+    let path = dir.join("fake-transcripts.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+    serde_json::from_str(&text).expect("fake-transcripts.json holds a list")
+}
+
 fn message_id() -> acp::MessageId {
     acp::MessageId::new(uuid::Uuid::new_v4().to_string())
 }
@@ -466,6 +482,42 @@ async fn main() -> agent_client_protocol::Result<()> {
         mcp_servers: Mutex::default(),
         instructions: Mutex::default(),
     });
+    if let Some(dir) = value("--sessions") {
+        let sessions: Vec<serde_json::Value> = transcripts(Path::new(&dir))
+            .iter()
+            .map(|session| {
+                serde_json::json!({
+                    "sessionId": session["sessionId"],
+                    "startedAt": session["startedAt"],
+                })
+            })
+            .collect();
+        println!("{}", serde_json::Value::from(sessions));
+        return Ok(());
+    }
+    if let Some(dir) = value("--transcript") {
+        let id = std::env::args()
+            .skip_while(|arg| arg != "--transcript")
+            .nth(2)
+            .expect("--transcript names a session");
+        let transcripts = transcripts(Path::new(&dir));
+        match transcripts
+            .iter()
+            .find(|session| session["sessionId"] == id)
+        {
+            Some(session) if session["fail"] != true => {
+                let transcript = serde_json::json!({
+                    "title": session["title"],
+                    "updates": session["updates"],
+                });
+                println!("{transcript}");
+                return Ok(());
+            }
+            Some(_) => eprintln!("transcript {id} is unreadable"),
+            None => eprintln!("session {id} not found"),
+        }
+        std::process::exit(1);
+    }
     if value("--describe").is_some() {
         let description = serde_json::json!({
             "configOptions": state.config_options(),

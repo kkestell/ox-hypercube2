@@ -13,6 +13,7 @@ mod conn;
 mod daemon;
 mod directories;
 mod files;
+mod import;
 mod mcp;
 mod session;
 mod state;

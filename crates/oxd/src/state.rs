@@ -840,8 +840,9 @@ impl State {
     }
 
     /// Starts a load: the session goes from `exited` to `starting` and
-    /// returns what to request from the agent. A session without a recorded
-    /// agent start requests and records replay to recover its conversation.
+    /// returns what to request from the agent. A session whose history holds
+    /// neither an agent start nor a prompt requests and records replay to
+    /// recover its conversation.
     pub fn load(&mut self) -> Result<Resume, ErrorBody> {
         let id = match &self.phase {
             Phase::Exited(Some(agent)) => agent.session_id.clone(),
@@ -854,9 +855,12 @@ impl State {
             phase => return Err(invalid_state(phase.state())),
         };
         let events = self.events.iter().flatten();
-        let replay = !events
-            .clone()
-            .any(|event| matches!(event.kind, EventKind::AgentStarted { .. }));
+        let replay = !events.clone().any(|event| {
+            matches!(
+                event.kind,
+                EventKind::AgentStarted { .. } | EventKind::PromptStarted { .. }
+            )
+        });
         let options = events
             .rev()
             .find_map(|event| match &event.kind {
@@ -2356,6 +2360,24 @@ mod tests {
         assert_eq!(state.state(), SessionState::Idle);
         assert_eq!(kinds(&state, 0), ["update", "agent_started"]);
         assert_eq!(state.title(), Some("Fix the build"));
+    }
+
+    #[test]
+    fn a_restored_session_whose_history_has_a_prompt_loads_without_replay() {
+        let mut state = State::restored("s".into(), None, "agent".into(), 2, Queue::default());
+        state.fill(stored(vec![
+            EventKind::PromptStarted {
+                prompt: vec![ContentBlock::Text(TextContent::new("Fix the build"))],
+                from: None,
+            },
+            EventKind::TurnEnded {
+                stop_reason: Some(StopReason::EndTurn),
+                error: None,
+            },
+        ]));
+        let resume = state.load().unwrap();
+        assert!(!resume.replay);
+        assert_eq!(resume.session_id, "agent");
     }
 
     fn idle_with(background: Vec<BackgroundWork>) -> Change {

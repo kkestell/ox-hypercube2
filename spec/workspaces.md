@@ -8,7 +8,13 @@ Users add local project directories as workspaces and browse their sessions in t
 
 1. Choose Add Workspace and select a directory. Cancelling the directory chooser makes no change.
 2. The workspace appears under its directory's final name. Hovering its heading shows its full path.
-3. Open the workspace heading's context menu and choose Remove Workspace to remove an empty workspace. This does not delete its directory.
+3. Open the workspace heading's context menu and choose Remove Workspace to remove a workspace whose sessions are all archived. When it has archived sessions, the app asks first, naming how many it deletes. Removing a workspace does not delete its directory or its sessions' branches.
+
+### Import Claude Code sessions
+
+1. Adding a workspace imports its Claude Code sessions in the background, newest first, as archived sessions. While the workspace shows archived sessions, each appears as soon as it is read. The import reports nothing when it succeeds.
+2. Choose Import Claude Code Sessions in the workspace heading's context menu to import the sessions not yet in Ox, such as those run in a terminal since. When it finishes, the app reports Imported N sessions, or No new Claude Code sessions.
+3. An imported session's title is the one Claude Code shows for it: its `/rename` title, else Claude's generated title, else its first prompt's text. It sorts by when it started, and its messages show when they happened.
 
 ### Browse sessions
 
@@ -32,9 +38,12 @@ Users add local project directories as workspaces and browse their sessions in t
 ## Rules
 
 - A workspace must be an existing directory. Adding a missing path, a non-directory, or an already-added path fails.
-- A workspace cannot be removed while any session belongs to it, including exited and archived sessions. Remove Workspace is disabled in that case.
+- A workspace cannot be removed while a session that is not archived belongs to it, including an exited one. Remove Workspace is disabled in that case.
 - Removing or hiding a workspace's presentation is not an instruction to delete project files.
 - Changes made by another connected client appear in the app's lists.
+- An import takes only interactive Claude Code sessions, run in a terminal or the Claude desktop app, started in the workspace directory itself. Sessions started in a subdirectory, and `claude -p` and Agent SDK runs, are left out.
+- A deleted session is never imported again. Sessions deleted by removing their workspace are imported again when the workspace is added back.
+- A failure to list a workspace's Claude Code sessions shows an error dialog. A session whose transcript cannot be read is skipped.
 
 ## Related areas
 

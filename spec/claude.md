@@ -20,6 +20,14 @@ Inherited `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` do not override the sub
 - Claude starts without saving a conversation and stops once it has answered. No prompt is sent.
 - A Claude that fails to start or refuses to initialize makes the bridge exit non-zero with the error on standard error.
 
+### Read sessions for import
+
+Two modes read Claude's transcripts under `CLAUDE_CONFIG_DIR` without starting Claude, print one JSON value, and exit. `<dir>` is an existing absolute directory.
+
+- `claude-code-acp --sessions <dir>` prints `[{"sessionId", "startedAt"}]`: the interactive sessions started in `<dir>` itself, newest first, with session ID breaking ties. A session is interactive when its transcript's first entrypoint is `cli` or `claude-desktop`. `startedAt` is the time of its transcript's first entry that has one, in milliseconds since the Unix epoch.
+- `claude-code-acp --transcript <dir> <id>` prints `{"title", "updates": [{"at", "update"}]}`. The updates are those a [replay](#continue-and-replay-conversations) sends, in ACP's schema, each with the time of the transcript entry that produced it; the failures of tool calls left without a result take the last entry's time. The title is the session's last `/rename` title, else Claude's last generated title, else its first prompt's text as a new session would be titled, and `null` without any.
+- A session `<dir>` has no transcript for makes `--transcript` exit non-zero with `session <id> not found` on standard error.
+
 ### Discover and open conversations
 
 - A standalone client can list bridge-created sessions and native Claude Code conversations, optionally restricted to a working directory. Results are ordered by most recent update, with session ID breaking ties, and contain up to 50 entries per page. An invalid continuation cursor is rejected.

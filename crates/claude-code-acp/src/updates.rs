@@ -58,10 +58,18 @@ enum Sent {
     RequiresAction,
 }
 
+/// Where a session's updates go.
+enum Output {
+    /// Notifications on the ACP connection.
+    Client(ConnectionTo<Client>),
+    /// A list the caller takes, for a transcript read without a client.
+    Listed(Mutex<Vec<SessionUpdate>>),
+}
+
 /// Translates a session's Claude events, permission requests, and questions
 /// into ACP updates.
 pub struct Updates {
-    connection: ConnectionTo<Client>,
+    output: Output,
     session_id: String,
     commands: Mutex<Vec<acp::AvailableCommand>>,
     tools: Mutex<Tools>,
@@ -70,8 +78,17 @@ pub struct Updates {
 
 impl Updates {
     pub fn new(connection: ConnectionTo<Client>, session_id: &str) -> Self {
+        Self::with_output(Output::Client(connection), session_id)
+    }
+
+    /// Updates that collect in a list, which `take_listed` drains.
+    pub fn listed(session_id: &str) -> Self {
+        Self::with_output(Output::Listed(Mutex::new(Vec::new())), session_id)
+    }
+
+    fn with_output(output: Output, session_id: &str) -> Self {
         Self {
-            connection,
+            output,
             session_id: session_id.to_owned(),
             commands: Mutex::new(Vec::new()),
             tools: Mutex::new(Tools::default()),
@@ -80,7 +97,26 @@ impl Updates {
     }
 
     fn send(&self, update: SessionUpdate) {
-        notify(&self.connection, &self.session_id, update);
+        match &self.output {
+            Output::Client(connection) => notify(connection, &self.session_id, update),
+            Output::Listed(list) => list.lock().unwrap().push(update),
+        }
+    }
+
+    /// The updates listed since the last call.
+    pub fn take_listed(&self) -> Vec<SessionUpdate> {
+        match &self.output {
+            Output::Listed(list) => std::mem::take(&mut *list.lock().unwrap()),
+            Output::Client(_) => panic!("updates sent to a client are not listed"),
+        }
+    }
+
+    /// The ACP connection, which only a session with a client has.
+    fn connection(&self) -> &ConnectionTo<Client> {
+        match &self.output {
+            Output::Client(connection) => connection,
+            Output::Listed(_) => panic!("listed updates ask nothing"),
+        }
     }
 
     pub fn commands(&self) -> Vec<acp::AvailableCommand> {
@@ -405,30 +441,36 @@ impl Updates {
         mut subagents: HashMap<String, Vec<Value>>,
     ) {
         for entry in entries {
-            // The blocks of one user entry make one message, which keeps the
-            // entry's `uuid`: the `messageId` it had when it was inserted.
-            let mut id = entry["uuid"].as_str().map(str::to_owned);
-            let mut user = Vec::new();
-            for event in message_events(&entry) {
-                if let Some(block) = user_block(&event) {
-                    user.push(block);
-                    continue;
-                }
-                self.send_user(&mut id, &mut user);
-                let subagent = match &event {
-                    Event::Tool { id: Some(id), .. } => subagents.remove_entry(id),
-                    _ => None,
-                };
-                self.event(event);
-                if let Some((parent, entries)) = subagent {
-                    for event in entries.iter().flat_map(message_events) {
-                        self.subagent_event(&parent, event);
-                    }
-                }
-            }
-            self.send_user(&mut id, &mut user);
+            self.replay_entry(&entry, &mut subagents);
         }
         self.fail_open_tools();
+    }
+
+    /// Sends the updates of one transcript entry, followed by the subagent
+    /// each of its tool calls started, taken from `subagents`.
+    pub fn replay_entry(&self, entry: &Value, subagents: &mut HashMap<String, Vec<Value>>) {
+        // The blocks of one user entry make one message, which keeps the
+        // entry's `uuid`: the `messageId` it had when it was inserted.
+        let mut id = entry["uuid"].as_str().map(str::to_owned);
+        let mut user = Vec::new();
+        for event in message_events(entry) {
+            if let Some(block) = user_block(&event) {
+                user.push(block);
+                continue;
+            }
+            self.send_user(&mut id, &mut user);
+            let subagent = match &event {
+                Event::Tool { id: Some(id), .. } => subagents.remove_entry(id),
+                _ => None,
+            };
+            self.event(event);
+            if let Some((parent, entries)) = subagent {
+                for event in entries.iter().flat_map(message_events) {
+                    self.subagent_event(&parent, event);
+                }
+            }
+        }
+        self.send_user(&mut id, &mut user);
     }
 
     /// Sends `blocks` as a user message with the entry's ID, or a new one
@@ -520,7 +562,7 @@ impl Updates {
             PermissionOptionKind::RejectOnce,
         ));
         let response = self
-            .connection
+            .connection()
             .send_request(
                 RequestPermissionRequest::new(self.session_id.clone(), title, options)
                     .subject(acp::RequestPermissionSubject::from(update)),
@@ -578,7 +620,7 @@ impl Updates {
         // The turn waits for the client until the guard drops.
         let _asking = Asking::new(self);
         let response = self
-            .connection
+            .connection()
             .send_request(CreateElicitationRequest::new(
                 ElicitationFormMode::new(
                     ElicitationSessionScope::new(self.session_id.clone())

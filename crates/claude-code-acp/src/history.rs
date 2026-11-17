@@ -8,6 +8,20 @@ use std::{
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::runner::{Event, message_events};
+
+/// The entrypoints of sessions a person ran: Claude Code in a terminal and
+/// the Claude desktop app. `sdk-cli` sessions come from `claude -p` and the
+/// Agent SDK, which Ox's own sessions use.
+pub const INTERACTIVE: [&str; 2] = ["cli", "claude-desktop"];
+
+/// A Claude session that `History::sessions` lists.
+pub struct Listed {
+    pub id: String,
+    /// The `timestamp` of the transcript's first entry that has one.
+    pub started_at: Option<String>,
+}
+
 /// The transcripts Claude keeps under its config directory.
 pub struct History {
     root: PathBuf,
@@ -67,6 +81,57 @@ impl History {
             .collect()
     }
 
+    /// The interactive sessions started in `cwd`, in no particular order.
+    pub fn sessions(&self, cwd: &Path) -> Vec<Listed> {
+        let Ok(projects) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        projects
+            .flatten()
+            .filter_map(|project| fs::read_dir(project.path()).ok())
+            .flat_map(Iterator::flatten)
+            .filter_map(|file| {
+                let path = file.path();
+                let id = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
+                Uuid::parse_str(id).ok()?;
+                let head = head(&path)?;
+                let interactive = head
+                    .entrypoint
+                    .is_some_and(|entrypoint| INTERACTIVE.contains(&entrypoint.as_str()));
+                (interactive && head.cwd.as_deref() == Some(cwd)).then(|| Listed {
+                    id: id.to_owned(),
+                    started_at: head.timestamp,
+                })
+            })
+            .collect()
+    }
+
+    /// The title of a session: the last title the user gave it with
+    /// `/rename`, else the last title Claude generated for it, else its first
+    /// prompt's text.
+    pub fn title(&self, id: &str, cwd: &Path) -> Option<String> {
+        let path = self.transcript(id, cwd)?;
+        let mut custom = None;
+        let mut generated = None;
+        let mut prompt = None;
+        for entry in entries(&path) {
+            match entry["type"].as_str() {
+                Some("custom-title") => custom = entry["customTitle"].as_str().map(str::to_owned),
+                Some("ai-title") => generated = entry["aiTitle"].as_str().map(str::to_owned),
+                Some("user") if prompt.is_none() && entry["isSidechain"] != true => {
+                    prompt = message_events(&entry)
+                        .into_iter()
+                        .find_map(|event| match event {
+                            Event::UserText(text) => acp_bridge::title(&text),
+                            _ => None,
+                        });
+                }
+                _ => {}
+            }
+        }
+        custom.or(generated).or(prompt)
+    }
+
     /// The transcript of session `id` started in `cwd`.
     fn transcript(&self, id: &str, cwd: &Path) -> Option<PathBuf> {
         Uuid::parse_str(id).ok()?;
@@ -74,12 +139,19 @@ impl History {
         projects
             .flatten()
             .map(|project| project.path().join(format!("{id}.jsonl")))
-            .find(|path| transcript_cwd(path).is_some_and(|found| found == cwd))
+            .find(|path| head(path).is_some_and(|head| head.cwd.as_deref() == Some(cwd)))
     }
 }
 
 /// The `user` and `assistant` entries of the transcript at `path`.
 fn messages(path: &Path) -> Vec<Value> {
+    let mut entries = entries(path);
+    entries.retain(|entry| matches!(entry["type"].as_str(), Some("user" | "assistant")));
+    entries
+}
+
+/// Every entry of the transcript at `path`.
+fn entries(path: &Path) -> Vec<Value> {
     let Ok(file) = File::open(path) else {
         return Vec::new();
     };
@@ -87,25 +159,37 @@ fn messages(path: &Path) -> Vec<Value> {
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .filter(|entry| matches!(entry["type"].as_str(), Some("user" | "assistant")))
         .collect()
 }
 
-/// The working directory of the session whose transcript is at `path`, from
-/// the first entry that has one.
-fn transcript_cwd(path: &Path) -> Option<PathBuf> {
+/// What the start of a transcript says about its session, each from the
+/// first entry that has it.
+#[derive(Default)]
+struct Head {
+    cwd: Option<PathBuf>,
+    entrypoint: Option<String>,
+    timestamp: Option<String>,
+}
+
+/// The head of the transcript at `path`, read from its first MiB.
+fn head(path: &Path) -> Option<Head> {
     if !path.metadata().ok()?.is_file() {
         return None;
     }
     let mut reader = BufReader::new(File::open(path).ok()?).take(1024 * 1024);
+    let mut head = Head::default();
     let mut line = String::new();
     while reader.read_line(&mut line).ok()? > 0 {
-        if let Ok(entry) = serde_json::from_str::<Value>(&line)
-            && let Some(cwd) = entry.get("cwd").and_then(Value::as_str)
-        {
-            return Some(PathBuf::from(cwd));
+        if let Ok(entry) = serde_json::from_str::<Value>(&line) {
+            let field = |key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+            head.cwd = head.cwd.or_else(|| field("cwd").map(PathBuf::from));
+            head.entrypoint = head.entrypoint.or_else(|| field("entrypoint"));
+            head.timestamp = head.timestamp.or_else(|| field("timestamp"));
+            if head.cwd.is_some() && head.entrypoint.is_some() && head.timestamp.is_some() {
+                break;
+            }
         }
         line.clear();
     }
-    None
+    Some(head)
 }

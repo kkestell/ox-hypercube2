@@ -18,8 +18,8 @@ mod messages;
 
 #[cfg(unix)]
 pub use client::{
-    Client, End, Error, Stream, Subscription, daemon_binary, data_dir, default_socket_path,
-    describe,
+    Client, End, Error, Stream, Subscription, bridge_mode, daemon_binary, data_dir,
+    default_socket_path, describe,
 };
 #[cfg(unix)]
 pub mod content;

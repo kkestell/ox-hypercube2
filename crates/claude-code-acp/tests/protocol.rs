@@ -3084,3 +3084,179 @@ next_message
     );
     child.kill().await.unwrap();
 }
+
+/// Runs the bridge with `args` against the Claude config dir `claude`.
+async fn read_sessions(claude: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    let output = Command::new(env!("CARGO_BIN_EXE_claude-code-acp"))
+        .args(args)
+        .env("CLAUDE_CONFIG_DIR", claude)
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(TIMEOUT, output)
+        .await
+        .expect("timed out reading sessions")
+        .unwrap()
+}
+
+/// A transcript's first entry: a user prompt with its working directory,
+/// entrypoint and time.
+fn first_entry(cwd: &Path, entrypoint: &str, timestamp: &str, prompt: &str) -> Value {
+    json!({"type": "user", "cwd": cwd, "entrypoint": entrypoint, "timestamp": timestamp,
+        "message": {"role": "user", "content": prompt}})
+}
+
+#[tokio::test]
+async fn sessions_lists_the_interactive_sessions_started_in_the_project() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, project) = dirs(temp.path());
+    let sub = project.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let claude = temp.path().join("claude");
+    let ids = [
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+        "00000000-0000-4000-8000-000000000003",
+        "00000000-0000-4000-8000-000000000004",
+        "00000000-0000-4000-8000-000000000005",
+    ];
+    let started = [
+        (&project, "cli", "2026-11-01T10:00:00.000Z"),
+        (&project, "claude-desktop", "2026-11-02T10:00:00.000Z"),
+        (&project, "sdk-cli", "2026-11-03T10:00:00.000Z"),
+        (
+            &temp.path().to_path_buf(),
+            "cli",
+            "2026-11-04T10:00:00.000Z",
+        ),
+        (&sub, "cli", "2026-11-05T10:00:00.000Z"),
+    ];
+    for (id, (cwd, entrypoint, timestamp)) in ids.iter().zip(started) {
+        let transcripts = claude.join("projects").join(format!("p{}", &id[35..]));
+        fs::create_dir_all(&transcripts).unwrap();
+        write_lines(
+            &transcripts.join(format!("{id}.jsonl")),
+            &[
+                json!({"type": "mode", "mode": "normal"}),
+                first_entry(cwd, entrypoint, timestamp, "hi"),
+            ],
+        );
+    }
+    let output = read_sessions(&claude, &["--sessions".as_ref(), project.as_os_str()]).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        listed,
+        json!([
+            {"sessionId": ids[1], "startedAt": 1_793_613_600_000_i64},
+            {"sessionId": ids[0], "startedAt": 1_793_527_200_000_i64},
+        ])
+    );
+}
+
+/// Runs the bridge's `--transcript` for session `id` in `project`.
+async fn transcript_of(claude: &Path, project: &Path, id: &str) -> Value {
+    let output = read_sessions(
+        claude,
+        &["--transcript".as_ref(), project.as_os_str(), id.as_ref()],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn transcript_prints_the_title_and_the_updates_with_their_times() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, project) = dirs(temp.path());
+    let claude = temp.path().join("claude");
+    let transcripts = claude.join("projects/sample");
+    fs::create_dir_all(&transcripts).unwrap();
+    let at = |second: u32| format!("2026-11-01T10:00:{second:02}.000Z");
+    let ms = |second: i64| 1_793_527_200_000_i64 + second * 1000;
+    write_lines(
+        &transcripts.join(format!("{HISTORY_ID}.jsonl")),
+        &[
+            first_entry(&project, "cli", &at(1), "Fix the build"),
+            json!({"type": "custom-title", "customTitle": "Build fix"}),
+            json!({"type": "ai-title", "aiTitle": "Fixing the build"}),
+            json!({"type": "assistant", "timestamp": at(2), "message": {"content": [{"type": "text", "text": "Running it"}]}}),
+            json!({"type": "assistant", "timestamp": at(3), "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "cargo build"}}]}}),
+            json!({"type": "user", "timestamp": at(4), "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}]}}),
+            json!({"type": "ai-title", "aiTitle": "Build fixing"}),
+            json!({"type": "assistant", "timestamp": at(5), "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": "Read", "input": {"file_path": "/x"}}]}}),
+        ],
+    );
+    let transcript = transcript_of(&claude, &project, HISTORY_ID).await;
+    assert_eq!(transcript["title"], "Build fix", "{transcript}");
+    let updates = transcript["updates"].as_array().unwrap();
+    let notifications: Vec<Value> = updates
+        .iter()
+        .map(|timed| json!({"method": "session/update", "params": {"update": timed["update"]}}))
+        .collect();
+    let times: Vec<i64> = updates
+        .iter()
+        .map(|timed| timed["at"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        describe_updates(&notifications),
+        [
+            "user_message: Fix the build",
+            "agent_message: Running it",
+            "tool_call_update: toolu_1 Bash `cargo build` pending",
+            "tool_call_update: toolu_1 completed [ok]",
+            "tool_call_update: toolu_2 Read `/x` pending",
+            "tool_call_update: toolu_2 failed",
+        ]
+    );
+    assert_eq!(times, [ms(1), ms(2), ms(3), ms(4), ms(5), ms(5)]);
+}
+
+#[tokio::test]
+async fn transcript_titles_a_session_without_claudes_title_by_its_first_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, project) = dirs(temp.path());
+    let claude = temp.path().join("claude");
+    let transcripts = claude.join("projects/sample");
+    fs::create_dir_all(&transcripts).unwrap();
+    write_lines(
+        &transcripts.join(format!("{HISTORY_ID}.jsonl")),
+        &[
+            first_entry(
+                &project,
+                "cli",
+                "2026-11-01T10:00:00.000Z",
+                "Fix   the\nbuild",
+            ),
+            json!({"type": "user", "timestamp": "2026-11-01T10:00:01.000Z", "message": {"role": "user", "content": "Then test"}}),
+        ],
+    );
+    let transcript = transcript_of(&claude, &project, HISTORY_ID).await;
+    assert_eq!(transcript["title"], "Fix the build", "{transcript}");
+}
+
+#[tokio::test]
+async fn transcript_of_an_unknown_session_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_, project) = dirs(temp.path());
+    let output = read_sessions(
+        &temp.path().join("claude"),
+        &[
+            "--transcript".as_ref(),
+            project.as_os_str(),
+            HISTORY_ID.as_ref(),
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("not found"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}

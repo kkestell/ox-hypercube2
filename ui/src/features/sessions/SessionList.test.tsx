@@ -137,4 +137,70 @@ describe("A session's context menu", () => {
     await core.choose(header, "Show Archived");
     expect(screen.queryByText("Archived")).not.toBeInTheDocument();
   });
+
+  it("imports an added workspace's Claude Code sessions", async () => {
+    const core = await renderApp();
+    const project = workspace({ path: "/src/project" });
+    core.on("plugin:dialog|open", () => project.path);
+    core.on("add_workspace", () => project);
+    await userEvent.click(screen.getByRole("button", { name: "Add Workspace" }));
+    expect(core.invoked("add_workspace")).toEqual([{ path: project.path }]);
+    expect(core.invoked("import_claude_sessions")).toEqual([{ workspaceId: project.id }]);
+  });
+
+  it("reports how many Claude Code sessions the heading's import added", async () => {
+    const project = workspace({ path: "/src/project" });
+    const core = await renderApp({ type: "workspace", workspace: project });
+    const header = screen.getByRole("heading", { name: "project" });
+    for (const [imported, text] of [
+      [2, "Imported 2 sessions"],
+      [0, "No new Claude Code sessions"],
+    ] as const) {
+      core.on("import_claude_sessions", () => imported);
+      await core.choose(header, "Import Claude Code Sessions");
+      expect(core.invoked("plugin:dialog|message").at(-1)).toMatchObject({
+        message: text,
+        kind: "info",
+      });
+    }
+    expect(core.invoked("import_claude_sessions")).toEqual([
+      { workspaceId: project.id },
+      { workspaceId: project.id },
+    ]);
+  });
+
+  it("removes a workspace of archived sessions once the user confirms", async () => {
+    const project = workspace({ path: "/src/project" });
+    const archived = { archived: true };
+    const core = await renderApp(
+      { type: "workspace", workspace: project },
+      { type: "session", session: session(project, archived) },
+      { type: "session", session: session(project, archived) },
+    );
+    const header = screen.getByRole("heading", { name: "project" });
+    expect((await core.contextMenu(header))["Remove Workspace"]).toBe(true);
+
+    // The dialog answers with the label of the button chosen.
+    core.on("plugin:dialog|message", () => "Cancel");
+    await core.choose(header, "Remove Workspace");
+    expect(core.invoked("plugin:dialog|message").at(-1)).toMatchObject({
+      message: "Remove this workspace and delete its 2 archived sessions?",
+    });
+    expect(core.invoked("remove_workspace")).toEqual([]);
+
+    core.on("plugin:dialog|message", () => "Remove");
+    await core.choose(header, "Remove Workspace");
+    expect(core.invoked("remove_workspace")).toEqual([{ workspaceId: project.id }]);
+  });
+
+  it("keeps a workspace with a session that is not archived", async () => {
+    const project = workspace({ path: "/src/project" });
+    const core = await renderApp(
+      { type: "workspace", workspace: project },
+      { type: "session", session: session(project, { archived: true }) },
+      { type: "session", session: session(project) },
+    );
+    const header = screen.getByRole("heading", { name: "project" });
+    expect((await core.contextMenu(header))["Remove Workspace"]).toBe(false);
+  });
 });

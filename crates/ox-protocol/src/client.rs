@@ -20,8 +20,8 @@ use tokio::task::JoinHandle;
 
 use crate::messages::{
     Branches, Checkout, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, ErrorBody, Event,
-    EventKind, FileContent, Harness, HelloResult, ListingChange, MessageSent, Method,
-    PROTOCOL_VERSION, QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage,
+    EventKind, FileContent, Harness, HelloResult, ImportedSessions, ListingChange, MessageSent,
+    Method, PROTOCOL_VERSION, QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage,
     WorkspaceInfo, WorktreeInfo,
 };
 
@@ -104,9 +104,19 @@ pub async fn describe(
     cwd: &Path,
     env: &BTreeMap<String, String>,
 ) -> Result<Controls, String> {
+    bridge_mode(bridge, &["--describe".as_ref(), cwd.as_os_str()], env).await
+}
+
+/// What `bridge` prints as JSON when run with `args`, which select one of
+/// its modes besides serving ACP. The bridge runs with `env` over this
+/// process's environment. A bridge that fails gives its standard error.
+pub async fn bridge_mode<T: DeserializeOwned>(
+    bridge: &Path,
+    args: &[&std::ffi::OsStr],
+    env: &BTreeMap<String, String>,
+) -> Result<T, String> {
     let output = tokio::process::Command::new(bridge)
-        .arg("--describe")
-        .arg(cwd)
+        .args(args)
         .envs(env)
         .stdin(Stdio::null())
         .kill_on_drop(true)
@@ -324,6 +334,20 @@ impl Client {
 
     pub async fn add_workspace(&self, path: PathBuf) -> Result<WorkspaceInfo, Error> {
         self.call(Method::WorkspaceAdd { path }).await
+    }
+
+    /// Imports the workspace's Claude Code sessions. The Claude bridge runs
+    /// with `env` over the daemon's environment.
+    pub async fn import_claude_sessions(
+        &self,
+        workspace_id: &str,
+        env: BTreeMap<String, String>,
+    ) -> Result<ImportedSessions, Error> {
+        self.call(Method::WorkspaceImportClaudeSessions {
+            workspace_id: workspace_id.into(),
+            env,
+        })
+        .await
     }
 
     pub async fn remove_workspace(&self, workspace_id: &str) -> Result<(), Error> {

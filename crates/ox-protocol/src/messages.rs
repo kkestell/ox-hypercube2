@@ -36,10 +36,27 @@ pub enum Method {
     /// no workspace has.
     #[serde(rename = "workspace.add")]
     WorkspaceAdd { path: PathBuf },
-    /// Removes a workspace. Refused while any session, exited or not,
-    /// belongs to it.
+    /// Removes a workspace and deletes its sessions, which must all be
+    /// archived; their branches are kept. A deleted session is not
+    /// remembered, so importing the directory's Claude Code sessions again
+    /// brings it back. Refused while a session that is not archived belongs
+    /// to it.
     #[serde(rename = "workspace.remove")]
     WorkspaceRemove { workspace_id: String },
+    /// Imports the interactive Claude Code sessions started in the
+    /// workspace's directory that the daemon does not have, newest first,
+    /// as archived, exited sessions with their transcripts' history. A
+    /// session the daemon has, or had and deleted, is skipped. Each session
+    /// is added as soon as its transcript is read. The Claude bridge runs
+    /// with `env` over the daemon's environment. The answer, when the import
+    /// is done, counts the sessions imported. Refused when the bridge cannot
+    /// list the sessions; a transcript it cannot read is skipped.
+    #[serde(rename = "workspace.import_claude_sessions")]
+    WorkspaceImportClaudeSessions {
+        workspace_id: String,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
     /// The branch the workspace's checkout is on. Refused outside a Git
     /// working tree. Git runs with `env` over the daemon's environment, as
     /// for `session.new`.
@@ -80,10 +97,10 @@ pub enum Method {
     /// `agent_session_id`, from the session's command and directory, which
     /// must still exist. The
     /// result is the session in state `starting`. The agent replays the
-    /// conversation before its `agent_started` event. A session with no
-    /// stored events records the replay as `update` events; a session that has
-    /// them, including one restored after an `oxd` restart, keeps them and
-    /// drops the replay.
+    /// conversation before its `agent_started` event. A session whose history
+    /// holds no agent start and no prompt records the replay as `update`
+    /// events; any other session, including one restored after an `oxd`
+    /// restart, keeps its history and drops the replay.
     #[serde(rename = "session.load")]
     SessionLoad {
         session_id: String,
@@ -445,6 +462,13 @@ pub struct Deleted {
     /// The branch the daemon created for the worktree, kept
     /// because it has commits on no other branch, tag or remote branch.
     pub kept_branch: Option<String>,
+}
+
+/// The result of `workspace.import_claude_sessions`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSessions {
+    /// The number of sessions imported.
+    pub imported: u64,
 }
 
 /// A config option value for `session.new` to set.

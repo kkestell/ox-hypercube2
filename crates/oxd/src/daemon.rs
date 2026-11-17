@@ -10,14 +10,16 @@ use ox_protocol::schema::{
     SessionConfigSelectOptions, TextContent,
 };
 use ox_protocol::{
-    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, Harness, ListingChange,
-    MessageSent, Method, QueueAdded, Sender, SessionInfo, SessionState, WorkspaceInfo, code,
+    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, Harness, ImportedSessions,
+    ListingChange, MessageSent, Method, QueueAdded, Sender, SessionInfo, SessionState,
+    WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::branches;
 use crate::directories::Directories;
+use crate::import::{self, ClaudeSession, Transcript};
 use crate::mcp::OxServer;
 use crate::session::{self, Opening, Session};
 use crate::state::{self, Change, Queue, State};
@@ -291,6 +293,9 @@ impl Daemon {
             Method::WorkspaceBranches { workspace_id, env } => {
                 Ok(to_value(self.branches(&workspace_id, env).await?))
             }
+            Method::WorkspaceImportClaudeSessions { workspace_id, env } => Ok(to_value(
+                self.import_claude_sessions(&workspace_id, env).await?,
+            )),
             Method::SessionNew {
                 workspace_id,
                 command,
@@ -568,8 +573,10 @@ impl Daemon {
         })
     }
 
+    /// Removes a workspace whose sessions are all archived, deleting them
+    /// with their worktrees' rows. Their branches are kept.
     fn remove_workspace(&self, id: &str) -> Result<(), ErrorBody> {
-        self.update(|registry| {
+        let removed = self.update(|registry| {
             let index = registry
                 .workspaces
                 .iter()
@@ -578,20 +585,42 @@ impl Daemon {
             // The store has the rows of sessions still being created.
             if self
                 .store
-                .workspace_has_sessions(id)
+                .workspace_has_unarchived_sessions(id)
                 .map_err(|error| storage(&error))?
             {
                 return Err(ErrorBody {
                     code: code::INVALID_STATE,
-                    message: "the workspace has sessions".into(),
+                    message: "the workspace has sessions that are not archived".into(),
                 });
             }
+            // TODO: an archived session being unarchived or deleted meanwhile
+            // is removed under its operation.
             self.store
                 .remove_workspace(id)
                 .map_err(|error| storage(&error))?;
             registry.workspaces.remove(index);
-            Ok(())
-        })
+            let ids: Vec<String> = registry
+                .sessions
+                .values()
+                .filter(|session| session.workspace_id() == id)
+                .map(|session| session.id.clone())
+                .collect();
+            let removed: Vec<Arc<Session>> = ids
+                .iter()
+                .filter_map(|id| registry.sessions.remove(id))
+                .collect();
+            for worktree in removed.iter().filter_map(|session| session.worktree()) {
+                registry.worktrees.remove(&worktree.id);
+            }
+            Ok::<_, ErrorBody>(removed)
+        })?;
+        for session in removed {
+            if let Some(worktree) = session.worktree() {
+                worktree.close();
+            }
+            session.close();
+        }
+        Ok(())
     }
 
     /// Creates a session in the workspace's directory or in a new worktree,
@@ -866,20 +895,7 @@ impl Daemon {
                 invalid_request("this session's harness is not known; name one".into())
             })?,
         };
-        // The harness's ACP bridge sits beside the daemon's executable.
-        let bridge = std::env::current_exe()
-            .map_err(|error| ErrorBody {
-                code: code::INVALID_STATE,
-                message: format!("finding the daemon's executable: {error}"),
-            })?
-            .with_file_name(harness.bridge());
-        if !bridge.is_file() {
-            return Err(invalid_state(&format!(
-                "the {} bridge is not installed at {}",
-                harness.executable(),
-                bridge.display()
-            )));
-        }
+        let bridge = bridge(harness)?;
         let env = requester.env();
         let git = Git::for_client(env.clone());
         let (checkout, branch_line) = if request.worktree {
@@ -1145,6 +1161,125 @@ impl Daemon {
         }
     }
 
+    /// Imports the interactive Claude sessions started in the workspace's
+    /// directory that no session has and no deleted session had, newest
+    /// first, each saved and registered as soon as its transcript is read.
+    /// Returns how many it imported.
+    async fn import_claude_sessions(
+        self: &Arc<Self>,
+        workspace_id: &str,
+        env: BTreeMap<String, String>,
+    ) -> Result<ImportedSessions, ErrorBody> {
+        let workspace = self.workspace_path(workspace_id)?;
+        let bridge = bridge(Harness::Claude)?;
+        let listed = import::sessions(&bridge, &workspace, &env)
+            .await
+            .map_err(|error| ErrorBody {
+                code: code::AGENT,
+                message: format!("listing Claude Code sessions: {error}"),
+            })?;
+        let mut imported = 0;
+        for claude in listed {
+            if self.knows_claude_session(&self.lock(), &claude.session_id)? {
+                continue;
+            }
+            let transcript =
+                match import::transcript(&bridge, &workspace, &claude.session_id, &env).await {
+                    Ok(transcript) => transcript,
+                    Err(error) => {
+                        eprintln!(
+                            "oxd: importing Claude Code session {}: {error}",
+                            claude.session_id
+                        );
+                        continue;
+                    }
+                };
+            if self.add_imported(workspace_id, &bridge, claude, transcript)? {
+                imported += 1;
+            }
+        }
+        Ok(ImportedSessions { imported })
+    }
+
+    /// Whether a session has Claude session `agent_session_id`, or a deleted
+    /// session had it.
+    fn knows_claude_session(
+        &self,
+        registry: &Registry,
+        agent_session_id: &str,
+    ) -> Result<bool, ErrorBody> {
+        let registered = registry
+            .sessions
+            .values()
+            .any(|session| session.agent_session_id().as_deref() == Some(agent_session_id));
+        Ok(registered
+            || self
+                .store
+                .was_deleted(agent_session_id)
+                .map_err(|error| storage(&error))?)
+    }
+
+    /// Saves and registers an imported Claude session as archived and
+    /// exited, as a session restored at startup is, unless a session has it
+    /// by now. Returns whether it was added.
+    fn add_imported(
+        &self,
+        workspace_id: &str,
+        bridge: &Path,
+        claude: ClaudeSession,
+        transcript: Transcript,
+    ) -> Result<bool, ErrorBody> {
+        self.update(|registry| {
+            if self.knows_claude_session(registry, &claude.session_id)? {
+                return Ok(false);
+            }
+            let workspace = registry
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == workspace_id)
+                .ok_or_else(|| not_found("workspace", workspace_id))?;
+            let id = uuid::Uuid::new_v4().to_string();
+            let events = import::events(&id, transcript.updates);
+            let mut saved = SavedSession {
+                number: 0,
+                id: id.clone(),
+                workspace_id: workspace_id.into(),
+                command: vec![bridge.to_string_lossy().into_owned()],
+                cwd: workspace.path.clone(),
+                title: transcript.title,
+                agent_session_id: Some(claude.session_id.clone()),
+                worktree_id: None,
+                last_seq: events.last().map_or(0, |event| event.seq),
+                archived: true,
+                created_at: claude.started_at,
+                unseen: None,
+                queue: Queue::default(),
+            };
+            saved.number = self
+                .store
+                .import_session(&saved, &events)
+                .map_err(|error| storage(&error))?;
+            let state = State::restored(
+                id.clone(),
+                saved.title.clone(),
+                claude.session_id,
+                saved.last_seq,
+                Queue::default(),
+            );
+            let session = Session::new(
+                self.store.clone(),
+                self.changed.clone(),
+                self.park_after,
+                self.ox_server.clone(),
+                saved,
+                None,
+                state,
+            );
+            registry.sessions.insert(id, session);
+            Ok(true)
+        })
+    }
+
     /// Deletes the session's rows, with its worktree's, and removes both from
     /// the registry.
     fn forget(&self, id: &str) -> Result<(), ErrorBody> {
@@ -1242,6 +1377,25 @@ async fn settings(
         });
     }
     Ok(settings)
+}
+
+/// The path of the ACP bridge of `harness`, which sits beside the daemon's
+/// executable.
+fn bridge(harness: Harness) -> Result<PathBuf, ErrorBody> {
+    let bridge = std::env::current_exe()
+        .map_err(|error| ErrorBody {
+            code: code::INVALID_STATE,
+            message: format!("finding the daemon's executable: {error}"),
+        })?
+        .with_file_name(harness.bridge());
+    if !bridge.is_file() {
+        return Err(invalid_state(&format!(
+            "the {} bridge is not installed at {}",
+            harness.executable(),
+            bridge.display()
+        )));
+    }
+    Ok(bridge)
 }
 
 /// The text blocks of a prompt, joined by newlines.

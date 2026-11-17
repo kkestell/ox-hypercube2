@@ -298,6 +298,18 @@ async fn add_workspace(app: State<'_, App>, path: PathBuf) -> Result<WorkspaceIn
         .map_err(message)
 }
 
+/// Imports the workspace's Claude Code sessions and returns how many it
+/// imported.
+#[tauri::command]
+async fn import_claude_sessions(app: State<'_, App>, workspace_id: String) -> Result<u64, String> {
+    app.client()
+        .await?
+        .import_claude_sessions(&workspace_id, utf8_env())
+        .await
+        .map(|imported| imported.imported)
+        .map_err(message)
+}
+
 #[tauri::command]
 async fn remove_workspace(app: State<'_, App>, workspace_id: String) -> Result<(), String> {
     app.client()
@@ -660,6 +672,7 @@ pub fn run() {
             watch_file,
             unwatch,
             add_workspace,
+            import_claude_sessions,
             remove_workspace,
             workspace_branches,
             move_branch,

@@ -128,6 +128,10 @@ impl Store {
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                 paused     INTEGER NOT NULL,
                 prompts    TEXT NOT NULL  -- JSON array of QueuedPrompt
+            );
+            -- The agent session IDs of deleted sessions, which an import skips.
+            CREATE TABLE IF NOT EXISTS deleted_agent_sessions (
+                agent_session_id TEXT PRIMARY KEY
             );",
         )?;
         let connection = Arc::new(Mutex::new(connection));
@@ -204,10 +208,20 @@ impl Store {
         Ok(added == 1)
     }
 
+    /// Deletes a workspace with its sessions, their events and their
+    /// worktrees. The sessions' agent session IDs are not remembered, so an
+    /// import brings them back.
     pub fn remove_workspace(&self, id: &str) -> rusqlite::Result<()> {
-        self.lock()
-            .execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
-        Ok(())
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM worktrees
+            WHERE id IN (SELECT worktree_id FROM sessions WHERE workspace_id = ?1)",
+            [id],
+        )?;
+        transaction.execute("DELETE FROM sessions WHERE workspace_id = ?1", [id])?;
+        transaction.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
+        transaction.commit()
     }
 
     /// Every worktree, in the order they were added.
@@ -322,6 +336,52 @@ impl Store {
         Ok(number)
     }
 
+    /// Saves an imported session with its title, agent session ID, creation
+    /// time, whether it is archived, and its events, in one transaction, and
+    /// returns its number. The session's other fields are ignored.
+    pub fn import_session(
+        &self,
+        session: &SavedSession,
+        events: &[Event],
+    ) -> rusqlite::Result<u64> {
+        let command =
+            serde_json::to_string(&session.command).expect("a list of strings serializes");
+        let mut connection = self.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO sessions (id, workspace_id, command, cwd, title, agent_session_id, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                session.id,
+                session.workspace_id,
+                command,
+                session.cwd.to_string_lossy(),
+                session.title,
+                session.agent_session_id,
+                time(session.created_at)
+            ],
+        )?;
+        let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
+        if session.archived {
+            transaction.execute(
+                "INSERT INTO archived (session_id) VALUES (?1)",
+                [&session.id],
+            )?;
+        }
+        insert_events(&transaction, events)?;
+        transaction.commit()?;
+        Ok(number)
+    }
+
+    /// Whether a deleted session had the agent session ID.
+    pub fn was_deleted(&self, agent_session_id: &str) -> rusqlite::Result<bool> {
+        self.lock().query_row(
+            "SELECT EXISTS (SELECT 1 FROM deleted_agent_sessions WHERE agent_session_id = ?1)",
+            [agent_session_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Forgets a worktree. The session that ran in it is kept, with no
     /// worktree.
     pub fn remove_worktree(&self, worktree_id: &str) -> rusqlite::Result<()> {
@@ -330,10 +390,11 @@ impl Store {
         Ok(())
     }
 
-    /// Whether any session belongs to the workspace.
-    pub fn workspace_has_sessions(&self, workspace_id: &str) -> rusqlite::Result<bool> {
+    /// Whether a session that is not archived belongs to the workspace.
+    pub fn workspace_has_unarchived_sessions(&self, workspace_id: &str) -> rusqlite::Result<bool> {
         self.lock().query_row(
-            "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM sessions WHERE workspace_id = ?1
+                AND id NOT IN (SELECT session_id FROM archived))",
             [workspace_id],
             |row| row.get(0),
         )
@@ -390,10 +451,17 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes a session, with its events and the worktree it runs in.
+    /// Deletes a session, with its events and the worktree it runs in, and
+    /// remembers its agent session ID, if it has one.
     pub fn remove_session(&self, id: &str) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO deleted_agent_sessions (agent_session_id)
+            SELECT agent_session_id FROM sessions
+            WHERE id = ?1 AND agent_session_id IS NOT NULL",
+            [id],
+        )?;
         transaction.execute(
             "DELETE FROM worktrees
             WHERE id = (SELECT worktree_id FROM sessions WHERE id = ?1)",
@@ -421,6 +489,29 @@ fn insert_worktree(
             worktree.compare
         ],
     )?;
+    Ok(())
+}
+
+/// Inserts events, dropping those of a session that is not saved.
+fn insert_events(
+    transaction: &rusqlite::Transaction<'_>,
+    events: &[Event],
+) -> rusqlite::Result<()> {
+    let mut insert = transaction.prepare_cached(
+        "INSERT INTO events (session_id, seq, recorded_at, kind)
+        SELECT ?1, ?2, ?3, ?4
+        WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
+    )?;
+    for event in events {
+        let seq = i64::try_from(event.seq).expect("seqs fit an i64");
+        let kind = serde_json::to_string(&event.kind).expect("an event kind serializes");
+        insert.execute(params![
+            event.session_id,
+            seq,
+            time(event.recorded_at),
+            kind
+        ])?;
+    }
     Ok(())
 }
 
@@ -466,26 +557,9 @@ fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
         let mut connection = connection.lock().unwrap();
         let result = (|| {
             let transaction = connection.transaction()?;
-            {
-                let mut insert = transaction.prepare_cached(
-                    "INSERT INTO events (session_id, seq, recorded_at, kind)
-                    SELECT ?1, ?2, ?3, ?4
-                    WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
-                )?;
-                for write in &batch {
-                    if let Write::Events(events) = write {
-                        for event in events {
-                            let seq = i64::try_from(event.seq).expect("seqs fit an i64");
-                            let kind = serde_json::to_string(&event.kind)
-                                .expect("an event kind serializes");
-                            insert.execute(params![
-                                event.session_id,
-                                seq,
-                                time(event.recorded_at),
-                                kind
-                            ])?;
-                        }
-                    }
+            for write in &batch {
+                if let Write::Events(events) = write {
+                    insert_events(&transaction, events)?;
                 }
             }
             transaction.commit()
@@ -710,15 +784,26 @@ mod tests {
     }
 
     #[test]
-    fn a_workspace_with_sessions_cannot_be_deleted() {
+    fn removing_a_workspace_deletes_its_sessions_without_remembering_them() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
+        store.add_workspace(&workspace("v", "/other")).unwrap();
+        add_worktree_session(&store, "s", &worktree("t"));
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("o", "v", &command(), Path::new("/other"), None, 0)
             .unwrap();
-        assert!(store.remove_workspace("w").is_err());
-        store.remove_session("s").unwrap();
+        store.set_agent_session_id("s", "claude").unwrap();
         store.remove_workspace("w").unwrap();
+        assert_eq!(store.workspaces().unwrap(), [workspace("v", "/other")]);
+        let sessions: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(sessions, ["o"]);
+        assert!(store.worktrees().unwrap().is_empty());
+        assert!(!store.was_deleted("claude").unwrap());
     }
 
     fn worktree(id: &str) -> SavedWorktree {
@@ -812,16 +897,18 @@ mod tests {
     }
 
     #[test]
-    fn whether_a_workspace_has_sessions() {
+    fn whether_a_workspace_has_unarchived_sessions() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store.add_workspace(&workspace("v", "/other")).unwrap();
-        assert!(!store.workspace_has_sessions("w").unwrap());
+        assert!(!store.workspace_has_unarchived_sessions("w").unwrap());
         store
             .add_session("s", "w", &command(), Path::new("/work"), None, 0)
             .unwrap();
-        assert!(store.workspace_has_sessions("w").unwrap());
-        assert!(!store.workspace_has_sessions("v").unwrap());
+        assert!(store.workspace_has_unarchived_sessions("w").unwrap());
+        assert!(!store.workspace_has_unarchived_sessions("v").unwrap());
+        store.set_archived("s", true).unwrap();
+        assert!(!store.workspace_has_unarchived_sessions("w").unwrap());
     }
 
     /// Event `seq` of `session`, recorded `seq` milliseconds after the
@@ -872,5 +959,56 @@ mod tests {
         store.log(vec![exited("s", 1)]);
         store.flush().await;
         assert!(store.events("s").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_imported_session_round_trips_as_archived_with_its_events() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        let session = SavedSession {
+            number: 0,
+            id: "s".into(),
+            workspace_id: "w".into(),
+            command: command(),
+            cwd: "/work".into(),
+            title: Some("Build fix".into()),
+            agent_session_id: Some("claude".into()),
+            worktree_id: None,
+            last_seq: 0,
+            archived: true,
+            created_at: 1_700_000_000_000,
+            unseen: None,
+            queue: Queue::default(),
+        };
+        let events = [exited("s", 1), exited("s", 2)];
+        let number = store.import_session(&session, &events).unwrap();
+        assert_eq!(
+            store.sessions().unwrap(),
+            [SavedSession {
+                number,
+                last_seq: 2,
+                ..session
+            }]
+        );
+        assert_eq!(store.events("s").unwrap(), events);
+    }
+
+    #[test]
+    fn a_deleted_session_leaves_its_agent_session_id_remembered() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        store
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .unwrap();
+        store
+            .add_session("two", "w", &command(), Path::new("/work"), None, 0)
+            .unwrap();
+        store.set_agent_session_id("one", "claude").unwrap();
+        assert!(!store.was_deleted("claude").unwrap());
+        store.remove_session("one").unwrap();
+        assert!(store.was_deleted("claude").unwrap());
+        // A session without an agent session ID adds nothing.
+        store.remove_session("two").unwrap();
+        assert_eq!(count(&store, "deleted_agent_sessions"), 1);
     }
 }
