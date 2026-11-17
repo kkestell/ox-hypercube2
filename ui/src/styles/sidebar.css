@@ -71,6 +71,10 @@
   white-space: nowrap;
 }
 
+.tree-row {
+  height: var(--tree-row-height);
+}
+
 /* A tree row indents by its depth. */
 .tree-row .select {
   padding-inline-start: calc(var(--sidebar-row-padding) + var(--depth) * var(--tree-indent));

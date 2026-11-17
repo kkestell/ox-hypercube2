@@ -91,6 +91,7 @@
   --sidebar-row-padding: calc(var(--spacing) * 2);
   --sidebar-row-gap: calc(var(--spacing) * 1.5);
   --row-action-inset: var(--spacing);
+  --tree-row-height: calc(var(--spacing) * 7);
   /* VS Code's explorer indent. */
   --tree-indent: calc(var(--spacing) * 2);
   --workspace-header-height: calc(var(--spacing) * 7);
