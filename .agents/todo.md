@@ -6,6 +6,61 @@ concerns. The spec describes current behavior; update the affected spec
 alongside any change in behavior. A `TODO` comment in the code marks several
 of these; remove it with the fix.
 
+## Structure
+
+Each of these underlies several bugs below, which the fix closes.
+
+- [x] **A session's state has no single owner.** High. It lives in `Phase`
+  inside `State`, ten separately locked fields on `Session` (`worktree`,
+  `archived`, `config`, `unseen`, `parker` and others), the `Registry`
+  (`sessions`, `worktrees`, `moving_checkouts`), SQLite rows, and history
+  that may not be loaded. Each operation updates a subset in an order chosen
+  by hand, and lock order is stated only in comments. The store records no
+  lifecycle status, so startup infers one from `agent_session_id` and
+  `worktree_id`. One owner per session would compute each transition's next
+  state, rows and events together, then persist before publishing. Underlies
+  restart losing never-started sessions, the dangling worktree ID, and
+  workspace removal racing unarchive or delete.
+  `crates/oxd/src/session.rs:70`, `crates/oxd/src/daemon.rs:28`,
+  `crates/oxd/src/daemon.rs:139`.
+- [x] **Callers enforce session preconditions instead of the transitions.**
+  Medium. Each handler checks `refuse_moving` and takes the lifecycle lock
+  itself (`send_unmoved`, `SessionLoad`, `send_message`, `new_session`).
+  `start_queued` starts a turn from inside `Session::update`, where neither is
+  visible, and `remove_workspace` skips the lifecycle lock. A session that
+  knows its checkout is moving can refuse a turn in the transition itself,
+  whatever path requests it. Underlies the queued prompt starting during a
+  branch move and the workspace removal race. `crates/oxd/src/daemon.rs:280`,
+  `crates/oxd/src/state.rs:813`, `crates/oxd/src/daemon.rs:612`.
+- [ ] **A restored session is a second mode of `State`.** Medium. Its events
+  are `None` until first read, and crash recovery runs in `fill` at that read
+  rather than at startup. Events are persisted in batches after their seq is
+  assigned in memory, and replay treats `after_seq` as a vector offset. A
+  durable log that owns seqs and recovery would give `State` one mode; the
+  memory cost of holding every session bears on it (see Scale). Underlies the
+  crash error shown only once history is read, the subscriber hung by a
+  delete during the first read, and replay breaking after a failed write.
+  `crates/oxd/src/state.rs:715`, `crates/oxd/src/store.rs`.
+- [ ] **The bridges infer which turn a result or dialog belongs to.** Medium.
+  Claude's stream-json and Pi's RPC tag neither with a prompt, so the bridges
+  track flags (`preempted`, `cancelling`, `initializing`, `unclaimed_error`)
+  and match by position. A pure turn state machine in each bridge, like
+  `Phase::after` in `oxd`, could be tested over interleavings of prompts,
+  steering, cancellation, dialogs and model changes. Underlies cancelling
+  during a preempted turn, cancelling before a Pi dialog arrives, and a
+  prompt running on the previous model.
+  `crates/claude-code-acp/src/runner.rs:646`, `crates/pi-acp/src/pi.rs:383`,
+  `crates/pi-acp/src/bridge.rs:273`.
+- [ ] **Clients sequence session lifecycle themselves.** Medium. Selecting an
+  exited session awaits `load_session` before switching, and `set_config`
+  replaces the whole config, so the composer tracks the base each change
+  builds on. Daemon operations that state intent and are idempotent, such as
+  focus loading the session or applying one setting, would leave the UI with
+  latest-wins requests and no sequencing. Underlies a slow session switch
+  undoing a later one and concurrent config edits dropping a setting.
+  `ui/src/features/sessions/SessionList.tsx:188`,
+  `ui/src/features/composer/Composer.tsx:277`.
+
 ## Bugs
 
 ### Daemon
