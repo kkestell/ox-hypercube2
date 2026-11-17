@@ -7,6 +7,14 @@
   sessions show none of this. The run dashboard shows some of it for the run's
   worktree only. Nothing shows the base checkout's status.
 
+## Agent tools
+
+- [ ] **Start a session in an existing worktree.** `start_session` runs the
+  new session in the workspace's checkout or in a new worktree. Let it also
+  take an existing worktree, such as the requesting session's own, so a
+  session can hand off work in the checkout it is using.
+  [ox-mcp](../crates/ox-mcp/src/main.rs)
+
 ## Persistence and recovery
 
 ### An event write failure can break replay after restart
