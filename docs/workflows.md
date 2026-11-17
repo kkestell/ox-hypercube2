@@ -122,16 +122,24 @@ exit code, and output: standard output and standard error interleaved as they
 arrived. A command's output is recorded when it ends, and only its last
 64 KiB is kept. A shell step hands its whole standard output to the next step.
 
-## A full workflow
+## Example workflows
 
-This workflow plans, implements, reviews, and commits a change. Plan, Work,
-and Review each stage a new file, and their postconditions check that it is
-staged. Plan's precondition requires a clean checkout and records the
-starting commit in Git's metadata, and Commit's postcondition checks that the
-run made one commit and left the checkout clean.
+These workflows carry a change through the `kplan`, `kwork`, and `kreview`
+skills and commit it. Each skill step stages a new file, and its
+postcondition checks that the file is staged. The first step's precondition
+requires a clean checkout and records the starting commit in Git's metadata.
+Commit's precondition requires staged changes outside the skills' artifacts,
+and its postcondition checks that the run made one commit and left the
+checkout clean.
+
+`plan-work-review-commit.yaml` plans a change from a request:
 
 ```yaml
 name: Plan, Work, Review, Commit
+
+# The run's input is the change to plan: a small, clear request.
+# Each step runs one of the kplan, kwork, and kreview skills, which keep their
+# artifacts in .agents/ if the repository has it, otherwise in agents/.
 
 steps:
   - name: Plan
@@ -149,34 +157,133 @@ steps:
           start_head_file=$(git rev-parse --git-path ox-workflow-start-head)
           printf '%s\n' "$start_head" > "$start_head_file"
     prompt: |
-      Write an implementation plan for the task in your input.
-      Save it as a new file under .agents/plans/ and stage it.
+      Use the kplan skill with your input as its argument.
+
+      This turn is one step of an Ox workflow: the step ends when your turn ends, and your
+      last message becomes the next step's input. Ask the user each decision the skill needs
+      with the AskUserQuestion tool, which waits for the answer within this turn. Never end
+      your turn to wait for an answer. Present the Check your assumptions entries this way,
+      one question per entry, offering the decision you made and its alternative, in as many
+      calls as the list needs.
+
+      When the plan is staged, reply with kplan's final response.
     postconditions:
       - shell: >-
-          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/plans/)"
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/plans/ agents/plans/)"
 
   - name: Work
-    agent:
-      harness: pi
-      model: openai-codex/gpt-6.1-terra
-      effort: high
+    agent: *claude
     prompt: |
-      Implement the newly staged plan under .agents/plans/.
-      Write a new work log under .agents/work/ describing the changes and verification.
-      Stage the implementation and work log for the final commit.
+      Your input is kplan's final response. Use the kwork skill with the plan path it names
+      as its argument.
+
+      This turn is one step of an Ox workflow: the step ends when your turn ends, and your
+      last message becomes the next step's input. Ask the user each decision the skill needs
+      with the AskUserQuestion tool, which waits for the answer within this turn. Never end
+      your turn to wait for an answer.
+
+      When the work is staged, reply with kwork's final response.
     postconditions:
       - shell: >-
-          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/work/)"
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/work/ agents/work/)"
 
   - name: Review
     agent: *claude
     prompt: |
-      Review the staged implementation against the staged plan under .agents/plans/.
-      Read the staged work log under .agents/work/ for verification details.
-      Save your findings as a new file under .agents/reviews/ and stage it.
+      Your input is kwork's final response. Use the kreview skill with the review scope its
+      Next line names as its argument. Fix the High and Medium findings. Record each Low
+      finding in the review with the fix label `Not fixed` and leave its code unchanged.
+
+      This turn is one step of an Ox workflow: the step ends when your turn ends, and your
+      last message becomes the next step's input. Ask the user each decision a High or Medium
+      fix needs with the AskUserQuestion tool, which waits for the answer within this turn.
+      Never end your turn to wait for an answer.
+
+      When the review is staged, reply with kreview's final response.
     postconditions:
       - shell: >-
-          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/reviews/)"
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/reviews/ agents/reviews/)"
+
+  - name: Commit
+    agent:
+      harness: claude
+      model: claude-sonnet-5-5
+      effort: low
+      permission_mode: manual
+    preconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only -- . ':(exclude).agents' ':(exclude)agents')"
+    prompt: |
+      Your input is the review's final response. Commit everything staged in one commit.
+      The subject is the plan's title: the first line of the staged plan, without its leading
+      `# `. The body is two or three sentences on what changed, taken from your input and the
+      staged work log. Reply with the commit's short hash and subject.
+    postconditions:
+      - shell: |
+          set -eu
+          start_head_file=$(git rev-parse --git-path ox-workflow-start-head)
+          start_head=$(cat "$start_head_file")
+          test "$(git rev-parse HEAD^ 2>/dev/null)" = "$start_head"
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          rm "$start_head_file"
+```
+
+`work-review-commit.yaml` implements a plan that already exists:
+
+```yaml
+name: Work, Review, Commit
+
+# The run's input identifies a committed plan by its path or slug, or is the
+# plan's full text. Each step runs one of the kwork and kreview skills, which
+# keep their artifacts in .agents/ if the repository has it, otherwise in agents/.
+
+steps:
+  - name: Work
+    agent: &claude
+      harness: claude
+      model: claude-opus-5-5
+      effort: high
+      permission_mode: manual
+    preconditions:
+      - shell: |
+          set -eu
+          status=$(git status --porcelain --untracked-files=all)
+          test -z "$status"
+          start_head=$(git rev-parse HEAD)
+          start_head_file=$(git rev-parse --git-path ox-workflow-start-head)
+          printf '%s\n' "$start_head" > "$start_head_file"
+    prompt: |
+      Use the kwork skill with your input as its argument. If your input is a plan's full
+      text rather than its path or slug, first save it as a new plan, named as kplan names
+      plans, and stage it; then use the kwork skill with its path.
+
+      This turn is one step of an Ox workflow: the step ends when your turn ends, and your
+      last message becomes the next step's input. Ask the user each decision the skill needs
+      with the AskUserQuestion tool, which waits for the answer within this turn. Never end
+      your turn to wait for an answer.
+
+      When the work is staged, reply with kwork's final response.
+    postconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/work/ agents/work/)"
+
+  - name: Review
+    agent: *claude
+    prompt: |
+      Your input is kwork's final response. Use the kreview skill with the review scope its
+      Next line names as its argument. Fix the High and Medium findings. Record each Low
+      finding in the review with the fix label `Not fixed` and leave its code unchanged.
+
+      This turn is one step of an Ox workflow: the step ends when your turn ends, and your
+      last message becomes the next step's input. Ask the user each decision a High or Medium
+      fix needs with the AskUserQuestion tool, which waits for the answer within this turn.
+      Never end your turn to wait for an answer.
+
+      When the review is staged, reply with kreview's final response.
+    postconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only --diff-filter=A -- .agents/reviews/ agents/reviews/)"
 
   - name: Commit
     agent:
@@ -184,10 +291,14 @@ steps:
       model: claude-haiku-5-5
       effort: low
       permission_mode: manual
+    preconditions:
+      - shell: >-
+          test -n "$(git diff --cached --name-only -- . ':(exclude).agents' ':(exclude)agents')"
     prompt: |
-      Read the staged diff, work log, and review record.
-      Write a commit message that describes what changed and why.
-      Commit the staged implementation and all three records together.
+      Your input is the review's final response. Commit everything staged in one commit.
+      The subject is the plan's title: the first line of the plan named in the staged work
+      log, without its leading `# `. The body is two or three sentences on what changed, taken
+      from your input and the staged work log. Reply with the commit's short hash and subject.
     postconditions:
       - shell: |
           set -eu
