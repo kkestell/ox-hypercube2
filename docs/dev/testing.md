@@ -1,8 +1,8 @@
 # Testing
 
 Test the behavior people rely on. Keep the suite understandable and the effort
-proportionate to the consequence of being wrong. The scope and edge-case policy
-in [Code style](code-style.md#implementation) applies to tests too.
+proportionate to the consequence of being wrong. The scope and rare-case rules
+in [Code style](code-style.md) apply to tests too.
 
 ## What to test
 
@@ -16,8 +16,7 @@ in [Code style](code-style.md#implementation) applies to tests too.
   failure modes. A broader test should prove something the focused test cannot.
 - Assert on the actual contract, so a refactor that keeps observable behavior
   keeps its tests passing.
-- Cover each rule with the cases that establish it. A deferred edge case gets
-  tests when it is handled.
+- Cover each rule with the cases that establish it.
 
 ## Test layers
 
@@ -105,7 +104,6 @@ not it failed today.
   checks each item's presence, or orders them through an event.
 - In end-to-end tests, wait for the element or attribute that shows the
   expected state.
-- Before delivering a test change, name the event behind each wait in it.
 
 Clippy rejects `tokio::time::sleep`, `sleep_until`, and `std::thread::sleep`
 (`clippy.toml`), and Biome rejects `browser.pause`, `setTimeout`, and

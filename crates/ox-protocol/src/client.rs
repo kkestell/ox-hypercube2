@@ -379,18 +379,6 @@ impl Client {
         .await
     }
 
-    pub async fn load_session(
-        &self,
-        session_id: &str,
-        env: BTreeMap<String, String>,
-    ) -> Result<SessionInfo, Error> {
-        self.call(Method::SessionLoad {
-            session_id: session_id.into(),
-            env,
-        })
-        .await
-    }
-
     pub async fn prompt(&self, session_id: &str, prompt: Vec<ContentBlock>) -> Result<(), Error> {
         self.ack(Method::SessionPrompt {
             session_id: session_id.into(),
@@ -680,10 +668,16 @@ impl Client {
     }
 
     /// Sets the session this connection shows in front of the user, or
-    /// clears it with `None`.
-    pub async fn focus(&self, session_id: Option<&str>) -> Result<(), Error> {
+    /// clears it with `None`. Focusing an exited session that has started
+    /// loads it with `env`.
+    pub async fn focus(
+        &self,
+        session_id: Option<&str>,
+        env: BTreeMap<String, String>,
+    ) -> Result<(), Error> {
         self.ack(Method::Focus {
             session_id: session_id.map(String::from),
+            env,
         })
         .await
     }

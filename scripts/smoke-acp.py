@@ -331,8 +331,9 @@ class SmokeRun:
             connection.close()
 
     def load_session(self):
-        """Restarts the session's agent and waits for it to start."""
-        self.call("session.load", session_id=self.session, env=self.env)
+        """Focuses the exited session, which restarts its agent, and waits for it
+        to start."""
+        self.call("focus", session_id=self.session, env=self.env)
         watch = Watch(self.socket, self.session, self.args.timeout)
         try:
             deadline = time.monotonic() + self.args.timeout

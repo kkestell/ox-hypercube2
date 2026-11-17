@@ -84,15 +84,32 @@ describe("The session list", () => {
     expect(core.invoked("focus").at(-1)).toEqual(inFront);
   });
 
-  it("views a saved session by loading its agent", async () => {
+  it("views a saved session at once and focuses it, which loads it", async () => {
     const project = workspace();
     const saved = session(project, { title: "Saved", state: "exited" });
     const core = await renderApp(
       { type: "workspace", workspace: project },
       { type: "session", session: saved },
     );
-    await view("Saved");
-    expect(core.invoked("load_session")).toEqual([{ sessionId: saved.id }]);
+    const row = await view("Saved");
+    expect(row.querySelector("button.select")).toHaveAttribute("aria-current", "true");
+    expect(core.invoked("focus").at(-1)).toEqual({ sessionId: saved.id });
+    expect(core.invoked("load_session")).toEqual([]);
+  });
+
+  it("shows the session selected last when saved sessions are selected in turn", async () => {
+    const project = workspace();
+    const first = session(project, { title: "First", state: "exited" });
+    const second = session(project, { title: "Second", state: "exited" });
+    const core = await renderApp(
+      { type: "workspace", workspace: project },
+      { type: "session", session: first },
+      { type: "session", session: second },
+    );
+    await view("First");
+    const row = await view("Second");
+    expect(row.querySelector("button.select")).toHaveAttribute("aria-current", "true");
+    expect(core.invoked("focus").at(-1)).toEqual({ sessionId: second.id });
   });
 });
 

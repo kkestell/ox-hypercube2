@@ -273,9 +273,10 @@ impl Daemon {
             .ok_or_else(|| not_found("worktree", id))
     }
 
-    /// Replaces session `session_id`'s config, sending its agent each
-    /// setting ahead of every later command to the session. The returned
-    /// future resolves once the agent has answered.
+    /// Sets the settings in `config` on session `session_id` and leaves the
+    /// others as they are, sending its agent each setting ahead of every
+    /// later command to the session. The returned future resolves once the
+    /// agent has answered.
     pub fn set_config(
         &self,
         session_id: &str,
@@ -314,11 +315,6 @@ impl Daemon {
                 self.new_session(&workspace_id, command, env, checkout, prompt, config)
                     .await?,
             )),
-            Method::SessionLoad { session_id, env } => {
-                let session = self.session(&session_id)?;
-                session.load(env).await?;
-                Ok(to_value(session.info()))
-            }
             Method::SessionPrompt { session_id, prompt } => {
                 self.session(&session_id)?.prompt(prompt)?;
                 Ok(Value::Null)

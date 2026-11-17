@@ -291,18 +291,10 @@ impl Session {
         };
     }
 
-    /// Loads an exited session that has an agent session ID, once no other
-    /// lifecycle operation runs: its history is read, and a new agent
-    /// resumes it, with replay if the history has no recorded agent start.
-    /// Records `AgentStarted` on success or `AgentExited` on failure.
-    pub async fn load(self: &Arc<Self>, env: BTreeMap<String, String>) -> Result<(), ErrorBody> {
-        let _lifecycle = self.lifecycle().await?;
-        self.history().await?;
-        self.resume(env)
-    }
-
-    /// Loads the session as `load` does if it is `exited` once no other
-    /// lifecycle operation runs, and otherwise leaves it as it is.
+    /// Loads the session if it is `exited` once no other lifecycle operation
+    /// runs, and otherwise leaves it as it is: its history is read, and a new
+    /// agent resumes it, with replay if the history has no recorded agent
+    /// start. Records `AgentStarted` on success or `AgentExited` on failure.
     pub async fn load_if_exited(
         self: &Arc<Self>,
         env: BTreeMap<String, String>,
@@ -519,9 +511,23 @@ impl Session {
     }
 
     /// Counts a connection's focus on the session while the guard lives, and
-    /// clears its unseen outcome.
-    pub fn focus(self: &Arc<Self>) -> SessionFocus {
-        self.update(State::focus);
+    /// clears its unseen outcome. An `exited` session that is not archived
+    /// and has started before is loaded with `env` in a task of its own, so
+    /// the focus does not wait for the load; a refused load goes to oxd's
+    /// log.
+    pub fn focus(self: &Arc<Self>, env: BTreeMap<String, String>) -> SessionFocus {
+        let loads = self.update(|state| {
+            state.focus();
+            state.state() == SessionState::Exited && !state.archived() && state.agent().is_some()
+        });
+        if loads {
+            let session = self.clone();
+            tokio::spawn(async move {
+                if let Err(refusal) = session.load_if_exited(env).await {
+                    eprintln!("oxd: session {}: {}", session.id, refusal.message);
+                }
+            });
+        }
         SessionFocus(self.clone())
     }
 
@@ -691,10 +697,11 @@ impl Session {
         })
     }
 
-    /// Replaces the session's config: the agent is sent each setting, in
-    /// order, ahead of every command sent after this returns, such as a
-    /// prompt. The returned future resolves once the agent has answered them
-    /// all, to the error naming each setting it refused.
+    /// Sets the settings in `config` and leaves the others as they are: the
+    /// agent is sent each setting, in order, ahead of every command sent
+    /// after this returns, such as a prompt. The returned future resolves
+    /// once the agent has answered them all, to the error naming each
+    /// setting it refused.
     pub fn set_config(
         &self,
         config: Vec<ConfigSetting>,

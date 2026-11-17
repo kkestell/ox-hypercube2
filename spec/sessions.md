@@ -18,10 +18,10 @@ Each New Session opens its own draft. A draft keeps its message while other sess
 
 ### Resume a session
 
-1. Select a non-archived Exited session that previously started successfully.
+1. Show a non-archived Exited session that previously started successfully while the window is in front.
 2. The session goes through Starting and resumes with the same identity, workspace, directory, and conversation. Resuming does not duplicate its existing conversation.
 3. A resumed agent may report ongoing work; the session remains Running until that work ends.
-4. A failed resume leaves the session Exited and available for another attempt.
+4. A refused resume leaves the session Exited, without an error dialog, and showing the session again while the window is in front tries again. A resume whose agent fails to start leaves the session Exited and available for another attempt.
 
 Resuming is refused while the session's agent is already active, while it is archived, if it never successfully started, or if its directory no longer exists. Resuming also depends on the agent still being able to continue that conversation.
 

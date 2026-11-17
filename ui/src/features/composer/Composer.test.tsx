@@ -520,8 +520,41 @@ describe("The model picker", () => {
     expect(screen.getByRole("combobox", { name: "Mode" })).toBeDisabled();
   });
 
-  it("shows a chosen model at once, until the agent refuses it", async () => {
+  it("sends only the mode when it is picked", async () => {
     const { core, task } = await withConfig();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
+    expect(core.invoked("set_config")).toEqual([
+      { sessionId: task.id, config: [setting("mode", "code")] },
+    ]);
+  });
+
+  it("shows a chosen model with its levels at once and sends it with its effort", async () => {
+    const { core } = await withConfig();
+    core.on("set_config", () => new Promise(() => {}));
+    await choose("Deep");
+    expect(picker()).toHaveTextContent("DeepHigh");
+    expect(screen.getByRole("slider", { name: "Effort", hidden: true })).toHaveAttribute(
+      "max",
+      "1",
+    );
+    await choose("Tiny");
+    expect(picker()).toHaveTextContent("Tiny");
+    expect(screen.queryByRole("slider", { name: "Effort", hidden: true })).not.toBeInTheDocument();
+    expect(sent(core)).toEqual([["model deep", "effort high"], ["model tiny"]]);
+  });
+
+  it("sends an effort and then a model with the effort not yet listed", async () => {
+    const { core } = await withConfig();
+    core.on("set_config", () => new Promise(() => {}));
+    const slider = screen.getByRole("slider", { name: "Effort", hidden: true });
+    fireEvent.change(slider, { target: { value: "2" } });
+    await choose("Fast");
+    expect(picker()).toHaveTextContent("FastOpenRouterHigh");
+    expect(sent(core)).toEqual([["effort high"], ["model fast", "effort high"]]);
+  });
+
+  it("shows the session's config again when the agent refuses a pick", async () => {
+    const { core } = await withConfig();
     let refuse: (error: string) => void = () => {};
     core.on(
       "set_config",
@@ -529,24 +562,34 @@ describe("The model picker", () => {
     );
     await choose("Fast");
     expect(picker()).toHaveTextContent("FastOpenRouterMedium");
-    expect(core.invoked("set_config")).toEqual([
-      {
-        sessionId: task.id,
-        config: [setting("model", "fast"), setting("effort", "medium"), setting("mode", "ask")],
-      },
-    ]);
     await act(async () => refuse("unavailable"));
     expect(picker()).toHaveTextContent("SmartMedium");
+    expect(core.invoked("plugin:dialog|message").at(-1)).toMatchObject({
+      message: "unavailable",
+    });
   });
 
-  it("sends a new model with the effort the draft rule picks for it", async () => {
-    const { core } = await withConfig();
-    await choose("Deep");
-    await choose("Tiny");
-    expect(sent(core)).toEqual([
-      ["model deep", "effort high", "mode ask"],
-      ["model tiny", "mode ask"],
-    ]);
+  it("keeps a pending pick shown when a listing changes another setting", async () => {
+    const { core, task } = await withConfig();
+    core.on("set_config", () => new Promise(() => {}));
+    await choose("Fast");
+    core.list({
+      type: "session",
+      session: {
+        ...task,
+        config: [setting("model", "smart"), setting("effort", "medium"), setting("mode", "code")],
+      },
+    });
+    expect(picker()).toHaveTextContent("FastOpenRouterMedium");
+    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("Code");
+    core.list({
+      type: "session",
+      session: {
+        ...task,
+        config: [setting("model", "fast"), setting("effort", "medium"), setting("mode", "code")],
+      },
+    });
+    expect(picker()).toHaveTextContent("FastOpenRouterMedium");
   });
 
   it("chooses with the keyboard and sets the effort with the slider", async () => {
@@ -556,11 +599,7 @@ describe("The model picker", () => {
     const slider = screen.getByRole("slider", { name: "Effort", hidden: true });
     fireEvent.change(slider, { target: { value: "2" } });
     expect(picker()).toHaveTextContent("FastOpenRouterHigh");
-    // The effort builds on the model sent before the session's config has it.
-    expect(sent(core)).toEqual([
-      ["model fast", "effort medium", "mode ask"],
-      ["model fast", "effort high", "mode ask"],
-    ]);
+    expect(sent(core)).toEqual([["model fast", "effort medium"], ["effort high"]]);
   });
 
   it("offers only the models the config lists, at the one the session records", async () => {
@@ -590,27 +629,8 @@ describe("The model picker", () => {
     expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("plan");
   });
 
-  it("keeps recorded settings the config does not list when another changes", async () => {
-    const { core, task } = await withConfig();
-    core.list({
-      type: "session",
-      session: {
-        ...task,
-        config: [setting("model", "other/one"), setting("effort", "max"), setting("mode", "plan")],
-      },
-    });
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
-    expect(sent(core)).toEqual([["model other/one", "effort max", "mode code"]]);
-  });
-
   it("shows the mode as its own picker", async () => {
-    const { core, task } = await withConfig();
-    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
-    expect(core.invoked("set_config")).toEqual([
-      {
-        sessionId: task.id,
-        config: [setting("model", "smart"), setting("effort", "medium"), setting("mode", "code")],
-      },
-    ]);
+    await withConfig();
+    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("Ask");
   });
 });

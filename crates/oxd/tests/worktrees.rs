@@ -676,7 +676,11 @@ async fn git_ignores_the_clients_repository_variables() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worktree_session_survives_a_restart_and_loads_only_while_its_directory_exists() {
     let repo = repo();
-    let daemon = Daemon::start().await;
+    let daemon = Daemon::start_with(Options {
+        log: true,
+        ..Options::default()
+    })
+    .await;
     let client = daemon.client().await;
     let session = new_session(&client, repo.path(), on_ox_branch())
         .await
@@ -685,7 +689,7 @@ async fn a_worktree_session_survives_a_restart_and_loads_only_while_its_director
     let worktree = worktree_of(&client, &session).await;
     drop(client);
 
-    let daemon = daemon.restart().await;
+    let mut daemon = daemon.restart().await;
     let client = daemon.client().await;
     let restored = info(&client, &session.id).await.unwrap();
     assert_eq!(restored.state, SessionState::Exited);
@@ -694,17 +698,20 @@ async fn a_worktree_session_survives_a_restart_and_loads_only_while_its_director
     assert_eq!(restored.cwd, session.cwd);
 
     std::fs::remove_dir_all(&session.cwd).unwrap();
-    let error = client
-        .load_session(&session.id, BTreeMap::new())
+    client
+        .focus(Some(&session.id), BTreeMap::new())
         .await
-        .unwrap_err();
-    let Error::Remote(refused) = error else {
-        panic!("expected a daemon error, got {error}");
-    };
-    assert_eq!(refused.code, code::INVALID_STATE);
-    assert!(
-        refused.message.contains(session.cwd.to_str().unwrap()),
-        "{refused:?}"
+        .unwrap();
+    daemon
+        .wait_for_log(&format!(
+            "oxd: session {}: the session's directory {} no longer exists",
+            session.id,
+            session.cwd.display()
+        ))
+        .await;
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Exited
     );
 }
 
@@ -1305,10 +1312,7 @@ async fn a_locked_worktree_fails_the_delete_and_the_session_loads_again() {
         repo.path(),
         &["worktree", "unlock", worktree.path.to_str().unwrap()],
     );
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     until_state(&client, &session.id, SessionState::Idle).await;
 }
 
@@ -1509,9 +1513,14 @@ async fn archiving_removes_the_worktree_and_keeps_the_branch_and_the_conversatio
     );
 
     // An archived session cannot run.
-    let refused = refusal(client.load_session(&session.id, BTreeMap::new()).await);
-    assert_eq!(refused.code, code::INVALID_STATE);
-    assert!(refused.message.contains("archived"), "{refused:?}");
+    client
+        .focus(Some(&session.id), BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().state,
+        SessionState::Exited
+    );
     refusal(client.prompt(&session.id, text("say 1 0")).await);
     let refused = refusal(archive(&client, &session.id, false).await);
     assert_eq!(refused.code, code::INVALID_STATE);
@@ -1525,10 +1534,7 @@ async fn archiving_removes_the_worktree_and_keeps_the_branch_and_the_conversatio
         git(&worktree.path, &["branch", "--show-current"]),
         worktree.branch
     );
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let last = history.last().unwrap().seq;
     let resumed = events_until(&client, &session.id, last, |kind| {
         matches!(
@@ -2057,8 +2063,9 @@ async fn a_session_imported_during_a_branch_move_refuses_loads_until_it_ends() {
         r#"[{"sessionId": "a", "startedAt": 1000, "title": "Session a", "updates": []}]"#,
     )
     .unwrap();
-    let daemon = Daemon::start_with(Options {
+    let mut daemon = Daemon::start_with(Options {
         bridges: true,
+        log: true,
         ..Options::default()
     })
     .await;
@@ -2081,18 +2088,21 @@ async fn a_session_imported_during_a_branch_move_refuses_loads_until_it_ends() {
             .unarchive(&session.id, BTreeMap::new())
             .await
             .unwrap();
-        let refused = refusal(client.load_session(&session.id, BTreeMap::new()).await);
-        assert_eq!(refused.code, code::INVALID_STATE, "{refused:?}");
-        assert!(refused.message.contains("branch move"), "{refused:?}");
+        client
+            .focus(Some(&session.id), BTreeMap::new())
+            .await
+            .unwrap();
+        daemon.wait_for_log("branch move").await;
+        assert_eq!(
+            info(&client, &session.id).await.unwrap().state,
+            SessionState::Exited
+        );
         blocked.release().await;
         session
     };
     let (moved, session) = tokio::join!(moving, during);
     moved.unwrap();
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,13 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ArrowUp, Paperclip, Square, X } from "lucide-react";
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { HarnessLogo, sessionAgent } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import type {
   Command,
   ConfigOption,
-  ConfigSetting,
   HarnessConfig,
   QueuedPrompt,
   Request,
@@ -16,7 +15,7 @@ import type {
 import { showError } from "../../lib/showError";
 import type { AgentId } from "../sessions/useAgents";
 import { CommandInput } from "./CommandInput";
-import { changedConfig, sessionOptions } from "./controls";
+import { pickedSettings, sessionOptions } from "./controls";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { OpenRequest } from "./OpenRequest";
 import { QueuedPrompts, queuedMessage } from "./QueuedPrompts";
@@ -243,13 +242,17 @@ export function Composer({
   );
 }
 
+/** The settings a session's composer shows before the session's config does. */
+type Picked = Record<string, string | boolean | null>;
+
 /**
  * A session's composer. On an idle session, Enter and Cmd+Enter send the
  * message. While the agent works, Enter queues it and Cmd+Enter steers the
  * running turn with it. The model, effort and mode pickers show the
  * session's config, with what `harness`, the config of the session's agent,
- * lists, and are disabled while the agent starts or has exited. A change
- * sends the whole config the change gives.
+ * lists, and are disabled while the agent starts or has exited. A pick shows
+ * at once, including a new model's effort levels and effort, and sends only
+ * what it changed; a model pick also sends its effort.
  */
 export const SessionComposer = memo(function SessionComposer({
   session,
@@ -267,20 +270,51 @@ export const SessionComposer = memo(function SessionComposer({
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
-  const options = useMemo(() => sessionOptions(harness, session.config), [harness, session.config]);
-  // The config last sent, built on `base`, the session's config then. A
-  // change made before the session is listed again builds on it. A listing
-  // that changes something else while an answer is pending ends this, so a
-  // change after it builds on the session's config.
-  const sent = useRef<{ base: ConfigSetting[]; config: ConfigSetting[] }>(undefined);
+  // The settings the user has picked that `session.config` does not show
+  // yet, by ID, with null for an effort a model pick removed. Each leaves
+  // when the config shows its value, or when the agent refuses it.
+  const [picked, setPicked] = useState<Picked>({});
+  useEffect(() => {
+    setPicked((current) => {
+      const pending = Object.entries(current).filter(([configId, value]) => {
+        const recorded = session.config.find((setting) => setting.config_id === configId)?.value;
+        return value === null ? recorded !== undefined : recorded !== value;
+      });
+      return pending.length === Object.keys(current).length ? current : Object.fromEntries(pending);
+    });
+  }, [session.config]);
+  const shown = useMemo(
+    () => [
+      ...session.config
+        .filter((setting) => picked[setting.config_id] !== null)
+        .map((setting) => ({ ...setting, value: picked[setting.config_id] ?? setting.value })),
+      ...Object.entries(picked)
+        .filter(
+          (entry): entry is [string, string | boolean] =>
+            entry[1] !== null && !session.config.some((setting) => setting.config_id === entry[0]),
+        )
+        .map(([config_id, value]) => ({ config_id, value })),
+    ],
+    [session.config, picked],
+  );
+  const options = useMemo(() => sessionOptions(harness, shown), [harness, shown]);
   const setOption = async (option: ConfigOption, value: string | boolean) => {
-    const current = sent.current?.base === session.config ? sent.current.config : session.config;
-    const config = changedConfig(harness, current, option.configId, value);
-    sent.current = { base: session.config, config };
+    const config = pickedSettings(harness, shown, option.configId, value);
+    const entries: Picked = Object.fromEntries(
+      config.map((setting) => [setting.config_id, setting.value]),
+    );
+    if (option.configId === "model" && !("effort" in entries)) entries.effort = null;
+    setPicked((current) => ({ ...current, ...entries }));
     try {
       await invoke("set_config", { sessionId: session.id, config });
     } catch (error) {
-      if (sent.current?.config === config) sent.current = undefined;
+      setPicked((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(
+            ([id, picked]) => !(id in entries) || picked !== entries[id],
+          ),
+        ),
+      );
       throw error;
     }
   };

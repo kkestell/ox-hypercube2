@@ -109,20 +109,6 @@ pub enum Method {
         #[serde(default)]
         config: Vec<ConfigSetting>,
     },
-    /// Restarts the agent of an exited session that has an
-    /// `agent_session_id`, from the session's command and directory, which
-    /// must still exist. The
-    /// result is the session in state `starting`. The agent replays the
-    /// conversation before its `agent_started` event. A session whose history
-    /// holds no agent start and no prompt records the replay as `update`
-    /// events; any other session, including one restored after an `oxd`
-    /// restart, keeps its history and drops the replay.
-    #[serde(rename = "session.load")]
-    SessionLoad {
-        session_id: String,
-        #[serde(default)]
-        env: BTreeMap<String, String>,
-    },
     /// Sends a prompt now. On an idle session it starts a turn
     /// (`prompt_started`); during a turn (state `running`,
     /// `awaiting_permission` or `awaiting_input`) it steers it
@@ -269,11 +255,12 @@ pub enum Method {
         #[serde(flatten)]
         action: ElicitationAction,
     },
-    /// Replaces the session's config: the agent is sent each setting, in
-    /// order, ahead of every later request to the session. Once it has
-    /// answered them all, the config becomes `config` if it accepted every
-    /// setting; otherwise each accepted setting replaces the one with its ID
-    /// and the error names each refused setting. The result is null.
+    /// Sets the settings it names and leaves the others as they are: the
+    /// agent is sent each setting, in order, ahead of every later request to
+    /// the session. Once it has answered them all, each accepted setting
+    /// replaces the one with its ID, or is added, and the error names each
+    /// refused setting. An accepted `model` sent without an `effort` removes
+    /// the session's effort. The result is null.
     #[serde(rename = "session.set_config")]
     SessionSetConfig {
         session_id: String,
@@ -299,7 +286,7 @@ pub enum Method {
     },
     /// Stops the session's agent, removes its worktree, and marks the
     /// session archived, keeping its branch. The conversation stays readable
-    /// by subscribing; `session.load` refuses an archived session. The
+    /// by subscribing; an archived session is not loaded. The
     /// archive is refused while the agent is starting. Worktree removal
     /// is refused with `UNSAVED_WORK`, as for
     /// `session.delete`, unless `discard` is set. Git runs with `env` over
@@ -315,7 +302,7 @@ pub enum Method {
     },
     /// Adds an archived session's worktree again, on its branch, and marks
     /// the session not archived. It is then an `exited` session, which
-    /// `session.load` resumes. Git runs with `env` over the daemon's
+    /// focusing it resumes. Git runs with `env` over the daemon's
     /// environment. The result is the session's [`SessionInfo`].
     #[serde(rename = "session.unarchive")]
     SessionUnarchive {
@@ -358,8 +345,23 @@ pub enum Method {
     /// `unseen`, and while any connection focuses a session, it gets no
     /// `unseen`. An unknown ID is refused with `NOT_FOUND` and leaves the
     /// connection unfocused. Answers `null`.
+    ///
+    /// Focusing an `exited`, unarchived session that has an
+    /// `agent_session_id` also restarts its agent, from the session's
+    /// command and directory, with `env` over the daemon's environment. The
+    /// answer does not wait for the load. The session moves to `starting`
+    /// and the agent replays the conversation before its `agent_started`
+    /// event. A session whose history holds no agent start and no prompt
+    /// records the replay as `update` events; any other session, including
+    /// one restored after an `oxd` restart, keeps its history and drops the
+    /// replay. A refused load, such as a missing directory, is logged and
+    /// leaves the session `exited`.
     #[serde(rename = "focus")]
-    Focus { session_id: Option<String> },
+    Focus {
+        session_id: Option<String>,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
 }
 
 /// How a session's turn ended while no client had it in focus, kept until a
@@ -660,8 +662,8 @@ pub struct SessionInfo {
     pub state: SessionState,
     /// The title the agent reported in a `session_info_update`.
     pub title: Option<String>,
-    /// The agent's ID for the session, which `session.load` resumes. Unset
-    /// until the session has started.
+    /// The agent's ID for the session, which focusing the session resumes.
+    /// Unset until the session has started.
     pub agent_session_id: Option<String>,
     /// The content the agent accepts in prompts. Empty until the session has
     /// started.
@@ -800,7 +802,7 @@ pub enum EventKind {
     },
     /// The daemon stopped the agent because the session was idle, with no
     /// background work, and unviewed, or because the session was archived. The session is `exited`;
-    /// `session.load` resumes it.
+    /// focusing the session resumes it.
     AgentParked,
     /// The session was closed. It is the last event of a session.
     SessionClosed,
@@ -1090,13 +1092,24 @@ mod tests {
         assert_eq!(serde_json::from_value::<Branches>(value).unwrap(), branches);
         let request: Request = serde_json::from_value(json!({
             "id": 12,
-            "method": "session.load",
-            "params": {"session_id": "s"}
+            "method": "focus",
+            "params": {"session_id": "s", "env": {"PATH": "/bin"}}
         }))
         .unwrap();
         assert!(matches!(
             request.method,
-            Method::SessionLoad { ref session_id, .. } if session_id == "s"
+            Method::Focus { session_id: Some(ref id), ref env }
+                if id == "s" && env.get("PATH").map(String::as_str) == Some("/bin")
+        ));
+        let request: Request = serde_json::from_value(json!({
+            "id": 13,
+            "method": "focus",
+            "params": {"session_id": null}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.method,
+            Method::Focus { session_id: None, ref env } if env.is_empty()
         ));
 
         let request: Request = serde_json::from_value(json!({

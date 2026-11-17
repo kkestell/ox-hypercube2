@@ -471,10 +471,7 @@ async fn a_held_queue_survives_a_restart() {
     let second = first.again(Options::default()).await;
     let client = second.client().await;
     assert_eq!(info(&client, &session.id).await.unwrap().queue, queue);
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     until(&mut events, agent_started).await;
     let loaded = until(&mut events, agent_started).await;
@@ -1458,10 +1455,7 @@ async fn a_turn_after_the_resume_answer_is_live() {
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     client.prompt(&session.id, text("exit 0")).await.unwrap();
     until(&mut events, agent_exited).await;
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let mut resumed = until(&mut events, agent_started).await;
     // A config change is a round-trip barrier after the resume handler has
     // sent all three live updates. No absence is checked before that barrier.
@@ -1534,10 +1528,7 @@ async fn a_loaded_session_sends_its_recorded_config_again() {
 
     // The new agent starts in its default mode and is set to the recorded
     // one before the next prompt.
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let started = until(&mut events, agent_started).await;
     let Some(EventKind::AgentStarted { config_options, .. }) =
         started.last().map(|event| &event.kind)
@@ -1554,26 +1545,56 @@ async fn a_loaded_session_sends_its_recorded_config_again() {
     assert_eq!(chunks(&turn), ["code"]);
 }
 
-/// The config is replaced whole, and a prompt sent after the change, without
-/// waiting for its answer, reaches the agent after it.
+/// The settings a request names are set and the others stay as they are, and
+/// a prompt sent after the change, without waiting for its answer, reaches the
+/// agent after it.
 #[tokio::test(flavor = "multi_thread")]
-async fn set_config_replaces_the_config_and_the_next_prompt_runs_with_it() {
+async fn set_config_sets_only_its_settings_and_the_next_prompt_runs_with_them() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     assert_eq!(session.config, reported());
     let mut events = client.subscribe(&session.id, started).await.unwrap();
-    let config = vec![setting("model", "fast"), setting("mode", "code")];
     // The connection sends its requests in the order they are first polled.
     let (set, prompted) = tokio::join!(
-        client.set_config(&session.id, config.clone()),
+        client.set_config(&session.id, vec![setting("mode", "code")]),
         client.prompt(&session.id, text("config mode")),
     );
     set.unwrap();
     prompted.unwrap();
     let turn = until(&mut events, turn_ended).await;
     assert_eq!(chunks(&turn), ["code"]);
-    assert_eq!(sessions(&client).await[0].config, config);
+    assert_eq!(
+        sessions(&client).await[0].config,
+        [
+            setting("model", "smart"),
+            setting("effort", "medium"),
+            setting("mode", "code"),
+        ]
+    );
+}
+
+/// Two clients that set different settings at once lose neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_set_config_requests_keep_every_setting() {
+    let daemon = Daemon::start().await;
+    let first = daemon.client().await;
+    let second = daemon.client().await;
+    let (session, _) = daemon.new_session(&first).await;
+    let (mode, effort) = tokio::join!(
+        first.set_config(&session.id, vec![setting("mode", "code")]),
+        second.set_config(&session.id, vec![setting("effort", "high")]),
+    );
+    mode.unwrap();
+    effort.unwrap();
+    assert_eq!(
+        info(&first, &session.id).await.unwrap().config,
+        [
+            setting("model", "smart"),
+            setting("effort", "high"),
+            setting("mode", "code"),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1842,11 +1863,6 @@ async fn workspaces_and_sessions_survive_a_restart() {
         [saved(titled), saved(plain), saved(unstarted.clone())]
     );
     assert_eq!(unstarted.agent_session_id, None);
-    let error = client
-        .load_session(&unstarted.id, BTreeMap::new())
-        .await
-        .unwrap_err();
-    assert_eq!(remote_code(error), code::INVALID_STATE);
 
     // Sessions created after the restart follow the saved ones.
     let (new, _) = second.new_session(&client).await;
@@ -1905,11 +1921,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
     let mut middle = client.subscribe(&session.id, started).await.unwrap();
     assert_eq!(next(&mut middle).await.seq, started + 1);
 
-    let loaded = client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
-    assert_eq!(loaded.state, SessionState::Starting);
+    load(&client, &session.id).await;
     // The fake agent only accepts a resume without a replay cursor.
     let restarted = next(&mut events).await;
     assert_eq!(restarted.seq, last_seq + 1);
@@ -1917,7 +1929,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
         &restarted.kind,
         EventKind::AgentStarted { agent_session_id: id, .. } if *id == agent_session_id
     ));
-    let loaded = info(&client, &loaded.id).await.unwrap();
+    let loaded = info(&client, &session.id).await.unwrap();
     assert_eq!(loaded.state, SessionState::Idle);
     assert_eq!(loaded.title.as_deref(), Some("Replay me"));
     assert_eq!(loaded.config, session.config);
@@ -1950,10 +1962,7 @@ async fn loading_a_restored_session_recovers_missing_history_from_the_agent() {
     let second = first.again(Options::default()).await;
     let client = second.client().await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let recovered = until(&mut events, agent_started).await;
     assert_eq!(replayed(&recovered), ["user: say 1 0", "agent: chunk-1"]);
 }
@@ -2087,10 +2096,7 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
     ));
 
     // The next events continue the seqs.
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let restarted = next(&mut events).await;
     assert_eq!(restarted.seq, rest.last().unwrap().seq + 1);
 }
@@ -2132,10 +2138,7 @@ async fn loading_a_session_whose_agent_exited_keeps_its_history() {
     client.prompt(&session.id, text("exit 1")).await.unwrap();
     let exited = until(&mut events, agent_exited).await.pop().unwrap();
 
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let restarted = next(&mut events).await;
     assert!(agent_started(&restarted.kind), "{restarted:?}");
     // The replay is not recorded: nothing comes between the exit and the
@@ -2183,10 +2186,7 @@ async fn a_loaded_agent_gets_new_permission_request_ids() {
     client.prompt(&session.id, text("exit 1")).await.unwrap();
     until(&mut events, agent_exited).await;
 
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     until(&mut events, agent_started).await;
     client
         .prompt(&session.id, text("permission"))
@@ -2207,21 +2207,17 @@ async fn a_loaded_agent_gets_new_permission_request_ids() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn only_an_exited_session_that_started_can_be_loaded() {
+async fn focus_loads_only_an_exited_session_that_started() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
-    let error = client
-        .load_session("unknown", BTreeMap::new())
-        .await
-        .unwrap_err();
-    assert_eq!(remote_code(error), code::NOT_FOUND);
+    let error = refusal(client.focus(Some("unknown"), BTreeMap::new()).await);
+    assert_eq!(error.code, code::NOT_FOUND);
 
     let (running, _) = daemon.new_session(&client).await;
-    let error = client
-        .load_session(&running.id, BTreeMap::new())
+    client
+        .focus(Some(&running.id), BTreeMap::new())
         .await
-        .unwrap_err();
-    assert_eq!(remote_code(error), code::INVALID_STATE);
+        .unwrap();
     assert_eq!(
         info(&client, &running.id).await.unwrap().state,
         SessionState::Idle
@@ -2249,11 +2245,77 @@ async fn only_an_exited_session_that_started_can_be_loaded() {
         info(&client, &unstarted.id).await.unwrap().state,
         SessionState::Exited
     );
-    let error = client
-        .load_session(&unstarted.id, BTreeMap::new())
+    client
+        .focus(Some(&unstarted.id), BTreeMap::new())
         .await
-        .unwrap_err();
-    assert_eq!(remote_code(error), code::INVALID_STATE);
+        .unwrap();
+    assert_eq!(
+        info(&client, &unstarted.id).await.unwrap().state,
+        SessionState::Exited
+    );
+
+    let (archived, _) = daemon.new_session(&client).await;
+    client
+        .archive(&archived.id, false, BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        info(&client, &archived.id).await.unwrap().state,
+        SessionState::Exited
+    );
+    client
+        .focus(Some(&archived.id), BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        info(&client, &archived.id).await.unwrap().state,
+        SessionState::Exited
+    );
+}
+
+/// Focusing one exited session and then another loads both, and leaves the
+/// connection focused on the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn focusing_one_exited_session_after_another_loads_both() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    // The fake agent resumes only a session that has recorded a prompt.
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (session, started) = daemon.new_session(&client).await;
+        let mut events = client.subscribe(&session.id, started).await.unwrap();
+        turn(&client, &mut events, &session.id, "say 1 0").await;
+        ids.push(session.id);
+    }
+    let [first, second] = ids.try_into().unwrap();
+    drop(client);
+
+    let daemon = daemon.restart().await;
+    let client = daemon.client().await;
+    let mut watch = client.watch().await.unwrap();
+    let mut listing = Listing::default();
+    for change in next_changes(&mut watch).await {
+        apply(&mut listing, change);
+    }
+    client.focus(Some(&first), BTreeMap::new()).await.unwrap();
+    client.focus(Some(&second), BTreeMap::new()).await.unwrap();
+    while !listing
+        .sessions
+        .iter()
+        .all(|session| session.state == SessionState::Idle)
+    {
+        for change in next_changes(&mut watch).await {
+            apply(&mut listing, change);
+        }
+    }
+    let mut events = client.subscribe(&first, 0).await.unwrap();
+    until(&mut events, turn_ended).await;
+    turn(&client, &mut events, &first, "say 1 0").await;
+    assert_eq!(unseen(&client, &first).await, Some(Unseen::Finished));
+    let mut events = client.subscribe(&second, 0).await.unwrap();
+    until(&mut events, turn_ended).await;
+    turn(&client, &mut events, &second, "say 1 0").await;
+    assert_eq!(unseen(&client, &second).await, None);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2554,10 +2616,7 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
 
     let second = first.again(Options::default()).await;
     let client = second.client().await;
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let mut events = client.subscribe(&session.id, 0).await.unwrap();
     // The history holds the first agent's start; the second follows it.
     until(&mut events, agent_started).await;
@@ -2903,10 +2962,7 @@ async fn a_parked_session_loads_again() {
     // The parked session loads like any exited one, and keeps its history.
     assert_eq!(chunks_before(&client, &session.id, seq).await, ["chunk-1"]);
     let mut events = client.subscribe(&session.id, seq).await.unwrap();
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     let restarted = next(&mut events).await;
     assert!(agent_started(&restarted.kind), "{restarted:?}");
     assert_eq!(restarted.seq, seq + 1);
@@ -3167,12 +3223,15 @@ async fn a_turn_that_ends_out_of_focus_is_unseen_until_the_session_is_focused() 
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
 
-    client.focus(Some(&session.id)).await.unwrap();
+    client
+        .focus(Some(&session.id), BTreeMap::new())
+        .await
+        .unwrap();
     assert_eq!(unseen(&client, &session.id).await, None);
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, None);
 
-    client.focus(None).await.unwrap();
+    client.focus(None, BTreeMap::new()).await.unwrap();
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
 }
@@ -3219,7 +3278,10 @@ async fn closing_the_focusing_connection_ends_its_focus() {
     let mut watch = client.watch().await.unwrap();
     next_changes(&mut watch).await;
     let focusing = daemon.client().await;
-    focusing.focus(Some(&session.id)).await.unwrap();
+    focusing
+        .focus(Some(&session.id), BTreeMap::new())
+        .await
+        .unwrap();
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, None);
 
@@ -3262,6 +3324,6 @@ async fn unseen_outcomes_survive_a_restart() {
 async fn focusing_an_unknown_session_is_refused() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
-    let error = refusal(client.focus(Some("missing")).await);
+    let error = refusal(client.focus(Some("missing"), BTreeMap::new()).await);
     assert_eq!(error.code, code::NOT_FOUND);
 }

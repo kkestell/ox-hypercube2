@@ -1,5 +1,5 @@
 import { ChevronDown, Search } from "lucide-react";
-import { type CSSProperties, type KeyboardEvent, useEffect, useRef, useState } from "react";
+import { type CSSProperties, type KeyboardEvent, useRef, useState } from "react";
 import type { ConfigOption, SelectOption } from "../../lib/protocol";
 
 export type SelectConfig = Extract<ConfigOption, { type: "select" }>;
@@ -25,15 +25,13 @@ export function ModelPicker({
   model: SelectConfig;
   effort: SelectConfig | undefined;
   disabled?: boolean;
-  /** Sets `option` to `value` and resolves to whether the agent accepted it. */
-  onChange: (option: SelectConfig, value: string) => Promise<boolean>;
+  /** Sets `option` to `value`. */
+  onChange: (option: SelectConfig, value: string) => Promise<unknown>;
 }) {
   const search = useRef<HTMLInputElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
-  const [selectedModel, setModel] = useChosen(model, onChange);
-  const [selectedEffort, setEffort] = useChosen(effort, onChange);
 
   const allModels = choices(model);
   const searchable = allModels.length >= 6;
@@ -44,11 +42,13 @@ export function ModelPicker({
         .toLowerCase()
         .includes(query.trim().toLowerCase()),
   );
-  const current = allModels.find((choice) => choice.value === selectedModel);
+  const current = allModels.find((choice) => choice.value === model.currentValue);
   const levels = effort ? choices(effort) : [];
-  const level = levels.findIndex((choice) => choice.value === selectedEffort);
+  const level = levels.findIndex((choice) => choice.value === effort?.currentValue);
 
-  const choose = (choice: SelectOption) => setModel(choice.value);
+  const choose = (choice: SelectOption) => {
+    if (choice.value !== model.currentValue) onChange(model, choice.value);
+  };
 
   const navigate = (event: KeyboardEvent<HTMLElement>) => {
     let next = active;
@@ -73,7 +73,7 @@ export function ModelPicker({
         popoverTarget="model-menu"
         style={{ anchorName: "--model-picker" }}
       >
-        <span>{current?.name ?? selectedModel}</span>
+        <span>{current?.name ?? model.currentValue}</span>
         {current?._meta?.["ox/provider"] && (
           <span className="provider-name">{current._meta["ox/provider"]}</span>
         )}
@@ -96,7 +96,7 @@ export function ModelPicker({
           } else {
             const index = Math.max(
               0,
-              allModels.findIndex((choice) => choice.value === selectedModel),
+              allModels.findIndex((choice) => choice.value === model.currentValue),
             );
             setActive(index);
             (list.current!.children[index] as HTMLButtonElement | undefined)?.focus();
@@ -139,7 +139,7 @@ export function ModelPicker({
               type="button"
               role="option"
               tabIndex={!searchable && index === active ? 0 : -1}
-              aria-selected={choice.value === selectedModel}
+              aria-selected={choice.value === model.currentValue}
               className={index === active ? "active" : undefined}
               onMouseEnter={(event) => {
                 setActive(index);
@@ -167,7 +167,7 @@ export function ModelPicker({
               value={level}
               aria-valuetext={levels[level]?.name}
               style={{ "--position": position(level, levels.length) } as CSSProperties}
-              onChange={(event) => setEffort(levels[Number(event.target.value)]!.value)}
+              onChange={(event) => onChange(effort!, levels[Number(event.target.value)]!.value)}
             />
             <div className="stops" aria-hidden="true">
               {levels.map((choice, index) => (
@@ -184,30 +184,6 @@ export function ModelPicker({
       </div>
     </>
   );
-}
-
-/**
- * The value of `option` to show, and a function that chooses one: the value
- * chosen last until the option has it, or until the agent refuses it, and
- * otherwise the option's current value.
- */
-function useChosen(
-  option: SelectConfig | undefined,
-  onChange: (option: SelectConfig, value: string) => Promise<boolean>,
-) {
-  const [chosen, setChosen] = useState<string | null>(null);
-  const current = option?.currentValue;
-  useEffect(() => {
-    if (chosen === current) setChosen(null);
-  }, [chosen, current]);
-
-  const choose = async (value: string) => {
-    if (!option || value === (chosen ?? current)) return;
-    setChosen(value);
-    const accepted = await onChange(option, value);
-    if (!accepted) setChosen((latest) => (latest === value ? null : latest));
-  };
-  return [chosen ?? current, choose] as const;
 }
 
 /** Where stop `index` of `count` sits along a slider, from 0 to 1. */

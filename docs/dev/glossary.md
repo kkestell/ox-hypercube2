@@ -38,8 +38,9 @@ ownership and lifecycle.
   worktree and preventing it from loading until unarchived.
 - **Focus**: The session a client shows in front of the user, which
   the client's connection tells `oxd`. The desktop sets it only while its
-  window is in front of other apps. Distinct from viewing, the event
-  subscriptions that keep a session from being parked.
+  window is in front of other apps. Focusing an exited session that has
+  started loads it. Distinct from viewing, the event subscriptions that keep
+  a session from being parked.
 - **Unseen**: How a session's turn ended, `finished` or `error`,
   while no client had it in focus. It turns the sidebar dot green or red
   until a client focuses it.

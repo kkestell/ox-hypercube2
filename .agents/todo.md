@@ -48,7 +48,7 @@ Each of these underlies several bugs below, which the fix closes.
   of prompts, cancellation, dialogs and model changes. Underlies cancelling
   before a Pi dialog arrives and a prompt running on the previous model.
   `crates/pi-acp/src/pi.rs:383`, `crates/pi-acp/src/bridge.rs:273`.
-- [ ] **Clients sequence session lifecycle themselves.** Medium. Selecting an
+- [x] **Clients sequence session lifecycle themselves.** Medium. Selecting an
   exited session awaits `load_session` before switching, and `set_config`
   replaces the whole config, so the composer tracks the base each change
   builds on. Daemon operations that state intent and are idempotent, such as
@@ -202,7 +202,7 @@ Each of these underlies several bugs below, which the fix closes.
 
 ### Desktop
 
-- [ ] **A slow session switch can undo a later one.** Medium. Selecting an
+- [x] **A slow session switch can undo a later one.** Medium. Selecting an
   exited session awaits its load before switching, so selecting another
   session meanwhile is overridden when the load finishes.
   `ui/src/features/sessions/SessionList.tsx:188`.
@@ -219,7 +219,7 @@ Each of these underlies several bugs below, which the fix closes.
   request should likewise be removed, including when an answer arrives at the
   same time. See
   [Permissions and questions](../spec/requests.md#answer-a-permission-request).
-- [ ] **Concurrent config edits can drop a pending setting.** Low. A listing
+- [x] **Concurrent config edits can drop a pending setting.** Low. A listing
   that changes something else while a change is pending resets the base the
   next change builds on. `ui/src/features/composer/Composer.tsx:277`.
 - [ ] **Simultaneous delete outcomes overwrite each other's dialogs.** Low.

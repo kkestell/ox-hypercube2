@@ -220,10 +220,12 @@ daemon sends it every setting of the config and then the prompt. A session
 whose agent or worktree fails to start ends the prompt's turn with the error.
 
 A session's config is the model, effort, and mode Ox set its agent to, and
-the composer shows it. `session.set_config` replaces it whole: the daemon
-sends the agent each setting, and records the new config once the agent has
-accepted every setting, or only the settings it accepted. What the agent
-reports about its options is recorded as events and changes neither the
+the composer shows it. `session.set_config` sets the settings it names and
+leaves the others as they are: the daemon sends the agent each setting, and
+once the agent has answered, each accepted setting replaces the one with its
+ID in the config. A model sent without an effort removes the effort. The
+composer shows a pick at once and sends only what the pick changed. What the
+agent reports about its options is recorded as events and changes neither the
 config nor the composer. A session created without a config, such as an
 imported one, takes the model, effort, and mode its agent reports when it
 starts.
@@ -273,16 +275,18 @@ until a client sends a prompt or sends a queued one now.
 
 After a daemon restart, every saved session returns `exited`, without a
 running agent. A session whose agent never started keeps its history,
-including its first prompt and the error that ended it, and cannot load. Loading
-a session starts its stored command in its stored directory, resumes the
-agent's conversation, and sends it the session's config again, retaining
-the Ox session ID and subscriptions. Missing history can be recovered through
-the agent's replay support.
+including its first prompt and the error that ended it, and cannot load.
+Focusing an exited session that has started loads it: the daemon starts its
+stored command in its stored directory, resumes the agent's conversation, and
+sends it the session's config again, retaining the Ox session ID and
+subscriptions. A refused load, such as one whose directory no longer exists,
+goes to the daemon's log and leaves the session exited. Missing history can be
+recovered through the agent's replay support.
 
 An idle session with no subscribers, pending requests, or reported background
 work can have its agent parked after an idle delay, 15 minutes unless
 `oxd --park-after-ms` sets it. Parking preserves the session's conversation
-and checkout; loading the session starts its agent again. Agents that do not
+and checkout; focusing the session starts its agent again. Agents that do not
 report background-work state are never parked.
 
 Archiving and deleting stop the agent. An archived session loads once it is

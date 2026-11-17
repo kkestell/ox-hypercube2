@@ -210,10 +210,7 @@ async fn an_unarchived_imported_session_resumes_without_replay() {
         .await
         .unwrap();
     let mut events = client.subscribe(&session.id, 3).await.unwrap();
-    client
-        .load_session(&session.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &session.id).await;
     // A replay precedes the agent's start.
     let resumed = until(&mut events, |kind| {
         matches!(

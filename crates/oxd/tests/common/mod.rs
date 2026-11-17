@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ox_protocol::schema::{ContentBlock, TextContent};
 use ox_protocol::{
-    Client, Error, ErrorBody, Event, EventKind, Listing, ListingChange, SessionInfo, Stream,
-    Subscription, WorkspaceInfo,
+    Client, Error, ErrorBody, Event, EventKind, Listing, ListingChange, SessionInfo, SessionState,
+    Stream, Subscription, WorkspaceInfo,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
@@ -422,6 +422,29 @@ pub async fn listing(client: &Client) -> Listing {
         apply(&mut listing, change);
     }
     listing
+}
+
+/// Loads the exited session `session_id`, as a client does by focusing it,
+/// and waits until it is no longer `exited`. The client stays focused on it.
+pub async fn load(client: &Client, session_id: &str) {
+    let mut watch = client.watch().await.unwrap();
+    let mut listing = Listing::default();
+    for change in next_changes(&mut watch).await {
+        apply(&mut listing, change);
+    }
+    client
+        .focus(Some(session_id), BTreeMap::new())
+        .await
+        .unwrap();
+    while !listing
+        .sessions
+        .iter()
+        .any(|session| session.id == session_id && session.state != SessionState::Exited)
+    {
+        for change in next_changes(&mut watch).await {
+            apply(&mut listing, change);
+        }
+    }
 }
 
 pub async fn sessions(client: &Client) -> Vec<SessionInfo> {

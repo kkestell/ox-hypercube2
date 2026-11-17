@@ -183,10 +183,10 @@ pub async fn serve(
             }
             // The last focus ends first, so a refused one leaves the
             // connection unfocused.
-            Method::Focus { session_id } => {
+            Method::Focus { session_id, env } => {
                 drop(focus.take());
                 session_id
-                    .map(|id| daemon.session(&id).map(|session| session.focus()))
+                    .map(|id| daemon.session(&id).map(|session| session.focus(env)))
                     .transpose()
                     .map(|guard| {
                         focus = guard;

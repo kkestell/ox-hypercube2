@@ -215,22 +215,22 @@ export function sessionOptions(
 }
 
 /**
- * The config a session takes when setting `configId` changes to `value`:
- * `config` with that setting replaced, and with a new model, the effort the
- * draft rule picks from the model's levels, or none where it lists none.
- * Every other setting keeps its recorded value.
+ * The settings one pick sends: `configId` at `value`, and with a new model,
+ * the effort the draft rule picks from the model's levels in `shown`, the
+ * config the pickers show, or none where the model lists none. The model and
+ * effort go together because an agent may reset its effort when its model
+ * changes.
  */
-export function changedConfig(
+export function pickedSettings(
   harness: HarnessConfig | undefined,
-  config: ConfigSetting[],
+  shown: ConfigSetting[],
   configId: string,
   value: string | boolean,
 ): ConfigSetting[] {
-  let values: Values = { ...valuesOf(config), [configId]: value };
-  if (harness && configId === "model") {
-    const { model, effort: _, ...rest } = values;
-    const effort = draftOptions(harness, values).find((option) => option.configId === "effort");
-    values = { model: model!, ...(effort && { effort: effort.currentValue }), ...rest };
-  }
-  return Object.entries(values).map(([config_id, value]) => ({ config_id, value }));
+  const picked = { config_id: configId, value };
+  if (!harness || configId !== "model") return [picked];
+  const effort = draftOptions(harness, { model: value }, valuesOf(shown)).find(
+    (option) => option.configId === "effort",
+  );
+  return effort ? [picked, { config_id: "effort", value: effort.currentValue }] : [picked];
 }

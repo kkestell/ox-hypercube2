@@ -16,9 +16,9 @@ An agent is started with the environment of the client creating or resuming the 
 
 1. The desktop shows the session's reported configuration controls below the composer. Its model, effort, and mode controls offer what [Ox's config](../docs/dev/architecture.md#oxs-config) lists for the session's harness, at the values the agent reports; the effort levels are those of the reported model. A reported value the config does not list shows as its ID.
 2. A model control opens a searchable picker. Search matches model names without case sensitivity; Up and Down select a result and Enter or a click chooses it. The menu remains open after a choice so effort can be changed next.
-3. When a model and thought-effort control are both supplied, the picker also shows effort and offers its ordered levels on a slider. A pending effort selection remains visible until accepted or rejected.
+3. When a model and thought-effort control are both supplied, the picker also shows effort and offers its ordered levels on a slider. A pick shows at once, including a new model's effort levels and effort.
 4. Other selection controls appear as dropdowns, retaining any agent-supplied groups. Boolean controls appear as checkboxes. Unsupported control kinds are not shown.
-5. Accepted changes update the session's controls for every client. A refusal displays the agent's error rather than claiming success.
+5. A pick sends only what it changed, and a model pick also sends its effort. Accepted changes update the session's controls for every client. A refusal displays the agent's error, and the controls show what the agent runs.
 
 Changing settings is refused while Starting or Exited. Whether a change is allowed during a turn, and its meaning and retention, are determined by the agent. Claude's defaults are specified in [the bridge](claude.md#models-effort-and-modes).
 

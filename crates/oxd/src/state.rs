@@ -1232,30 +1232,33 @@ impl State {
         &self.config
     }
 
-    /// Records the agent's answers to a new config: the config becomes the
-    /// answered settings when the agent accepted them all, and otherwise
-    /// each accepted setting replaces the one with its ID. Returns the error
-    /// naming each refused setting.
+    /// Records the agent's answers to the settings a client sent: each
+    /// accepted setting replaces the one with its ID, or is added, and the
+    /// other settings keep their values. An accepted `model` sent without an
+    /// `effort` removes the session's effort, because a model without effort
+    /// levels takes none. Returns the error naming each refused setting.
     pub fn settle_config(
         &mut self,
         answers: Vec<(ConfigSetting, Option<String>)>,
     ) -> Result<(), String> {
         let refusals = refusals(&answers);
-        if refusals.is_empty() {
-            self.config = answers.into_iter().map(|(setting, _)| setting).collect();
-        } else {
-            for (setting, refusal) in answers {
-                if refusal.is_some() {
-                    continue;
-                }
-                match self
-                    .config
-                    .iter_mut()
-                    .find(|current| current.config_id == setting.config_id)
-                {
-                    Some(current) => *current = setting,
-                    None => self.config.push(setting),
-                }
+        let sets_effort = answers
+            .iter()
+            .any(|(setting, _)| setting.config_id == "effort");
+        for (setting, refusal) in answers {
+            if refusal.is_some() {
+                continue;
+            }
+            if setting.config_id == "model" && !sets_effort {
+                self.config.retain(|current| current.config_id != "effort");
+            }
+            match self
+                .config
+                .iter_mut()
+                .find(|current| current.config_id == setting.config_id)
+            {
+                Some(current) => *current = setting,
+                None => self.config.push(setting),
             }
         }
         self.unsaved.push(RowChange::Config(self.config.clone()));
@@ -3368,22 +3371,40 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_config_takes_what_the_agent_accepted() {
+    fn a_settled_config_sets_only_the_settings_the_agent_accepted() {
         let effort = |value: &str| ConfigSetting {
             config_id: "effort".into(),
             value: ConfigValue::Id(value.into()),
         };
+        let mode = |value: &str| ConfigSetting {
+            config_id: "mode".into(),
+            value: ConfigValue::Id(value.into()),
+        };
         let mut state = State::created(
             &SavedSession {
-                config: vec![model("fast"), effort("low")],
+                config: vec![model("fast"), effort("low"), mode("code")],
                 ..saved()
             },
             None,
         );
+        state.settle_config(vec![(mode("plan"), None)]).unwrap();
+        assert_eq!(state.config(), [model("fast"), effort("low"), mode("plan")]);
+        assert_eq!(
+            state.take_unsaved(),
+            [RowChange::Config(vec![
+                model("fast"),
+                effort("low"),
+                mode("plan")
+            ])]
+        );
+
         state
             .settle_config(vec![(model("smart"), None), (effort("high"), None)])
             .unwrap();
-        assert_eq!(state.config(), [model("smart"), effort("high")]);
+        assert_eq!(
+            state.config(),
+            [model("smart"), effort("high"), mode("plan")]
+        );
 
         let refused = state
             .settle_config(vec![
@@ -3392,11 +3413,13 @@ mod tests {
             ])
             .unwrap_err();
         assert_eq!(refused, "The agent refused effort max: no");
-        assert_eq!(state.config(), [model("fast"), effort("high")]);
         assert_eq!(
-            state.take_unsaved(),
-            [RowChange::Config(vec![model("fast"), effort("high")])]
+            state.config(),
+            [model("fast"), effort("high"), mode("plan")]
         );
+
+        state.settle_config(vec![(model("tiny"), None)]).unwrap();
+        assert_eq!(state.config(), [model("tiny"), mode("plan")]);
     }
 
     #[tokio::test]

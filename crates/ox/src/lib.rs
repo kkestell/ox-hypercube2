@@ -142,8 +142,9 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
                 Ok(()) = focus.changed() => {
                     let target = focus.borrow_and_update().clone();
                     // A refused focus, such as on a session just deleted,
-                    // leaves the connection unfocused.
-                    let _ = client.focus(target.as_deref()).await;
+                    // leaves the connection unfocused. Focusing an exited
+                    // session loads it.
+                    let _ = client.focus(target.as_deref(), utf8_env()).await;
                 }
                 changes = watch.next() => {
                     let Ok(changes) = changes else {
@@ -400,17 +401,6 @@ async fn new_session(
             Some(prompt),
         )
         .await
-        .map_err(message)
-}
-
-/// Restarts the agent of an exited session, which replays its conversation.
-#[tauri::command]
-async fn load_session(app: State<'_, App>, session_id: String) -> Result<(), String> {
-    app.client()
-        .await?
-        .load_session(&session_id, utf8_env())
-        .await
-        .map(drop)
         .map_err(message)
 }
 
@@ -681,7 +671,6 @@ pub fn run() {
             workspace_branches,
             move_branch,
             new_session,
-            load_session,
             prompt,
             queue_add,
             queue_edit,

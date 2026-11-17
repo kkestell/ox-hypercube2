@@ -16,9 +16,9 @@ required behavior and everyday use.
 - Plans contain only work required now. Include speculative follow-up
   architecture only when explicitly requested.
 - Base generalization on concrete uses.
-- Resolve routine implementation choices in code, outside the specification.
-  Discuss changes to observable behavior or scope when necessary.
-- Observable behavior means the desktop app's.
+- Resolve implementation choices in code, outside the specification. Discuss
+  changes to scope, or to what the user sees or does in everyday use of the
+  desktop app, when necessary.
 
 ## Implementation
 
@@ -26,6 +26,9 @@ required behavior and everyday use.
   control flow. Keep responsibilities clear with as few abstractions as the
   problem needs.
 - Handle invalid input and failures likely to occur in everyday use clearly.
+- Decide how rare cases behave yourself, such as races, crashes, failures that
+  coincide, and states everyday use does not reach, and handle them the
+  simplest reasonable way.
 - Trust internal invariants and fail clearly when they break, checking each
   once.
 - Implement required semantics correctly and completely.
@@ -53,5 +56,5 @@ required behavior and everyday use.
 - A change that would make one element differ from its peers, or that nudges a
   value by a few pixels to line things up, points at a missing or wrong shared
   abstraction: a class for the kind of element, a token, or a shared layout
-  component. Propose the abstraction and build it first, so the change lands
-  in the shared rule.
+  component. Build the abstraction first, so the change lands in the shared
+  rule.

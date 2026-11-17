@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Menu } from "@tauri-apps/api/menu";
 import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
-import { type MouseEvent, memo, useCallback, useState } from "react";
+import { type MouseEvent, memo, useState } from "react";
 import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
@@ -181,18 +181,6 @@ export const SessionList = memo(function SessionList({
       await invoke("remove_workspace", { workspaceId });
     });
 
-  // Viewing a saved session whose agent is not running starts its agent, which
-  // replays the conversation.
-  const select = useCallback(
-    async (session: SessionInfo) => {
-      if (session.state === "exited" && !session.archived && session.agent_session_id !== null) {
-        await run(() => invoke("load_session", { sessionId: session.id }));
-      }
-      onSelect(session.id);
-    },
-    [onSelect],
-  );
-
   return (
     <Sidebar
       actions={
@@ -236,7 +224,7 @@ export const SessionList = memo(function SessionList({
               }
               selected={session.id === selected}
               busy={busy.has(session.id)}
-              onSelect={select}
+              onSelect={onSelect}
               deleteSession={deleteSession}
               archiveSession={archiveSession}
               unarchiveSession={unarchiveSession}
@@ -402,7 +390,7 @@ const SessionRow = memo(function SessionRow({
   selected: boolean;
   /** Whether an action on the session is in flight. */
   busy: boolean;
-  onSelect: (session: SessionInfo) => void;
+  onSelect: (id: string) => void;
 } & Pick<SessionActions, "deleteSession" | "archiveSession" | "unarchiveSession">) {
   const merge = localMerge(session, worktree);
   const branch = merge && branchStatus(merge.compare, merge.comparison);
@@ -430,7 +418,7 @@ const SessionRow = memo(function SessionRow({
         className="select"
         title={session.cwd}
         aria-current={selected}
-        onClick={() => onSelect(session)}
+        onClick={() => onSelect(session.id)}
       >
         <StatusIcon status={sessionStatus(session)} />
         <span className="title">{session.title ?? "New session"}</span>

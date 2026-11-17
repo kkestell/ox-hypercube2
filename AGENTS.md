@@ -8,7 +8,7 @@ workflow.
 
 | Document | Owns |
 | --- | --- |
-| [Code style](docs/dev/code-style.md) | Implementation, architecture, scope, and edge-case decisions |
+| [Code style](docs/dev/code-style.md) | Implementation, architecture, and scope decisions |
 | [Development](docs/dev/development.md) | Development tools and how to use them |
 | [Testing](docs/dev/testing.md) | Test design, verification procedures, and evidence of completion |
 | [Documentation](docs/dev/documentation.md) | Document ownership, maintenance, writing, and naming rules |
@@ -30,8 +30,9 @@ workflow.
 - Establish the requested outcome and read the relevant code and project
   documents. Distinguish requirements from assumptions and possible future
   work.
-- Resolve ordinary implementation decisions yourself. Ask when a missing
-  decision materially changes the requested outcome or scope.
+- Resolve implementation decisions yourself. Ask when a missing decision
+  changes what the user sees or does in everyday use of the desktop app, or
+  the requested scope.
 - Use a plan when the work needs design decisions or sequencing.
 - Write every test to pass or fail on behavior alone, at any machine speed:
   it synchronizes on events and controls time as

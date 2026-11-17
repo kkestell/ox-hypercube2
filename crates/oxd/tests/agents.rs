@@ -286,10 +286,7 @@ async fn a_message_loads_a_session_restored_after_a_restart() {
     };
     let daemon = daemon.restart().await;
     let client = daemon.client().await;
-    client
-        .load_session(&sender.id, BTreeMap::new())
-        .await
-        .unwrap();
+    load(&client, &sender.id).await;
     let mut sender_events = client.subscribe(&sender.id, sender_seq).await.unwrap();
     until(&mut sender_events, |kind| {
         matches!(kind, EventKind::AgentStarted { .. })
