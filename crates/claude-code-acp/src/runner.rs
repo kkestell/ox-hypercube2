@@ -164,7 +164,6 @@ impl Claude {
             text_id: None,
             thought_id: None,
             unclaimed_error: None,
-            preempted: false,
         };
         tokio::spawn(output.read(child));
         let _ = input.send(initialize_request());
@@ -373,9 +372,6 @@ struct Output {
     /// is why the prompt fails if claude exits, as when claude cannot resume
     /// the conversation.
     unclaimed_error: Option<String>,
-    /// A prompt preempted the running turn, so the turn's result continues
-    /// the work with that prompt's turn rather than ending it.
-    preempted: bool,
 }
 
 impl Output {
@@ -535,7 +531,11 @@ impl Output {
                     // of working; the client has the request itself.
                     match event["state"].as_str() {
                         Some("running") => self.updates.working(),
-                        Some("idle") => self.updates.idle_without_reason(),
+                        Some("idle") if self.updates.is_working() => {
+                            self.state.lock().unwrap().cancelling = false;
+                            self.close_turn();
+                            self.updates.idle_without_reason();
+                        }
                         _ => {}
                     }
                 }
@@ -564,10 +564,6 @@ impl Output {
                         .collect();
                     self.updates.background_tasks(tasks);
                 }
-                // Claude stops a turn that has shown no output when a prompt
-                // arrives, and runs the prompt's turn after the stopped
-                // turn's result.
-                Some("turn_preempted") => self.preempted = true,
                 _ => {}
             },
             Some("result") => self.result(&value),
@@ -643,18 +639,11 @@ impl Output {
 
     /// Ends a turn. An interrupt also drops the prompts claude had not taken.
     fn result(&mut self, result: &Value) {
-        if std::mem::take(&mut self.preempted) {
-            self.continued();
-            return;
-        }
         let aborted = result["terminal_reason"]
             .as_str()
             .is_some_and(|reason| reason.starts_with("aborted"));
         let (dropped, waiting, cancelling) = {
             let mut state = self.state.lock().unwrap();
-            for (_, permission) in state.permissions.drain() {
-                permission.abort();
-            }
             let dropped = if aborted {
                 std::mem::take(&mut state.prompts)
             } else {
@@ -677,9 +666,7 @@ impl Output {
             self.unclaimed_error = Some(error.clone());
             return;
         }
-        self.updates.fail_open_tools();
-        self.text_id = None;
-        self.thought_id = None;
+        self.close_turn();
         for (_, prompt) in dropped {
             prompt.fail(RunError::Cancelled);
         }
@@ -694,10 +681,9 @@ impl Output {
         self.updates.idle(stop_reason(&outcome));
     }
 
-    /// Ends a turn that a prompt preempted. The work goes on with the
-    /// prompt's turn, so the prompts claude has not taken stay and the
-    /// client sees no end; what the stopped turn left open fails.
-    fn continued(&mut self) {
+    /// Closes what a turn left open: its dialogs are withdrawn and its
+    /// unfinished tool calls fail.
+    fn close_turn(&mut self) {
         for (_, permission) in self.state.lock().unwrap().permissions.drain() {
             permission.abort();
         }

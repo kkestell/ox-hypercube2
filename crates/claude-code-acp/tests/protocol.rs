@@ -2375,43 +2375,6 @@ next_message
 }
 
 #[tokio::test]
-async fn a_preempted_turn_continues_with_the_prompt_that_preempted_it() {
-    let temp = tempfile::tempdir().unwrap();
-    let (bin, project) = dirs(temp.path());
-    // The second prompt preempts the turn before it shows output: claude
-    // ends that turn as aborted and runs the prompt's turn.
-    fake_claude(
-        &bin,
-        r#"
-next_prompt
-next_message
-uuid=$(printf '%s\n' "$message" | sed 's/.*"uuid":"\([^"]*\)".*/\1/')
-printf '{"type":"system","subtype":"turn_preempted","preempted_by_uuid":"%s"}\n' "$uuid"
-printf '%s\n' '{"type":"result","subtype":"error_during_execution","is_error":true,"terminal_reason":"aborted_streaming"}'
-started
-printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"answer"}]}}'
-printf '%s\n' '{"type":"result"}'
-next_message
-"#,
-    );
-    let (mut child, mut reader) = start(&bin);
-    initialize(&mut child, &mut reader).await;
-    let session = new_session(&mut child, &mut reader, 2, &project).await;
-    send_prompt(&mut child, 3, &session, "first").await;
-    let (answer, seen) = response(&mut reader, 3).await;
-    assert!(answer["result"].is_object(), "{answer}");
-    send_prompt(&mut child, 4, &session, "follow-up").await;
-    let (idle, updates) = finish(&mut reader, 4, seen).await;
-    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
-    assert_eq!(idles(&updates).len(), 1, "{:?}", describe_updates(&updates));
-    assert!(
-        updates.iter().any(|v| shown_text(v) == Some("answer")),
-        "{updates:?}"
-    );
-    child.kill().await.unwrap();
-}
-
-#[tokio::test]
 async fn mcp_commands_are_absolute_paths() {
     let temp = tempfile::tempdir().unwrap();
     let (bin, project) = dirs(temp.path());
@@ -2587,6 +2550,49 @@ exit 1
         idle["stopReason"], "cancelled",
         "cancellation was classified as a failure: {idle}"
     );
+}
+
+#[tokio::test]
+async fn idle_without_a_result_ends_the_turn_and_its_cancel() {
+    let temp = tempfile::tempdir().unwrap();
+    let (bin, project) = dirs(temp.path());
+    fake_claude(
+        &bin,
+        r#"
+next_prompt
+state running
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"sleep 30"}}]}}'
+printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}'
+next_message
+case "$message" in *'"subtype":"interrupt"'*) ;; *) exit 21;; esac
+state idle
+next_prompt
+printf '%s\n' '{"type":"result","is_error":true,"result":"second turn failed"}'
+state idle
+next_message
+"#,
+    );
+    let (mut child, mut reader) = start(&bin);
+    initialize(&mut child, &mut reader).await;
+    let session = new_session(&mut child, &mut reader, 2, &project).await;
+    send(&mut child, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"first"}]}})).await;
+    let seen = until_text(&mut reader, "working").await;
+    send(
+        &mut child,
+        json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session}}),
+    )
+    .await;
+    let (_, updates) = finish(&mut reader, 3, seen).await;
+    assert!(
+        updates
+            .iter()
+            .any(|v| update(v)["toolCallId"] == "tool-1" && update(v)["status"] == "failed"),
+        "{updates:?}"
+    );
+    send(&mut child, json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":session,"prompt":[{"type":"text","text":"second"}]}})).await;
+    let (idle, _) = finished(&mut reader, 4).await;
+    child.kill().await.unwrap();
+    assert_eq!(error_message(&idle), Some("second turn failed"), "{idle}");
 }
 
 /// A fake claude that starts the background Bash `bg-1` as task `t1`, as

@@ -41,16 +41,13 @@ Each of these underlies several bugs below, which the fix closes.
   crash error shown only once history is read, the subscriber hung by a
   delete during the first read, and replay breaking after a failed write.
   `crates/oxd/src/state.rs:715`, `crates/oxd/src/store.rs`.
-- [ ] **The bridges infer which turn a result or dialog belongs to.** Medium.
-  Claude's stream-json and Pi's RPC tag neither with a prompt, so the bridges
-  track flags (`preempted`, `cancelling`, `initializing`, `unclaimed_error`)
-  and match by position. A pure turn state machine in each bridge, like
-  `Phase::after` in `oxd`, could be tested over interleavings of prompts,
-  steering, cancellation, dialogs and model changes. Underlies cancelling
-  during a preempted turn, cancelling before a Pi dialog arrives, and a
-  prompt running on the previous model.
-  `crates/claude-code-acp/src/runner.rs:646`, `crates/pi-acp/src/pi.rs:383`,
-  `crates/pi-acp/src/bridge.rs:273`.
+- [ ] **The Pi bridge infers which prompt a dialog or model change belongs
+  to.** Medium. Pi's RPC tags neither with a prompt, and Pi handles RPC lines
+  concurrently, so the bridge matches them by position. A pure turn state
+  machine, like `Phase::after` in `oxd`, could be tested over interleavings
+  of prompts, cancellation, dialogs and model changes. Underlies cancelling
+  before a Pi dialog arrives and a prompt running on the previous model.
+  `crates/pi-acp/src/pi.rs:383`, `crates/pi-acp/src/bridge.rs:273`.
 - [ ] **Clients sequence session lifecycle themselves.** Medium. Selecting an
   exited session awaits `load_session` before switching, and `set_config`
   replaces the whole config, so the composer tracks the base each change
@@ -171,7 +168,7 @@ Each of these underlies several bugs below, which the fix closes.
 
 ### Claude Code bridge
 
-- [ ] **Cancelling during a preempted turn can leave it open.** Medium. The
+- [x] **Cancelling during a preempted turn can leave it open.** Medium. The
   first result after a preemption is treated as the continuation, which
   neither ends the turn nor resolves the cancellation.
   `crates/claude-code-acp/src/runner.rs:646`.
