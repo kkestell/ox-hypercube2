@@ -1,8 +1,9 @@
 # Architecture
 
-Ox separates the desktop interface from session execution. The desktop app
-and `oxctl` are clients of `oxd`, a per-user daemon that owns session state
-and agent processes. Closing a client leaves its sessions running. Saved
+Ox separates the desktop interface from session execution. The desktop app,
+Ox's only user interface, is a client of `oxd`, a per-user daemon that owns
+session state and agent processes. `oxctl` is a second client, for agents
+and integration tests. Closing a client leaves its sessions running. Saved
 sessions and conversations also survive a daemon restart.
 
 ## Processes and communication
@@ -45,8 +46,8 @@ The desktop app uses Tauri 2. Its React webview calls the Rust core through
 Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
 streams updates back over Tauri channels. The core keeps one conversation
 view per channel, so the run view follows every child session of a run at
-once. `oxctl` uses the same daemon client and gives the integration tests
-access to the same operations.
+once. `oxctl` uses the same daemon client to give agents and the integration
+tests the same operations, and follows the daemon protocol as it changes.
 
 The app offers an agent for each [harness](glossary.md) on the `PATH` it
 passes to sessions, and checks again each time its window gains focus.

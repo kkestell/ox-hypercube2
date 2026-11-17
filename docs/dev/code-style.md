@@ -18,6 +18,9 @@ required behavior and everyday use.
 - Base generalization on concrete uses.
 - Resolve routine implementation choices in code, outside the specification.
   Discuss changes to observable behavior or scope when necessary.
+- Observable behavior means the desktop app's. Change `oxctl` to match the
+  daemon as part of the work; it serves agents and tests, as
+  [Architecture](architecture.md) describes.
 
 ## Implementation
 
