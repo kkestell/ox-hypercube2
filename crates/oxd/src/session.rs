@@ -11,14 +11,14 @@ use agent_client_protocol::v2::schema::{
     ElicitationCapabilities, ElicitationFormCapabilities, Implementation, InitializeRequest,
     NewSessionRequest, PermissionOption, PromptRequest, ReplayFrom, ReplayFromStart,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    ResumeSessionRequest, SessionConfigOption, SessionConfigOptionValue,
-    SetSessionConfigOptionRequest, SystemPrompt, TextContent, UpdateSessionNotification,
+    ResumeSessionRequest, SessionConfigOptionValue, SetSessionConfigOptionRequest, SystemPrompt,
+    TextContent, UpdateSessionNotification,
 };
 use agent_client_protocol::v2::{ConnectionTo, InitializeOutcome, Responder};
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, Client};
 use ox_protocol::{
-    ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo, SessionRequest,
-    SessionState, TranscriptPage, Unseen, code,
+    ConfigSetting, ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionInfo,
+    SessionRequest, SessionState, TranscriptPage, Unseen, code,
 };
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -29,7 +29,7 @@ use crate::store::{SavedSession, Store};
 use crate::transcript;
 use crate::worktree::Worktree;
 
-type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
+type ConfigReply = oneshot::Sender<Result<(), String>>;
 
 /// Ox's instructions to an agent that has the `ox` tools.
 const OX_INSTRUCTIONS: &str = "You are running in Ox, a desktop app for coding agents.\n\n\
@@ -44,11 +44,9 @@ enum Launch {
 
 /// What a new session's agent is given once it opens its ACP session.
 pub struct Opening {
-    /// Option values the agent is set to where it reports others.
-    pub options: Vec<(String, SessionConfigOptionValue)>,
     /// The first prompt, with the seq of the `PromptStarted` event that
     /// `record_first_prompt` recorded for it, sent once the agent has
-    /// accepted the options, and rejected when it has not.
+    /// accepted the session's config, and rejected when it has not.
     pub prompt: Option<(Vec<ContentBlock>, u64)>,
 }
 
@@ -59,16 +57,16 @@ enum Command {
         seq: u64,
     },
     Cancel,
-    SetConfigOption {
-        config_id: String,
-        value: SessionConfigOptionValue,
+    /// A new config, whose settings the agent is sent in order.
+    SetConfig {
+        config: Vec<ConfigSetting>,
         reply: ConfigReply,
     },
 }
 
 /// One ACP agent process and its event history. The database keeps the
-/// session's workspace, command, directory, title, agent session ID, and
-/// the ID of its worktree.
+/// session's workspace, command, directory, title, agent session ID, config,
+/// and the ID of its worktree.
 pub struct Session {
     pub id: String,
     pub number: u64,
@@ -83,6 +81,9 @@ pub struct Session {
     worktree: Mutex<Option<Arc<Worktree>>>,
     /// Whether the session is archived.
     archived: Mutex<bool>,
+    /// The values Ox set the agent to, in the order they are sent. Changed
+    /// under the state lock.
+    config: Mutex<Vec<ConfigSetting>>,
     /// Held while the session adds its worktree and launches its agent,
     /// while it loads, and while it is deleted.
     lifecycle: Arc<tokio::sync::Mutex<()>>,
@@ -228,6 +229,7 @@ impl Session {
             env: Mutex::default(),
             worktree: Mutex::new(worktree),
             archived: Mutex::new(saved.archived),
+            config: Mutex::new(saved.config),
             lifecycle: Arc::default(),
             store,
             ox_server,
@@ -438,9 +440,7 @@ impl Session {
             prompt_capabilities: agent
                 .map(|agent| agent.prompt_capabilities.clone())
                 .unwrap_or_default(),
-            config_options: agent
-                .map(|agent| agent.config_options.clone())
-                .unwrap_or_default(),
+            config: self.config.lock().unwrap().clone(),
             available_commands: agent
                 .map(|agent| agent.available_commands.clone())
                 .unwrap_or_default(),
@@ -644,26 +644,20 @@ impl Session {
         })
     }
 
-    /// Asks the agent to change a config option. The request goes to the
-    /// agent ahead of every command sent after this returns, such as a
-    /// prompt. The returned future resolves to the agent's resulting options.
-    pub fn set_config_option(
+    /// Replaces the session's config: the agent is sent each setting, in
+    /// order, ahead of every command sent after this returns, such as a
+    /// prompt. The returned future resolves once the agent has answered them
+    /// all, to the error naming each setting it refused.
+    pub fn set_config(
         &self,
-        config_id: String,
-        value: ConfigValue,
-    ) -> Result<impl Future<Output = Result<Vec<SessionConfigOption>, ErrorBody>> + use<>, ErrorBody>
-    {
+        config: Vec<ConfigSetting>,
+    ) -> Result<impl Future<Output = Result<(), ErrorBody>> + use<>, ErrorBody> {
         let state = self.lock().state();
         if matches!(state, SessionState::Starting | SessionState::Exited) {
             return Err(invalid_state(state));
         }
-        let value = option_value(value);
         let (reply, result) = oneshot::channel();
-        self.send(Command::SetConfigOption {
-            config_id,
-            value,
-            reply,
-        });
+        self.send(Command::SetConfig { config, reply });
         Ok(async move {
             result
                 .await
@@ -759,12 +753,62 @@ impl Session {
         let _ = self.commands.lock().unwrap().send(command);
     }
 
+    /// The values Ox set the agent to.
+    fn config(&self) -> Vec<ConfigSetting> {
+        self.config.lock().unwrap().clone()
+    }
+
+    /// Records that the agent opened its ACP session. A session without a
+    /// config takes the one the agent reports.
+    fn record_start(&self, agent: state::Agent) {
+        self.update(|state| {
+            let mut config = self.config.lock().unwrap();
+            if state.state() == SessionState::Starting && config.is_empty() {
+                *config = state::reported_config(&agent.config_options);
+            }
+            drop(config);
+            state.record(Change::Started(agent));
+        });
+    }
+
+    /// Records the agent's answers to a new config: the session's config
+    /// becomes the answered settings when the agent accepted them all, and
+    /// otherwise each accepted setting replaces the one with its ID. Returns
+    /// the error naming each refused setting.
+    fn settle_config(&self, answers: Vec<(ConfigSetting, Option<String>)>) -> Result<(), String> {
+        let refusals = refusals(&answers);
+        self.update(|_| {
+            let mut config = self.config.lock().unwrap();
+            if refusals.is_empty() {
+                *config = answers.into_iter().map(|(setting, _)| setting).collect();
+                return;
+            }
+            for (setting, refusal) in answers {
+                if refusal.is_some() {
+                    continue;
+                }
+                match config
+                    .iter_mut()
+                    .find(|current| current.config_id == setting.config_id)
+                {
+                    Some(current) => *current = setting,
+                    None => config.push(setting),
+                }
+            }
+        });
+        if refusals.is_empty() {
+            Ok(())
+        } else {
+            Err(refusals.join("\n"))
+        }
+    }
+
     /// Changes the state, starts the queue's next prompt if the session can
     /// take it, publishes the seq of its last event, records the unseen
     /// outcome its new events give, queues them for the database, saves a
-    /// changed title, agent session ID, unseen outcome or queue, signals the
-    /// daemon if the session's `SessionInfo` changed, and asks the worktree
-    /// for its comparison again when a turn ended.
+    /// changed title, agent session ID, unseen outcome, config or queue,
+    /// signals the daemon if the session's `SessionInfo` changed, and asks
+    /// the worktree for its comparison again when a turn ended.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.lock();
         let before = self.info_of(&state);
@@ -825,6 +869,11 @@ impl Session {
                 "oxd: saving the unseen outcome of session {}: {error}",
                 self.id
             );
+        }
+        if after.config != before.config
+            && let Err(error) = self.store.set_session_config(&self.id, &after.config)
+        {
+            eprintln!("oxd: saving the config of session {}: {error}", self.id);
         }
     }
 
@@ -970,24 +1019,23 @@ impl Session {
                             });
                     let mut preamble = instructions
                         .filter(|_| !takes_system_prompt && matches!(launch, Launch::New(_)));
+                    // The config as the session was launched with it, before
+                    // a session without one takes the agent's.
+                    let config = session.config();
                     let (opened, open) = oneshot::channel();
                     let start = {
                         let session = session.clone();
                         move |result: Result<state::Agent, _>| {
                             let result = result.map(|agent| {
                                 let id = agent.session_id.clone();
-                                session.record(Change::Started(agent));
+                                session.record_start(agent);
                                 id
                             });
                             let _ = opened.send(result);
                         }
                     };
-                    let (options, opening) = match launch {
-                        Launch::Resume(Resume {
-                            session_id,
-                            replay,
-                            options,
-                        }) => {
+                    let opening = match launch {
+                        Launch::Resume(Resume { session_id, replay }) => {
                             connection
                                 .prepare_request(
                                     ResumeSessionRequest::new(
@@ -1009,7 +1057,7 @@ impl Session {
                                     }));
                                     Ok(())
                                 })?;
-                            (options, None)
+                            None
                         }
                         Launch::New(opening) => {
                             connection
@@ -1027,89 +1075,46 @@ impl Session {
                                     }));
                                     Ok(())
                                 })?;
-                            (opening.options, Some(opening.prompt))
+                            Some(opening.prompt)
                         }
                     };
                     let acp_session = open.await.map_err(|_| {
                         agent_client_protocol::Error::internal_error()
                             .data("the agent closed the connection before the session opened")
                     })??;
-                    // The agent reports its own option values, and is set to
-                    // the resumed session's, or those a new session was
-                    // given, where they differ. A resumed agent's values are
-                    // ones it accepted before, so they are set without
-                    // waiting. A new session's first prompt waits for its
-                    // settings, and is not sent when one fails.
-                    let reported = state::option_values(&session.info().config_options);
-                    let mut failed = Vec::new();
-                    for (config_id, value) in options {
-                        let current = reported
-                            .iter()
-                            .find(|(id, _)| *id == config_id)
-                            .map(|(_, current)| current);
-                        if current == Some(&value) {
-                            continue;
-                        }
-                        if opening.is_some() {
-                            if current.is_none() {
-                                failed.push(format!("The agent has no {config_id} option"));
-                                continue;
-                            }
-                            let shown = shown(&value);
-                            match connection
-                                .send_request(SetSessionConfigOptionRequest::new(
-                                    acp_session.clone(),
-                                    config_id.clone(),
-                                    value,
-                                ))
-                                .block_task()
-                                .await
-                            {
-                                Ok(response) => {
-                                    session
-                                        .record(Change::ConfigOptionsSet(response.config_options));
+                    // The agent is set to the session's config. A new
+                    // session's first prompt waits for the answers, and is
+                    // not sent when the agent refuses a setting. A resumed
+                    // agent is set to values it accepted before, so its
+                    // answers are not waited for.
+                    let answers = send_config(&connection, &acp_session, config);
+                    let mut first = None;
+                    match opening {
+                        Some(prompt) => {
+                            let refused = refusals(&answers.await);
+                            match prompt {
+                                Some((prompt, seq)) if refused.is_empty() => {
+                                    first = Some(Command::Prompt { prompt, seq });
                                 }
-                                Err(error) => failed.push(format!(
-                                    "The agent refused {config_id} {shown}: {error}"
-                                )),
+                                Some((_, seq)) => session.record(Change::PromptRejected {
+                                    prompt: seq,
+                                    error: refused.join("\n"),
+                                }),
+                                None => {
+                                    for refusal in refused {
+                                        eprintln!("oxd: session {}: {refusal}", session.id);
+                                    }
+                                }
                             }
-                            continue;
                         }
-                        if current.is_none() {
-                            continue;
-                        }
-                        let session = session.clone();
-                        connection
-                            .send_request(SetSessionConfigOptionRequest::new(
-                                acp_session.clone(),
-                                config_id,
-                                value,
-                            ))
-                            .on_receiving_result(async move |result| {
-                                match result {
-                                    Ok(response) => session
-                                        .record(Change::ConfigOptionsSet(response.config_options)),
-                                    Err(error) => eprintln!(
-                                        "oxd: setting a config option of session {}: {error}",
-                                        session.id
-                                    ),
+                        None => {
+                            let id = session.id.clone();
+                            connection.spawn(async move {
+                                for refusal in refusals(&answers.await) {
+                                    eprintln!("oxd: session {id}: {refusal}");
                                 }
                                 Ok(())
                             })?;
-                    }
-                    let mut first = None;
-                    match opening.flatten() {
-                        Some((prompt, seq)) if failed.is_empty() => {
-                            first = Some(Command::Prompt { prompt, seq });
-                        }
-                        Some((_, seq)) => session.record(Change::PromptRejected {
-                            prompt: seq,
-                            error: failed.join("\n"),
-                        }),
-                        None => {
-                            for failure in failed {
-                                eprintln!("oxd: session {}: {failure}", session.id);
-                            }
                         }
                     }
                     loop {
@@ -1157,29 +1162,13 @@ impl Session {
                                 ))?;
                                 session.record(Change::Cancelled);
                             }
-                            Some(Command::SetConfigOption {
-                                config_id,
-                                value,
-                                reply,
-                            }) => {
+                            Some(Command::SetConfig { config, reply }) => {
+                                let answers = send_config(&connection, &acp_session, config);
                                 let session = session.clone();
-                                connection
-                                    .send_request(SetSessionConfigOptionRequest::new(
-                                        acp_session.clone(),
-                                        config_id,
-                                        value,
-                                    ))
-                                    .on_receiving_result(async move |result| {
-                                        let result = result
-                                            .map(|response| response.config_options)
-                                            .map_err(|error| error.to_string());
-                                        if let Ok(options) = &result {
-                                            session
-                                                .record(Change::ConfigOptionsSet(options.clone()));
-                                        }
-                                        let _ = reply.send(result);
-                                        Ok(())
-                                    })?;
+                                connection.spawn(async move {
+                                    let _ = reply.send(session.settle_config(answers.await));
+                                    Ok(())
+                                })?;
                             }
                         }
                     }
@@ -1191,17 +1180,54 @@ impl Session {
     }
 }
 
-/// An option value as an error message shows it.
-fn shown(value: &SessionConfigOptionValue) -> String {
-    match value {
-        SessionConfigOptionValue::Id { value } => value.to_string(),
-        SessionConfigOptionValue::Boolean { value } => value.to_string(),
-        other => format!("{other:?}"),
+/// Sends the agent of ACP session `session_id` each setting of `config`, in
+/// order, and returns the future of the settings with the error of each one
+/// the agent refused.
+fn send_config(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    config: Vec<ConfigSetting>,
+) -> impl Future<Output = Vec<(ConfigSetting, Option<String>)>> + use<> {
+    let sent: Vec<_> = config
+        .into_iter()
+        .map(|setting| {
+            let request = connection.send_request(SetSessionConfigOptionRequest::new(
+                session_id.to_owned(),
+                setting.config_id.clone(),
+                option_value(setting.value.clone()),
+            ));
+            (setting, request)
+        })
+        .collect();
+    async move {
+        let mut answers = Vec::with_capacity(sent.len());
+        for (setting, request) in sent {
+            let refusal = request.block_task().await.err();
+            answers.push((setting, refusal.map(|error| error.to_string())));
+        }
+        answers
     }
 }
 
+/// The refused settings of `answers`, each as `The agent refused <id>
+/// <value>: <error>`.
+fn refusals(answers: &[(ConfigSetting, Option<String>)]) -> Vec<String> {
+    answers
+        .iter()
+        .filter_map(|(setting, refusal)| {
+            let value = match &setting.value {
+                ConfigValue::Id(id) => id.clone(),
+                ConfigValue::Boolean(value) => value.to_string(),
+            };
+            refusal
+                .as_ref()
+                .map(|error| format!("The agent refused {} {value}: {error}", setting.config_id))
+        })
+        .collect()
+}
+
 /// The ACP value of an option value from a client.
-pub fn option_value(value: ConfigValue) -> SessionConfigOptionValue {
+fn option_value(value: ConfigValue) -> SessionConfigOptionValue {
     match value {
         ConfigValue::Boolean(value) => SessionConfigOptionValue::boolean(value),
         ConfigValue::Id(id) => SessionConfigOptionValue::id(id),

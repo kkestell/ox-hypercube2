@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ox_protocol::schema::{ContentBlock, SessionUpdate};
-use ox_protocol::{Client, Event, EventKind, SessionInfo, SessionState};
+use ox_protocol::{
+    Client, ConfigSetting, ConfigValue, Event, EventKind, SessionInfo, SessionState,
+};
 use serde_json::{Value, json};
 
 mod common;
@@ -202,6 +204,7 @@ async fn an_unarchived_imported_session_resumes_without_replay() {
     .unwrap();
     assert_eq!(import(&client, &workspace).await, 1);
     let session = imported(&client, "a").await.unwrap();
+    assert!(session.config.is_empty());
     client
         .unarchive(&session.id, BTreeMap::new())
         .await
@@ -228,6 +231,19 @@ async fn an_unarchived_imported_session_resumes_without_replay() {
             .iter()
             .any(|event| matches!(event.kind, EventKind::Update(SessionUpdate::UserMessage(_)))),
         "{resumed:?}"
+    );
+    // A session without a config takes the one its agent reports.
+    let setting = |config_id: &str, value: &str| ConfigSetting {
+        config_id: config_id.into(),
+        value: ConfigValue::Id(value.into()),
+    };
+    assert_eq!(
+        imported(&client, "a").await.unwrap().config,
+        [
+            setting("model", "smart"),
+            setting("effort", "medium"),
+            setting("mode", "ask"),
+        ]
     );
     assert_eq!(
         described(&history(&client, &session.id, 3).await),

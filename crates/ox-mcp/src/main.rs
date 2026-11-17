@@ -28,8 +28,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use ox_protocol::config::{Choice, HarnessConfig};
-use ox_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
-use ox_protocol::{Client, Harness, Listing, ListingChange, SessionInfo, SessionState};
+use ox_protocol::{
+    Client, ConfigValue, Harness, Listing, ListingChange, SessionInfo, SessionState,
+};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::transport::stdio;
@@ -312,12 +313,16 @@ fn format_listing(
             if let Some(harness) = Harness::of_command(&session.command) {
                 fields.push(format!("harness: {}", harness.executable()));
             }
-            for (category, label) in [
-                (SessionConfigOptionCategory::Model, "model"),
-                (SessionConfigOptionCategory::ThoughtLevel, "effort"),
-            ] {
-                if let Some(value) = current_value(session, &category) {
-                    fields.push(format!("{label}: {value}"));
+            for id in ["model", "effort"] {
+                let value = session
+                    .config
+                    .iter()
+                    .find(|setting| setting.config_id == id)
+                    .map(|setting| &setting.value);
+                match value {
+                    Some(ConfigValue::Id(value)) => fields.push(format!("{id}: {value}")),
+                    Some(ConfigValue::Boolean(value)) => fields.push(format!("{id}: {value}")),
+                    None => {}
                 }
             }
             fields.push(format!("directory: {}", session.cwd.display()));
@@ -375,16 +380,6 @@ fn format_harnesses(harnesses: &[HarnessConfig]) -> String {
 fn ids(choices: &[Choice]) -> String {
     let ids: Vec<&str> = choices.iter().map(|choice| choice.id.as_str()).collect();
     ids.join(", ")
-}
-
-/// The current value of the session's select option of `category`.
-fn current_value(session: &SessionInfo, category: &SessionConfigOptionCategory) -> Option<String> {
-    session.config_options.iter().find_map(|option| {
-        let SessionConfigKind::Select(select) = &option.kind else {
-            return None;
-        };
-        (option.category.as_ref() == Some(category)).then(|| select.current_value.to_string())
-    })
 }
 
 /// This process's environment, for git run on its behalf.

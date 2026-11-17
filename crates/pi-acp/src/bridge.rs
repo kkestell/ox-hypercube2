@@ -252,13 +252,19 @@ impl acp_bridge::Bridge for Bridge {
     ) -> impl Future<Output = Result<acp::SetSessionConfigOptionResponse, Error>> + Send + 'static
     {
         let id = request.session_id.to_string();
+        let config_id = request.config_id.to_string();
+        let mut effort = None;
         let change = (|| {
             drop(self.require(&id)?);
             let acp::SessionConfigOptionValue::Id { value } = &request.value else {
                 return Err(invalid("Expected a select value"));
             };
-            let command = options::command(&request.config_id.to_string(), &value.to_string())
+            let value = value.to_string();
+            let command = options::command(&config_id, &value)
                 .ok_or_else(|| invalid("Unknown configuration option or value"))?;
+            if config_id == "effort" {
+                effort = Some(value);
+            }
             if self.start_pi(&id, &connection)? {
                 self.publish_description(&id, &connection);
             }
@@ -279,6 +285,9 @@ impl acp_bridge::Bridge for Bridge {
                     description.config_options.clone(),
                 )),
             );
+            if let Some(effort) = effort {
+                options::check_effort(&description.state, &effort).map_err(invalid)?;
+            }
             Ok(acp::SetSessionConfigOptionResponse::new(
                 description.config_options,
             ))

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_client_protocol::v2::schema::{ContentBlock, ElicitationAction, SessionConfigOption};
+use agent_client_protocol::v2::schema::{ContentBlock, ElicitationAction};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19,10 +19,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::messages::{
-    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, DirEntry, ErrorBody, Event, EventKind,
-    FileContent, HelloResult, ImportedSessions, ListingChange, MessageSent, Method,
-    PROTOCOL_VERSION, QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage,
-    WorkspaceInfo, WorktreeInfo,
+    Branches, Checkout, ConfigSetting, Deleted, DirEntry, ErrorBody, Event, EventKind, FileContent,
+    HelloResult, ImportedSessions, ListingChange, MessageSent, Method, PROTOCOL_VERSION,
+    QueueAdded, Request, ServerMessage, SessionInfo, TranscriptPage, WorkspaceInfo, WorktreeInfo,
 };
 
 /// How long a started daemon has to report that it is ready.
@@ -447,17 +446,15 @@ impl Client {
         .await
     }
 
-    /// Sets a config option and returns the agent's resulting options.
-    pub async fn set_config_option(
+    /// Replaces the session's config, setting its agent to each setting.
+    pub async fn set_config(
         &self,
         session_id: &str,
-        config_id: &str,
-        value: ConfigValue,
-    ) -> Result<Vec<SessionConfigOption>, Error> {
-        self.call(Method::SessionSetConfigOption {
+        config: Vec<ConfigSetting>,
+    ) -> Result<(), Error> {
+        self.ack(Method::SessionSetConfig {
             session_id: session_id.into(),
-            config_id: config_id.into(),
-            value,
+            config,
         })
         .await
     }

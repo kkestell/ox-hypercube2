@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use ox_protocol::config::{self, HarnessConfig};
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
-    Branches, Checkout, Client, ConfigSetting, ConfigValue, Deleted, DirEntry, Error, FileContent,
-    Harness, ListingChange, SessionInfo, WorkspaceInfo, code, content, default_socket_path,
+    Branches, Checkout, Client, ConfigSetting, Deleted, DirEntry, Error, FileContent, Harness,
+    ListingChange, SessionInfo, WorkspaceInfo, code, content, default_socket_path,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
@@ -528,17 +528,15 @@ async fn respond_elicitation(
 }
 
 #[tauri::command]
-async fn set_config_option(
+async fn set_config(
     app: State<'_, App>,
     session_id: String,
-    config_id: String,
-    value: ConfigValue,
+    config: Vec<ConfigSetting>,
 ) -> Result<(), String> {
     app.client()
         .await?
-        .set_config_option(&session_id, &config_id, value)
+        .set_config(&session_id, config)
         .await
-        .map(drop)
         .map_err(message)
 }
 
@@ -692,7 +690,7 @@ pub fn run() {
             cancel,
             permit,
             respond_elicitation,
-            set_config_option,
+            set_config,
             delete_session,
             archive_session,
             unarchive_session,

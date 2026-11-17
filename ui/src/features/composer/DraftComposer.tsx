@@ -5,14 +5,13 @@ import type {
   Checkout,
   Command,
   ConfigOption,
-  ConfigSetting,
   SessionInfo,
   WorkspaceInfo,
 } from "../../lib/protocol";
 import { directoryName } from "../sessions/SessionList";
 import type { Draft } from "../sessions/useDrafts";
 import { Composer } from "./Composer";
-import type { Values } from "./controls";
+import { settingsOf, type Values } from "./controls";
 import type { Unsents } from "./useUnsent";
 
 const noCommands: Command[] = [];
@@ -54,10 +53,7 @@ export function DraftComposer({
         if (head === null) throw `${directoryName(workspace.path)} is not on a branch`;
         checkout = { type: "worktree", compare: head };
       }
-      const config: ConfigSetting[] = options.map((option) => ({
-        config_id: option.configId,
-        value: option.currentValue,
-      }));
+      const config = settingsOf(options);
       const session = await invoke<SessionInfo>("new_session", {
         agent: draft.agent,
         workspaceId: workspace.id,

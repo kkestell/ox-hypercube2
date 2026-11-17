@@ -7,6 +7,7 @@ import { SelectPicker } from "../../components/SelectPicker";
 import type {
   Command,
   ConfigOption,
+  ConfigSetting,
   HarnessConfig,
   QueuedPrompt,
   Request,
@@ -15,7 +16,7 @@ import type {
 import { showError } from "../../lib/showError";
 import type { AgentId } from "../sessions/useAgents";
 import { CommandInput } from "./CommandInput";
-import { sessionOptions } from "./controls";
+import { changedConfig, sessionOptions } from "./controls";
 import { ModelPicker, type SelectConfig } from "./ModelPicker";
 import { OpenRequest } from "./OpenRequest";
 import { QueuedPrompts, queuedMessage } from "./QueuedPrompts";
@@ -245,34 +246,44 @@ export function Composer({
 /**
  * A session's composer. On an idle session, Enter and Cmd+Enter send the
  * message. While the agent works, Enter queues it and Cmd+Enter steers the
- * running turn with it. The model, effort and mode pickers offer what
- * `harness`, the config of the session's agent, lists. A new session whose
- * agent is starting shows `starting`, the options it was sent with,
- * disabled, until its agent reports its own.
+ * running turn with it. The model, effort and mode pickers show the
+ * session's config, with what `harness`, the config of the session's agent,
+ * lists, and are disabled while the agent starts or has exited. A change
+ * sends the whole config the change gives.
  */
 export const SessionComposer = memo(function SessionComposer({
   session,
   request,
   unsent,
   harness,
-  starting,
 }: {
   session: SessionInfo;
   /** The session's oldest unanswered permission request or form. */
   request: Request | undefined;
   unsent: Unsents;
   harness: HarnessConfig | undefined;
-  starting: ConfigOption[] | undefined;
 }) {
   const running =
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
-  const reported = session.config_options;
-  const options = useMemo(
-    () => starting ?? sessionOptions(harness, reported),
-    [starting, harness, reported],
-  );
+  const options = useMemo(() => sessionOptions(harness, session.config), [harness, session.config]);
+  // The config last sent, built on `base`, the session's config then. A
+  // change made before the session is listed again builds on it. A listing
+  // that changes something else while an answer is pending ends this, so a
+  // change after it builds on the session's config.
+  const sent = useRef<{ base: ConfigSetting[]; config: ConfigSetting[] }>(undefined);
+  const setOption = async (option: ConfigOption, value: string | boolean) => {
+    const current = sent.current?.base === session.config ? sent.current.config : session.config;
+    const config = changedConfig(harness, current, option.configId, value);
+    sent.current = { base: session.config, config };
+    try {
+      await invoke("set_config", { sessionId: session.id, config });
+    } catch (error) {
+      if (sent.current?.config === config) sent.current = undefined;
+      throw error;
+    }
+  };
   return (
     <Composer
       unsentId={session.id}
@@ -285,7 +296,7 @@ export const SessionComposer = memo(function SessionComposer({
       running={running}
       disabled={session.state === "exited"}
       idle={session.state === "idle"}
-      optionsDisabled={starting !== undefined}
+      optionsDisabled={session.state === "starting" || session.state === "exited"}
       onSend={(text, attachments, steer) =>
         invoke(steer || !running ? "prompt" : "queue_add", {
           sessionId: session.id,
@@ -297,13 +308,7 @@ export const SessionComposer = memo(function SessionComposer({
         invoke("queue_edit", { sessionId: session.id, promptId, text, attachments })
       }
       onStop={() => invoke("cancel", { sessionId: session.id })}
-      onSetOption={(option, value) =>
-        invoke("set_config_option", {
-          sessionId: session.id,
-          configId: option.configId,
-          value,
-        })
-      }
+      onSetOption={setOption}
     />
   );
 });

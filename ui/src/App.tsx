@@ -97,21 +97,9 @@ export function App() {
     if (!draft || !draftHarness) return [];
     return draftOptions(draftHarness, draft.config, lastUsed.get(draft.agent, draft.workspaceId));
   }, [draft, draftHarness, lastUsed]);
-  // A session offers what the config lists for its agent. A new session
-  // shows the values it was sent with until its agent reports its own.
+  // A session offers what the config lists for its agent.
   const sessionAgentId = session && sessionAgent(session.command);
   const sessionHarness = harnesses.find(({ harness }) => harness === sessionAgentId);
-  const startingConfig = useMemo(() => {
-    if (
-      !session ||
-      !sessionHarness ||
-      session.state !== "starting" ||
-      session.agent_session_id !== null
-    ) {
-      return undefined;
-    }
-    return draftOptions(sessionHarness, lastUsed.get(sessionHarness.harness, session.workspace_id));
-  }, [session, sessionHarness, lastUsed]);
   const { setConfig } = drafts;
   const { remember } = lastUsed;
   const draftSent = useCallback(
@@ -155,7 +143,6 @@ export function App() {
             request={request}
             unsent={unsent}
             harness={sessionHarness}
-            starting={startingConfig}
           />
         </SessionContent>
       );

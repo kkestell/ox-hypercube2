@@ -9,12 +9,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ox_protocol::schema::{
-    ContentBlock, SessionConfigKind, SessionUpdate, TextContent, UserMessage,
-};
+use ox_protocol::schema::{ContentBlock, SessionUpdate, TextContent, UserMessage};
 use ox_protocol::{
-    Checkout, Client, Event, EventKind, Harness, ListingChange, RequestedCheckout, Sender,
-    SessionInfo, SessionRequest, SessionState, Subscription,
+    Checkout, Client, ConfigSetting, ConfigValue, Event, EventKind, Harness, ListingChange,
+    RequestedCheckout, Sender, SessionInfo, SessionRequest, SessionState, Subscription,
 };
 use serde_json::json;
 use tempfile::TempDir;
@@ -578,19 +576,6 @@ async fn request(
     (request_id, title, session_request.unwrap())
 }
 
-fn config_value(session: &SessionInfo, id: &str) -> String {
-    session
-        .config_options
-        .iter()
-        .find_map(|option| match &option.kind {
-            SessionConfigKind::Select(select) if *option.config_id.0 == *id => {
-                Some(select.current_value.to_string())
-            }
-            _ => None,
-        })
-        .unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn an_approved_request_starts_the_session_it_describes() {
     let repo = repo();
@@ -651,9 +636,18 @@ async fn an_approved_request_starts_the_session_it_describes() {
     let listing = listing(&client).await;
     let session = listing.sessions.iter().find(|s| s.id == id).unwrap();
     assert_eq!(session.title.as_deref(), Some(r#"text "started""#));
-    assert_eq!(config_value(session, "model"), "fast");
-    assert_eq!(config_value(session, "effort"), "low");
-    assert_eq!(config_value(session, "mode"), "code");
+    let setting = |config_id: &str, value: &str| ConfigSetting {
+        config_id: config_id.into(),
+        value: ConfigValue::Id(value.into()),
+    };
+    assert_eq!(
+        session.config,
+        [
+            setting("model", "fast"),
+            setting("effort", "low"),
+            setting("mode", "code"),
+        ]
+    );
     let worktree = listing
         .worktrees
         .iter()

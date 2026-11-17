@@ -193,20 +193,18 @@ pub async fn serve(
                         Value::Null
                     })
             }
-            // A config option change goes to the agent here, in the order of
-            // the connection's requests, so a prompt sent after it reaches the
+            // A config change goes to the agent here, in the order of the
+            // connection's requests, so a prompt sent after it reaches the
             // agent after it. Its answer waits on the agent in its own task.
-            Method::SessionSetConfigOption {
-                session_id,
-                config_id,
-                value,
-            } => match daemon.set_config_option(&session_id, config_id, value) {
-                Ok(options) => {
-                    answer_later(id, options, outgoing.clone(), stopping.clone());
-                    continue;
+            Method::SessionSetConfig { session_id, config } => {
+                match daemon.set_config(&session_id, config) {
+                    Ok(answered) => {
+                        answer_later(id, answered, outgoing.clone(), stopping.clone());
+                        continue;
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) => Err(error),
-            },
+            }
             // Creating a session in a worktree, deleting a session, listing
             // or moving branches and comparing a worktree's branch wait on
             // git, importing Claude sessions waits on the Claude bridge, and

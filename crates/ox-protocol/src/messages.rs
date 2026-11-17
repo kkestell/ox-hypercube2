@@ -101,11 +101,11 @@ pub enum Method {
         /// has started and `config` is applied.
         #[serde(default)]
         prompt: Option<Vec<ContentBlock>>,
-        /// Option values the agent is set to once it has started, in order,
-        /// each only where the agent reports a different value. The first
-        /// prompt waits for the agent's answers; when it refuses a value, or
-        /// reports no option with its ID, the first prompt is not sent and
-        /// its turn ends with an error naming each failed setting.
+        /// The session's config, which the agent is set to once it has
+        /// started, in order. The first prompt waits for the agent's
+        /// answers; when it refuses a setting, the first prompt is not sent
+        /// and its turn ends with an error naming each refused setting. An
+        /// empty config becomes what the agent reports when it starts.
         #[serde(default)]
         config: Vec<ConfigSetting>,
     },
@@ -269,11 +269,15 @@ pub enum Method {
         #[serde(flatten)]
         action: ElicitationAction,
     },
-    #[serde(rename = "session.set_config_option")]
-    SessionSetConfigOption {
+    /// Replaces the session's config: the agent is sent each setting, in
+    /// order, ahead of every later request to the session. Once it has
+    /// answered them all, the config becomes `config` if it accepted every
+    /// setting; otherwise each accepted setting replaces the one with its ID
+    /// and the error names each refused setting. The result is null.
+    #[serde(rename = "session.set_config")]
+    SessionSetConfig {
         session_id: String,
-        config_id: String,
-        value: ConfigValue,
+        config: Vec<ConfigSetting>,
     },
     /// Stops the session's agent and deletes the session. A session in a
     /// worktree waits for its startup to finish, then has its worktree
@@ -508,7 +512,7 @@ pub struct ImportedSessions {
     pub imported: u64,
 }
 
-/// A config option value for `session.new` to set.
+/// A config option value the session's agent is set to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigSetting {
     pub config_id: String,
@@ -662,8 +666,10 @@ pub struct SessionInfo {
     /// The content the agent accepts in prompts. Empty until the session has
     /// started.
     pub prompt_capabilities: PromptCapabilities,
-    /// The agent's current config options, such as model and mode.
-    pub config_options: Vec<SessionConfigOption>,
+    /// The session's config: the values Ox set its agent to, such as model,
+    /// effort and mode, in the order they are sent. Empty for a session
+    /// whose agent has not reported its own yet.
+    pub config: Vec<ConfigSetting>,
     /// The agent's complete current slash-command catalog.
     pub available_commands: Vec<AvailableCommand>,
     /// The ID of the worktree the session runs in, if it has one. Unset
@@ -748,9 +754,7 @@ pub enum EventKind {
     /// The agent reported work no prompt asked for, as Claude does when a
     /// background task it started reports back.
     TurnStarted,
-    /// An ACP `session/update` notification, unchanged. When an agent answers
-    /// `session.set_config_option` with options it has not reported in a
-    /// notification, the daemon adds a `config_option_update` with them.
+    /// An ACP `session/update` notification, unchanged.
     Update(SessionUpdate),
     /// A `session/request_permission` request, unchanged. A tool call
     /// subject carries the tool call's details, which a client applies as it
@@ -1097,27 +1101,30 @@ mod tests {
 
         let request: Request = serde_json::from_value(json!({
             "id": 5,
-            "method": "session.set_config_option",
-            "params": {"session_id": "s", "config_id": "mode", "value": "plan"}
+            "method": "session.set_config",
+            "params": {"session_id": "s", "config": [
+                {"config_id": "mode", "value": "plan"},
+                {"config_id": "fast", "value": true}
+            ]}
         }))
         .unwrap();
-        assert!(matches!(
-            request.method,
-            Method::SessionSetConfigOption { value: ConfigValue::Id(ref id), .. } if id == "plan"
-        ));
-        let request: Request = serde_json::from_value(json!({
-            "id": 6,
-            "method": "session.set_config_option",
-            "params": {"session_id": "s", "config_id": "fast", "value": true}
-        }))
-        .unwrap();
-        assert!(matches!(
-            request.method,
-            Method::SessionSetConfigOption {
-                value: ConfigValue::Boolean(true),
-                ..
-            }
-        ));
+        let Method::SessionSetConfig { session_id, config } = request.method else {
+            panic!("not session.set_config: {:?}", request.method);
+        };
+        assert_eq!(session_id, "s");
+        assert_eq!(
+            config,
+            [
+                ConfigSetting {
+                    config_id: "mode".into(),
+                    value: ConfigValue::Id("plan".into()),
+                },
+                ConfigSetting {
+                    config_id: "fast".into(),
+                    value: ConfigValue::Boolean(true),
+                },
+            ]
+        );
 
         let accept = json!({
             "id": 19,
@@ -1348,7 +1355,7 @@ mod tests {
                 "title": "Fix the build",
                 "agent_session_id": "a",
                 "prompt_capabilities": {},
-                "config_options": [],
+                "config": [{"config_id": "model", "value": "smart"}],
                 "available_commands": [],
                 "worktree_id": "01234567-89ab",
                 "archived": false,

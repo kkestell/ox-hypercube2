@@ -58,6 +58,24 @@ pub fn command(id: &str, value: &str) -> Option<Value> {
     }
 }
 
+/// Refuses an effort Pi does not run at after `set_thinking_level`: Pi
+/// clamps a level its model lacks to one it has and reports success.
+pub fn check_effort(state: &Value, requested: &str) -> Result<(), String> {
+    let reported = state["thinkingLevel"].as_str();
+    if reported == Some(requested) {
+        return Ok(());
+    }
+    let model = format!(
+        "{}/{}",
+        state["model"]["provider"].as_str().unwrap_or_default(),
+        state["model"]["id"].as_str().unwrap_or_default()
+    );
+    Err(format!(
+        "Pi runs {model} at effort {}, not {requested}",
+        reported.unwrap_or("none")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +130,15 @@ mod tests {
         ] {
             assert_eq!(command(id, value), None, "{id}: {value}");
         }
+    }
+
+    #[test]
+    fn an_effort_pi_clamped_is_refused() {
+        let state = json!({"model":{"provider":"openai","id":"org/one"},"thinkingLevel":"high"});
+        assert_eq!(check_effort(&state, "high"), Ok(()));
+        assert_eq!(
+            check_effort(&state, "xhigh"),
+            Err("Pi runs openai/org/one at effort high, not xhigh".into())
+        );
     }
 }

@@ -3,22 +3,24 @@
 use agent_client_protocol::schema::MaybeUndefined;
 use agent_client_protocol::v2::schema::StopReason;
 use agent_client_protocol::v2::schema::{
-    AvailableCommand, BackgroundWork, CancelledPermissionOutcome, ConfigOptionUpdate, ContentBlock,
+    AvailableCommand, BackgroundWork, CancelledPermissionOutcome, ContentBlock,
     CreateElicitationRequest, ElicitationAction, ElicitationMode, ElicitationPropertySchema,
     ElicitationSchema, ElicitationScope, EmbeddedResourceResource, PermissionOption,
     PromptCapabilities, RequestPermissionOutcome, RequestPermissionRequest,
-    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionValue,
+    SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionUpdate, StateUpdate, TextContent, ToolCallId,
 };
 use ox_protocol::{
-    ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionRequest, SessionState, Unseen, code,
+    ConfigSetting, ConfigValue, ErrorBody, Event, EventKind, QueuedPrompt, Sender, SessionRequest,
+    SessionState, Unseen, code,
 };
 use tokio::sync::oneshot;
 
 /// Events a subscriber is handed at a time.
 const BATCH: usize = 256;
 
-/// What an agent reports when its ACP session opens.
+/// What an agent reports when its ACP session opens, with its available
+/// commands kept current.
 pub struct Agent {
     pub session_id: String,
     pub prompt_capabilities: PromptCapabilities,
@@ -83,13 +85,6 @@ pub enum Request {
 pub enum Change {
     Started(Agent),
     Update(SessionUpdate),
-    /// The options an agent answered `session/set_config_option` with. The
-    /// connection's dispatch loop waits for each handler to finish before it
-    /// reads the next message (the SDK's `concepts::ordering` chapter), so a
-    /// `config_option_update` the agent sent before its response is already
-    /// recorded, and options that differ from the session's have not been
-    /// reported.
-    ConfigOptionsSet(Vec<SessionConfigOption>),
     /// A permission request, the agent's or, with `session_request`, the
     /// daemon's own for `session.request`.
     PermissionRequested {
@@ -425,11 +420,6 @@ impl Phase {
             (Self::Live(mut live), Change::Update(update)) => {
                 let mut turn = Vec::new();
                 match &update {
-                    SessionUpdate::ConfigOptionUpdate(options) => {
-                        live.agent
-                            .config_options
-                            .clone_from(&options.config_options);
-                    }
                     SessionUpdate::AvailableCommandsUpdate(commands) => {
                         live.agent
                             .available_commands
@@ -443,15 +433,6 @@ impl Phase {
                 }
                 let mut events = vec![EventKind::Update(update)];
                 events.extend(turn);
-                (Self::Live(live), events)
-            }
-            (Self::Live(mut live), Change::ConfigOptionsSet(options)) => {
-                let mut events = Vec::new();
-                if live.agent.config_options != options {
-                    live.agent.config_options.clone_from(&options);
-                    let update = ConfigOptionUpdate::new(options);
-                    events.push(EventKind::Update(SessionUpdate::ConfigOptionUpdate(update)));
-                }
                 (Self::Live(live), events)
             }
             (
@@ -565,8 +546,7 @@ impl Phase {
 
             (
                 phase @ Self::Starting { .. },
-                Change::ConfigOptionsSet(_)
-                | Change::PermissionRequested { .. }
+                Change::PermissionRequested { .. }
                 | Change::ElicitationRequested { .. }
                 | Change::ElicitationWithdrawn
                 | Change::Cancelled
@@ -581,7 +561,6 @@ impl Phase {
                 phase @ Self::Exited(_),
                 Change::Started(_)
                 | Change::Update(_)
-                | Change::ConfigOptionsSet(_)
                 | Change::PermissionRequested { .. }
                 | Change::ElicitationRequested { .. }
                 | Change::ElicitationWithdrawn
@@ -638,28 +617,30 @@ pub struct State {
 pub struct Resume {
     pub session_id: String,
     pub replay: bool,
-    /// The value of each option the agent last reported, which the resumed
-    /// agent is set to again.
-    pub options: Vec<(String, SessionConfigOptionValue)>,
 }
 
-/// The value of each select and boolean option in `options`, by option ID.
-pub fn option_values(options: &[SessionConfigOption]) -> Vec<(String, SessionConfigOptionValue)> {
-    options
-        .iter()
-        .filter_map(|option| {
-            let value = match &option.kind {
-                SessionConfigKind::Select(select) => {
-                    SessionConfigOptionValue::id(select.current_value.clone())
-                }
-                SessionConfigKind::Boolean(boolean) => {
-                    SessionConfigOptionValue::boolean(boolean.current_value)
-                }
-                _ => return None,
-            };
-            Some((option.config_id.to_string(), value))
+/// The config an agent's reported options amount to: the current values of
+/// its model, thought level and mode select options, by category, as
+/// `model`, `effort` and `mode`, in that order.
+pub fn reported_config(options: &[SessionConfigOption]) -> Vec<ConfigSetting> {
+    [
+        (SessionConfigOptionCategory::Model, "model"),
+        (SessionConfigOptionCategory::ThoughtLevel, "effort"),
+        (SessionConfigOptionCategory::Mode, "mode"),
+    ]
+    .into_iter()
+    .filter_map(|(category, config_id)| {
+        options.iter().find_map(|option| match &option.kind {
+            SessionConfigKind::Select(select) if option.category.as_ref() == Some(&category) => {
+                Some(ConfigSetting {
+                    config_id: config_id.into(),
+                    value: ConfigValue::Id(select.current_value.to_string()),
+                })
+            }
+            _ => None,
         })
-        .collect()
+    })
+    .collect()
 }
 
 impl State {
@@ -867,24 +848,12 @@ impl State {
             }
             phase => return Err(invalid_state(phase.state())),
         };
-        let events = self.events.iter().flatten();
-        let replay = !events.clone().any(|event| {
+        let replay = !self.events.iter().flatten().any(|event| {
             matches!(
                 event.kind,
                 EventKind::AgentStarted { .. } | EventKind::PromptStarted { .. }
             )
         });
-        let options = events
-            .rev()
-            .find_map(|event| match &event.kind {
-                EventKind::AgentStarted { config_options, .. } => Some(config_options),
-                EventKind::Update(SessionUpdate::ConfigOptionUpdate(update)) => {
-                    Some(&update.config_options)
-                }
-                _ => None,
-            })
-            .map(|options| option_values(options))
-            .unwrap_or_default();
         self.phase = Phase::Starting {
             busy: false,
             background: None,
@@ -895,7 +864,6 @@ impl State {
         Ok(Resume {
             session_id: id,
             replay,
-            options,
         })
     }
 
@@ -918,8 +886,7 @@ impl State {
         self.phase.state()
     }
 
-    /// What the agent reported when it started, with its current config
-    /// options.
+    /// What the agent reported when it started, with its current commands.
     pub fn agent(&self) -> Option<&Agent> {
         match &self.phase {
             Phase::Live(live) => Some(&live.agent),
@@ -1359,8 +1326,8 @@ mod tests {
         ElicitationFormMode, ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode,
         EnumOption, ErrorStopReason, IdleStateUpdate, MultiSelectPropertySchema,
         OtherElicitationPropertySchema, OtherStateUpdate, PermissionOptionKind,
-        RequiresActionStateUpdate, RunningStateUpdate, SessionInfoUpdate, StopReason,
-        StringPropertySchema, TextContent,
+        RequiresActionStateUpdate, RunningStateUpdate, SessionConfigSelectOption,
+        SessionInfoUpdate, StopReason, StringPropertySchema, TextContent,
     };
     use serde_json::json;
 
@@ -2175,7 +2142,6 @@ mod tests {
         let (answer, _outcome) = oneshot::channel();
         for change in [
             chunk(),
-            Change::ConfigOptionsSet(Vec::new()),
             Change::PermissionRequested {
                 request: RequestPermissionRequest::new("agent", "Tool", Vec::new()),
                 session_request: None,
@@ -2194,6 +2160,51 @@ mod tests {
         state.subscribe(closed - 1).unwrap();
         let error = state.subscribe(closed).unwrap_err();
         assert_eq!(error.code, code::INVALID_REQUEST);
+    }
+
+    #[test]
+    fn reported_config_reads_model_effort_and_mode_by_category() {
+        let select = |id: &str, value: &str, category: Option<SessionConfigOptionCategory>| {
+            SessionConfigOption::select(
+                id.to_owned(),
+                id.to_owned(),
+                value.to_owned(),
+                vec![SessionConfigSelectOption::new(
+                    value.to_owned(),
+                    value.to_owned(),
+                )],
+            )
+            .category(category)
+        };
+        let options = [
+            select("mode", "code", Some(SessionConfigOptionCategory::Mode)),
+            select("speed", "fast", None),
+            select(
+                "thinking",
+                "high",
+                Some(SessionConfigOptionCategory::ThoughtLevel),
+            ),
+            SessionConfigOption::boolean("fast", "Fast", true),
+            select(
+                "model",
+                "openai/one",
+                Some(SessionConfigOptionCategory::Model),
+            ),
+        ];
+        let setting = |config_id: &str, value: &str| ConfigSetting {
+            config_id: config_id.into(),
+            value: ConfigValue::Id(value.into()),
+        };
+        assert_eq!(
+            reported_config(&options),
+            [
+                setting("model", "openai/one"),
+                setting("effort", "high"),
+                setting("mode", "code"),
+            ]
+        );
+        assert_eq!(reported_config(&options[..2]), [setting("mode", "code")]);
+        assert!(reported_config(&[]).is_empty());
     }
 
     fn replayed(text: &str) -> Change {

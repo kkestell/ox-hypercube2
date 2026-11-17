@@ -361,14 +361,20 @@ class SmokeRun:
         )
 
     def set_option(self, option, value):
-        """Sets a select option and returns the agent's resulting value."""
-        options = self.call(
-            "session.set_config_option",
-            session_id=self.session,
-            config_id=option,
-            value=value,
+        """Sets one setting of the session's config and returns the setting's
+        resulting value. A new model drops the effort, since models offer
+        different levels; the other settings are kept."""
+        config = self.session_info()["config"]
+        if option == "model":
+            config = [s for s in config if s["config_id"] != "effort"]
+        setting = {"config_id": option, "value": value}
+        index = next(
+            (i for i, s in enumerate(config) if s["config_id"] == option), len(config)
         )
-        return next(o for o in options if o["configId"] == option)["currentValue"]
+        config[index : index + 1] = [setting]
+        self.call("session.set_config", session_id=self.session, config=config)
+        config = self.session_info()["config"]
+        return next(s for s in config if s["config_id"] == option)["value"]
 
     def permit(self, request_id, option_id):
         self.call(

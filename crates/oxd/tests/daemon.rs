@@ -256,6 +256,31 @@ fn assert_contiguous(events: &[Event], first: u64) {
     assert_eq!(seqs, expected);
 }
 
+fn setting(config_id: &str, value: &str) -> ConfigSetting {
+    ConfigSetting {
+        config_id: config_id.into(),
+        value: ConfigValue::Id(value.into()),
+    }
+}
+
+/// The config the fake agent reports when it starts.
+fn reported() -> Vec<ConfigSetting> {
+    vec![
+        setting("model", "smart"),
+        setting("effort", "medium"),
+        setting("mode", "ask"),
+    ]
+}
+
+/// Whether an event is a `config_option_update` that reports mode `mode`.
+fn reports_mode(kind: &EventKind, mode: &str) -> bool {
+    matches!(
+        kind,
+        EventKind::Update(SessionUpdate::ConfigOptionUpdate(update))
+            if current(&update.config_options, "mode") == mode
+    )
+}
+
 /// The current value of a select config option.
 fn current(options: &[SessionConfigOption], id: &str) -> String {
     let option = options
@@ -457,8 +482,14 @@ async fn a_held_queue_survives_a_restart() {
     // Still held after the agent started: sending it now starts its turn.
     assert_eq!(info(&client, &session.id).await.unwrap().queue, queue);
     client.queue_send(&session.id, &id).await.unwrap();
+    // The agent's reports of the config it was sent at the resume may come
+    // before the turn's start.
     let turn = until_turn_ended(&client, &session.id, after).await;
-    assert_eq!(started_prompt(&turn[0]), text("text \"queued\""));
+    let prompt_started = turn
+        .iter()
+        .find(|event| matches!(event.kind, EventKind::PromptStarted { .. }))
+        .unwrap();
+    assert_eq!(started_prompt(prompt_started), text("text \"queued\""));
     assert!(info(&client, &session.id).await.unwrap().queue.is_empty());
 }
 
@@ -1432,21 +1463,12 @@ async fn a_turn_after_the_resume_answer_is_live() {
         .await
         .unwrap();
     let mut resumed = until(&mut events, agent_started).await;
-    // A config update is a round-trip barrier after the resume handler has
+    // A config change is a round-trip barrier after the resume handler has
     // sent all three live updates. No absence is checked before that barrier.
-    client
-        .set_config_option(&session.id, "mode", ConfigValue::Id("code".into()))
-        .await
-        .unwrap();
-    resumed.extend(
-        until(&mut events, |kind| {
-            matches!(
-                kind,
-                EventKind::Update(SessionUpdate::ConfigOptionUpdate(_))
-            )
-        })
-        .await,
-    );
+    let mut config = reported();
+    config[2] = setting("mode", "code");
+    client.set_config(&session.id, config).await.unwrap();
+    resumed.extend(until(&mut events, |kind| reports_mode(kind, "code")).await);
     assert!(
         resumed
             .iter()
@@ -1496,19 +1518,22 @@ async fn socket_is_private() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_loaded_agent_is_set_to_the_sessions_options() {
+async fn a_loaded_session_sends_its_recorded_config_again() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
     let mut events = client.subscribe(&session.id, started).await.unwrap();
+    let mut config = reported();
+    config[2] = setting("mode", "code");
     client
-        .set_config_option(&session.id, "mode", ConfigValue::Id("code".into()))
+        .set_config(&session.id, config.clone())
         .await
         .unwrap();
     client.prompt(&session.id, text("exit 1")).await.unwrap();
     until(&mut events, agent_exited).await;
 
-    // The new agent starts in its default mode.
+    // The new agent starts in its default mode and is set to the recorded
+    // one before the next prompt.
     client
         .load_session(&session.id, BTreeMap::new())
         .await
@@ -1520,90 +1545,70 @@ async fn a_loaded_agent_is_set_to_the_sessions_options() {
         panic!("{started:?}");
     };
     assert_eq!(current(config_options, "mode"), "ask");
-    until(&mut events, |kind| {
-        matches!(
-            kind,
-            EventKind::Update(SessionUpdate::ConfigOptionUpdate(_))
-        )
-    })
-    .await;
-    let options = info(&client, &session.id).await.unwrap().config_options;
-    assert_eq!(current(&options, "mode"), "code");
+    assert_eq!(info(&client, &session.id).await.unwrap().config, config);
+    client
+        .prompt(&session.id, text("config mode"))
+        .await
+        .unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(chunks(&turn), ["code"]);
 }
 
+/// The config is replaced whole, and a prompt sent after the change, without
+/// waiting for its answer, reaches the agent after it.
 #[tokio::test(flavor = "multi_thread")]
-async fn config_options_are_listed_and_set() {
-    // An agent that reports the change before its response, or not at all,
-    // yields one update. One that reports it after its response yields its
-    // own notification as well.
-    for (flags, updates) in [
-        (&[][..], 1),
-        (&["--silent-config"][..], 1),
-        (&["--late-config-update"][..], 2),
-    ] {
-        let daemon = Daemon::start().await;
-        let client = daemon.client().await;
-        let (session, started) = daemon.new_session_with(&client, flags).await;
-        assert_eq!(current(&session.config_options, "mode"), "ask");
-        let mut events = client.subscribe(&session.id, started).await.unwrap();
-
-        let other = daemon.client().await;
-        let options = other
-            .set_config_option(&session.id, "mode", ConfigValue::Id("code".into()))
-            .await
-            .unwrap();
-        assert_eq!(current(&options, "mode"), "code");
-        let listed = sessions(&other).await;
-        assert_eq!(current(&listed[0].config_options, "mode"), "code");
-
-        let error = other
-            .set_config_option(&session.id, "mode", ConfigValue::Id("fly".into()))
-            .await
-            .unwrap_err();
-        assert_eq!(remote_code(error), code::AGENT);
-        let listed = sessions(&other).await;
-        assert_eq!(current(&listed[0].config_options, "mode"), "code");
-
-        client
-            .prompt(&session.id, text("config mode"))
-            .await
-            .unwrap();
-        let turn = until(&mut events, turn_ended).await;
-        let reported: Vec<String> = turn
-            .iter()
-            .filter_map(|event| match &event.kind {
-                EventKind::Update(SessionUpdate::ConfigOptionUpdate(update)) => {
-                    Some(current(&update.config_options, "mode"))
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            reported,
-            vec!["code"; updates],
-            "fake agent flags {flags:?}"
-        );
-        assert_eq!(chunks(&turn), ["code"]);
-    }
-}
-
-/// A prompt sent after a config option change, without waiting for the
-/// change's answer, reaches the agent after the change.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_prompt_sent_after_a_config_change_runs_with_the_new_value() {
+async fn set_config_replaces_the_config_and_the_next_prompt_runs_with_it() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
     let (session, started) = daemon.new_session(&client).await;
+    assert_eq!(session.config, reported());
     let mut events = client.subscribe(&session.id, started).await.unwrap();
+    let config = vec![setting("model", "fast"), setting("mode", "code")];
     // The connection sends its requests in the order they are first polled.
     let (set, prompted) = tokio::join!(
-        client.set_config_option(&session.id, "mode", ConfigValue::Id("code".into())),
+        client.set_config(&session.id, config.clone()),
         client.prompt(&session.id, text("config mode")),
     );
     set.unwrap();
     prompted.unwrap();
     let turn = until(&mut events, turn_ended).await;
     assert_eq!(chunks(&turn), ["code"]);
+    assert_eq!(sessions(&client).await[0].config, config);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_setting_is_named_and_the_accepted_ones_are_kept() {
+    let daemon = Daemon::start().await;
+    let client = daemon.client().await;
+    let (session, _) = daemon.new_session(&client).await;
+    let error = client
+        .set_config(
+            &session.id,
+            vec![
+                setting("model", "fast"),
+                setting("effort", "medium"),
+                setting("mode", "fly"),
+            ],
+        )
+        .await
+        .unwrap_err();
+    let Error::Remote(error) = error else {
+        panic!("expected a daemon error, got {error}");
+    };
+    assert_eq!(error.code, code::AGENT);
+    assert!(
+        error.message.starts_with("The agent refused mode fly: "),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().config,
+        [
+            setting("model", "fast"),
+            setting("effort", "medium"),
+            setting("mode", "ask"),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1829,7 +1834,6 @@ async fn workspaces_and_sessions_survive_a_restart() {
     let saved = |session: SessionInfo| SessionInfo {
         state: SessionState::Exited,
         prompt_capabilities: PromptCapabilities::default(),
-        config_options: Vec::new(),
         available_commands: Vec::new(),
         ..session
     };
@@ -1912,7 +1916,7 @@ async fn loading_a_restored_session_keeps_its_stored_history() {
     let loaded = info(&client, &loaded.id).await.unwrap();
     assert_eq!(loaded.state, SessionState::Idle);
     assert_eq!(loaded.title.as_deref(), Some("Replay me"));
-    assert_eq!(loaded.config_options, session.config_options);
+    assert_eq!(loaded.config, session.config);
     assert_eq!(loaded.available_commands, session.available_commands);
 
     client.prompt(&loaded.id, text("say 1 0")).await.unwrap();
@@ -2360,24 +2364,31 @@ async fn a_new_sessions_first_prompt_shows_before_its_agent_starts() {
     reader.await.unwrap();
 }
 
+/// The fake agent starts at mode `ask`, and its updates report it until the
+/// session's config is set.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_new_session_sets_its_options_before_its_first_prompt() {
+async fn a_new_session_shows_its_config_throughout_and_sets_it_before_its_first_prompt() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
+    let mut watch = listings(&client).await;
+    let config = vec![setting("mode", "code")];
     let session = daemon
-        .new_session_prompted(
-            &client,
-            &[],
-            vec![ConfigSetting {
-                config_id: "mode".into(),
-                value: ConfigValue::Id("code".into()),
-            }],
-            text("config mode"),
-        )
+        .new_session_prompted(&client, &[], config.clone(), text("config mode"))
         .await
         .unwrap();
+    assert_eq!(session.config, config);
     let turn = until_turn_ended(&client, &session.id, 0).await;
     assert_eq!(chunks(&turn), ["code"]);
+    let listings = watch
+        .until(|listing| state_in(&listing.sessions, &session.id) == Some(SessionState::Idle))
+        .await;
+    for listed in listings
+        .iter()
+        .flat_map(|listing| &listing.sessions)
+        .filter(|listed| listed.id == session.id)
+    {
+        assert_eq!(listed.config, config, "{:?}", listed.state);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2388,7 +2399,11 @@ async fn a_setting_the_agent_fails_rejects_the_first_prompt() {
             "huge",
             "The agent refused model huge: Invalid params",
         ),
-        ("speed", "fast", "The agent has no speed option"),
+        (
+            "speed",
+            "fast",
+            "The agent refused speed fast: Invalid params",
+        ),
     ] {
         let daemon = Daemon::start().await;
         let client = daemon.client().await;
@@ -2521,6 +2536,17 @@ async fn a_session_resumed_while_its_agent_is_working_runs_until_the_agent_is_id
         )
     })
     .await;
+    // The resumed agent reports each setting of the session's config it is
+    // sent.
+    let rest: Vec<_> = rest
+        .into_iter()
+        .filter(|event| {
+            !matches!(
+                event.kind,
+                EventKind::Update(SessionUpdate::ConfigOptionUpdate(_))
+            )
+        })
+        .collect();
     assert_eq!(update_names(&rest), ["idle"]);
     assert_eq!(
         info(&client, &session.id).await.unwrap().state,

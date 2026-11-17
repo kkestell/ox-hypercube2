@@ -13,8 +13,8 @@ function choices(option: SelectConfig): SelectOption[] {
  * The session's model and effort: a button showing both, which opens a menu
  * to search for and choose a model and to set the effort. The menu stays open
  * after a model is chosen, so the effort can be set next. A model or effort
- * level shows as soon as it is chosen, until the agent reports it or refuses
- * it.
+ * level shows as soon as it is chosen, until the option has it or the agent
+ * refuses it.
  */
 export function ModelPicker({
   model,
@@ -188,8 +188,8 @@ export function ModelPicker({
 
 /**
  * The value of `option` to show, and a function that chooses one: the value
- * chosen last until the agent reports it, or until it refuses it, and
- * otherwise the agent's current value.
+ * chosen last until the option has it, or until the agent refuses it, and
+ * otherwise the option's current value.
  */
 function useChosen(
   option: SelectConfig | undefined,

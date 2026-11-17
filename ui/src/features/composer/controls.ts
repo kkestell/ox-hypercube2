@@ -3,6 +3,7 @@ import { sessionAgent } from "../../components/HarnessLogo";
 import type {
   Choice,
   ConfigOption,
+  ConfigSetting,
   HarnessConfig,
   ModelConfig,
   SelectOption,
@@ -28,9 +29,14 @@ function loadAll<T>(prefix: string): Record<string, T> {
   return entries;
 }
 
-/** The current value of each of `options`. */
-function valuesOf(options: ConfigOption[]): Values {
-  return Object.fromEntries(options.map((option) => [option.configId, option.currentValue]));
+/** The value of each setting of `config`. */
+function valuesOf(config: ConfigSetting[]): Values {
+  return Object.fromEntries(config.map((setting) => [setting.config_id, setting.value]));
+}
+
+/** The settings that set an agent to each of `options`' current values. */
+export function settingsOf(options: ConfigOption[]): ConfigSetting[] {
+  return options.map((option) => ({ config_id: option.configId, value: option.currentValue }));
 }
 
 function sameValues(a: Values | undefined, b: Values) {
@@ -43,8 +49,8 @@ function sameValues(a: Values | undefined, b: Values) {
 
 /**
  * The option values last used with each agent in each workspace, kept in
- * local storage: those of the newest session that reports options, or those
- * a draft was sent with, through `remember`.
+ * local storage: those of the newest session that has a config, or those a
+ * draft was sent with, through `remember`.
  */
 export function useLastUsed(sessions: SessionInfo[]) {
   const [lastUsed, setLastUsed] = useState(() => loadAll<Values>(lastUsedPrefix));
@@ -75,12 +81,8 @@ export function useLastUsed(sessions: SessionInfo[]) {
 
   useEffect(() => {
     for (const session of newest.values()) {
-      if (session.config_options.length === 0) continue;
-      remember(
-        sessionAgent(session.command)!,
-        session.workspace_id,
-        valuesOf(session.config_options),
-      );
+      if (session.config.length === 0) continue;
+      remember(sessionAgent(session.command)!, session.workspace_id, valuesOf(session.config));
     }
   }, [newest, remember]);
 
@@ -171,35 +173,64 @@ export function draftOptions(
 }
 
 /**
- * A running session's options with the choices `harness` lists: its Model,
- * Effort and Mode selects, each where the session reports an option of its
- * category, at the reported value and with the reported option's ID. The
- * effort levels are those of the listed model the session reports. A
- * reported effort or mode they do not list is added as its ID; the model
- * picker shows an unlisted model's ID itself. A select with nothing listed,
- * such as every one of a harness the config does not list, is left out.
+ * A session's options: its Model, Effort and Mode selects, each where its
+ * config has a `model`, `effort` or `mode` setting, at the recorded value
+ * and with the choices `harness` lists. The effort levels are those of the
+ * recorded model. A recorded effort or mode they do not list is added as its
+ * ID; the model picker shows an unlisted model's ID itself. A select with
+ * nothing listed, such as every one of a harness the config does not list,
+ * is left out.
  */
 export function sessionOptions(
   harness: HarnessConfig | undefined,
-  reported: ConfigOption[],
+  config: ConfigSetting[],
 ): ConfigOption[] {
-  const model = reported.find((option) => option.category === "model")?.currentValue;
+  const values = valuesOf(config);
+  const recorded = (configId: string) => {
+    const value = values[configId];
+    return typeof value === "string" ? value : undefined;
+  };
+  const model = recorded("model");
   const efforts = harness?.models.find(({ id }) => id === model)?.efforts ?? [];
-  return reported.flatMap((option): ConfigOption[] => {
-    if (option.type !== "select") return [option];
-    const listed = (name: string, choices: SelectOption[]) =>
-      choices.length === 0
-        ? []
-        : [select(option.configId, name, option.category!, option.currentValue, choices)];
-    switch (option.category) {
-      case "model":
-        return listed("Model", modelChoices(harness?.models ?? []));
-      case "thought_level":
-        return listed("Effort", withReported(choicesOf(efforts), option.currentValue));
-      case "mode":
-        return listed("Mode", withReported(choicesOf(harness?.modes ?? []), option.currentValue));
-      default:
-        return [option];
-    }
-  });
+  const listed = (
+    configId: string,
+    name: string,
+    category: string,
+    choices: (value: string) => SelectOption[],
+  ): ConfigOption[] => {
+    const value = recorded(configId);
+    if (value === undefined) return [];
+    const offered = choices(value);
+    return offered.length === 0 ? [] : [select(configId, name, category, value, offered)];
+  };
+  return [
+    ...listed("model", "Model", "model", () => modelChoices(harness?.models ?? [])),
+    ...listed("effort", "Effort", "thought_level", (value) =>
+      withReported(choicesOf(efforts), value),
+    ),
+    ...listed("mode", "Mode", "mode", (value) =>
+      withReported(choicesOf(harness?.modes ?? []), value),
+    ),
+  ];
+}
+
+/**
+ * The config a session takes when setting `configId` changes to `value`:
+ * `config` with that setting replaced, and with a new model, the effort the
+ * draft rule picks from the model's levels, or none where it lists none.
+ * Every other setting keeps its recorded value.
+ */
+export function changedConfig(
+  harness: HarnessConfig | undefined,
+  config: ConfigSetting[],
+  configId: string,
+  value: string | boolean,
+): ConfigSetting[] {
+  let values: Values = { ...valuesOf(config), [configId]: value };
+  if (harness && configId === "model") {
+    const { model, effort: _, ...rest } = values;
+    const effort = draftOptions(harness, values).find((option) => option.configId === "effort");
+    values = { model: model!, ...(effort && { effort: effort.currentValue }), ...rest };
+  }
+  return Object.entries(values).map(([config_id, value]) => ({ config_id, value }));
 }

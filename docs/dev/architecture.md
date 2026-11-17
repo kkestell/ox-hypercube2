@@ -163,9 +163,9 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, each session's queue, conversation events,
-and the agent session IDs of deleted sessions, which keep an import from
-bringing them back. Each conversation event is saved with the time `oxd`
+comparison refs, archive state, each session's queue and config,
+conversation events, and the agent session IDs of deleted sessions, which keep
+an import from bringing them back. Each conversation event is saved with the time `oxd`
 recorded it; an imported event, with the time its transcript gives.
 
 The database's `PRAGMA user_version` is its schema version. `oxd` brings an
@@ -173,12 +173,12 @@ older database to the version it writes by applying the migration steps in
 `crates/oxd/src/store.rs` it has not had, all in one transaction, and refuses
 to open a database of a newer version. Stored JSON is part of the schema: a
 change to how `EventKind` (including the ACP updates it holds),
-`QueuedPrompt`, or a session's command serializes either still reads every
-older shape or comes with a migration step that rewrites the rows. Each
-schema version has a SQL fixture in `crates/oxd/tests/fixtures`, and a test
-opens every fixture with the current code. Values the UI keeps in local
-storage follow the same rule: a new shape still reads what the previous build
-wrote.
+`QueuedPrompt`, `ConfigSetting`, or a session's command serializes either
+still reads every older shape or comes with a migration step that rewrites
+the rows. Each schema version has a SQL fixture in
+`crates/oxd/tests/fixtures`, and a test opens every fixture with the current
+code. Values the UI keeps in local storage follow the same rule: a new shape
+still reads what the previous build wrote.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence
@@ -200,24 +200,32 @@ session records separately from the daemon's database.
 ## Session lifecycle
 
 A saved session belongs to a workspace and records its agent command,
-working directory, and agent session ID. Its lifetime is independent of any
-client connection and of the agent process currently serving it. A workspace
+working directory, agent session ID, and config. Its lifetime is independent
+of any client connection and of the agent process currently serving it. A workspace
 cannot be removed while sessions still belong to it.
 
 The daemon owns turn state, including turns the agent starts without a
 client prompt. A session's requests reach its agent in the order a
-connection sends them, so a prompt sent after a config option change runs
-with the new value. Agent state updates drive the turn lifecycle; the prompt
+connection sends them, so a prompt sent after a config change runs with the
+new value. Agent state updates drive the turn lifecycle; the prompt
 response acknowledges insertion rather than turn completion. Permission
 requests and form elicitations are recorded with the session and can be
 answered by clients.
 
-A new session can carry its first prompt and config option values. The daemon
-records the prompt and titles the session from its text when it creates the
+A new session can carry its first prompt and its config. The daemon records
+both, and titles the session from the prompt's text, when it creates the
 session, before the agent or worktree exists. Once the agent starts, the
-daemon sets the option values the agent reports differently and then sends
-the prompt. A session whose agent or worktree fails to start ends the prompt's
-turn with the error.
+daemon sends it every setting of the config and then the prompt. A session
+whose agent or worktree fails to start ends the prompt's turn with the error.
+
+A session's config is the model, effort, and mode Ox set its agent to, and
+the composer shows it. `session.set_config` replaces it whole: the daemon
+sends the agent each setting, and records the new config once the agent has
+accepted every setting, or only the settings it accepted. What the agent
+reports about its options is recorded as events and changes neither the
+config nor the composer. A session created without a config, such as an
+imported one, takes the model, effort, and mode its agent reports when it
+starts.
 
 A prompt sent during a turn steers it: the daemon sends it to the agent at
 once, records it as steered, and records it as taken when the agent answers
@@ -242,9 +250,8 @@ creates the session as a client's `session.new` would, with the requester's
 environment; declining it, or stopping the requester's turn, creates nothing.
 
 A new session's first prompt waits for the agent's answers to the session's
-option settings. When the agent refuses one, or has no option with its ID,
-the prompt is not sent and its turn ends with an error naming each failed
-setting.
+config. When the agent refuses a setting, the prompt is not sent and its turn
+ends with an error naming each refused setting.
 
 `workspace.import_claude_sessions` imports the Claude sessions started in a
 workspace's directory. The daemon runs the Claude bridge beside its executable
@@ -265,7 +272,7 @@ until a client sends a prompt or sends a queued one now.
 
 After a daemon restart, saved sessions begin without running agents. Loading
 a session starts its stored command in its stored directory, resumes the
-agent's conversation, and sets the session's config options again, retaining
+agent's conversation, and sends it the session's config again, retaining
 the Ox session ID and subscriptions. Missing history can be recovered through
 the agent's replay support.
 

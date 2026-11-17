@@ -199,7 +199,7 @@ export function session(
     state: "idle",
     title: null,
     agent_session_id: "agent",
-    config_options: [],
+    config: [],
     available_commands: [],
     worktree_id: null,
     archived: false,

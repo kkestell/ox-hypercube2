@@ -20,7 +20,7 @@ use crate::branches;
 use crate::directories::Directories;
 use crate::import::{self, ClaudeSession, Transcript};
 use crate::mcp::OxServer;
-use crate::session::{self, Opening, Session};
+use crate::session::{Opening, Session};
 use crate::state::{self, Change, Queue, State};
 use crate::store::{SavedSession, SavedWorkspace, Store};
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
@@ -299,19 +299,19 @@ impl Daemon {
             .ok_or_else(|| not_found("worktree", id))
     }
 
-    /// Sends session `session_id`'s agent a config option change, ahead of
-    /// every later command to the session. The returned future resolves to
-    /// the agent's resulting options.
-    pub fn set_config_option(
+    /// Replaces session `session_id`'s config, sending its agent each
+    /// setting ahead of every later command to the session. The returned
+    /// future resolves once the agent has answered.
+    pub fn set_config(
         &self,
         session_id: &str,
-        config_id: String,
-        value: ConfigValue,
+        config: Vec<ConfigSetting>,
     ) -> Result<impl Future<Output = Result<Value, ErrorBody>> + use<>, ErrorBody> {
-        let options = self
-            .session(session_id)?
-            .set_config_option(config_id, value)?;
-        Ok(async move { Ok(to_value(options.await?)) })
+        let answered = self.session(session_id)?.set_config(config)?;
+        Ok(async move {
+            answered.await?;
+            Ok(Value::Null)
+        })
     }
 
     /// Handles every method except `hello`, `session.subscribe`, `watch`, and
@@ -380,11 +380,9 @@ impl Daemon {
                 self.send_unmoved(&session_id, |session| session.queue_send(prompt_id))?;
                 Ok(Value::Null)
             }
-            Method::SessionSetConfigOption {
-                session_id,
-                config_id,
-                value,
-            } => self.set_config_option(&session_id, config_id, value)?.await,
+            Method::SessionSetConfig { session_id, config } => {
+                self.set_config(&session_id, config)?.await
+            }
             Method::SessionCancel { session_id } => {
                 self.session(&session_id)?.cancel();
                 Ok(Value::Null)
@@ -660,7 +658,7 @@ impl Daemon {
     }
 
     /// Creates a session in the workspace's directory or in a new worktree,
-    /// with its first prompt and the option values its agent is set to.
+    /// with its first prompt and its config.
     /// For a worktree, the branch is resolved and created here, and the
     /// worktree is added before the session's agent starts.
     async fn new_session(
@@ -680,16 +678,19 @@ impl Daemon {
         if let Some(prompt) = &prompt {
             state::check_prompt(prompt, &PromptCapabilities::default())?;
         }
-        let opening = Opening {
-            options: config
-                .into_iter()
-                .map(|setting| (setting.config_id, session::option_value(setting.value)))
-                .collect(),
-            prompt: None,
-        };
+        let opening = Opening { prompt: None };
         let id = uuid::Uuid::new_v4().to_string();
         let Checkout::Worktree { compare, branch } = checkout else {
-            return self.add_session(id, workspace_id, command, env, &mut None, opening, prompt);
+            return self.add_session(
+                id,
+                workspace_id,
+                command,
+                config,
+                env,
+                &mut None,
+                opening,
+                prompt,
+            );
         };
         let git = Git::for_client(env.clone());
         let workspace = self.workspace_path(workspace_id)?;
@@ -712,6 +713,7 @@ impl Daemon {
             id,
             workspace_id,
             command,
+            config,
             env,
             &mut pending,
             opening,
@@ -725,8 +727,8 @@ impl Daemon {
         added
     }
 
-    /// Saves and registers a session, with its worktree if it has one, and
-    /// starts it with `opening`, taking the worktree to add. A first
+    /// Saves and registers a session, with its config and its worktree if it
+    /// has one, and starts it with `opening`, taking the worktree to add. A first
     /// `prompt` is recorded at once and titles the session. A session that
     /// cannot be saved leaves the worktree where it is.
     #[expect(
@@ -738,6 +740,7 @@ impl Daemon {
         id: String,
         workspace_id: &str,
         command: Vec<String>,
+        config: Vec<ConfigSetting>,
         env: BTreeMap<String, String>,
         worktree: &mut Option<(Git, WorktreePlan)>,
         mut opening: Opening,
@@ -764,6 +767,7 @@ impl Daemon {
                     &cwd,
                     saved_worktree.as_ref(),
                     created_at,
+                    &config,
                 )
                 .map_err(|error| storage(&error))?;
             let saved = SavedSession {
@@ -780,6 +784,7 @@ impl Daemon {
                 created_at,
                 unseen: None,
                 queue: Queue::default(),
+                config,
             };
             let session = Session::new(
                 self.store.clone(),
@@ -1284,6 +1289,7 @@ impl Daemon {
                 created_at: claude.started_at,
                 unseen: None,
                 queue: Queue::default(),
+                config: Vec::new(),
             };
             saved.number = self
                 .store

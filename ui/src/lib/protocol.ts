@@ -40,7 +40,7 @@ export interface Command {
   input?: { type: string; hint?: string } | null;
 }
 
-/** A config option value that a new session's agent is set to. */
+/** A config option value that a session's agent is set to. */
 export interface ConfigSetting {
   config_id: string;
   value: string | boolean;
@@ -122,7 +122,11 @@ export interface SessionInfo {
   state: SessionState;
   title: string | null;
   agent_session_id: string | null;
-  config_options: ConfigOption[];
+  /**
+   * The values Ox set the session's agent to, in the order they are sent.
+   * Empty for a session whose agent has not reported its own yet.
+   */
+  config: ConfigSetting[];
   available_commands: Command[];
   /** The ID of the worktree the session runs in. */
   worktree_id: string | null;

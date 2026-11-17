@@ -1,8 +1,8 @@
 import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type { Command, ConfigOption, Field, SessionInfo } from "../../lib/protocol";
-import { renderApp, session, view, workspace } from "../../test/core";
+import type { Command, ConfigSetting, Field, SessionInfo } from "../../lib/protocol";
+import { type Core, renderApp, session, view, workspace } from "../../test/core";
 
 const project = workspace();
 
@@ -474,117 +474,115 @@ describe("Slash command completion", () => {
 });
 
 describe("The model picker", () => {
-  const model: ConfigOption = {
-    configId: "model",
-    name: "Model",
-    category: "model",
-    type: "select",
-    currentValue: "smart",
-    options: [
-      { value: "fast", name: "Fast", _meta: { "ox/provider": "OpenRouter" } },
-      { value: "smart", name: "Smart" },
-    ],
-  };
-  const effort: ConfigOption = {
-    configId: "effort",
-    name: "Effort",
-    category: "thought_level",
-    type: "select",
-    currentValue: "medium",
-    options: ["low", "medium", "high"].map((value) => ({
-      value,
-      name: value[0]!.toUpperCase() + value.slice(1),
-    })),
-  };
-  const mode: ConfigOption = {
-    configId: "mode",
-    name: "Mode",
-    category: "mode",
-    type: "select",
-    currentValue: "ask",
-    options: [
-      { value: "ask", name: "Ask" },
-      { value: "code", name: "Code" },
-    ],
-  };
+  const setting = (config_id: string, value: string): ConfigSetting => ({ config_id, value });
+  const config = [setting("model", "smart"), setting("effort", "medium"), setting("mode", "ask")];
   const picker = () => document.querySelector("button.model-picker")!;
+  const models = () => screen.getByRole("listbox", { name: "Model", hidden: true });
+  const choose = (name: string) => userEvent.click(within(models()).getByText(name));
+  const sent = (core: Core) =>
+    core
+      .invoked("set_config")
+      .map(({ config }) =>
+        (config as ConfigSetting[]).map(({ config_id, value }) => `${config_id} ${value}`),
+      );
 
-  async function withOptions() {
-    const task = session(project, { title: "Task", config_options: [model, effort, mode] });
+  async function withConfig() {
+    const task = session(project, { title: "Task", config });
     const core = await viewSession(task);
     return { core, task };
   }
 
-  it("shows a chosen model at once, until the agent refuses it", async () => {
-    const { core, task } = await withOptions();
+  it("shows the session's config", async () => {
+    await withConfig();
     expect(picker()).toHaveTextContent("SmartMedium");
+    expect(picker()).toBeEnabled();
+    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("Ask");
+  });
+
+  it("shows a starting session's config disabled", async () => {
+    const task = session(project, {
+      title: "Task",
+      state: "starting",
+      agent_session_id: null,
+      config: [setting("model", "fast"), setting("effort", "low"), setting("mode", "code")],
+    });
+    await viewSession(task);
+    expect(picker()).toBeDisabled();
+    expect(picker()).toHaveTextContent("FastOpenRouterLow");
+    expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("Code");
+    expect(screen.getByRole("combobox", { name: "Mode" })).toBeDisabled();
+  });
+
+  it("shows an exited session's config disabled", async () => {
+    await viewSession(session(project, { title: "Task", state: "exited", config }));
+    expect(picker()).toBeDisabled();
+    expect(picker()).toHaveTextContent("SmartMedium");
+    expect(screen.getByRole("combobox", { name: "Mode" })).toBeDisabled();
+  });
+
+  it("shows a chosen model at once, until the agent refuses it", async () => {
+    const { core, task } = await withConfig();
     let refuse: (error: string) => void = () => {};
     core.on(
-      "set_config_option",
+      "set_config",
       () => new Promise((_, reject) => (refuse = reject as (error: string) => void)),
     );
-    await userEvent.click(
-      within(screen.getByRole("listbox", { name: "Model", hidden: true })).getByText("Fast"),
-    );
+    await choose("Fast");
     expect(picker()).toHaveTextContent("FastOpenRouterMedium");
-    expect(core.invoked("set_config_option")).toEqual([
-      { sessionId: task.id, configId: "model", value: "fast" },
+    expect(core.invoked("set_config")).toEqual([
+      {
+        sessionId: task.id,
+        config: [setting("model", "fast"), setting("effort", "medium"), setting("mode", "ask")],
+      },
     ]);
     await act(async () => refuse("unavailable"));
     expect(picker()).toHaveTextContent("SmartMedium");
   });
 
+  it("sends a new model with the effort the draft rule picks for it", async () => {
+    const { core } = await withConfig();
+    await choose("Deep");
+    await choose("Tiny");
+    expect(sent(core)).toEqual([
+      ["model deep", "effort high", "mode ask"],
+      ["model tiny", "mode ask"],
+    ]);
+  });
+
   it("chooses with the keyboard and sets the effort with the slider", async () => {
-    const { core } = await withOptions();
-    const list = screen.getByRole("listbox", { name: "Model", hidden: true });
-    for (const key of ["ArrowDown", "ArrowUp", "Enter"]) fireEvent.keyDown(list, { key });
+    const { core } = await withConfig();
+    for (const key of ["ArrowDown", "ArrowUp", "Enter"]) fireEvent.keyDown(models(), { key });
     expect(picker()).toHaveTextContent("FastOpenRouterMedium");
     const slider = screen.getByRole("slider", { name: "Effort", hidden: true });
     fireEvent.change(slider, { target: { value: "2" } });
     expect(picker()).toHaveTextContent("FastOpenRouterHigh");
-    expect(
-      core.invoked("set_config_option").map(({ configId, value }) => [configId, value]),
-    ).toEqual([
-      ["model", "fast"],
-      ["effort", "high"],
+    // The effort builds on the model sent before the session's config has it.
+    expect(sent(core)).toEqual([
+      ["model fast", "effort medium", "mode ask"],
+      ["model fast", "effort high", "mode ask"],
     ]);
   });
 
-  it("offers only the models the config lists, at the one the agent reports", async () => {
-    const reported = (currentValue: string): ConfigOption => ({
-      ...model,
-      currentValue,
-      options: ["fast", "smart", "other/one", "other/two"].map((value) => ({
-        value,
-        name: value,
-      })),
-    });
-    const { core, task } = await withOptions();
-    core.list({ type: "session", session: { ...task, config_options: [reported("smart")] } });
-    const listbox = screen.getByRole("listbox", { name: "Model", hidden: true });
-    expect([...listbox.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+  it("offers only the models the config lists, at the one the session records", async () => {
+    const { core, task } = await withConfig();
+    expect([...models().querySelectorAll("button")].map((button) => button.textContent)).toEqual([
       "FastOpenRouter",
       "Smart",
       "Deep",
       "Tiny",
     ]);
-    expect(picker()).toHaveTextContent("Smart");
-
-    core.list({ type: "session", session: { ...task, config_options: [reported("other/one")] } });
+    core.list({ type: "session", session: { ...task, config: [setting("model", "other/one")] } });
     expect(picker()).toHaveTextContent("other/one");
+    expect(models().querySelectorAll("button")).toHaveLength(4);
   });
 
-  it("shows a reported effort or mode the config does not list as its ID", async () => {
-    const { core, task } = await withOptions();
+  it("shows a recorded effort or mode the config does not list as its ID", async () => {
+    const { core, task } = await withConfig();
     core.list({
       type: "session",
       session: {
         ...task,
-        config_options: [
-          { ...model, currentValue: "deep" },
-          effort,
-          { ...mode, currentValue: "plan" },
-        ],
+        config: [setting("model", "deep"), setting("effort", "medium"), setting("mode", "plan")],
       },
     });
     expect(picker()).toHaveTextContent("Deepmedium");
@@ -592,11 +590,27 @@ describe("The model picker", () => {
     expect(screen.getByRole("combobox", { name: "Mode" })).toHaveDisplayValue("plan");
   });
 
-  it("shows other options as their own pickers", async () => {
-    const { core, task } = await withOptions();
+  it("keeps recorded settings the config does not list when another changes", async () => {
+    const { core, task } = await withConfig();
+    core.list({
+      type: "session",
+      session: {
+        ...task,
+        config: [setting("model", "other/one"), setting("effort", "max"), setting("mode", "plan")],
+      },
+    });
     await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
-    expect(core.invoked("set_config_option")).toEqual([
-      { sessionId: task.id, configId: "mode", value: "code" },
+    expect(sent(core)).toEqual([["model other/one", "effort max", "mode code"]]);
+  });
+
+  it("shows the mode as its own picker", async () => {
+    const { core, task } = await withConfig();
+    await userEvent.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "code");
+    expect(core.invoked("set_config")).toEqual([
+      {
+        sessionId: task.id,
+        config: [setting("model", "smart"), setting("effort", "medium"), setting("mode", "code")],
+      },
     ]);
   });
 });

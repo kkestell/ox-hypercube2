@@ -42,7 +42,7 @@ class Listing {
       state,
       title,
       agent_session_id: state === "starting" ? null : "agent",
-      config_options: [],
+      config: [],
       available_commands: [],
       worktree_id: worktreeId,
       archived: false,

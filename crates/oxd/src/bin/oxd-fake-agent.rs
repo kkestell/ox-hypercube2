@@ -111,9 +111,6 @@
 //!   `background-start <name>` does
 //! - `--no-commands`: omit commands from setup responses
 //! - `--model-providers`: include provider labels in the model choices
-//! - `--silent-config`: send no `config_option_update` when an option is set
-//! - `--late-config-update`: send the `config_option_update` after the
-//!   response
 //! - `--hold <path>`: open `path`, a FIFO, for writing and keep it open
 //!   until the process exits, so its reader sees end of file then
 //! - `--sessions <dir>`: print the sessions of `<dir>/fake-transcripts.json`,
@@ -738,15 +735,8 @@ async fn main() -> agent_client_protocol::Result<()> {
                             options.clone(),
                         )),
                     );
-                    if flag("--silent-config") {
-                        responder.respond(acp::SetSessionConfigOptionResponse::new(options))
-                    } else if flag("--late-config-update") {
-                        responder.respond(acp::SetSessionConfigOptionResponse::new(options))?;
-                        connection.send_notification(update)
-                    } else {
-                        connection.send_notification(update)?;
-                        responder.respond(acp::SetSessionConfigOptionResponse::new(options))
-                    }
+                    connection.send_notification(update)?;
+                    responder.respond(acp::SetSessionConfigOptionResponse::new(options))
                 }
             },
             agent_client_protocol::on_receive_request!(),

@@ -32,7 +32,7 @@ relays the update or acts on it as the protocol requires.
 | `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |
 | `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude takes the prompt in at its next opportunity (`priority: "next"`), and Pi steers the turn with it; each bridge answers the prompt when its harness takes it in. A prompt Claude has not taken in when the turn ends starts a turn of its own. |
-| `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `effort`, its thinking level, when Pi reports one. Each option offers only its current value, and the bridge passes any value to its harness. Ox supports select and boolean options. |
+| `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `effort`, its thinking level, when Pi reports one. Each option offers only its current value, and the bridge passes any value to its harness. Pi sets an effort its model lacks to one the model has, and Pi's bridge refuses that change, naming the level Pi runs at. Ox supports select and boolean options. |
 | `session/delete` | ❌ | ❌ | ❌ | |
 | `session/fork` (unstable) | ❌ | ❌ | ❌ | |
 | `session/archive` (unstable) | ❌ | ❌ | ❌ | |

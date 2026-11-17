@@ -1,7 +1,7 @@
 import { act, cleanup, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import type { Command, ConfigOption, SessionInfo } from "../../lib/protocol";
+import type { Command, ConfigSetting, SessionInfo } from "../../lib/protocol";
 import {
   claudeConfig,
   piConfig,
@@ -12,17 +12,7 @@ import {
   workspace,
 } from "../../test/core";
 
-/** An option as an agent reports it, offering only its current value. */
-function reported(configId: string, category: string, currentValue: string): ConfigOption {
-  return {
-    configId,
-    name: configId,
-    category,
-    type: "select",
-    currentValue,
-    options: [{ value: currentValue, name: currentValue }],
-  };
-}
+const setting = (config_id: string, value: string): ConfigSetting => ({ config_id, value });
 const review: Command = { type: "command", name: "review", description: "Review a file" };
 
 /** Chooses `item` from the New Session menu of the workspace named `name`. */
@@ -227,11 +217,7 @@ describe("A draft's options", () => {
     const used = (title: string, model: string, effort: string, mode: string) =>
       session(project, {
         title,
-        config_options: [
-          reported("model", "model", model),
-          reported("effort", "thought_level", effort),
-          reported("mode", "mode", mode),
-        ],
+        config: [setting("model", model), setting("effort", effort), setting("mode", mode)],
       });
     const core = await renderApp(
       { type: "workspace", workspace: project },
@@ -268,11 +254,13 @@ describe("A draft's options", () => {
       title: "Go",
       state: "starting",
       agent_session_id: null,
+      config: [setting("model", "fast"), setting("effort", "low"), setting("mode", "code")],
     });
     core.on("new_session", () => started);
     await newDraft("project");
     await userEvent.selectOptions(modePicker()!, "code");
     await userEvent.type(message(), "Go{Enter}");
+    expect(core.invoked("new_session")[0]!.config).toEqual(started.config);
     core.list({ type: "session", session: started });
     expect(picker()).toBeDisabled();
     expect(picker()).toHaveTextContent("FastOpenRouterLow");
@@ -281,16 +269,11 @@ describe("A draft's options", () => {
 
     core.list({
       type: "session",
-      session: {
-        ...started,
-        state: "idle",
-        agent_session_id: "agent",
-        config_options: [reported("model", "model", "smart")],
-      },
+      session: { ...started, state: "idle", agent_session_id: "agent" },
     });
     expect(picker()).toBeEnabled();
-    expect(picker()).toHaveTextContent("Smart");
-    expect(modePicker()).not.toBeInTheDocument();
+    expect(picker()).toHaveTextContent("FastOpenRouterLow");
+    expect(modePicker()).toHaveValue("code");
   });
 
   it("complete no slash commands", async () => {

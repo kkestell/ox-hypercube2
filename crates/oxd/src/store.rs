@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ox_protocol::{Event, EventKind, Unseen};
+use ox_protocol::schema::SessionUpdate;
+use ox_protocol::{ConfigSetting, Event, EventKind, Unseen};
 use rusqlite::{Connection, Transaction, params};
 use tokio::sync::oneshot;
 
-use crate::state::Queue;
+use crate::state::{self, Queue};
 
 /// A workspace as the database holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,8 @@ pub struct SavedSession {
     pub created_at: u64,
     pub unseen: Option<Unseen>,
     pub queue: Queue,
+    /// The session's config.
+    pub config: Vec<ConfigSetting>,
 }
 
 /// A worktree as the database holds it.
@@ -118,18 +121,11 @@ impl Store {
         )?;
         query
             .query_map([session_id], |row| {
-                let kind: String = row.get(2)?;
                 Ok(Event {
                     session_id: session_id.into(),
                     seq: u64::try_from(row.get::<_, i64>(0)?).expect("seqs are positive"),
                     recorded_at: time_value(row, 1)?,
-                    kind: serde_json::from_str::<EventKind>(&kind).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
+                    kind: json_value(row, 2)?,
                 })
             })?
             .collect()
@@ -210,25 +206,18 @@ impl Store {
                 EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
                 created_at,
                 (SELECT unseen FROM session_unseen WHERE session_id = sessions.id),
-                session_queues.paused, session_queues.prompts
+                session_queues.paused, session_queues.prompts, config
             FROM sessions
             LEFT JOIN session_queues ON session_queues.session_id = sessions.id
             ORDER BY number",
         )?;
         query
             .query_map([], |row| {
-                let command: String = row.get(3)?;
                 Ok(SavedSession {
                     number: u64::try_from(row.get::<_, i64>(0)?).expect("rowids are positive"),
                     id: row.get(1)?,
                     workspace_id: row.get(2)?,
-                    command: serde_json::from_str(&command).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?,
+                    command: json_value(row, 3)?,
                     cwd: PathBuf::from(row.get::<_, String>(4)?),
                     title: row.get(5)?,
                     agent_session_id: row.get(6)?,
@@ -250,14 +239,17 @@ impl Store {
                             None => Vec::new(),
                         },
                     },
+                    config: json_value(row, 14)?,
                 })
             })?
             .collect()
     }
 
     /// Saves a session that has not started, created at `created_at`, with
-    /// the worktree it runs in, if any, and returns its number, which is
-    /// greater than the number of every session saved before it.
+    /// its config and the worktree it runs in, if any, and returns its
+    /// number, which is greater than the number of every session saved
+    /// before it.
+    #[expect(clippy::too_many_arguments, reason = "the session's saved fields")]
     pub fn add_session(
         &self,
         id: &str,
@@ -266,23 +258,26 @@ impl Store {
         cwd: &Path,
         worktree: Option<&SavedWorktree>,
         created_at: u64,
+        config: &[ConfigSetting],
     ) -> rusqlite::Result<u64> {
         let command = serde_json::to_string(command).expect("a list of strings serializes");
+        let config = serde_json::to_string(config).expect("settings serialize");
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         if let Some(worktree) = worktree {
             insert_worktree(&transaction, worktree)?;
         }
         transaction.execute(
-            "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, workspace_id, command, cwd, worktree_id, created_at, config)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 id,
                 workspace_id,
                 command,
                 cwd.to_string_lossy(),
                 worktree.map(|worktree| &worktree.id),
-                time(created_at)
+                time(created_at),
+                config
             ],
         )?;
         // `number` is the table's rowid.
@@ -292,8 +287,9 @@ impl Store {
     }
 
     /// Saves an imported session with its title, agent session ID, creation
-    /// time, whether it is archived, and its events, in one transaction, and
-    /// returns its number. The session's other fields are ignored.
+    /// time, config, whether it is archived, and its events, in one
+    /// transaction, and returns its number. The session's other fields are
+    /// ignored.
     pub fn import_session(
         &self,
         session: &SavedSession,
@@ -301,11 +297,13 @@ impl Store {
     ) -> rusqlite::Result<u64> {
         let command =
             serde_json::to_string(&session.command).expect("a list of strings serializes");
+        let config = serde_json::to_string(&session.config).expect("settings serialize");
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT INTO sessions (id, workspace_id, command, cwd, title, agent_session_id, created_at)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions
+                (id, workspace_id, command, cwd, title, agent_session_id, created_at, config)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 session.id,
                 session.workspace_id,
@@ -313,7 +311,8 @@ impl Store {
                 session.cwd.to_string_lossy(),
                 session.title,
                 session.agent_session_id,
-                time(session.created_at)
+                time(session.created_at),
+                config
             ],
         )?;
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
@@ -367,6 +366,16 @@ impl Store {
         self.lock().execute(
             "UPDATE sessions SET agent_session_id = ?2 WHERE id = ?1",
             params![id, agent_session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces a session's config.
+    pub fn set_session_config(&self, id: &str, config: &[ConfigSetting]) -> rusqlite::Result<()> {
+        let config = serde_json::to_string(config).expect("settings serialize");
+        self.lock().execute(
+            "UPDATE sessions SET config = ?2 WHERE id = ?1",
+            params![id, config],
         )?;
         Ok(())
     }
@@ -431,11 +440,12 @@ impl Store {
 /// `i` takes a database from schema version `i` to `i + 1`; the schema
 /// version, kept in `PRAGMA user_version`, is the number of steps applied.
 ///
-/// Stored JSON is schema: changing how `EventKind`, `QueuedPrompt` or a
-/// session's command serializes either keeps reading every older shape or
-/// comes with a step that rewrites the rows. Each schema version has a
-/// fixture in `tests/fixtures`, which every later build opens.
-const MIGRATIONS: &[fn(&Transaction<'_>) -> rusqlite::Result<()>] = &[create_tables];
+/// Stored JSON is schema: changing how `EventKind`, `QueuedPrompt`,
+/// `ConfigSetting` or a session's command serializes either keeps reading
+/// every older shape or comes with a step that rewrites the rows. Each schema
+/// version has a fixture in `tests/fixtures`, which every later build opens.
+const MIGRATIONS: &[fn(&Transaction<'_>) -> rusqlite::Result<()>] =
+    &[create_tables, add_session_config];
 
 /// The schema version this build writes.
 fn schema_version() -> i64 {
@@ -522,6 +532,37 @@ fn create_tables(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     )
 }
 
+/// Schema version 2: each session's config, a JSON array of
+/// `ConfigSetting`. A session takes the config its latest `agent_started` or
+/// `config_option_update` event reports, and is left empty without one.
+fn add_session_config(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction
+        .execute_batch("ALTER TABLE sessions ADD COLUMN config TEXT NOT NULL DEFAULT '[]'")?;
+    // With `MAX(seq)`, SQLite takes the bare `kind` from the row with the
+    // greatest seq, so each session's latest report is found in one scan.
+    let reports: Vec<(String, EventKind)> = transaction
+        .prepare(
+            "SELECT session_id, kind, MAX(seq) FROM events
+            WHERE kind ->> '$.type' = 'agent_started'
+                OR kind ->> '$.data.sessionUpdate' = 'config_option_update'
+            GROUP BY session_id",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, json_value(row, 1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut update = transaction.prepare("UPDATE sessions SET config = ?2 WHERE id = ?1")?;
+    for (session_id, kind) in reports {
+        let options = match kind {
+            EventKind::AgentStarted { config_options, .. } => config_options,
+            EventKind::Update(SessionUpdate::ConfigOptionUpdate(update)) => update.config_options,
+            other => unreachable!("the query selects only option reports, not {other:?}"),
+        };
+        let config =
+            serde_json::to_string(&state::reported_config(&options)).expect("settings serialize");
+        update.execute(params![session_id, config])?;
+    }
+    Ok(())
+}
+
 fn insert_worktree(
     transaction: &Transaction<'_>,
     worktree: &SavedWorktree,
@@ -578,6 +619,21 @@ fn unseen_name(unseen: Unseen) -> &'static str {
         Unseen::Finished => "finished",
         Unseen::Error => "error",
     }
+}
+
+/// The JSON value in column `index`.
+fn json_value<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let text: String = row.get(index)?;
+    serde_json::from_str(&text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
 }
 
 /// The unseen outcome in column `index`, which holds its name or `NULL`.
@@ -683,6 +739,7 @@ mod tests {
                 Path::new("/work"),
                 None,
                 1_700_000_000_000,
+                &[],
             )
             .unwrap();
         let second = store
@@ -693,6 +750,7 @@ mod tests {
                 Path::new("/work"),
                 None,
                 1_700_000_000_001,
+                &[],
             )
             .unwrap();
         assert!(first < second);
@@ -713,6 +771,7 @@ mod tests {
                     created_at: 1_700_000_000_000,
                     unseen: None,
                     queue: Queue::default(),
+                    config: Vec::new(),
                 },
                 SavedSession {
                     number: second,
@@ -728,6 +787,7 @@ mod tests {
                     created_at: 1_700_000_000_001,
                     unseen: None,
                     queue: Queue::default(),
+                    config: Vec::new(),
                 },
             ]
         );
@@ -738,7 +798,7 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert!(!store.sessions().unwrap()[0].archived);
         store.set_archived("one", true).unwrap();
@@ -755,7 +815,7 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert_eq!(store.sessions().unwrap()[0].unseen, None);
         store
@@ -780,7 +840,7 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         let queue = Queue {
             prompts: vec![QueuedPrompt {
@@ -798,18 +858,40 @@ mod tests {
         assert_eq!(count(&store, "session_queues"), 0);
     }
 
+    fn setting(config_id: &str, value: &str) -> ConfigSetting {
+        ConfigSetting {
+            config_id: config_id.into(),
+            value: ox_protocol::ConfigValue::Id(value.into()),
+        }
+    }
+
     #[test]
-    fn title_and_agent_session_id_updates_are_saved() {
+    fn title_agent_session_id_and_config_updates_are_saved() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None, 0)
+            .add_session(
+                "s",
+                "w",
+                &command(),
+                Path::new("/work"),
+                None,
+                0,
+                &[setting("model", "smart")],
+            )
             .unwrap();
+        assert_eq!(
+            store.sessions().unwrap()[0].config,
+            [setting("model", "smart")]
+        );
         store.set_title("s", Some("Fix the build")).unwrap();
         store.set_agent_session_id("s", "agent").unwrap();
+        let config = [setting("model", "fast"), setting("effort", "low")];
+        store.set_session_config("s", &config).unwrap();
         let saved = &store.sessions().unwrap()[0];
         assert_eq!(saved.title.as_deref(), Some("Fix the build"));
         assert_eq!(saved.agent_session_id.as_deref(), Some("agent"));
+        assert_eq!(saved.config, config);
 
         store.set_title("s", None).unwrap();
         assert_eq!(store.sessions().unwrap()[0].title, None);
@@ -820,12 +902,12 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         let first = store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         store.remove_session("one").unwrap();
         assert!(store.sessions().unwrap().is_empty());
         let second = store
-            .add_session("two", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("two", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert!(second > first);
     }
@@ -837,7 +919,7 @@ mod tests {
         store.add_workspace(&workspace("v", "/other")).unwrap();
         add_worktree_session(&store, "s", &worktree("t"));
         store
-            .add_session("o", "v", &command(), Path::new("/other"), None, 0)
+            .add_session("o", "v", &command(), Path::new("/other"), None, 0, &[])
             .unwrap();
         store.set_agent_session_id("s", "claude").unwrap();
         store.remove_workspace("w").unwrap();
@@ -867,7 +949,7 @@ mod tests {
 
     fn add_worktree_session(store: &Store, id: &str, worktree: &SavedWorktree) {
         store
-            .add_session(id, "w", &command(), &worktree.path, Some(worktree), 0)
+            .add_session(id, "w", &command(), &worktree.path, Some(worktree), 0, &[])
             .unwrap();
     }
 
@@ -887,7 +969,7 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("plain", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("plain", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         let mut compared = worktree("01234567");
         compared.compare = Some("main".into());
@@ -937,6 +1019,7 @@ mod tests {
                 Path::new("/work"),
                 Some(&worktree("one")),
                 0,
+                &[],
             )
             .unwrap_err();
         assert_eq!(count(&store, "sessions"), 1);
@@ -950,7 +1033,7 @@ mod tests {
         store.add_workspace(&workspace("v", "/other")).unwrap();
         assert!(!store.workspace_has_unarchived_sessions("w").unwrap());
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("s", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         assert!(store.workspace_has_unarchived_sessions("w").unwrap());
         assert!(!store.workspace_has_unarchived_sessions("v").unwrap());
@@ -977,7 +1060,7 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("s", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("s", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         store
     }
@@ -1026,6 +1109,7 @@ mod tests {
             created_at: 1_700_000_000_000,
             unseen: None,
             queue: Queue::default(),
+            config: vec![setting("model", "smart")],
         };
         let events = [exited("s", 1), exited("s", 2)];
         let number = store.import_session(&session, &events).unwrap();
@@ -1045,10 +1129,10 @@ mod tests {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         store
-            .add_session("two", "w", &command(), Path::new("/work"), None, 0)
+            .add_session("two", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         store.set_agent_session_id("one", "claude").unwrap();
         assert!(!store.was_deleted("claude").unwrap());
@@ -1097,15 +1181,36 @@ mod tests {
     }
 
     #[test]
-    fn a_database_from_before_versions_opens_at_version_one_with_its_rows() {
+    fn a_database_from_before_versions_opens_at_the_latest_version_with_its_rows() {
         let sql = std::fs::read_to_string(fixtures().join("schema-1.sql")).unwrap();
         let connection = database(&sql);
         connection.pragma_update(None, "user_version", 0).unwrap();
         let store = Store::with(connection).unwrap();
-        assert_eq!(user_version(&store.lock()), 1);
+        assert_eq!(user_version(&store.lock()), schema_version());
         assert_eq!(store.workspaces().unwrap().len(), 1);
         assert_eq!(store.sessions().unwrap().len(), 2);
         assert_eq!(count(&store, "events"), 34);
+    }
+
+    /// The `plain` session's last option report is a `config_option_update`
+    /// with only its model; `archived` never started.
+    #[test]
+    fn a_schema_1_database_gives_each_session_the_config_it_last_reported() {
+        let sql = std::fs::read_to_string(fixtures().join("schema-1.sql")).unwrap();
+        let store = Store::with(database(&sql)).unwrap();
+        let configs: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| (session.id, session.config))
+            .collect();
+        assert_eq!(
+            configs,
+            [
+                ("plain".into(), vec![setting("model", "claude-sonnet-5-5")]),
+                ("archived".into(), Vec::new()),
+            ]
+        );
     }
 
     #[test]
@@ -1128,7 +1233,7 @@ mod tests {
     }
 
     /// What a fixture holds.
-    #[derive(Debug, PartialEq)]
+    #[derive(Clone, Copy, Debug, PartialEq)]
     struct Contents {
         workspaces: usize,
         worktrees: usize,
@@ -1138,25 +1243,26 @@ mod tests {
         queued: usize,
         events: usize,
         deleted_agent_sessions: usize,
+        /// Sessions with a config.
+        configured: usize,
     }
 
     /// Every fixture, each a database of a schema version some build wrote,
     /// opens with this build and reads back whole.
     #[test]
     fn every_schema_fixture_opens_and_reads_back() {
-        let expected = [(
-            "schema-1.sql",
-            Contents {
-                workspaces: 1,
-                worktrees: 1,
-                sessions: 2,
-                archived: 1,
-                unseen: 1,
-                queued: 1,
-                events: 34,
-                deleted_agent_sessions: 1,
-            },
-        )];
+        let contents = Contents {
+            workspaces: 1,
+            worktrees: 1,
+            sessions: 2,
+            archived: 1,
+            unseen: 1,
+            queued: 1,
+            events: 34,
+            deleted_agent_sessions: 1,
+            configured: 1,
+        };
+        let expected = [("schema-1.sql", contents), ("schema-2.sql", contents)];
         let mut names: Vec<String> = std::fs::read_dir(fixtures())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -1201,6 +1307,10 @@ mod tests {
                 events,
                 deleted_agent_sessions: usize::try_from(count(&store, "deleted_agent_sessions"))
                     .unwrap(),
+                configured: sessions
+                    .iter()
+                    .filter(|session| !session.config.is_empty())
+                    .count(),
             };
             assert_eq!(read, contents, "{name}");
         }
