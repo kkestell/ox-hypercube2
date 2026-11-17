@@ -21,18 +21,14 @@ impl OxServer {
         })
     }
 
-    /// The `ox` server for the session `session_id`, with the tools of a
-    /// run's child session when `child` is set.
-    pub fn for_session(&self, session_id: &str, child: bool) -> McpServer {
-        let mut args = vec![
+    /// The `ox` server for the session `session_id`.
+    pub fn for_session(&self, session_id: &str) -> McpServer {
+        let args = vec![
             "--socket".into(),
             self.socket.display().to_string(),
             "--session".into(),
             session_id.into(),
         ];
-        if child {
-            args.push("--child".into());
-        }
         McpServer::Stdio(McpServerStdio::new("ox", self.command.clone()).args(args))
     }
 }

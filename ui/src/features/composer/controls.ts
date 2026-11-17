@@ -1,13 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { sessionAgent } from "../../components/HarnessLogo";
-import type {
-  ConfigOption,
-  Controls,
-  RunInfo,
-  SessionInfo,
-  WorkspaceInfo,
-} from "../../lib/protocol";
+import type { ConfigOption, Controls, SessionInfo, WorkspaceInfo } from "../../lib/protocol";
 import type { AgentId } from "../sessions/useAgents";
 
 /** Option values by option ID. */
@@ -93,11 +87,10 @@ function sameValues(a: Values | undefined, b: Values) {
 
 /**
  * The option values last used with each agent in each workspace, kept in
- * local storage: those of the newest session that reports options, leaving
- * out run children, whose options come from their workflow steps, or those
+ * local storage: those of the newest session that reports options, or those
  * a draft was sent with, through `remember`.
  */
-export function useLastUsed(sessions: SessionInfo[], parents: Map<string, RunInfo>) {
+export function useLastUsed(sessions: SessionInfo[]) {
   const [lastUsed, setLastUsed] = useState(() => loadAll<Values>(lastUsedPrefix));
 
   const remember = useCallback((agent: AgentId, workspaceId: string, values: Values) => {
@@ -114,7 +107,7 @@ export function useLastUsed(sessions: SessionInfo[], parents: Map<string, RunInf
     const newest = new Map<string, SessionInfo>();
     for (const session of sessions) {
       const agent = sessionAgent(session.command);
-      if (agent === undefined || parents.has(session.id)) continue;
+      if (agent === undefined) continue;
       const pair = `${agent}:${session.workspace_id}`;
       const current = newest.get(pair);
       if (current === undefined || current.created_at < session.created_at) {
@@ -122,7 +115,7 @@ export function useLastUsed(sessions: SessionInfo[], parents: Map<string, RunInf
       }
     }
     return newest;
-  }, [sessions, parents]);
+  }, [sessions]);
 
   useEffect(() => {
     for (const session of newest.values()) {

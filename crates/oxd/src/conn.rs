@@ -13,9 +13,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
-use crate::daemon::{ClientGuard, Daemon, FocusGuard, Sent};
+use crate::daemon::{ClientGuard, Daemon, Sent};
 use crate::directories::{self, Changes};
-use crate::session::Session;
+use crate::session::{Session, SessionFocus};
 
 /// Messages queued for a client before its subscriptions wait for it to
 /// read.
@@ -52,8 +52,8 @@ pub async fn serve(
     // and watches, by the id of the request that started each.
     let mut forwards: HashMap<u64, Task> = HashMap::new();
     let mut watches: HashMap<u64, Task> = HashMap::new();
-    // The session or run the client shows in front of the user.
-    let mut focus: Option<FocusGuard> = None;
+    // The session the client shows in front of the user.
+    let mut focus: Option<SessionFocus> = None;
     let mut lines = BufReader::new(read).lines();
     let mut greeted = false;
 
@@ -182,10 +182,10 @@ pub async fn serve(
             }
             // The last focus ends first, so a refused one leaves the
             // connection unfocused.
-            Method::Focus { focus: target } => {
+            Method::Focus { session_id } => {
                 drop(focus.take());
-                target
-                    .map(|target| daemon.focus(target))
+                session_id
+                    .map(|id| daemon.session(&id).map(|session| session.focus()))
                     .transpose()
                     .map(|guard| {
                         focus = guard;
@@ -206,9 +206,9 @@ pub async fn serve(
                 }
                 Err(error) => Err(error),
             },
-            // Creating a session in a worktree, starting a run, deleting a
-            // session or a run, listing or moving branches and comparing a
-            // worktree's branch wait on git, and messaging a session, reading
+            // Creating a session in a worktree, deleting a session, listing
+            // or moving branches and comparing a worktree's branch wait on
+            // git, and messaging a session, reading
             // its transcript and requesting a session wait on agents, the
             // database or the user, so each runs in its own task and the
             // connection keeps serving other requests. A client that
@@ -218,8 +218,6 @@ pub async fn serve(
             | Method::SessionTranscript { .. }
             | Method::SessionRequest { .. }
             | Method::SessionDelete { .. }
-            | Method::RunStart { .. }
-            | Method::RunDelete { .. }
             | Method::SessionArchive { .. }
             | Method::SessionUnarchive { .. }
             | Method::WorkspaceBranches { .. }
@@ -311,8 +309,8 @@ async fn forward(
     }
 }
 
-/// Sends watch `subscription` every workspace, worktree, session and run,
-/// then those that are added, change, or are removed.
+/// Sends watch `subscription` every workspace, worktree and session, then
+/// those that are added, change, or are removed.
 async fn watch(daemon: Arc<Daemon>, subscription: u64, outgoing: mpsc::Sender<ServerMessage>) {
     let mut signal = daemon.changed();
     let mut sent = Sent::default();

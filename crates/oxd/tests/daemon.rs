@@ -11,7 +11,7 @@ use ox_protocol::schema::{
 };
 use ox_protocol::{
     Checkout, Client, ConfigSetting, ConfigValue, DirEntry, End, EntryKind, Error, Event,
-    EventKind, Focus, Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream,
+    EventKind, Listing, ListingChange, PROTOCOL_VERSION, SessionInfo, SessionState, Stream,
     Subscription, Unseen, WorkspaceInfo, code,
 };
 use serde_json::{Value, json};
@@ -2941,12 +2941,6 @@ async fn unseen(client: &Client, session_id: &str) -> Option<Unseen> {
     info(client, session_id).await.unwrap().unseen
 }
 
-fn focus_session(session_id: &str) -> Focus {
-    Focus::Session {
-        session_id: session_id.into(),
-    }
-}
-
 /// Prompts `script` and returns once its turn has ended.
 async fn turn(client: &Client, events: &mut Subscription, session_id: &str, script: &str) {
     client.prompt(session_id, text(script)).await.unwrap();
@@ -2963,10 +2957,7 @@ async fn a_turn_that_ends_out_of_focus_is_unseen_until_the_session_is_focused() 
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, Some(Unseen::Finished));
 
-    client
-        .focus(Some(focus_session(&session.id)))
-        .await
-        .unwrap();
+    client.focus(Some(&session.id)).await.unwrap();
     assert_eq!(unseen(&client, &session.id).await, None);
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, None);
@@ -3018,10 +3009,7 @@ async fn closing_the_focusing_connection_ends_its_focus() {
     let mut watch = client.watch().await.unwrap();
     next_changes(&mut watch).await;
     let focusing = daemon.client().await;
-    focusing
-        .focus(Some(focus_session(&session.id)))
-        .await
-        .unwrap();
+    focusing.focus(Some(&session.id)).await.unwrap();
     turn(&client, &mut events, &session.id, "say 1 0").await;
     assert_eq!(unseen(&client, &session.id).await, None);
 
@@ -3061,17 +3049,9 @@ async fn unseen_outcomes_survive_a_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn focusing_an_unknown_session_or_run_is_refused() {
+async fn focusing_an_unknown_session_is_refused() {
     let daemon = Daemon::start().await;
     let client = daemon.client().await;
-    let error = refusal(client.focus(Some(focus_session("missing"))).await);
-    assert_eq!(error.code, code::NOT_FOUND);
-    let error = refusal(
-        client
-            .focus(Some(Focus::Run {
-                run_id: "missing".into(),
-            }))
-            .await,
-    );
+    let error = refusal(client.focus(Some("missing")).await);
     assert_eq!(error.code, code::NOT_FOUND);
 }

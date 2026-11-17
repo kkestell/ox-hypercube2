@@ -52,34 +52,13 @@
   white-space: nowrap;
 }
 
-/* An exited session and a pending step dim their contents but not their
-   tree line. */
-.sidebar-row.exited .select > :not(.tree-branch),
-.sidebar-row.pending .select > :not(.tree-branch) {
+/* An exited session dims its contents. */
+.sidebar-row.exited .select > * {
   opacity: var(--dimmed-opacity);
 }
 
-/* A pending step is as dark as in the run view. */
-.sidebar-row.pending .select {
-  color: var(--muted-foreground);
-}
-
-/* A run's title, followed by its chevron, which takes the row's end once the
-   title is too long. */
-.title-group {
-  display: flex;
-  flex: 1;
-  align-items: center;
-  gap: var(--spacing);
-  min-width: 0;
-}
-
-.title-group .title {
-  flex: 0 1 auto;
-}
-
-/* The chevron shows while its row or header is hovered or focused, and points
-   down while what it collapses shows. Hidden, it leaves the title the row's width. */
+/* The chevron shows while its header is hovered or focused, and points down
+   while what it collapses shows. Hidden, it leaves the name the header's width. */
 .disclosure {
   display: none;
   flex: none;
@@ -96,13 +75,7 @@
   transform: rotate(90deg);
 }
 
-:is(
-    .sidebar-row:hover,
-    .sidebar-row .select:focus-visible,
-    .workspace-header:hover,
-    .workspace-toggle:focus-visible
-  )
-  .disclosure {
+:is(.workspace-header:hover, .workspace-toggle:focus-visible) .disclosure {
   display: flex;
 }
 

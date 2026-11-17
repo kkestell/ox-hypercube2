@@ -281,13 +281,6 @@
   gap: calc(var(--spacing) * 3);
 }
 
-/* A request with no entry below it, as in a run's view, stands alone. */
-.request-panel:last-child {
-  margin: 0;
-  padding-bottom: calc(var(--spacing) * 4);
-  border-radius: var(--radius-2xl);
-}
-
 /* A request's description keeps its lines. */
 .request-panel .description {
   white-space: pre-wrap;

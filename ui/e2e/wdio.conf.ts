@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { stopDaemon } from "./helpers.ts";
 
-// The launcher, app and workers inherit a socket and config directory of their own.
+// The launcher, app and workers inherit a socket of their own, and a configuration
+// home that keeps the user's global Git ignore and attributes files out.
 const runDir = process.env.OX_E2E_DIR ?? mkdtempSync(join(tmpdir(), "ox-e2e-"));
 process.env.OX_E2E_DIR = runDir;
 process.env.OX_SOCKET = join(runDir, "oxd.sock");

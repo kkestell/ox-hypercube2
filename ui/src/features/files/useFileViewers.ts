@@ -10,7 +10,7 @@ import {
 } from "./viewerState";
 
 /**
- * Keeps the viewer of each session and each run live, each `id` with its
+ * Keeps the viewer of each session and each draft live, each `id` with its
  * files under `cwd`, so selection can use an inactive viewer's snapshot
  * before paint.
  */

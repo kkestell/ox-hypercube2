@@ -2,9 +2,8 @@
 //!
 //! Usage: `oxd [--socket PATH] [--idle-exit-ms MS] [--park-after-ms MS]`
 //!
-//! Workspaces, sessions and workflow runs are saved in `<socket>.db`, and
-//! their worktrees are added in `worktrees` beside the socket. Workflow
-//! definitions are read from `workflows` in Ox's configuration directory.
+//! Workspaces and sessions are saved in `<socket>.db`, and their worktrees
+//! are added in `worktrees` beside the socket.
 //!
 //! The daemon prints `ready` on stdout once a daemon is listening on the
 //! socket: itself, or one that was already running, in which case it exits.
@@ -14,15 +13,11 @@ mod conn;
 mod daemon;
 mod directories;
 mod files;
-mod instructions;
 mod mcp;
-mod run;
 mod session;
-mod shell;
 mod state;
 mod store;
 mod transcript;
-mod workflow;
 mod worktree;
 
 use std::ffi::OsString;
@@ -152,16 +147,8 @@ async fn run(args: Args) -> io::Result<()> {
     // Agents run `ox-mcp` in their own directories, so the socket it
     // connects to is absolute.
     let ox_server = Arc::new(OxServer::new(std::path::absolute(&args.socket)?)?);
-    let workflows = ox_protocol::config_dir().join("workflows");
-    let daemon = Daemon::new(
-        store,
-        worktrees,
-        workflows,
-        args.park_after,
-        directories,
-        ox_server,
-    )
-    .map_err(|error| io::Error::other(format!("reading {}: {error}", database.display())))?;
+    let daemon = Daemon::new(store, worktrees, args.park_after, directories, ox_server)
+        .map_err(|error| io::Error::other(format!("reading {}: {error}", database.display())))?;
     let daemon = Arc::new(daemon);
 
     match std::fs::remove_file(&args.socket) {

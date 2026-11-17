@@ -2,7 +2,6 @@
 """Run opt-in smoke checks against an ACP bridge through oxd."""
 
 import argparse
-import contextlib
 import json
 import os
 import select
@@ -392,27 +391,6 @@ class SmokeRun:
             content=content,
         )
 
-    def wait_run(self, run, timeout):
-        """Waits until a run is not running and returns it."""
-        connection = Connection(self.socket, self.args.timeout)
-        try:
-            connection.call("watch")
-            deadline = time.monotonic() + timeout
-            while True:
-                for change in connection.changes(deadline):
-                    check(
-                        change != {"type": "run_removed", "run_id": run},
-                        "The run was removed",
-                    )
-                    if (
-                        change["type"] == "run"
-                        and change["run"]["id"] == run
-                        and change["run"]["state"] != "running"
-                    ):
-                        return change["run"]
-        finally:
-            connection.close()
-
     def attach(self, after):
         if self.attachment is not None:
             self.attachment.close()
@@ -462,8 +440,6 @@ class SmokeRun:
         )
 
     def start_daemon(self):
-        # oxd reads workflow definitions from its configuration directory.
-        env = {**os.environ, "XDG_CONFIG_HOME": str(self.directory / "config")}
         self.daemon = subprocess.Popen(
             [
                 str(self.binaries / "oxd"),
@@ -473,7 +449,6 @@ class SmokeRun:
             ],
             stdout=subprocess.PIPE,
             stderr=self.daemon_log,
-            env=env,
         )
         # oxd prints `ready` once it is listening and nothing else on stdout.
         with self.daemon.stdout:
@@ -758,77 +733,6 @@ class SmokeRun:
             run.cleanup()
             raise
 
-    def check_workflow(self):
-        """Runs a two-step workflow on this agent in its own repository, and
-        checks that the launch input reached the second step through the
-        first step's reply."""
-        project = self.directory / "workflow-project"
-        project.mkdir()
-        command(["git", "init", "--quiet", "-b", "main"], cwd=project)
-        (project / "README").write_text("Workflow smoke project\n")
-        command(["git", "add", "README"], cwd=project)
-        command(
-            [
-                "git",
-                "-c",
-                "user.name=Ox",
-                "-c",
-                "user.email=ox@example.com",
-                "commit",
-                "--quiet",
-                "-m",
-                "first",
-            ],
-            cwd=project,
-        )
-        workflows = self.directory / "config" / "ox" / "workflows"
-        workflows.mkdir(parents=True)
-        # JSON is YAML, so each step's agent is a flow mapping.
-        agent = json.dumps(self.workflow_agent())
-        (workflows / "smoke.yaml").write_text(
-            "name: Smoke handoff\n"
-            "steps:\n"
-            "  - name: Extract\n"
-            f"    agent: {agent}\n"
-            "    prompt: Your input contains a token. Reply with only that token. "
-            "Do not use tools.\n"
-            "  - name: Repeat\n"
-            f"    agent: {agent}\n"
-            "    prompt: Your input is a token. Reply with only that token. "
-            "Do not use tools.\n"
-        )
-        workspace = self.add_workspace(project)
-        token = f"{self.directory.name}-workflow"
-        run = self.call(
-            "run.start",
-            workspace_id=workspace,
-            workflow="smoke",
-            input=f"The token is {token}.",
-            env=self.env,
-        )["id"]
-        info = None
-        try:
-            info = self.wait_run(run, self.args.timeout * 2)
-            check(info["state"] == "succeeded", f"The workflow did not succeed: {info}")
-            output = info["steps"][1]["output"]
-            check(token in output, f"The token did not reach step 2: {info}")
-            self.report(
-                "workflow_hands_off_between_steps",
-                run_id=run,
-                outputs=[step["output"] for step in info["steps"]],
-            )
-        finally:
-            self.remember_agents()
-            if self.daemon.poll() is None:
-                if info is None:
-                    # A run still going is cancelled, and removed once it ends.
-                    # Cancelling a run that has ended is refused.
-                    with contextlib.suppress(RuntimeError):
-                        self.call("run.cancel", run_id=run)
-                    self.wait_run(run, self.args.timeout)
-                self.call("run.delete", run_id=run, discard=True, env=self.env)
-                self.remove_workspace(workspace)
-
     def cleanup(self):
         try:
             if self.attachment is not None:
@@ -903,16 +807,7 @@ class ClaudeRun(SmokeRun):
             self.check_title_tool,
             self.check_load_after_restart,
             self.check_parking,
-            self.check_workflow,
         )
-
-    def workflow_agent(self):
-        return {
-            "harness": "claude",
-            "model": self.args.model,
-            "effort": "low",
-            "permission_mode": "acceptEdits",
-        }
 
     def permission(self):
         events = self.until(lambda e: kind(e) == "permission_requested")
@@ -1248,11 +1143,7 @@ class PiRun(SmokeRun):
             self.check_title_tool,
             self.check_load_after_restart,
             self.check_parking,
-            self.check_workflow,
         )
-
-    def workflow_agent(self):
-        return {"harness": "pi", "model": self.args.model, "effort": "low"}
 
     def check_thinking(self):
         thinking = self.set_option("thinking", "low")

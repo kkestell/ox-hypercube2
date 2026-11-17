@@ -23,7 +23,6 @@ use ox_protocol::{
 use tokio::sync::{OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
-use crate::instructions::{self, StepRole};
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
 use crate::store::{SavedSession, Store};
@@ -32,6 +31,11 @@ use crate::worktree::Worktree;
 
 type ConfigReply = oneshot::Sender<Result<Vec<SessionConfigOption>, String>>;
 
+/// Ox's instructions to an agent that has the `ox` tools.
+const OX_INSTRUCTIONS: &str = "You are running in Ox, a desktop app for coding agents.\n\n\
+    Use the `ox` tool `set_title` to give this session a short title once its task is clear, \
+    and again if the task changes.";
+
 /// How an agent task opens its ACP session: a new one, or a resumed one.
 enum Launch {
     New(Opening),
@@ -39,10 +43,7 @@ enum Launch {
 }
 
 /// What a new session's agent is given once it opens its ACP session.
-#[derive(Default)]
 pub struct Opening {
-    /// The workflow step a run's child session runs.
-    pub step: Option<StepRole>,
     /// Option values the agent is set to where it reports others.
     pub options: Vec<(String, SessionConfigOptionValue)>,
     /// The first prompt, with the seq of the `PromptStarted` event that
@@ -112,8 +113,6 @@ pub struct Session {
     unseen: Mutex<Option<Unseen>>,
     /// The connections that focus the session.
     focused: AtomicUsize,
-    /// The focus count of the run whose child the session is.
-    run_focused: Option<Arc<AtomicUsize>>,
 }
 
 /// Whether a session is quiet and unviewed. `lapses` counts the times it
@@ -205,12 +204,7 @@ impl Session {
     /// The session `saved` in `state`, in `worktree` if it runs in one: a
     /// session just saved is `starting`, and `start` launches its agent; a
     /// restored one is `exited`, and its stored history is read by
-    /// `history`. A run's child session shares the run's focus count,
-    /// `run_focused`.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the daemon's shared parts and the session's saved parts"
-    )]
+    /// `history`.
     pub fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
@@ -219,7 +213,6 @@ impl Session {
         saved: SavedSession,
         worktree: Option<Arc<Worktree>>,
         state: State,
-        run_focused: Option<Arc<AtomicUsize>>,
     ) -> Arc<Self> {
         let session = Arc::new(Self {
             last_seq: watch::Sender::new(state.last_seq()),
@@ -246,7 +239,6 @@ impl Session {
             parker: Mutex::new(None),
             unseen: Mutex::new(saved.unseen),
             focused: AtomicUsize::new(0),
-            run_focused,
         });
         *session.parker.lock().unwrap() =
             Some(tokio::spawn(session.clone().park_when_idle(park_after)));
@@ -407,11 +399,6 @@ impl Session {
         self.lock().title().map(String::from)
     }
 
-    /// Whether the session is a run's child session.
-    pub fn is_child(&self) -> bool {
-        self.run_focused.is_some()
-    }
-
     pub fn worktree(&self) -> Option<Arc<Worktree>> {
         self.worktree.lock().unwrap().clone()
     }
@@ -478,31 +465,16 @@ impl Session {
         SessionFocus(self.clone())
     }
 
-    /// Clears the unseen outcome of a child session whose run was focused.
-    pub fn clear_unseen(&self) {
-        self.update(|_| *self.unseen.lock().unwrap() = None);
-    }
-
-    /// Whether a connection focuses the session or its run.
-    fn focused(&self) -> bool {
-        self.focused.load(Ordering::SeqCst) > 0
-            || self
-                .run_focused
-                .as_ref()
-                .is_some_and(|run| run.load(Ordering::SeqCst) > 0)
-    }
-
     /// Records the unseen outcome `events` give a session out of focus. An
-    /// error replaces a finish but not the reverse, and a run's child
-    /// session takes no finish.
+    /// error replaces a finish but not the reverse.
     fn note_unseen(&self, events: &[Event]) {
-        if self.focused() {
+        if self.focused.load(Ordering::SeqCst) > 0 {
             return;
         }
         let mut unseen = self.unseen.lock().unwrap();
         match state::unseen(events) {
             Some(Unseen::Error) => *unseen = Some(Unseen::Error),
-            Some(Unseen::Finished) if unseen.is_none() && self.run_focused.is_none() => {
+            Some(Unseen::Finished) if unseen.is_none() => {
                 *unseen = Some(Unseen::Finished);
             }
             _ => {}
@@ -555,10 +527,8 @@ impl Session {
         self.lock().events_after(after_seq)
     }
 
-    /// Sends a prompt now, starting a turn or steering the running one, and
-    /// returns the seq of the `PromptStarted` or `PromptSteered` event that
-    /// records it.
-    pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<u64, ErrorBody> {
+    /// Sends a prompt now, starting a turn or steering the running one.
+    pub fn prompt(&self, prompt: Vec<ContentBlock>) -> Result<(), ErrorBody> {
         self.send_prompt(Request::Prompt(prompt))
     }
 
@@ -660,19 +630,18 @@ impl Session {
     }
 
     /// Takes a queued prompt out of the queue and sends it now.
-    pub fn queue_send(&self, id: String) -> Result<u64, ErrorBody> {
+    pub fn queue_send(&self, id: String) -> Result<(), ErrorBody> {
         self.send_prompt(Request::QueueSend { id })
     }
 
-    /// Applies a request that sends a prompt, sends it to the agent, and
-    /// returns the seq of the event that records it.
-    fn send_prompt(&self, request: Request) -> Result<u64, ErrorBody> {
+    /// Applies a request that sends a prompt, and sends it to the agent.
+    fn send_prompt(&self, request: Request) -> Result<(), ErrorBody> {
         self.update(|state| {
             let (prompt, seq) = state
                 .request(request)?
                 .expect("a prompt request sends a prompt");
             self.send(Command::Prompt { prompt, seq });
-            Ok(seq)
+            Ok(())
         })
     }
 
@@ -977,11 +946,7 @@ impl Session {
                     // chapter), so every later update finds it live.
                     let prompt_capabilities = capabilities.prompt.unwrap_or_default();
                     let mcp_servers = if capabilities.mcp.is_some_and(|mcp| mcp.stdio.is_some()) {
-                        vec![
-                            session
-                                .ox_server
-                                .for_session(&session.id, session.is_child()),
-                        ]
+                        vec![session.ox_server.for_session(&session.id)]
                     } else {
                         Vec::new()
                     };
@@ -990,11 +955,8 @@ impl Session {
                     // session's first prompt.
                     // TODO: A new session whose agent exits before its first
                     // prompt is resumed without them.
-                    let step = match &launch {
-                        Launch::New(opening) => opening.step.as_ref(),
-                        Launch::Resume(_) => None,
-                    };
-                    let instructions = instructions::text(step, !mcp_servers.is_empty());
+                    let instructions =
+                        (!mcp_servers.is_empty()).then(|| OX_INSTRUCTIONS.to_owned());
                     let takes_system_prompt = capabilities.system_prompt.is_some();
                     let system_prompt =
                         instructions

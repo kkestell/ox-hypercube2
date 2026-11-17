@@ -1,8 +1,8 @@
 # Ox
 
 Ox is a macOS desktop app for running Claude Code and Pi agents in parallel
-sessions and multi-step workflows. A per-user daemon runs the agents, so they
-keep working when the app closes.
+sessions. A per-user daemon runs the agents, so they keep working when the app
+closes.
 
 ## Features
 
@@ -10,8 +10,6 @@ keep working when the app closes.
   permissions, skills, and extension commands.
 - Sessions grouped by workspace, each in the workspace checkout or its own Git
   worktree and branch.
-- Workflows that run a task through a sequence of agent and shell steps in one
-  worktree.
 - Streaming responses, thinking, tool calls, and background-task updates. A
   completed turn's work folds under Worked, leaving its prompt and reply.
 - File attachments on prompts.

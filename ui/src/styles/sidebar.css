@@ -40,11 +40,10 @@
 }
 
 .sidebar-row {
-  --row-height: var(--sidebar-row-height);
   position: relative;
   display: flex;
   align-items: center;
-  height: var(--row-height);
+  height: var(--sidebar-row-height);
   border-radius: var(--radius-md);
 }
 
@@ -75,71 +74,4 @@
 /* A tree row indents by its depth. */
 .tree-row .select {
   padding-inline-start: calc(var(--sidebar-row-padding) + var(--depth) * var(--tree-indent));
-}
-
-/* A run's child row: its stretch of the line that runs down from the centre
-   of the run's status dot, with a stroke across to the child's dot that
-   starts beside the line, so translucent strokes never overlap. The last
-   child's line turns the corner into its stroke. It is an icon wide, so the
-   child's dot lines up with the start of the run's title. */
-.tree-branch {
-  --line: calc((var(--icon-size) - var(--border-width)) / 2);
-  --end: calc(
-    var(--icon-size) +
-    var(--sidebar-row-gap) +
-    (var(--icon-size) - var(--status-dot-size)) /
-    2
-  );
-  position: relative;
-  flex: none;
-  align-self: stretch;
-  width: var(--icon-size);
-  pointer-events: none;
-}
-
-.tree-branch::before,
-.tree-branch::after {
-  content: "";
-  position: absolute;
-  box-sizing: border-box;
-  border: 0 solid var(--border);
-}
-
-.tree-branch::before {
-  top: 0;
-  bottom: 0;
-  left: var(--line);
-  border-left-width: var(--border-width);
-}
-
-/* The first child's line starts just below the run's dot. */
-.tree-branch.first::before {
-  top: calc((var(--status-dot-size) - var(--row-height)) / 2);
-}
-
-.tree-branch::after {
-  bottom: 50%;
-  left: calc(var(--line) + var(--border-width));
-  width: var(--tree-branch-length);
-  border-bottom-width: var(--border-width);
-}
-
-.tree-branch.last::before {
-  bottom: 50%;
-  width: calc(var(--end) - var(--line));
-  border-bottom-width: var(--border-width);
-  border-bottom-left-radius: var(--radius-sm);
-}
-
-.tree-branch.last::after {
-  content: none;
-}
-
-/* A run's child rows are shorter than other rows. */
-.sidebar-row.child {
-  --row-height: calc(var(--spacing) * 6);
-}
-
-.child .title {
-  font-size: var(--text-xs);
 }

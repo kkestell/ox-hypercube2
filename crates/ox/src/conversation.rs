@@ -94,15 +94,6 @@ pub enum Item {
     },
 }
 
-/// An item and when its key first appeared: the time `oxd` recorded the
-/// event it came from, in milliseconds since the Unix epoch.
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct ConversationUpdate {
-    pub recorded_at: u64,
-    #[serde(flatten)]
-    pub item: Item,
-}
-
 /// A text or image block of a tool call's content.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -219,19 +210,8 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    /// The changes to the conversation from the next event, in order, each
-    /// with the time the event was recorded.
-    pub fn apply(&mut self, event: &Event) -> Vec<ConversationUpdate> {
-        self.items(event)
-            .into_iter()
-            .map(|item| ConversationUpdate {
-                recorded_at: event.recorded_at,
-                item,
-            })
-            .collect()
-    }
-
-    fn items(&mut self, event: &Event) -> Vec<Item> {
+    /// The changes to the conversation from the next event, in order.
+    pub fn apply(&mut self, event: &Event) -> Vec<Item> {
         let key = event.seq.to_string();
         match &event.kind {
             EventKind::AgentStarted { .. } => {
@@ -536,25 +516,25 @@ impl Item {
     }
 }
 
-/// `updates` with each item merged into the earlier one with its key, which
-/// keeps its time: text appended to text of the same kind, and anything else
-/// in its place. The UI ends with the same items applying the result as
-/// applying `updates` one by one.
-pub fn coalesce(updates: impl IntoIterator<Item = ConversationUpdate>) -> Vec<ConversationUpdate> {
-    let mut merged: Vec<ConversationUpdate> = Vec::new();
+/// `items` with each item merged into the earlier one with its key: text
+/// appended to text of the same kind, and anything else in its place. The UI
+/// ends with the same items applying the result as applying `items` one by
+/// one.
+pub fn coalesce(items: impl IntoIterator<Item = Item>) -> Vec<Item> {
+    let mut merged: Vec<Item> = Vec::new();
     let mut positions: HashMap<String, usize> = HashMap::new();
-    for update in updates {
-        if let Item::Removed { key } = &update.item {
+    for item in items {
+        if let Item::Removed { key } = &item {
             positions.remove(key);
         }
-        let Some(&position) = update.item.key().and_then(|key| positions.get(key)) else {
-            if let Some(key) = update.item.key() {
+        let Some(&position) = item.key().and_then(|key| positions.get(key)) else {
+            if let Some(key) = item.key() {
                 positions.insert(key.to_owned(), merged.len());
             }
-            merged.push(update);
+            merged.push(item);
             continue;
         };
-        match (&mut merged[position].item, update.item) {
+        match (&mut merged[position], item) {
             (
                 Item::Text { text, .. },
                 Item::Text {
@@ -604,38 +584,7 @@ mod tests {
                     kind,
                 })
             })
-            .map(|update| update.item)
             .collect()
-    }
-
-    /// `item` with key first seen at `recorded_at`.
-    fn at(recorded_at: u64, item: Item) -> ConversationUpdate {
-        ConversationUpdate { recorded_at, item }
-    }
-
-    #[test]
-    fn each_item_carries_the_time_of_its_event() {
-        let mut conversation = Conversation::default();
-        let updates = conversation.apply(&Event {
-            session_id: "s".into(),
-            seq: 1,
-            recorded_at: 5,
-            kind: agent("m", "Hello"),
-        });
-        assert_eq!(updates, [at(5, item_text("text:m", "Hello", false))]);
-        assert_eq!(
-            serde_json::to_value(&updates[0]).unwrap(),
-            json!({"recorded_at": 5, "type": "text", "key": "text:m", "text": "Hello", "replace": false})
-        );
-    }
-
-    #[test]
-    fn a_merged_item_keeps_the_time_its_key_first_appeared() {
-        let merged = coalesce([
-            at(5, item_text("a", "x", false)),
-            at(9, item_text("a", "y", false)),
-        ]);
-        assert_eq!(merged, [at(5, item_text("a", "xy", false))]);
     }
 
     fn text(text: &str) -> ContentBlock {
@@ -1297,11 +1246,7 @@ mod tests {
             ),
         ];
         for (name, items, expected) in cases {
-            let merged: Vec<_> = coalesce(items.into_iter().map(|item| at(0, item)))
-                .into_iter()
-                .map(|update| update.item)
-                .collect();
-            assert_eq!(merged, expected, "{name}");
+            assert_eq!(coalesce(items), expected, "{name}");
         }
     }
 }

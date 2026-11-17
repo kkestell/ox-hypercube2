@@ -73,6 +73,3 @@ Delete and archive refuse to remove a worktree that has
 uncommitted changes, commits on no branch, remote branch or tag, or submodule
 commits on no remote branch. Ox asks whether to discard the unsaved work
 before removing the worktree.
-
-A [workflow run](workflows.md#cancelling-removing-and-restarting) owns its
-worktree.

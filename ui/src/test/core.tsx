@@ -12,9 +12,7 @@ import type {
   DirEntry,
   FileContent,
   ListingChange,
-  RunInfo,
   SessionInfo,
-  StepInfo,
   WatchMessage,
   WorkspaceInfo,
   WorktreeInfo,
@@ -59,8 +57,6 @@ export class Core {
           return null;
         case "agents":
           return this.agents;
-        case "workflows":
-          return [];
         case "workspace_branches":
           return { head: "main" };
         case "agent_controls":
@@ -146,14 +142,14 @@ export async function renderApp(...changes: ListingChange[]) {
   return core;
 }
 
-/** Views the session or run titled `title` from the sidebar. */
+/** Views the session titled `title` from the sidebar. */
 export async function view(title: string) {
   const row = sidebarRow(title);
   await act(async () => row.querySelector<HTMLButtonElement>("button.select")!.click());
   return row;
 }
 
-/** The sidebar row of the session or run titled `title`. */
+/** The sidebar row of the session titled `title`. */
 export function sidebarRow(title: string): HTMLElement {
   return screen.getByText(title, { selector: ".sidebar-row .title" }).closest("li")!;
 }
@@ -198,35 +194,6 @@ export function worktree(fields: Partial<WorktreeInfo> = {}): WorktreeInfo {
     created_branch: true,
     compare: "main",
     comparison: { type: "compared", tip: "b", compare_tip: "a", ahead: 0, behind: 0 },
-    ...fields,
-  };
-}
-
-export function run(
-  workspaceInfo: WorkspaceInfo,
-  worktreeInfo: WorktreeInfo,
-  steps: Partial<StepInfo>[],
-  fields: Partial<RunInfo> = {},
-): RunInfo {
-  return {
-    id: nextId("run"),
-    workspace_id: workspaceInfo.id,
-    workflow: "implement",
-    name: "Implement",
-    input: "",
-    worktree_id: worktreeInfo.id,
-    state: "running",
-    error: null,
-    steps: steps.map((step, index) => ({
-      name: `Step ${index + 1}`,
-      state: "pending",
-      started_at: null,
-      session_id: null,
-      ...step,
-    })),
-    created_at: ++ids,
-    ended_at: null,
-    unseen: null,
     ...fields,
   };
 }

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,29 +10,24 @@ use ox_protocol::schema::{
     SessionConfigSelectOptions, TextContent,
 };
 use ox_protocol::{
-    Branches, Checkout, CommandState, ConfigSetting, ConfigValue, Deleted, ErrorBody, Focus,
-    Harness, ListingChange, MessageSent, Method, QueueAdded, RunInfo, RunState, Sender,
-    SessionInfo, SessionState, StepInfo, StepState, Unseen, WorkspaceInfo, code,
+    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, Harness, ListingChange,
+    MessageSent, Method, QueueAdded, Sender, SessionInfo, SessionState, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{OwnedMutexGuard, watch};
 
 use crate::branches;
 use crate::directories::Directories;
-use crate::instructions::StepRole;
 use crate::mcp::OxServer;
-use crate::run::{Run, RunFocus};
-use crate::session::{self, Opening, Session, SessionFocus};
+use crate::session::{self, Opening, Session};
 use crate::state::{self, Change, Queue, State};
-use crate::store::{SavedRun, SavedSession, SavedWorkspace, SessionWorktree, Store};
-use crate::workflow;
+use crate::store::{SavedSession, SavedWorkspace, Store};
 use crate::worktree::{self, Git, Worktree, WorktreePlan};
 
 struct Registry {
     workspaces: Vec<SavedWorkspace>,
     worktrees: HashMap<String, Arc<Worktree>>,
     sessions: HashMap<String, Arc<Session>>,
-    runs: HashMap<String, Arc<Run>>,
     clients: usize,
     moving_checkouts: HashSet<PathBuf>,
     /// Counts the changes to the registry.
@@ -43,16 +37,14 @@ struct Registry {
 pub struct Daemon {
     registry: Mutex<Registry>,
     store: Arc<Store>,
-    /// The directory that holds sessions' and runs' worktrees.
+    /// The directory that holds sessions' worktrees.
     worktrees_dir: PathBuf,
-    /// The directory that holds workflow definitions.
-    workflows_dir: PathBuf,
     /// How long a session stays idle, with no background work, and unviewed
     /// before its agent is parked.
     park_after: Duration,
-    /// Sent when a workspace, worktree, session or run is added or removed, a
-    /// client connects or disconnects, or a session's `SessionInfo`, a
-    /// worktree's `WorktreeInfo` or a run's `RunInfo` changes.
+    /// Sent when a workspace, worktree or session is added or removed, a
+    /// client connects or disconnects, or a session's `SessionInfo` or a
+    /// worktree's `WorktreeInfo` changes.
     changed: watch::Sender<()>,
     /// The directories that directory watches follow.
     directories: Arc<Directories>,
@@ -61,14 +53,13 @@ pub struct Daemon {
 }
 
 /// What a watch has sent: the workspaces, as of a version of the registry,
-/// and the version of each worktree's, session's and run's info.
+/// and the version of each worktree's and session's info.
 #[derive(Default)]
 pub struct Sent {
     registry_version: Option<u64>,
     workspaces: Vec<WorkspaceInfo>,
     worktrees: HashMap<String, u64>,
     sessions: HashMap<String, u64>,
-    runs: HashMap<String, u64>,
 }
 
 /// Counts one connected client for as long as it lives.
@@ -78,13 +69,6 @@ impl Drop for ClientGuard {
     fn drop(&mut self) {
         self.0.update(|registry| registry.clients -= 1);
     }
-}
-
-/// A connection's focus on a session or a run, counted while it lives.
-#[expect(dead_code, reason = "a guard is held for its drop")]
-pub enum FocusGuard {
-    Session(SessionFocus),
-    Run(RunFocus),
 }
 
 struct CheckoutMove<'a> {
@@ -115,31 +99,20 @@ impl Registry {
         }
         Ok(())
     }
-
-    /// The session's worktree, unless a run owns it.
-    fn owned_worktree(&self, session: &Session) -> Option<Arc<Worktree>> {
-        session
-            .worktree()
-            .filter(|worktree| !self.runs.values().any(|run| run.worktree.id == worktree.id))
-    }
 }
 
 impl Daemon {
-    /// A daemon with the workspaces, worktrees, sessions and runs `store`
-    /// holds, which adds worktrees in `worktrees_dir`, reads workflow
-    /// definitions from `workflows_dir`, and parks the agent of a session
-    /// that has been idle, with no background work, and unviewed for
+    /// A daemon with the workspaces, worktrees and sessions `store` holds,
+    /// which adds worktrees in `worktrees_dir` and parks the agent of a
+    /// session that has been idle, with no background work, and unviewed for
     /// `park_after`, whose directory watches follow `directories`, and whose
     /// sessions' agents are given `ox_server`. Each saved session is
     /// `exited`, with no agent, until it loads. A saved session that never
     /// started has nothing to load. One without a worktree is deleted; one
-    /// with a worktree stays `exited`. A run that was running is
-    /// `interrupted`, with its running step and command, and stays so, with
-    /// an unseen error.
+    /// with a worktree stays `exited`.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
-        workflows_dir: PathBuf,
         park_after: Duration,
         directories: Arc<Directories>,
         ox_server: Arc<OxServer>,
@@ -151,40 +124,6 @@ impl Daemon {
             .into_iter()
             .map(|saved| (saved.id.clone(), Worktree::new(saved, changed.clone())))
             .collect();
-        let runs: HashMap<String, Arc<Run>> = store
-            .runs()?
-            .into_iter()
-            .map(|mut saved| {
-                if saved.state == RunState::Running {
-                    saved.state = RunState::Interrupted;
-                    for step in &mut saved.steps {
-                        if step.state == StepState::Running {
-                            step.state = StepState::Interrupted;
-                        }
-                        for command in &mut step.commands {
-                            if command.state == CommandState::Running {
-                                command.state = CommandState::Interrupted;
-                            }
-                        }
-                    }
-                    saved.unseen = Some(Unseen::Error);
-                    store.update_run(
-                        &saved.id,
-                        saved.state,
-                        saved.error.as_deref(),
-                        &saved.steps,
-                        saved.ended_at,
-                        saved.unseen,
-                    )?;
-                }
-                let worktree = worktrees
-                    .get(&saved.worktree_id)
-                    .expect("a run's worktree is saved")
-                    .clone();
-                let run = Run::new(saved, worktree, store.clone(), changed.clone());
-                Ok((run.id.clone(), run))
-            })
-            .collect::<rusqlite::Result<_>>()?;
         let mut sessions = HashMap::new();
         let saved_sessions = store.sessions()?;
         for saved in saved_sessions {
@@ -212,11 +151,6 @@ impl Daemon {
                     State::unstarted(saved.id.clone(), saved.title.clone(), saved.queue.clone())
                 }
             };
-            let run_focused = worktree.as_ref().and_then(|worktree| {
-                runs.values()
-                    .find(|run| run.worktree.id == worktree.id)
-                    .map(|run| run.focused())
-            });
             let session = Session::new(
                 store.clone(),
                 changed.clone(),
@@ -225,7 +159,6 @@ impl Daemon {
                 saved,
                 worktree,
                 state,
-                run_focused,
             );
             sessions.insert(session.id.clone(), session);
         }
@@ -233,7 +166,6 @@ impl Daemon {
             workspaces: store.workspaces()?,
             worktrees,
             sessions,
-            runs,
             clients: 0,
             moving_checkouts: HashSet::new(),
             version: 0,
@@ -242,7 +174,6 @@ impl Daemon {
             registry: Mutex::new(registry),
             store,
             worktrees_dir,
-            workflows_dir,
             park_after,
             changed,
             directories,
@@ -255,8 +186,8 @@ impl Daemon {
         ClientGuard(self.clone())
     }
 
-    /// Resolves once the daemon has had no clients, no running agents and no
-    /// running runs for `idle_exit`. A session whose agent is not running,
+    /// Resolves once the daemon has had no clients and no running agents for
+    /// `idle_exit`. A session whose agent is not running,
     /// `exited`, is saved and does not keep the daemon alive.
     pub async fn idle(&self, idle_exit: Duration) {
         idle_for(self.changed.subscribe(), idle_exit, || self.is_idle()).await;
@@ -267,25 +198,17 @@ impl Daemon {
         nothing_running(
             registry.clients,
             registry.sessions.values().map(|session| session.state()),
-            registry.runs.values().any(|run| run.running()),
         )
     }
 
-    /// Stops every runner, every agent and every comparison. The runs and
-    /// sessions stay saved. Runners stop first, so that none sees its step's
-    /// session close.
+    /// Stops every agent and every comparison. The sessions stay saved.
     pub fn close_all(&self) {
-        let mut runs = Vec::new();
         let mut sessions = Vec::new();
         let mut worktrees = Vec::new();
         self.update(|registry| {
-            runs.extend(registry.runs.drain().map(|(_, r)| r));
             sessions.extend(registry.sessions.drain().map(|(_, s)| s));
             worktrees.extend(registry.worktrees.drain().map(|(_, w)| w));
         });
-        for run in runs {
-            run.close();
-        }
         for session in sessions {
             session.close();
         }
@@ -331,40 +254,6 @@ impl Daemon {
             .ok_or_else(|| not_found("session", id))?;
         registry.refuse_moving(session.cwd())?;
         send(session)
-    }
-
-    /// Counts a connection's focus on a session or a run while the guard
-    /// lives, and clears its unseen outcome: a run's, then its child
-    /// sessions'. Refused for an unknown ID.
-    pub fn focus(&self, focus: Focus) -> Result<FocusGuard, ErrorBody> {
-        match focus {
-            Focus::Session { session_id } => {
-                Ok(FocusGuard::Session(self.session(&session_id)?.focus()))
-            }
-            Focus::Run { run_id } => {
-                let run = self.run(&run_id)?;
-                let guard = run.focus();
-                let children: Vec<Arc<Session>> = {
-                    let registry = self.lock();
-                    run.session_ids()
-                        .iter()
-                        .filter_map(|id| registry.sessions.get(id).cloned())
-                        .collect()
-                };
-                for child in children {
-                    child.clear_unseen();
-                }
-                Ok(FocusGuard::Run(guard))
-            }
-        }
-    }
-
-    fn run(&self, id: &str) -> Result<Arc<Run>, ErrorBody> {
-        self.lock()
-            .runs
-            .get(id)
-            .cloned()
-            .ok_or_else(|| not_found("run", id))
     }
 
     fn worktree(&self, id: &str) -> Result<Arc<Worktree>, ErrorBody> {
@@ -558,24 +447,6 @@ impl Daemon {
                 self.session(&session_id)?.set_title(&title)?;
                 Ok(Value::Null)
             }
-            Method::RunStart {
-                workspace_id,
-                workflow,
-                input,
-                env,
-            } => Ok(to_value(
-                self.start_run(&workspace_id, &workflow, input, env).await?,
-            )),
-            Method::RunCancel { run_id } => {
-                self.run(&run_id)?.cancel()?;
-                Ok(Value::Null)
-            }
-            Method::RunDelete {
-                run_id,
-                discard,
-                env,
-            } => Ok(to_value(self.delete_run(&run_id, discard, env).await?)),
-            Method::WorkflowList => Ok(to_value(workflow::list(&self.workflows_dir))),
             Method::Hello { .. }
             | Method::SessionSubscribe { .. }
             | Method::Watch
@@ -602,12 +473,11 @@ impl Daemon {
         result
     }
 
-    /// The changes to the workspaces, worktrees, sessions and runs since
-    /// `sent`, which then records them: removals of runs, sessions and
-    /// worktrees, then additions and changes of workspaces, worktrees,
-    /// sessions and runs, in that order, so that a session's worktree comes
-    /// before the session, and a run's worktree and child sessions before the
-    /// run. Only worktrees, sessions and runs whose info changed are read,
+    /// The changes to the workspaces, worktrees and sessions since `sent`,
+    /// which then records them: removals of sessions and worktrees, then
+    /// additions and changes of workspaces, worktrees and sessions, in that
+    /// order, so that a session's worktree comes before the session. Only
+    /// worktrees and sessions whose info changed are read,
     /// and the workspaces only when the registry changed, such as when a
     /// client connects.
     pub fn listing_changes(&self, sent: &mut Sent) -> Vec<ListingChange> {
@@ -619,14 +489,9 @@ impl Daemon {
             stale(&registry.worktrees, &sent.worktrees, Worktree::version);
         let (mut outdated, removed) =
             stale(&registry.sessions, &sent.sessions, Session::info_version);
-        let (mut outdated_runs, removed_runs) = stale(&registry.runs, &sent.runs, Run::version);
         drop(registry);
 
         let mut changes = Vec::new();
-        for id in removed_runs {
-            sent.runs.remove(&id);
-            changes.push(ListingChange::RunRemoved { run_id: id });
-        }
         for id in removed {
             sent.sessions.remove(&id);
             changes.push(ListingChange::SessionRemoved { session_id: id });
@@ -666,12 +531,6 @@ impl Daemon {
             changes.push(ListingChange::Session {
                 session: Box::new(info),
             });
-        }
-        outdated_runs.sort_by_key(|run| run.number);
-        for run in outdated_runs {
-            let (info, version) = run.versioned_info();
-            sent.runs.insert(run.id.clone(), version);
-            changes.push(ListingChange::Run { run: info });
         }
         changes
     }
@@ -724,7 +583,7 @@ impl Daemon {
             {
                 return Err(ErrorBody {
                     code: code::INVALID_STATE,
-                    message: "the workspace has sessions or runs".into(),
+                    message: "the workspace has sessions".into(),
                 });
             }
             self.store
@@ -757,7 +616,6 @@ impl Daemon {
             state::check_prompt(prompt, &PromptCapabilities::default())?;
         }
         let opening = Opening {
-            step: None,
             options: config
                 .into_iter()
                 .map(|setting| (setting.config_id, session::option_value(setting.value)))
@@ -769,26 +627,6 @@ impl Daemon {
             return self.add_session(id, workspace_id, command, env, &mut None, opening, prompt);
         };
         let git = Git::for_client(env.clone());
-        self.with_new_worktree(workspace_id, compare, branch, git, "session", |worktree| {
-            self.add_session(id, workspace_id, command, env, worktree, opening, prompt)
-        })
-        .await
-    }
-
-    /// Plans a new worktree of the workspace on local branch `branch`, or on
-    /// a new branch at `HEAD`, which it creates, compared with `compare`,
-    /// and gives `add` the worktree to take once it is saved. A branch
-    /// created for a worktree `add` does not take, a `what` that was not
-    /// saved, is deleted again.
-    async fn with_new_worktree<T>(
-        &self,
-        workspace_id: &str,
-        compare: Option<String>,
-        branch: Option<String>,
-        git: Git,
-        what: &str,
-        add: impl FnOnce(&mut Option<(Git, WorktreePlan)>) -> Result<T, ErrorBody>,
-    ) -> Result<T, ErrorBody> {
         let workspace = self.workspace_path(workspace_id)?;
         let worktree_id = uuid::Uuid::new_v4().to_string();
         let plan = worktree::plan(
@@ -803,12 +641,21 @@ impl Daemon {
         if plan.created_branch {
             worktree::create_branch(&git, &plan).await?;
         }
+        // A branch created for a session that is not saved is deleted again.
         let mut pending = Some((git, plan));
-        let added = add(&mut pending);
+        let added = self.add_session(
+            id,
+            workspace_id,
+            command,
+            env,
+            &mut pending,
+            opening,
+            prompt,
+        );
         if let Some((git, plan)) = pending
             && let Err(error) = worktree::roll_back(&git, &plan, false).await
         {
-            eprintln!("oxd: undoing a {what} that was not saved: {error}");
+            eprintln!("oxd: undoing a session that was not saved: {error}");
         }
         added
     }
@@ -841,22 +688,44 @@ impl Daemon {
                 Some((_, plan)) => (plan.cwd.clone(), Some(plan.saved())),
                 None => (workspace.path.clone(), None),
             };
-            let session = self.save_session(
-                registry,
-                id,
-                workspace_id,
+            registry.refuse_moving(&cwd)?;
+            let created_at = now();
+            let number = self
+                .store
+                .add_session(
+                    &id,
+                    workspace_id,
+                    &command,
+                    &cwd,
+                    saved_worktree.as_ref(),
+                    created_at,
+                )
+                .map_err(|error| storage(&error))?;
+            let saved = SavedSession {
+                number,
+                id: id.clone(),
+                workspace_id: workspace_id.into(),
                 command,
                 cwd,
-                saved_worktree
-                    .as_ref()
-                    .map_or(SessionWorktree::None, SessionWorktree::New),
-                || {
-                    saved_worktree
-                        .clone()
-                        .map(|saved| Worktree::new(saved, self.changed.clone()))
-                },
-                None,
-            )?;
+                title: None,
+                agent_session_id: None,
+                worktree_id: saved_worktree.as_ref().map(|saved| saved.id.clone()),
+                last_seq: 0,
+                archived: false,
+                created_at,
+                unseen: None,
+                queue: Queue::default(),
+            };
+            let session = Session::new(
+                self.store.clone(),
+                self.changed.clone(),
+                self.park_after,
+                self.ox_server.clone(),
+                saved,
+                saved_worktree.map(|saved| Worktree::new(saved, self.changed.clone())),
+                State::new(id.clone()),
+            );
+            registry.sessions.insert(id, session.clone());
             if let Some(prompt) = prompt {
                 if let Some(title) = acp_bridge::title(&prompt_text(&prompt)) {
                     session
@@ -886,71 +755,6 @@ impl Daemon {
             }
             Ok(session.info())
         })
-    }
-
-    /// Saves session `id`, `starting`, in `cwd` of the workspace, and
-    /// registers it, with the worktree `worktree` gives once the session is
-    /// saved, and the focus count of its run, `run_focused`, if it is a
-    /// run's child.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the session's saved fields, which the two callers build differently"
-    )]
-    fn save_session(
-        &self,
-        registry: &mut Registry,
-        id: String,
-        workspace_id: &str,
-        command: Vec<String>,
-        cwd: PathBuf,
-        saved_worktree: SessionWorktree<'_>,
-        worktree: impl FnOnce() -> Option<Arc<Worktree>>,
-        run_focused: Option<Arc<AtomicUsize>>,
-    ) -> Result<Arc<Session>, ErrorBody> {
-        registry.refuse_moving(&cwd)?;
-        let created_at = now();
-        let number = self
-            .store
-            .add_session(
-                &id,
-                workspace_id,
-                &command,
-                &cwd,
-                saved_worktree,
-                created_at,
-            )
-            .map_err(|error| storage(&error))?;
-        let worktree = worktree();
-        let state = State::new(id.clone());
-        let saved = SavedSession {
-            number,
-            id,
-            workspace_id: workspace_id.into(),
-            command,
-            cwd,
-            title: None,
-            agent_session_id: None,
-            worktree_id: worktree.as_ref().map(|worktree| worktree.id.clone()),
-            last_seq: 0,
-            archived: false,
-            created_at,
-            unseen: None,
-            queue: Queue::default(),
-        };
-        let session = Session::new(
-            self.store.clone(),
-            self.changed.clone(),
-            self.park_after,
-            self.ox_server.clone(),
-            saved,
-            worktree,
-            state,
-            run_focused,
-        );
-        registry
-            .sessions
-            .insert(session.id.clone(), session.clone());
-        Ok(session)
     }
 
     /// Adds the session's worktree, then launches its agent in it with
@@ -987,90 +791,9 @@ impl Daemon {
         session.fail_start(message);
     }
 
-    /// Starts a run of workflow `workflow` in a new worktree of the
-    /// workspace's repository, on a new branch at `HEAD`. The definition is
-    /// read, and the branch created, before the answer; the runner adds the
-    /// worktree and runs the steps.
-    async fn start_run(
-        self: &Arc<Self>,
-        workspace_id: &str,
-        workflow: &str,
-        input: String,
-        env: BTreeMap<String, String>,
-    ) -> Result<RunInfo, ErrorBody> {
-        let definition = workflow::load(&self.workflows_dir, workflow)?;
-        let git = Git::for_client(env.clone());
-        self.with_new_worktree(workspace_id, None, None, git, "run", |pending| {
-            self.update(|registry| {
-                if !registry
-                    .workspaces
-                    .iter()
-                    .any(|workspace| workspace.id == workspace_id)
-                {
-                    return Err(not_found("workspace", workspace_id));
-                }
-                let (_, plan) = pending.as_ref().expect("the worktree is not added yet");
-                registry.refuse_moving(&plan.cwd)?;
-                let saved_worktree = plan.saved();
-                let mut saved = SavedRun {
-                    number: 0,
-                    id: uuid::Uuid::new_v4().to_string(),
-                    workspace_id: workspace_id.into(),
-                    worktree_id: saved_worktree.id.clone(),
-                    workflow: workflow.into(),
-                    name: definition.name.clone(),
-                    input,
-                    state: RunState::Running,
-                    error: None,
-                    steps: definition
-                        .steps
-                        .iter()
-                        .map(|step| StepInfo {
-                            name: step.name.clone(),
-                            state: StepState::Pending,
-                            started_at: None,
-                            session_id: None,
-                            output: None,
-                            commands: Vec::new(),
-                        })
-                        .collect(),
-                    created_at: now(),
-                    ended_at: None,
-                    unseen: None,
-                };
-                saved.number = self
-                    .store
-                    .add_run(&saved, &saved_worktree)
-                    .map_err(|error| storage(&error))?;
-                let worktree = Worktree::new(saved_worktree, self.changed.clone());
-                registry
-                    .worktrees
-                    .insert(worktree.id.clone(), worktree.clone());
-                let run = Run::new(saved, worktree, self.store.clone(), self.changed.clone());
-                let (git, plan) = pending.take().expect("the worktree is not added yet");
-                run.spawn(self.clone(), definition, git, plan, env);
-                let info = run.info();
-                registry.runs.insert(run.id.clone(), run);
-                Ok(info)
-            })
-        })
-        .await
-    }
-
-    /// The ACP bridge of `harness`, beside the daemon's executable.
-    fn bridge(harness: Harness) -> Result<PathBuf, ErrorBody> {
-        Ok(std::env::current_exe()
-            .map_err(|error| ErrorBody {
-                code: code::INVALID_STATE,
-                message: format!("finding the daemon's executable: {error}"),
-            })?
-            .with_file_name(harness.bridge()))
-    }
-
-    /// Sends a peer message from standalone session `sender_id` to
-    /// standalone session `to`. An exited recipient is loaded first, with
-    /// the sender's environment, and the message waits for its agent to
-    /// start.
+    /// Sends a peer message from session `sender_id` to session `to`. An
+    /// exited recipient is loaded first, with the sender's environment, and
+    /// the message waits for its agent to start.
     async fn send_message(
         &self,
         sender_id: &str,
@@ -1078,11 +801,6 @@ impl Daemon {
         text: String,
     ) -> Result<MessageSent, ErrorBody> {
         let sender = self.session(sender_id)?;
-        if sender.is_child() {
-            return Err(invalid_request(
-                "a workflow run's session cannot send messages".into(),
-            ));
-        }
         if to == sender_id {
             return Err(invalid_request("a session cannot message itself".into()));
         }
@@ -1090,11 +808,6 @@ impl Daemon {
             return Err(invalid_request("the message is empty".into()));
         }
         let recipient = self.session(to)?;
-        if recipient.is_child() {
-            return Err(invalid_request(format!(
-                "session {to} belongs to a workflow run"
-            )));
-        }
         if recipient.archived() {
             return Err(invalid_state(&format!("session {to} is archived")));
         }
@@ -1116,7 +829,7 @@ impl Daemon {
         Ok(MessageSent { steered })
     }
 
-    /// Asks the user, through a permission request on standalone session
+    /// Asks the user, through a permission request on session
     /// `requester_id`, to start the session `request` describes, once it is
     /// checked. Starting it, the new session gets the requester's
     /// environment. Resolves to `None` when the user does not start it.
@@ -1126,11 +839,6 @@ impl Daemon {
         request: SessionRequest,
     ) -> Result<Option<SessionInfo>, ErrorBody> {
         let requester = self.session(requester_id)?;
-        if requester.is_child() {
-            return Err(invalid_request(
-                "a workflow run's session cannot request sessions".into(),
-            ));
-        }
         if request.prompt.trim().is_empty() {
             return Err(invalid_request("the prompt is empty".into()));
         }
@@ -1158,7 +866,13 @@ impl Daemon {
                 invalid_request("this session's harness is not known; name one".into())
             })?,
         };
-        let bridge = Self::bridge(harness)?;
+        // The harness's ACP bridge sits beside the daemon's executable.
+        let bridge = std::env::current_exe()
+            .map_err(|error| ErrorBody {
+                code: code::INVALID_STATE,
+                message: format!("finding the daemon's executable: {error}"),
+            })?
+            .with_file_name(harness.bridge());
         if !bridge.is_file() {
             return Err(invalid_state(&format!(
                 "the {} bridge is not installed at {}",
@@ -1250,106 +964,6 @@ impl Daemon {
             .map(Some)
     }
 
-    /// Saves, registers and starts the child session of step `position` of
-    /// `run`, which runs `role`: the bridge of `harness` beside the daemon's
-    /// executable, in `cwd` in the run's worktree, with `env` over the
-    /// daemon's environment.
-    pub fn add_step_session(
-        self: &Arc<Self>,
-        run: &Run,
-        position: usize,
-        role: StepRole,
-        harness: Harness,
-        cwd: &Path,
-        env: BTreeMap<String, String>,
-    ) -> Result<Arc<Session>, ErrorBody> {
-        let bridge = Self::bridge(harness)?;
-        let command = vec![bridge.to_string_lossy().into_owned()];
-        let id = uuid::Uuid::new_v4().to_string();
-        self.update(|registry| {
-            let session = self.save_session(
-                registry,
-                id,
-                &run.workspace_id,
-                command,
-                cwd.to_owned(),
-                SessionWorktree::Run(&run.worktree.id),
-                || Some(run.worktree.clone()),
-                Some(run.focused()),
-            )?;
-            session.start(
-                env,
-                Opening {
-                    step: Some(role),
-                    ..Opening::default()
-                },
-            );
-            run.set_step_session(position, &session.id);
-            Ok(session)
-        })
-    }
-
-    /// Removes a run that is not running: its child sessions' agents are
-    /// stopped, its worktree removed and the branch rule applied, with git
-    /// run with `env`, and the run and its child sessions deleted. A
-    /// worktree that would lose work refuses the removal unless `discard` is
-    /// set, leaving the run as it was.
-    async fn delete_run(
-        &self,
-        id: &str,
-        discard: bool,
-        env: BTreeMap<String, String>,
-    ) -> Result<Deleted, ErrorBody> {
-        let run = self.run(id)?;
-        if run.running() {
-            return Err(invalid_state("the run is running"));
-        }
-        let sessions: Vec<Arc<Session>> = {
-            let registry = self.lock();
-            run.session_ids()
-                .iter()
-                .filter_map(|id| registry.sessions.get(id).cloned())
-                .collect()
-        };
-        let mut lifecycles = Vec::new();
-        for session in &sessions {
-            lifecycles.push(session.lifecycle().await);
-        }
-        if !self.lock().runs.contains_key(id) {
-            return Err(not_found("run", id));
-        }
-        let git = Git::for_client(env);
-        let stop = async {
-            for session in &sessions {
-                session.stop(Change::Exited(None)).await;
-            }
-        };
-        run.worktree.remove(&git, discard, stop).await?;
-        let kept_branch = run.worktree.apply_branch_rule(&git).await?;
-        self.recompare(&run.worktree.saved().common_dir);
-        self.update(|registry| {
-            self.store.remove_run(id).map_err(|error| storage(&error))?;
-            registry.runs.remove(id);
-            registry.worktrees.remove(&run.worktree.id);
-            for session in &sessions {
-                registry.sessions.remove(&session.id);
-            }
-            Ok::<_, ErrorBody>(())
-        })?;
-        drop(lifecycles);
-        run.close();
-        for session in &sessions {
-            session.close();
-        }
-        run.worktree.close();
-        Ok(Deleted { kept_branch })
-    }
-
-    /// The session's worktree, unless a run owns it.
-    fn owned_worktree(&self, session: &Session) -> Option<Arc<Worktree>> {
-        self.lock().owned_worktree(session)
-    }
-
     fn workspace_path(&self, id: &str) -> Result<PathBuf, ErrorBody> {
         self.lock()
             .workspaces
@@ -1386,9 +1000,8 @@ impl Daemon {
     }
 
     /// Deletes a session once its startup has finished. A session in a
-    /// worktree of its own has its agent stopped, then its worktree removed
-    /// and the branch rule applied, with git run with `env`; a run's child
-    /// session leaves the run's worktree. A worktree that would
+    /// worktree has its agent stopped, then its worktree removed and the
+    /// branch rule applied, with git run with `env`. A worktree that would
     /// lose work refuses the delete unless `discard` is set, leaving the
     /// session as it was, or `exited` when the work appeared after its agent
     /// stopped.
@@ -1401,7 +1014,7 @@ impl Daemon {
         let session = self.session(id)?;
         let _lifecycle = self.lifecycle(&session).await?;
         let mut kept_branch = None;
-        if let Some(worktree) = self.owned_worktree(&session) {
+        if let Some(worktree) = session.worktree() {
             let git = Git::for_client(env);
             worktree
                 .remove(&git, discard, session.stop(Change::Exited(None)))
@@ -1414,10 +1027,10 @@ impl Daemon {
         Ok(Deleted { kept_branch })
     }
 
-    /// Archives a session that is not starting: its agent is
-    /// stopped and its own worktree removed, with git run with `env`, and the
-    /// branch is kept. A run's child session leaves the run's worktree. A worktree that would lose work refuses the archive
-    /// unless `discard` is set, leaving the session as it was, or `exited`
+    /// Archives a session that is not starting: its agent is stopped and its
+    /// worktree removed, with git run with `env`, and the branch is kept. A
+    /// worktree that would lose work refuses the archive unless `discard` is
+    /// set, leaving the session as it was, or `exited`
     /// when the work appeared after its agent stopped.
     async fn archive_session(
         &self,
@@ -1432,7 +1045,7 @@ impl Daemon {
         if session.archived() {
             return Err(invalid_state("the session is already archived"));
         }
-        match self.owned_worktree(&session) {
+        match session.worktree() {
             Some(worktree) => {
                 let git = Git::for_client(env);
                 worktree
@@ -1448,7 +1061,7 @@ impl Daemon {
         Ok(session.info())
     }
 
-    /// Adds an archived session's own worktree again, with git run with
+    /// Adds an archived session's worktree again, with git run with
     /// `env`, and unarchives it.
     async fn unarchive_session(
         &self,
@@ -1460,7 +1073,7 @@ impl Daemon {
         if !session.archived() {
             return Err(invalid_state("the session is not archived"));
         }
-        if let Some(worktree) = self.owned_worktree(&session) {
+        if let Some(worktree) = session.worktree() {
             worktree.restore(&Git::for_client(env)).await?;
         }
         self.store
@@ -1532,25 +1145,17 @@ impl Daemon {
         }
     }
 
-    /// Deletes the session's rows, with its own worktree's, and removes both
-    /// from the registry. A run's child session leaves the run's worktree,
-    /// and its step no longer names it.
+    /// Deletes the session's rows, with its worktree's, and removes both from
+    /// the registry.
     fn forget(&self, id: &str) -> Result<(), ErrorBody> {
         let worktree = self.update(|registry| {
             self.store
                 .remove_session(id)
                 .map_err(|error| storage(&error))?;
             let session = registry.sessions.remove(id);
-            let worktree = session
-                .as_ref()
-                .and_then(|session| registry.owned_worktree(session));
+            let worktree = session.and_then(|session| session.worktree());
             if let Some(worktree) = &worktree {
                 registry.worktrees.remove(&worktree.id);
-            }
-            for run in registry.runs.values() {
-                if run.session_ids().iter().any(|session_id| session_id == id) {
-                    run.forget_session(id);
-                }
             }
             Ok::<_, ErrorBody>(worktree)
         })?;
@@ -1732,14 +1337,10 @@ fn to_value(value: impl serde::Serialize) -> Value {
     serde_json::to_value(value).expect("protocol types serialize")
 }
 
-/// Whether nothing keeps the daemon running: no client, no session whose
-/// agent is running, and no running run.
-fn nothing_running(
-    clients: usize,
-    mut sessions: impl Iterator<Item = SessionState>,
-    run_running: bool,
-) -> bool {
-    clients == 0 && sessions.all(|state| state == SessionState::Exited) && !run_running
+/// Whether nothing keeps the daemon running: no client and no session whose
+/// agent is running.
+fn nothing_running(clients: usize, mut sessions: impl Iterator<Item = SessionState>) -> bool {
+    clients == 0 && sessions.all(|state| state == SessionState::Exited)
 }
 
 /// Resolves once `is_idle` has held for `delay` with no change signalled on
@@ -1777,23 +1378,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_clients_live_sessions_and_running_runs_keep_the_daemon_running() {
+    fn only_clients_and_live_sessions_keep_the_daemon_running() {
         use SessionState::*;
-        for (clients, sessions, run_running, expected) in [
-            (0, vec![], false, true),
-            (0, vec![Exited, Exited], false, true),
-            (1, vec![], false, false),
-            (0, vec![], true, false),
-            (0, vec![Exited, Starting], false, false),
-            (0, vec![Idle], false, false),
-            (0, vec![Running], false, false),
-            (0, vec![AwaitingPermission], false, false),
-            (0, vec![AwaitingInput], false, false),
+        for (clients, sessions, expected) in [
+            (0, vec![], true),
+            (0, vec![Exited, Exited], true),
+            (1, vec![], false),
+            (0, vec![Exited, Starting], false),
+            (0, vec![Idle], false),
+            (0, vec![Running], false),
+            (0, vec![AwaitingPermission], false),
+            (0, vec![AwaitingInput], false),
         ] {
             assert_eq!(
-                nothing_running(clients, sessions.iter().copied(), run_running),
+                nothing_running(clients, sessions.iter().copied()),
                 expected,
-                "{clients} clients, sessions {sessions:?}, run running {run_running}"
+                "{clients} clients, sessions {sessions:?}"
             );
         }
     }

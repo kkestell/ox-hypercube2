@@ -17,7 +17,7 @@ ownership and lifecycle.
 - **Steered prompt**: A prompt sent during a turn, which the agent takes into
   that turn at its next opportunity. Distinct from a queued prompt, which
   waits for the turn to end.
-- **Peer message**: A message one standalone session's agent sends another
+- **Peer message**: A message one session's agent sends another
   through the `ox` tools, recorded with its sender. It starts a turn or steers
   like a prompt sent now, without resuming a held queue.
 - **Agent**: The ACP-speaking process that `oxd` runs for a session.
@@ -28,30 +28,18 @@ ownership and lifecycle.
 - **Client**: The desktop app when discussing the daemon protocol;
   `oxd` when discussing ACP. Qualify as daemon client or ACP client when ambiguous.
 - **Checkout**: A Git working tree, either the workspace's existing checkout or
-  a worktree created for a session or a run.
-- **Worktree**: An additional Git working tree created by Ox for a session or
-  a run.
+  a worktree created for a session.
+- **Worktree**: An additional Git working tree created by Ox for a session.
 - **Comparison ref**: The Git ref against which a worktree's branch is
   compared for commits ahead and behind.
 - **Parking**: Stopping an idle session's agent while retaining its conversation
   and checkout.
 - **Archiving**: Retaining a session's conversation and branch while removing its
   worktree and preventing it from loading until unarchived.
-- **Workflow**: A named sequence of steps defined in a YAML file in Ox's
-  configuration directory.
-- **Run**: One execution of a workflow in a workspace, in a worktree the run
-  owns.
-- **Step**: One entry of a workflow. An agent step sends a prompt to a new
-  child session. A shell step runs a command in the run's worktree.
-- **Check**: A precondition or postcondition shell command of a step.
-- **Child session**: The session a run starts for one of its agent steps, in the
-  run's worktree.
-- **Run view**: The desktop view of a run: each step with its start time and
-  its agent's messages with their times.
-- **Focus**: The session or run a client shows in front of the user, which
+- **Focus**: The session a client shows in front of the user, which
   the client's connection tells `oxd`. The desktop sets it only while its
   window is in front of other apps. Distinct from viewing, the event
   subscriptions that keep a session from being parked.
-- **Unseen**: How a session's turn or a run ended, `finished` or `error`,
+- **Unseen**: How a session's turn ended, `finished` or `error`,
   while no client had it in focus. It turns the sidebar dot green or red
   until a client focuses it.

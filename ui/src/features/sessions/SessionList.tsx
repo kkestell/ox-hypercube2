@@ -3,27 +3,17 @@ import { Menu } from "@tauri-apps/api/menu";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ChevronRight, FolderPlus, GitBranch, Plus } from "lucide-react";
 import { type MouseEvent, memo, useCallback, useState } from "react";
-import { Dialog } from "../../components/Dialog";
 import { HarnessLogo } from "../../components/HarnessLogo";
 import { SelectPicker } from "../../components/SelectPicker";
 import { Sidebar } from "../../components/Sidebar";
-import type {
-  RunInfo,
-  SessionInfo,
-  SessionState,
-  StepInfo,
-  StepState,
-  WorkflowInfo,
-  WorkspaceInfo,
-  WorktreeInfo,
-} from "../../lib/protocol";
+import type { SessionInfo, SessionState, WorkspaceInfo, WorktreeInfo } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
 import { branchStatus, localMerge } from "./localMerge";
 import { type AgentId, agentNames } from "./useAgents";
 import type { Draft } from "./useDrafts";
 import type { SessionActions } from "./useSessionActions";
 
-export const stateLabels: Record<SessionState, string> = {
+const stateLabels: Record<SessionState, string> = {
   starting: "Starting",
   idle: "Idle",
   running: "Running",
@@ -32,40 +22,30 @@ export const stateLabels: Record<SessionState, string> = {
   exited: "Exited",
 };
 
-/** The label of a step's or a run's state. */
-export const stepLabels: Record<StepState, string> = {
-  pending: "Pending",
-  running: "Running",
-  succeeded: "Succeeded",
-  failed: "Failed",
-  cancelled: "Cancelled",
-  interrupted: "Interrupted",
-};
-
 /** Whether the session awaits a permission answer or a form. */
-export function awaiting(session: SessionInfo) {
+function awaiting(session: SessionInfo) {
   return session.state === "awaiting_permission" || session.state === "awaiting_input";
 }
 
 /** Whether the session's agent is starting or in a turn. */
-export function working(session: SessionInfo | undefined) {
-  return session?.state === "starting" || session?.state === "running";
+function working(session: SessionInfo) {
+  return session.state === "starting" || session.state === "running";
 }
 
 /**
  * A dot's colour: blue working, orange blocked, red error, green finished,
  * or gray, with no class.
  */
-export type Dot = "running" | "attention" | "error" | "finished" | null;
+type Dot = "running" | "attention" | "error" | "finished" | null;
 
-/** A session's, a run's or a step's dot and its label. */
-export interface Status {
+/** A session's dot and its label. */
+interface Status {
   className: Dot;
   label: string;
 }
 
 /** A status's dot. */
-export function StatusIcon({ status }: { status: Status }) {
+function StatusIcon({ status }: { status: Status }) {
   return (
     <span
       className={status.className === null ? "status" : `status ${status.className}`}
@@ -87,52 +67,6 @@ function sessionStatus(session: SessionInfo): Status {
   if (working(session)) return { className: "running", label };
   if (session.unseen === "finished") return { className: "finished", label: "Finished" };
   return { className: null, label };
-}
-
-/**
- * What a run needs from the user, from its state and unseen outcome and its
- * child sessions'. The label is the run's state, or what a child awaits.
- */
-function runStatus(run: RunInfo, children: readonly SessionInfo[]): Status {
-  const waiting = children.find(awaiting);
-  if (waiting) return { className: "attention", label: stateLabels[waiting.state] };
-  const label = stepLabels[run.state];
-  if (run.unseen === "error" || children.some((child) => child.unseen === "error")) {
-    return { className: "error", label };
-  }
-  if (run.state === "running") return { className: "running", label };
-  if (run.unseen === "finished") return { className: "finished", label };
-  return { className: null, label };
-}
-
-/**
- * What a run's step needs from the user, from its state and its child
- * session's, if it has one. A failed or interrupted step is red while its
- * run's error is unseen, `runError`. The label is the step's state, or what
- * its session awaits.
- */
-function childStatus(step: StepInfo, session: SessionInfo | undefined, runError: boolean): Status {
-  if (session && awaiting(session)) {
-    return { className: "attention", label: stateLabels[session.state] };
-  }
-  const label = stepLabels[step.state];
-  if (
-    session?.unseen === "error" ||
-    (runError && (step.state === "failed" || step.state === "interrupted"))
-  ) {
-    return { className: "error", label };
-  }
-  if (step.state === "running" || working(session))
-    return { className: "running", label: "Running" };
-  return { className: null, label };
-}
-
-/**
- * A run's title: its input with runs of whitespace collapsed, or its
- * workflow's name when the input is blank.
- */
-export function runTitle(run: RunInfo) {
-  return run.input.replace(/\s+/g, " ").trim() || run.name;
 }
 
 /** Opens a native context menu of `items` at the pointer. */
@@ -175,30 +109,25 @@ export const SessionList = memo(function SessionList({
   workspaces,
   worktrees,
   sessions,
-  runs,
-  parents,
   drafts,
   draftTitles,
   selected,
   onSelect,
   onNewDraft,
   onDeleteDraft,
-  actions: { busy, deleteSession, archiveSession, unarchiveSession, cancelRun, deleteRun },
+  actions: { busy, deleteSession, archiveSession, unarchiveSession },
 }: {
   /** The installed agents. */
   agents: AgentId[];
   workspaces: WorkspaceInfo[];
   worktrees: Map<string, WorktreeInfo>;
   sessions: SessionInfo[];
-  runs: RunInfo[];
-  /** The run each child session belongs to, by session ID. */
-  parents: Map<string, RunInfo>;
   /** The drafts, newest first. */
   drafts: Draft[];
   /** Each draft's title, by draft ID. */
   draftTitles: Map<string, string>;
   selected: string | null;
-  /** Views the session, run or draft with this ID. */
+  /** Views the session or draft with this ID. */
   onSelect: (id: string) => void;
   /** Adds a draft and views it. */
   onNewDraft: (workspaceId: string, agent: AgentId, checkout: Draft["checkout"]) => void;
@@ -211,17 +140,8 @@ export const SessionList = memo(function SessionList({
   const agent = chosen !== null && agents.includes(chosen) ? chosen : agents[0];
   // The workspaces that list their archived sessions.
   const [showArchived, setShowArchived] = useState<ReadonlySet<string>>(new Set());
-  // The runs whose steps show.
-  const [expandedRuns, setExpandedRuns] = useState<ReadonlySet<string>>(new Set());
   // The workspaces whose rows are collapsed.
   const [collapsedWorkspaces, setCollapsedWorkspaces] = useState<ReadonlySet<string>>(new Set());
-  // The definitions the New Session menus list, read each time one opens.
-  const [workflows, setWorkflows] = useState<WorkflowInfo[]>([]);
-  // The workflow whose input the Start Run dialog asks for.
-  const [starting, setStarting] = useState<{
-    workspaceId: string;
-    workflow: WorkflowInfo;
-  } | null>(null);
 
   const addWorkspace = async () => {
     const path = await open({ directory: true, title: "Add Workspace" });
@@ -244,88 +164,6 @@ export const SessionList = memo(function SessionList({
     [onSelect],
   );
 
-  const toggleRun = useCallback(
-    (runId: string) => setExpandedRuns((expanded) => toggled(expanded, runId)),
-    [],
-  );
-
-  const children = new Map<string, SessionInfo[]>();
-  for (const session of sessions) {
-    const parent = parents.get(session.id);
-    if (parent === undefined) continue;
-    const list = children.get(parent.id) ?? [];
-    list.push(session);
-    children.set(parent.id, list);
-  }
-  for (const list of children.values()) list.sort((a, b) => a.created_at - b.created_at);
-
-  const sessionRow = (
-    session: SessionInfo,
-    child?: { step: StepInfo; first: boolean; last: boolean; runError: boolean },
-  ) => (
-    <SessionRow
-      key={session.id}
-      session={session}
-      worktree={session.worktree_id === null ? undefined : worktrees.get(session.worktree_id)}
-      selected={session.id === selected}
-      busy={busy.has(session.id)}
-      step={child?.step}
-      first={child?.first ?? false}
-      last={child?.last ?? false}
-      runError={child?.runError ?? false}
-      onSelect={select}
-      deleteSession={deleteSession}
-      archiveSession={archiveSession}
-      unarchiveSession={unarchiveSession}
-    />
-  );
-
-  const runRows = (run: RunInfo) => {
-    const runChildren = children.get(run.id) ?? [];
-    const status = runStatus(run, runChildren);
-    const expanded = expandedRuns.has(run.id);
-    const row = (
-      <RunRow
-        key={run.id}
-        run={run}
-        worktree={worktrees.get(run.worktree_id)}
-        status={status}
-        selected={run.id === selected}
-        busy={busy.has(run.id)}
-        expanded={expanded}
-        onSelect={onSelect}
-        onToggle={toggleRun}
-        cancelRun={cancelRun}
-        deleteRun={deleteRun}
-      />
-    );
-    if (!expanded) return [row];
-    return [
-      row,
-      ...run.steps.map((step, index) => {
-        const child = {
-          step,
-          first: index === 0,
-          last: index === run.steps.length - 1,
-          runError: run.unseen === "error",
-        };
-        const session = runChildren.find((session) => session.id === step.session_id);
-        if (session !== undefined) return sessionRow(session, child);
-        return (
-          <StepRow
-            // biome-ignore lint/suspicious/noArrayIndexKey: a run's steps never move
-            key={`${run.id}:${index}`}
-            step={step}
-            first={child.first}
-            last={child.last}
-            runError={child.runError}
-            onSelect={() => onSelect(run.id)}
-          />
-        );
-      }),
-    ];
-  };
-
   return (
     <Sidebar
       actions={
@@ -344,7 +182,6 @@ export const SessionList = memo(function SessionList({
         const workspaceSessions = sessions.filter(
           (session) => session.workspace_id === workspace.id,
         );
-        const workspaceRuns = runs.filter((run) => run.workspace_id === workspace.id);
         const archivedShown = showArchived.has(workspace.id);
         const draftRows = drafts
           .filter((draft) => draft.workspaceId === workspace.id)
@@ -358,15 +195,24 @@ export const SessionList = memo(function SessionList({
               onDelete={onDeleteDraft}
             />
           ));
-        const rows = [
-          ...workspaceSessions
-            .filter((session) => !parents.has(session.id) && (archivedShown || !session.archived))
-            .map((session) => ({
-              created_at: session.created_at,
-              rows: [sessionRow(session)],
-            })),
-          ...workspaceRuns.map((run) => ({ created_at: run.created_at, rows: runRows(run) })),
-        ].sort(newestFirst);
+        const sessionRows = workspaceSessions
+          .filter((session) => archivedShown || !session.archived)
+          .sort(newestFirst)
+          .map((session) => (
+            <SessionRow
+              key={session.id}
+              session={session}
+              worktree={
+                session.worktree_id === null ? undefined : worktrees.get(session.worktree_id)
+              }
+              selected={session.id === selected}
+              busy={busy.has(session.id)}
+              onSelect={select}
+              deleteSession={deleteSession}
+              archiveSession={archiveSession}
+              unarchiveSession={unarchiveSession}
+            />
+          ));
         const open = !collapsedWorkspaces.has(workspace.id);
         const menu = `new-session-${workspace.id}`;
         return (
@@ -389,7 +235,7 @@ export const SessionList = memo(function SessionList({
                     },
                     {
                       text: "Remove Workspace",
-                      enabled: workspaceSessions.length === 0 && workspaceRuns.length === 0,
+                      enabled: workspaceSessions.length === 0,
                       action: () => removeWorkspace(workspace.id),
                     },
                   ])
@@ -427,11 +273,6 @@ export const SessionList = memo(function SessionList({
                   role="menu"
                   popover="auto"
                   style={{ positionAnchor: `--${menu}` }}
-                  onToggle={(event) => {
-                    if (event.newState === "open" && workspace.git_working_tree) {
-                      run(async () => setWorkflows(await invoke<WorkflowInfo[]>("workflows")));
-                    }
-                  }}
                 >
                   {agents.length > 1 && (
                     <div className="menu-field">
@@ -464,182 +305,19 @@ export const SessionList = memo(function SessionList({
                   >
                     Session in Checkout
                   </button>
-                  {workspace.git_working_tree && workflows.length > 0 && (
-                    <>
-                      <hr className="menu-separator" />
-                      {workflows.map((workflow) => (
-                        <button
-                          key={workflow.workflow}
-                          type="button"
-                          role="menuitem"
-                          title={workflow.error ?? undefined}
-                          disabled={workflow.error !== null}
-                          popoverTarget={menu}
-                          popoverTargetAction="hide"
-                          onClick={() => setStarting({ workspaceId: workspace.id, workflow })}
-                        >
-                          {workflow.name}
-                        </button>
-                      ))}
-                    </>
-                  )}
                 </div>
               )}
             </div>
             {open && (
               <ul>
                 {draftRows}
-                {rows.flatMap((row) => row.rows)}
+                {sessionRows}
               </ul>
             )}
           </section>
         );
       })}
-      {starting !== null && (
-        <StartRunDialog
-          workspaceId={starting.workspaceId}
-          workflow={starting.workflow}
-          onStarted={onSelect}
-          onClose={() => setStarting(null)}
-        />
-      )}
     </Sidebar>
-  );
-});
-
-/** Asks for a run's input, then starts the run and views it. */
-function StartRunDialog({
-  workspaceId,
-  workflow,
-  onStarted,
-  onClose,
-}: {
-  workspaceId: string;
-  workflow: WorkflowInfo;
-  onStarted: (runId: string) => void;
-  onClose: () => void;
-}) {
-  const [input, setInput] = useState("");
-  const [pending, setPending] = useState(false);
-
-  const start = async () => {
-    setPending(true);
-    try {
-      const started = await invoke<RunInfo>("start_run", {
-        workspaceId,
-        workflow: workflow.workflow,
-        input,
-      });
-      onClose();
-      onStarted(started.id);
-    } catch (e) {
-      setPending(false);
-      await showError(e);
-    }
-  };
-
-  return (
-    <Dialog
-      title={workflow.name}
-      onClose={onClose}
-      actions={
-        <>
-          <button type="button" className="text-button" onClick={onClose}>
-            Cancel
-          </button>
-          <button type="button" className="text-button" disabled={pending} onClick={start}>
-            Run
-          </button>
-        </>
-      }
-    >
-      <textarea
-        className="text-field"
-        aria-label="Input"
-        rows={4}
-        value={input}
-        disabled={pending}
-        onChange={(event) => setInput(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter" && event.metaKey && !pending) {
-            event.preventDefault();
-            start();
-          }
-        }}
-      />
-    </Dialog>
-  );
-}
-
-/** A run's row, which renders again only when its props change. */
-const RunRow = memo(function RunRow({
-  run,
-  worktree,
-  status,
-  selected,
-  busy,
-  expanded,
-  onSelect,
-  onToggle,
-  cancelRun,
-  deleteRun,
-}: {
-  run: RunInfo;
-  worktree: WorktreeInfo | undefined;
-  /** The run's dot and its label, from `runStatus`. */
-  status: Status;
-  selected: boolean;
-  /** Whether an action on the run is in flight. */
-  busy: boolean;
-  /** Whether the run's steps show. */
-  expanded: boolean;
-  onSelect: (runId: string) => void;
-  onToggle: (runId: string) => void;
-} & Pick<SessionActions, "cancelRun" | "deleteRun">) {
-  const running = run.state === "running";
-  const branch =
-    worktree?.compare != null && worktree.comparison != null
-      ? branchStatus(worktree.compare, worktree.comparison)
-      : null;
-  return (
-    <li
-      className="sidebar-row run"
-      onContextMenu={(event) =>
-        contextMenu(event, [
-          { text: "Cancel Run", enabled: !busy && running, action: () => cancelRun(run.id) },
-          {
-            text: "Delete Run",
-            enabled: !busy && !running,
-            action: () => deleteRun(run.id, false),
-          },
-        ])
-      }
-    >
-      <button
-        type="button"
-        className="select"
-        aria-current={selected}
-        aria-expanded={expanded}
-        onClick={() => onSelect(run.id)}
-        onDoubleClick={() => onToggle(run.id)}
-      >
-        <StatusIcon status={status} />
-        <span className="title-group">
-          <span className="title">{runTitle(run)}</span>
-          <span
-            className={`disclosure${expanded ? " open" : ""}`}
-            aria-hidden="true"
-            onClick={(event) => {
-              event.stopPropagation();
-              onToggle(run.id);
-            }}
-          >
-            <ChevronRight />
-          </span>
-        </span>
-        {branch && <BranchIcon status={branch} />}
-      </button>
-    </li>
   );
 });
 
@@ -674,52 +352,12 @@ const DraftRow = memo(function DraftRow({
   );
 });
 
-/**
- * A run's step that has no session yet, or runs no agent: a shell step, or a
- * pending agent step. It follows the run's tree line, and selects the run.
- */
-function StepRow({
-  step,
-  first,
-  last,
-  runError,
-  onSelect,
-}: {
-  step: StepInfo;
-  first: boolean;
-  last: boolean;
-  /** Whether the step's run has an unseen error. */
-  runError: boolean;
-  onSelect: () => void;
-}) {
-  const status = childStatus(step, undefined, runError);
-  return (
-    <li className={`sidebar-row session child${step.state === "pending" ? " pending" : ""}`}>
-      <button type="button" className="select" onClick={onSelect}>
-        <span
-          className={["tree-branch", first && "first", last && "last"].filter(Boolean).join(" ")}
-          aria-hidden="true"
-        />
-        <StatusIcon status={status} />
-        <span className="title">{step.name}</span>
-      </button>
-    </li>
-  );
-}
-
-/**
- * A session's row, which renders again only when its props change. A run's
- * child is titled with its step's name, and follows the run's tree line.
- */
+/** A session's row, which renders again only when its props change. */
 const SessionRow = memo(function SessionRow({
   session,
   worktree,
   selected,
   busy,
-  step,
-  first,
-  last,
-  runError,
   onSelect,
   deleteSession,
   archiveSession,
@@ -730,29 +368,13 @@ const SessionRow = memo(function SessionRow({
   selected: boolean;
   /** Whether an action on the session is in flight. */
   busy: boolean;
-  /** The step, when the session is a run's child. */
-  step: StepInfo | undefined;
-  /** Whether a child is its run's first, or its last. */
-  first: boolean;
-  last: boolean;
-  /** Whether a child's run has an unseen error. */
-  runError: boolean;
   onSelect: (session: SessionInfo) => void;
 } & Pick<SessionActions, "deleteSession" | "archiveSession" | "unarchiveSession">) {
-  const child = step !== undefined;
-  const status = step ? childStatus(step, session, runError) : sessionStatus(session);
-  // A run's children share its worktree, whose branch the run's row shows.
-  const merge = child ? null : localMerge(session, worktree);
+  const merge = localMerge(session, worktree);
   const branch = merge && branchStatus(merge.compare, merge.comparison);
-  const classes = [
-    "sidebar-row",
-    "session",
-    child && "child",
-    session.state === "exited" && "exited",
-  ];
   return (
     <li
-      className={classes.filter(Boolean).join(" ")}
+      className={`sidebar-row session${session.state === "exited" ? " exited" : ""}`}
       onContextMenu={(event) =>
         contextMenu(event, [
           {
@@ -776,14 +398,8 @@ const SessionRow = memo(function SessionRow({
         aria-current={selected}
         onClick={() => onSelect(session)}
       >
-        {child && (
-          <span
-            className={["tree-branch", first && "first", last && "last"].filter(Boolean).join(" ")}
-            aria-hidden="true"
-          />
-        )}
-        <StatusIcon status={status} />
-        <span className="title">{step?.name ?? session.title ?? "New session"}</span>
+        <StatusIcon status={sessionStatus(session)} />
+        <span className="title">{session.title ?? "New session"}</span>
         {branch && <BranchIcon status={branch} />}
       </button>
     </li>

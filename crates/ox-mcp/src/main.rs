@@ -1,6 +1,6 @@
 //! ox-mcp: the `ox` MCP server that oxd gives each agent it starts.
 //!
-//! Usage: `ox-mcp --socket PATH --session ID [--child]`
+//! Usage: `ox-mcp --socket PATH --session ID`
 //!
 //! Serves MCP on stdio until stdin closes. Each tool call connects to the
 //! daemon listening on `PATH`, calls a daemon method for the oxd session
@@ -18,11 +18,8 @@
 //!   (`session.send_message`)
 //! - `start_session { prompt, worktree, workspace?, branch?, harness?,
 //!   model?, effort? }`: asks the user to start a session (`session.request`)
-//!
-//! A run's child session, `--child`, has `set_title` and `read_transcript`
-//! only.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -37,19 +34,13 @@ use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 struct Args {
     socket: PathBuf,
     session: String,
-    child: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut socket = None;
     let mut session = None;
-    let mut child = false;
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        if arg == "--child" {
-            child = true;
-            continue;
-        }
         let value = args
             .next()
             .ok_or_else(|| format!("{} needs a value", arg.display()))?;
@@ -68,7 +59,6 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         socket: socket.ok_or("--socket is required")?,
         session: session.ok_or("--session is required")?,
-        child,
     })
 }
 
@@ -268,7 +258,6 @@ fn listing(changes: Vec<ListingChange>) -> Listing {
             ListingChange::Workspace { workspace } => listing.workspaces.push(workspace),
             ListingChange::Worktree { worktree } => listing.worktrees.push(worktree),
             ListingChange::Session { session } => listing.sessions.push(*session),
-            ListingChange::Run { run } => listing.runs.push(run),
             _ => {}
         }
     }
@@ -276,26 +265,17 @@ fn listing(changes: Vec<ListingChange>) -> Listing {
 }
 
 /// The workspaces and the sessions in them that session `caller` can
-/// message: every session but the caller, archived sessions, runs' child
-/// sessions, and sessions whose agent never started. `heads` holds the
+/// message: every session but the caller, archived sessions, and sessions
+/// whose agent never started. `heads` holds the
 /// branch of each workspace's checkout.
 fn format_listing(
     listing: &Listing,
     caller: &str,
     heads: &BTreeMap<String, Option<String>>,
 ) -> String {
-    let run_worktrees: HashSet<&str> = listing
-        .runs
-        .iter()
-        .map(|run| run.worktree_id.as_str())
-        .collect();
     let messageable = |session: &&SessionInfo| {
         session.id != caller
             && !session.archived
-            && !session
-                .worktree_id
-                .as_deref()
-                .is_some_and(|id| run_worktrees.contains(id))
             && (session.state != SessionState::Exited || session.agent_session_id.is_some())
     };
     let mut text = String::new();
@@ -377,16 +357,10 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut tool_router = Ox::tool_router();
-    if args.child {
-        for tool in ["list_sessions", "send_message", "start_session"] {
-            tool_router.remove_route(tool);
-        }
-    }
     let server = Ox {
         socket: args.socket,
         session: args.session,
-        tool_router,
+        tool_router: Ox::tool_router(),
     };
     let result = match server.serve(stdio()).await {
         Ok(service) => service.waiting().await.map(drop).map_err(|e| e.to_string()),

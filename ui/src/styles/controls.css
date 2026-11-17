@@ -138,27 +138,16 @@ textarea.text-field {
 }
 
 .sidebar-row:hover,
-.menu button:hover:enabled,
+.menu button:hover,
 .menu button:focus-visible,
 .menu button.active {
   background: var(--hover);
-}
-
-.menu button:disabled {
-  opacity: var(--disabled-opacity);
 }
 
 .menu-field {
   display: flex;
   align-items: center;
   gap: calc(var(--spacing) * 1.5);
-}
-
-.menu-separator {
-  height: var(--border-width);
-  border: none;
-  margin: var(--menu-separator-margin) calc(var(--menu-padding) * -1);
-  background: var(--border);
 }
 
 .sidebar-row:has(.select[aria-current="true"]),

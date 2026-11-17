@@ -18,7 +18,7 @@ export function saveTreeState(viewId: string, state: TreeState) {
   localStorage.setItem(prefix + viewId, JSON.stringify(state));
 }
 
-/** Removes the saved tree of every session or run not in `views`. */
+/** Removes the saved tree of every session or draft not in `views`. */
 export function forgetDeletedTrees(views: readonly { id: string }[]) {
   const ids = new Set(views.map((view) => view.id));
   const keys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index));

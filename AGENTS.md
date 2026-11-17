@@ -22,7 +22,6 @@ workflow.
 | [Architecture](docs/dev/architecture.md) | Process ownership, boundaries, persistence, and session lifecycle |
 | [ACP v2 support](docs/dev/acp-v2.md) | Protocol support and integration caveats |
 | [Where sessions run](docs/worktrees.md) | Checkout selection, branches, comparisons, and worktree cleanup |
-| [Workflows](docs/workflows.md) | Workflow definitions, runs, step handoff, and run cleanup |
 | [Performance](docs/dev/performance.md) | How the daemon, the desktop core, and the UI keep work proportional to what changed |
 | [Claude Code research](docs/research/harnesses/claude-code.md) and [Pi research](docs/research/harnesses/pi.md) | Historical harness observations |
 

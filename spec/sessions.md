@@ -82,7 +82,6 @@ Each session's dot in the sidebar shows what it needs from the user, the first t
 - Red and green clear when the user views the session in a window in front of other apps. Prompting or answering a request does not clear them.
 - Red stays through later turns until it clears; green gives way to blue while the next turn runs.
 - A turn that oxd shutting down cuts off turns red.
-- Runs and their steps follow [workflow status dots](../docs/workflows.md#running-a-workflow).
 
 ### History and service restarts
 

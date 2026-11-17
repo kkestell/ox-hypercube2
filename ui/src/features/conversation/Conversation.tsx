@@ -1,53 +1,38 @@
 import { Check, ChevronRight, X } from "lucide-react";
-import {
-  memo,
-  type ReactNode,
-  type UIEvent,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { memo, type ReactNode, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { CodeSpans } from "../../components/CodeSpans";
 import type { Item, ToolCallStatus } from "../../lib/protocol";
 import { Markdown } from "./Markdown";
 
 /**
- * A ref and scroll handler for a scrolling view that follows its end as its
- * content grows, from when `key` changes until the user scrolls away from the
- * end. Each render of the calling component follows its end.
- */
-export function useFollowEnd<T extends HTMLElement>(key?: unknown) {
-  const ref = useRef<T>(null);
-  // Whether the view follows its end as its content grows.
-  const following = useRef(true);
-
-  // biome-ignore lint/correctness/useExhaustiveDependencies: a new key is followed from its end
-  useLayoutEffect(() => {
-    following.current = true;
-  }, [key]);
-
-  // Each render follows a change to the content, which scrolls a followed view.
-  useLayoutEffect(() => {
-    const node = ref.current;
-    if (node && following.current) node.scrollTop = node.scrollHeight;
-  });
-
-  const onScroll = (event: UIEvent<T>) => {
-    const node = event.currentTarget;
-    following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 1;
-  };
-  return { ref, onScroll };
-}
-
-/**
  * A scrolling transcript that follows its end as it grows, from when `viewId`
  * changes until the user scrolls away from the end.
  */
-export function Transcript({ viewId, children }: { viewId: string; children: ReactNode }) {
-  const { ref, onScroll } = useFollowEnd<HTMLDivElement>(viewId);
+function Transcript({ viewId, children }: { viewId: string; children: ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Whether the view follows its end as its content grows.
+  const following = useRef(true);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new view is followed from its end
+  useLayoutEffect(() => {
+    following.current = true;
+  }, [viewId]);
+
+  // Each render follows a change to the content, which scrolls a followed view.
+  useLayoutEffect(() => {
+    const node = ref.current!;
+    if (following.current) node.scrollTop = node.scrollHeight;
+  });
+
   return (
-    <div className="conversation" ref={ref} onScroll={onScroll}>
+    <div
+      className="conversation"
+      ref={ref}
+      onScroll={(event) => {
+        const node = event.currentTarget;
+        following.current = node.scrollHeight - node.scrollTop - node.clientHeight < 1;
+      }}
+    >
       {children}
     </div>
   );
@@ -178,7 +163,7 @@ const WorkedGroup = memo(
     previous.items.every((item, index) => item === next.items[index]),
 );
 
-export const ItemView = memo(function ItemView({ item }: { item: Item }) {
+const ItemView = memo(function ItemView({ item }: { item: Item }) {
   if (!shown(item)) return null;
   switch (item.type) {
     case "prompt":

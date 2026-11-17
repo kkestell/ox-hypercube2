@@ -2,23 +2,18 @@ import type {
   Comparison,
   ConversationUpdate,
   ListingChange,
-  RunInfo,
-  RunState,
   SessionInfo,
   SessionState,
-  StepState,
-  WorkflowInfo,
   WorkspaceInfo,
   WorktreeInfo,
 } from "../src/lib/protocol";
 
 /** A fixed state of the daemon, as the app's mocked backend reports it. */
 export interface Scenario {
-  /** The listing's changes: workspaces, then worktrees, sessions and runs. */
+  /** The listing's changes: workspaces, then worktrees and sessions. */
   changes: ListingChange[];
   /** Each session's conversation, by session ID. */
   conversations?: Record<string, ConversationUpdate[]>;
-  workflows?: WorkflowInfo[];
 }
 
 /** Builds a scenario's listing in one workspace, oldest entry first. */
@@ -30,7 +25,6 @@ class Listing {
   };
   readonly worktrees: WorktreeInfo[] = [];
   readonly sessions: SessionInfo[] = [];
-  readonly runs: RunInfo[] = [];
   private clock = Date.now() - 3_600_000;
 
   /** A minute after the previous time this listing gave out. */
@@ -78,98 +72,18 @@ class Listing {
     return this.session(title, "idle", id);
   }
 
-  /**
-   * A run whose steps each have a session, in `sessionState`, unless pending,
-   * and whose worktree compares with `main` as `comparison` says.
-   */
-  run(
-    input: string,
-    state: RunState,
-    steps: [string, StepState, SessionState?][],
-    comparison: Comparison | null = null,
-  ) {
-    const id = `run-${this.runs.length}`;
-    const worktree: WorktreeInfo = {
-      id: `worktree-${id}`,
-      path: `${this.workspace.path}/.ox/${id}`,
-      branch: `ox/${id}`,
-      base: "main",
-      created_branch: true,
-      compare: "main",
-      comparison,
-    };
-    this.worktrees.push(worktree);
-    const created_at = this.tick();
-    const run: RunInfo = {
-      id,
-      workspace_id: this.workspace.id,
-      workflow: "implement",
-      name: "Implement",
-      input,
-      worktree_id: worktree.id,
-      state,
-      error: state === "failed" ? "The Implement step failed" : null,
-      steps: steps.map(([name, stepState, sessionState]) => ({
-        name,
-        state: stepState,
-        started_at: stepState === "pending" ? null : created_at,
-        session_id:
-          sessionState === undefined ? null : this.session(name, sessionState, worktree.id).id,
-      })),
-      created_at,
-      ended_at: state === "running" || state === "interrupted" ? null : this.tick(),
-      unseen: null,
-    };
-    this.runs.push(run);
-    return run;
-  }
-
-  /** The session with ID `id`. */
-  find(id: string | null) {
-    const session = this.sessions.find((session) => session.id === id);
-    if (session === undefined) throw new Error(`No session ${id}`);
-    return session;
-  }
-
   changes(): ListingChange[] {
     return [
       { type: "workspace", workspace: this.workspace },
       ...this.worktrees.map((worktree) => ({ type: "worktree" as const, worktree })),
       ...this.sessions.map((session) => ({ type: "session" as const, session })),
-      ...this.runs.map((run) => ({ type: "run" as const, run })),
     ];
   }
 }
 
-/** Every session and run status in the sidebar. */
+/** Every session status in the sidebar. */
 function sidebar(): Scenario {
   const listing = new Listing();
-  const failed = listing.run("Fix the replay cursor", "failed", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "failed", "exited"],
-    ["Review", "pending"],
-  ]);
-  failed.unseen = "error";
-  listing.find(failed.steps[1]!.session_id).unseen = "error";
-  listing.run("Rename the store module", "cancelled", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "cancelled", "exited"],
-  ]);
-  listing.run("Add run archiving", "succeeded", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "succeeded", "exited"],
-    ["Review", "succeeded", "exited"],
-  ]).unseen = "finished";
-  listing.run("Inject agent instructions", "running", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "running", "awaiting_permission"],
-    ["Review", "pending"],
-  ]);
-  listing.run("Align run view icons", "running", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "running", "running"],
-    ["Review", "pending"],
-  ]);
   for (const title of ["Try a flat sidebar", "Profile replay", "Draft the README"]) {
     listing.session(title, "exited").archived = true;
   }
@@ -183,7 +97,7 @@ function sidebar(): Scenario {
   working.queue = [
     {
       id: "queued-1",
-      prompt: [{ type: "text", text: "Then check the run view's dots match." }],
+      prompt: [{ type: "text", text: "Then check the dots in the dark theme." }],
     },
     {
       id: "queued-2",
@@ -202,28 +116,24 @@ function sidebar(): Scenario {
     conversations: {
       [working.id]: [
         {
-          recorded_at: listing.tick(),
           type: "prompt",
           key: "1",
           text: "Why do the sidebar's status dots look the same?",
           attachments: [],
         },
         {
-          recorded_at: listing.tick(),
           type: "thought",
           key: "thought:1",
           text: "The dots take their colours from the status classes.",
           replace: false,
         },
         {
-          recorded_at: listing.tick(),
           type: "text",
           key: "text:1",
           text: "Checking the status styles.",
           replace: false,
         },
         {
-          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:1",
           title: "Read `ui/src/features/sessions/SessionList.tsx`",
@@ -232,7 +142,6 @@ function sidebar(): Scenario {
           content: [],
         },
         {
-          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:2",
           title: "Search for `--success`",
@@ -241,22 +150,19 @@ function sidebar(): Scenario {
           content: [{ type: "text", text: "ui/src/styles/controls.css" }],
         },
         {
-          recorded_at: listing.tick(),
           type: "text",
           key: "text:2",
           text: "Running and succeeded sessions both use `--success`.",
           replace: false,
         },
-        { recorded_at: listing.tick(), type: "turn_completed", key: "7" },
+        { type: "turn_completed", key: "7" },
         {
-          recorded_at: listing.tick(),
           type: "prompt",
           key: "8",
           text: "Make running and succeeded look different.",
           attachments: [],
         },
         {
-          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:3",
           title: "Read ui/src/styles/controls.css",
@@ -265,14 +171,12 @@ function sidebar(): Scenario {
           content: [],
         },
         {
-          recorded_at: listing.tick(),
           type: "text",
           key: "text:3",
           text: "Both states use `--success`. ",
           replace: false,
         },
         {
-          recorded_at: listing.tick(),
           type: "steered",
           key: "12",
           text: "Keep the failed colour as it is.",
@@ -281,7 +185,6 @@ function sidebar(): Scenario {
       ],
       [reviewer.id]: [
         {
-          recorded_at: listing.tick(),
           type: "prompt",
           key: "1",
           text: "The event store change is ready. Can someone review it?",
@@ -289,14 +192,12 @@ function sidebar(): Scenario {
           from: { session_id: explainer.id, title: "Explain the event store" },
         },
         {
-          recorded_at: listing.tick(),
           type: "text",
           key: "text:1",
           text: "I'll ask for a review session.",
           replace: false,
         },
         {
-          recorded_at: listing.tick(),
           type: "permission",
           key: "request:1",
           request_id: "1",
@@ -310,43 +211,6 @@ function sidebar(): Scenario {
           ],
         },
       ],
-    },
-    workflows: [{ workflow: "implement", name: "Implement", error: null }],
-  };
-}
-
-function runStatus(): Scenario {
-  const listing = new Listing();
-  const run = listing.run("Follow workflow agent messages", "running", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "running", "running"],
-    ...Array.from({ length: 30 }, (_, index): [string, StepState] => [
-      `Verify fixture ${index + 1}`,
-      "pending",
-    ]),
-  ]);
-  const failed = listing.run("Fix the replay cursor", "failed", [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "failed", "exited"],
-    ["Review", "pending"],
-  ]);
-  const text = (key: string, text: string): ConversationUpdate => ({
-    recorded_at: listing.tick(),
-    type: "text",
-    key,
-    text,
-    replace: false,
-  });
-  return {
-    changes: listing.changes(),
-    conversations: {
-      [run.steps[0]!.session_id!]: [text("text:1", "Read the run view")],
-      [run.steps[1]!.session_id!]: [
-        text("text:1", "Updated the run view.\n\nEach step now lists its agent's messages."),
-        text("text:2", "Running checks"),
-      ],
-      [failed.steps[0]!.session_id!]: [text("text:1", "Planned the replay cursor fix")],
-      [failed.steps[1]!.session_id!]: [text("text:1", "The replay tests still fail")],
     },
   };
 }
@@ -370,45 +234,9 @@ function merge(): Scenario {
   return { changes: listing.changes() };
 }
 
-/**
- * A session in the workspace's checkout, and worktree sessions and runs in
- * each comparison state.
- */
+/** A session in the workspace's checkout, and worktree sessions in each comparison state. */
 function checkouts(): Scenario {
   const listing = new Listing();
-  const done: [string, StepState, SessionState?][] = [
-    ["Plan", "succeeded", "exited"],
-    ["Implement", "succeeded", "exited"],
-  ];
-  listing.run("Run: comparison failed", "succeeded", done, {
-    type: "failed",
-    error: "fatal: bad revision 'main'",
-  });
-  listing.run("Run: 1 ahead, 2 behind (rebase)", "succeeded", done, compared(1, 2));
-  listing.run("Run: 3 ahead (squash)", "succeeded", done, compared(3, 0));
-  listing.run("Run: 1 ahead (mergeable)", "succeeded", done, compared(1, 0));
-  listing.run(
-    "Run: no commits",
-    "failed",
-    [
-      ["Plan", "succeeded", "exited"],
-      ["Implement", "failed", "exited"],
-    ],
-    compared(0, 0),
-  );
-  listing.run(
-    "Run: working, no commits yet",
-    "running",
-    [
-      ["Plan", "succeeded", "exited"],
-      ["Implement", "running", "running"],
-    ],
-    compared(0, 0),
-  );
-  listing.run("Run: just started, not compared yet", "running", [
-    ["Plan", "running", "running"],
-    ["Implement", "pending"],
-  ]);
   listing.worktreeSession("Worktree: comparison failed", {
     type: "failed",
     error: "fatal: bad revision 'main'",
@@ -425,7 +253,6 @@ function checkouts(): Scenario {
 
 export const scenarios: Record<string, Scenario> = {
   sidebar: sidebar(),
-  "run-status": runStatus(),
   merge: merge(),
   checkouts: checkouts(),
   empty: { changes: [] },

@@ -2,7 +2,7 @@ import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { Command, ConfigOption, Field, SessionInfo } from "../../lib/protocol";
-import { renderApp, run, session, view, workspace, worktree } from "../../test/core";
+import { renderApp, session, view, workspace } from "../../test/core";
 
 const project = workspace();
 
@@ -125,25 +125,6 @@ describe("The composer", () => {
     expect(message()).toBeDisabled();
     expect(screen.getByRole("button", { name: "Attach Files" })).toBeDisabled();
   });
-
-  it("is disabled in a running run's child, whose Stop cancels the run", async () => {
-    const repo = workspace({ git_working_tree: true });
-    const tree = worktree();
-    const child = session(repo, { title: "Child", state: "running", worktree_id: tree.id });
-    const parent = run(repo, tree, [{ name: "Work", state: "running", session_id: child.id }]);
-    const core = await renderApp(
-      { type: "workspace", workspace: repo },
-      { type: "worktree", worktree: tree },
-      { type: "session", session: child },
-      { type: "run", run: parent },
-    );
-    // The child's row shows under its expanded run, titled with its step.
-    await userEvent.dblClick(screen.getByText("Implement"));
-    await view("Work");
-    expect(message()).toBeDisabled();
-    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
-    expect(core.invoked("cancel_run")).toEqual([{ runId: parent.id }]);
-  });
 });
 
 describe("The queue", () => {
@@ -243,7 +224,6 @@ describe("A permission request", () => {
     const core = await viewSession(task);
     core.update(task.id, {
       type: "permission",
-      recorded_at: 0,
       key: "request:7",
       request_id: "7",
       title: "Run `ls`",
@@ -256,7 +236,7 @@ describe("A permission request", () => {
     expect(core.invoked("permit")).toEqual([
       { sessionId: task.id, requestId: "7", optionId: "yes" },
     ]);
-    core.update(task.id, { type: "removed", recorded_at: 0, key: "request:7" });
+    core.update(task.id, { type: "removed", key: "request:7" });
     expect(screen.queryByRole("button", { name: "Allow" })).not.toBeInTheDocument();
   });
 });
@@ -267,7 +247,6 @@ describe("A session request", () => {
     const core = await viewSession(task);
     core.update(task.id, {
       type: "permission",
-      recorded_at: 0,
       key: "request:1",
       request_id: "1",
       title: "Start a session in ox?",
@@ -318,7 +297,6 @@ describe("An agent's form", () => {
     const core = await viewSession(task);
     core.update(task.id, {
       type: "elicitation",
-      recorded_at: 0,
       key: "request:9",
       request_id: "9",
       message: "Order",

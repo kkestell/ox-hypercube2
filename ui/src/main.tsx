@@ -10,7 +10,6 @@ import "./styles/sidebar.css";
 import "./styles/sessions.css";
 import "./styles/conversation.css";
 import "./styles/composer.css";
-import "./styles/run-view.css";
 
 /** The animations of a running dot. */
 const breathing = new Set(["breathe", "glow"]);

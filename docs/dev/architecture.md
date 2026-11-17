@@ -41,9 +41,7 @@ stderr to `oxd.log` beside the socket.
 
 The desktop app uses Tauri 2. Its React webview calls the Rust core through
 Tauri commands; the core uses `ox_protocol::Client` to talk to `oxd` and
-streams updates back over Tauri channels. The core keeps one conversation
-view per channel, so the run view follows every child session of a run at
-once.
+streams updates back over Tauri channels.
 
 The app offers an agent for each [harness](glossary.md) on the `PATH` it
 passes to sessions, and checks again each time its window gains focus.
@@ -92,19 +90,13 @@ session:
 | `send_message` | `session.send_message` | Sends a [peer message](glossary.md) to another session |
 | `start_session` | `session.request` | Asks the user to start a new session |
 
-A run's child session gets `ox-mcp --child`, which has only `set_title` and
-`read_transcript`. Messaging and session requests are between standalone
-sessions.
-
 Each tool call opens and closes its own daemon connection, so the MCP server
 does not keep the daemon alive between calls.
 
 ### Instructions
 
-`oxd` gives each agent instructions about Ox when any apply. An agent with
-the `ox` tools is told to title its session with `set_title`. A run's child
-session is told which step of which workflow it runs and that its final
-reply is the next step's input. An agent that advertises
+`oxd` gives each agent with the `ox` tools instructions about Ox: to title
+its session with `set_title`. An agent that advertises
 `session.systemPrompt` gets the instructions in its system prompt when its
 session is opened or resumed. Another gets them as a text block before a new
 session's first prompt.
@@ -113,14 +105,12 @@ session's first prompt.
 
 `oxd` owns:
 
-- Shared persistent state: workspaces, sessions, workflow runs, and
-  conversation history.
+- Shared persistent state: workspaces, sessions, and conversation history.
 - Agent processes and work that must continue when a client disconnects,
   including each session's [queue](glossary.md) of prompts.
 - State updates and pending requests that every connected client must see.
 - Each connection's [focus](glossary.md) and the unseen outcome of each
-  session and run, which a focus clears and a turn or run ending out of
-  focus sets.
+  session, which a focus clears and a turn ending out of focus sets.
 - Repository writes and the coordination needed to complete or undo them.
 
 Clients own presentation and workflow choices: which branch to use, which
@@ -152,12 +142,8 @@ daemon, desktop core, and UI without reprocessing unrelated state.
 
 `oxd` is the only writer of the SQLite database beside its socket. The
 database holds workspace and session metadata, worktrees with their
-comparison refs, archive state, each session's queue, conversation events,
-and workflow runs. A
-run's steps, with their commands, are saved as one JSON column of its row,
-rewritten whenever the run changes.
-Each conversation event is saved with the time `oxd` recorded it, and a run
-with the time it ended.
+comparison refs, archive state, each session's queue, and conversation
+events. Each conversation event is saved with the time `oxd` recorded it.
 
 Session metadata is saved as sessions are created or changed. Conversation
 events are queued and committed in batches, ordered by session and sequence
@@ -181,7 +167,7 @@ session records separately from the daemon's database.
 A saved session belongs to a workspace and records its agent command,
 working directory, and agent session ID. Its lifetime is independent of any
 client connection and of the agent process currently serving it. A workspace
-cannot be removed while sessions or runs still belong to it.
+cannot be removed while sessions still belong to it.
 
 The daemon owns turn state, including turns the agent starts without a
 client prompt. A session's requests reach its agent in the order a
@@ -250,35 +236,13 @@ lifecycle lock. Shutdown stops agents but preserves saved sessions. Each
 connected client then receives the rest of every session it follows, up to
 the session's close, before the daemon exits; a client that has not read
 it within five seconds is disconnected. The daemon can exit when it has no
-clients, running agents, or running workflow runs; exited sessions do not
-keep it alive.
-
-## Workflow runs
-
-A run of a [workflow](../workflows.md) owns a worktree and the child
-sessions its steps run in. The daemon reads the workflow's definition when the
-run starts and runs the run's steps itself, so a run continues without
-clients. Its runner adds the worktree, then for each agent step starts a child
-session with the step's harness bridge from beside `oxd`'s executable, sets
-the step's config options, sends the prompt, and advances when the turn
-ends. A step's output is the final reply of its turn, or a shell step's
-standard output. A step's `started_at` is set when it leaves `pending`. The
-runner runs shell steps and checks through `shell::run`, each in its own
-process group, and records each command in the step's `commands`. When the
-daemon stops, it aborts the runners, which kills their running commands'
-process groups.
-
-Child sessions are ordinary sessions that refer to the run's worktree: a
-session is a child of the run that owns its worktree. A running run keeps the
-daemon alive. [Workflows](../workflows.md#cancelling-removing-and-restarting)
-owns what removing a run or a child session does and what a restart does to a
-running run.
+clients or running agents; exited sessions do not keep it alive.
 
 ## Repository ownership
 
 A session runs in the workspace's existing checkout or in an additional Git
-worktree owned by Ox. Each worktree belongs to a session or to a workflow
-run. The daemon uses the Git CLI for repository operations.
+worktree owned by Ox. Each worktree belongs to a session. The daemon uses
+the Git CLI for repository operations.
 [Where sessions run](../worktrees.md) owns checkout choices, branch
 comparisons, merge behavior, and cleanup rules.
 

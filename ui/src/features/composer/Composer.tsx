@@ -10,7 +10,6 @@ import type {
   Controls,
   QueuedPrompt,
   Request,
-  RunInfo,
   SessionInfo,
 } from "../../lib/protocol";
 import { showError } from "../../lib/showError";
@@ -37,11 +36,11 @@ async function attempt(action: () => Promise<unknown>) {
  * prompts of `queue`, and the agent's config options. `unsentId` names the
  * unsent text it edits. The entry and attachments are disabled while
  * `disabled`. Send is enabled while there is something to send and the
- * composer is `idle` or `running` and not `disabled`; `onSend` gets `steer`
- * set for Cmd+Enter. While `running`, the form's button sends a message that
- * has content and stops otherwise, and Escape stops. While a queued prompt is
- * edited, Enter saves it in its place with `onSaveEdit` and brings back the
- * message it replaced.
+ * composer is `idle` or `running`; `onSend` gets `steer` set for Cmd+Enter.
+ * While `running`, the form's button sends a message that has content and
+ * stops otherwise, and Escape stops. While a queued prompt is edited, Enter
+ * saves it in its place with `onSaveEdit` and brings back the message it
+ * replaced.
  */
 export function Composer({
   unsentId,
@@ -85,7 +84,7 @@ export function Composer({
     ? current.editing
     : undefined;
   const hasContent = text.trim() !== "" || attachments.length > 0;
-  const canSend = (idle || (running && !disabled)) && hasContent;
+  const canSend = (idle || running) && hasContent;
   const showStop = running && !hasContent;
 
   const send = (steer: boolean) =>
@@ -245,21 +244,17 @@ export function Composer({
 /**
  * A session's composer. On an idle session, Enter and Cmd+Enter send the
  * message. While the agent works, Enter queues it and Cmd+Enter steers the
- * running turn with it. While the run a child session belongs to is running,
- * the entry and attachments are disabled and Stop and Escape cancel the run. A new
- * session whose agent is starting shows `starting`, the controls it was sent
- * with, disabled, until its agent reports its own.
+ * running turn with it. A new session whose agent is starting shows
+ * `starting`, the controls it was sent with, disabled, until its agent
+ * reports its own.
  */
 export const SessionComposer = memo(function SessionComposer({
   session,
-  run: parent,
   request,
   unsent,
   starting,
 }: {
   session: SessionInfo;
-  /** The run the session is a child of. */
-  run: RunInfo | undefined;
   /** The session's oldest unanswered permission request or form. */
   request: Request | undefined;
   unsent: Unsents;
@@ -269,7 +264,6 @@ export const SessionComposer = memo(function SessionComposer({
     session.state === "running" ||
     session.state === "awaiting_permission" ||
     session.state === "awaiting_input";
-  const runRunning = parent?.state === "running";
   return (
     <Composer
       unsentId={session.id}
@@ -279,9 +273,9 @@ export const SessionComposer = memo(function SessionComposer({
       commands={starting?.available_commands ?? session.available_commands}
       request={request}
       queue={session.queue}
-      running={running || runRunning}
-      disabled={session.state === "exited" || runRunning}
-      idle={session.state === "idle" && !runRunning}
+      running={running}
+      disabled={session.state === "exited"}
+      idle={session.state === "idle"}
       optionsDisabled={starting !== undefined}
       onSend={(text, attachments, steer) =>
         invoke(steer || !running ? "prompt" : "queue_add", {
@@ -293,11 +287,7 @@ export const SessionComposer = memo(function SessionComposer({
       onSaveEdit={(promptId, text, attachments) =>
         invoke("queue_edit", { sessionId: session.id, promptId, text, attachments })
       }
-      onStop={() =>
-        runRunning
-          ? invoke("cancel_run", { runId: parent.id })
-          : invoke("cancel", { sessionId: session.id })
-      }
+      onStop={() => invoke("cancel", { sessionId: session.id })}
       onSetOption={(option, value) =>
         invoke("set_config_option", {
           sessionId: session.id,

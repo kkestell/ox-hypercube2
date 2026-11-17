@@ -408,7 +408,8 @@ async fn a_session_runs_in_a_worktree_on_an_existing_branch() {
 }
 
 /// A watch lists a session's worktree as its own entry, before the session
-/// that names it, and reports it removed with the session.
+/// that names it, and reports it removed with the session, after the
+/// session's removal.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worktree_is_listed_before_its_session_and_removed_with_it() {
     let repo = repo();
@@ -440,14 +441,24 @@ async fn a_worktree_is_listed_before_its_session_and_removed_with_it() {
     assert!(worktree < listed, "{changes:?}");
 
     delete(&client, &session.id, false).await.unwrap();
-    loop {
+    // The daemon forgets the session and its worktree in one change.
+    let removals = loop {
         let changes = next_changes(&mut watch).await;
-        if changes.iter().any(|change| {
-            matches!(change, ListingChange::WorktreeRemoved { worktree_id } if *worktree_id == id)
-        }) {
-            break;
+        let removals: Vec<&ListingChange> = changes
+            .iter()
+            .filter(|change| {
+                matches!(change, ListingChange::SessionRemoved { session_id } if *session_id == session.id)
+                    || matches!(change, ListingChange::WorktreeRemoved { worktree_id } if *worktree_id == id)
+            })
+            .collect();
+        if !removals.is_empty() {
+            break removals
+                .into_iter()
+                .map(|change| matches!(change, ListingChange::SessionRemoved { .. }))
+                .collect::<Vec<_>>();
         }
-    }
+    };
+    assert_eq!(removals, [true, false], "the session's removal comes first");
 }
 
 #[tokio::test(flavor = "multi_thread")]

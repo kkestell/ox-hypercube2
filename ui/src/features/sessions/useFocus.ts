@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
-import type { Focus } from "../../lib/protocol";
 
 /** Whether the window is in front, following its `focus` and `blur` events. */
 function useForeground() {
@@ -19,14 +18,13 @@ function useForeground() {
 }
 
 /**
- * Tells oxd which session or run the window shows in front of the user:
- * `focus` while the window is in front, and nothing while it is not. Each
- * new `focus` object is sent again, so callers keep it stable.
+ * Tells oxd which session the window shows in front of the user: `sessionId`
+ * while the window is in front, and nothing while it is not.
  */
-export function useFocus(focus: Focus | null) {
+export function useFocus(sessionId: string | null) {
   const foreground = useForeground();
-  const target = foreground ? focus : null;
+  const target = foreground ? sessionId : null;
   useEffect(() => {
-    invoke("focus", { focus: target });
+    invoke("focus", { sessionId: target });
   }, [target]);
 }

@@ -18,8 +18,6 @@
 //!   one message, spaced by the delay
 //! - `stream <n> <delay_ms> <JSON string>`: n chunks of the turn's message,
 //!   each the decoded text, spaced by the delay
-//! - `messages <n> <JSON string>`: n agent messages of their own, each the
-//!   decoded text
 //! - `text <JSON string>`: append the decoded text to the turn's message
 //! - `thought <JSON string>`: append the decoded text to the turn's thinking
 //! - `pid`: one chunk containing the process id
@@ -77,9 +75,6 @@
 //!   session's cwd and append its standard output to the turn's message. A
 //!   non-zero exit ends the turn with the stop reason `error` and the
 //!   command's standard error as its message
-//! - `next <JSON string>`: run the decoded text as the script of the
-//!   session's next prompt, in place of that prompt's text. The prompt is
-//!   still echoed as a `user_message`
 //! - `instructions`: one chunk with the session's instructions, or `none`
 //!
 //! The agent advertises `session.mcp.stdio` and keeps the MCP servers of
@@ -219,9 +214,6 @@ struct State {
     form_elicitation: AtomicBool,
     /// Each session's MCP servers, by session ID.
     mcp_servers: Mutex<HashMap<String, Vec<acp::McpServer>>>,
-    /// The script of each session's next prompt, set by `next`, by session
-    /// ID.
-    next: Mutex<HashMap<String, String>>,
     /// Each session's instructions, by session ID.
     instructions: Mutex<HashMap<String, String>>,
 }
@@ -472,7 +464,6 @@ async fn main() -> agent_client_protocol::Result<()> {
         deferred_rejection: Mutex::new(None),
         form_elicitation: AtomicBool::new(false),
         mcp_servers: Mutex::default(),
-        next: Mutex::default(),
         instructions: Mutex::default(),
     });
     if value("--describe").is_some() {
@@ -744,13 +735,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                     }
                     // A prompt the agent cannot run is answered with an
                     // error: it was not inserted.
-                    let text = script(&request.prompt);
-                    let script = state
-                        .next
-                        .lock()
-                        .unwrap()
-                        .remove(&request.session_id.to_string())
-                        .unwrap_or_else(|| text.clone());
+                    let script = script(&request.prompt);
                     if script == "deferred-reject" {
                         state_update(&connection, &request.session_id, running())?;
                         state_update(
@@ -772,7 +757,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         Err(error) => return responder.respond_with_error(error),
                     };
                     state.cancelled.send_replace(false);
-                    state.record(&request.session_id, "user", &text);
+                    state.record(&request.session_id, "user", &script);
                     let id = message_id();
                     notify(
                         &connection,
@@ -810,10 +795,6 @@ enum Directive {
         delay: Duration,
         text: Option<String>,
     },
-    Messages {
-        count: u64,
-        text: String,
-    },
     Thought(String),
     Pid,
     Permission,
@@ -836,7 +817,6 @@ enum Directive {
         arguments: serde_json::Value,
     },
     Shell(String),
-    Next(String),
     Instructions,
     BackgroundStart(String),
     BackgroundEnd(String),
@@ -866,10 +846,6 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
                 count: parse_number(count)?,
                 delay: Duration::from_millis(parse_number(delay)?),
                 text: Some(json_after(line, 3)?),
-            },
-            ["messages", count, ..] => Directive::Messages {
-                count: parse_number(count)?,
-                text: json_after(line, 2)?,
             },
             ["pid"] => Directive::Pid,
             ["text" | "thought", ..] => {
@@ -904,7 +880,6 @@ fn parse(script: &str) -> Result<Vec<Directive>, Error> {
                 arguments: json_after(line, 2)?,
             },
             ["shell", ..] => Directive::Shell(json_after(line, 1)?),
-            ["next", ..] => Directive::Next(json_after(line, 1)?),
             ["background-start", name] => Directive::BackgroundStart((*name).to_owned()),
             ["background-end", name] => Directive::BackgroundEnd((*name).to_owned()),
             ["exit", code] => Directive::Exit(parse_number(code)?),
@@ -1045,16 +1020,6 @@ async fn run(
                     if i < count {
                         pace(delay).await;
                     }
-                }
-            }
-            Directive::Messages { count, text } => {
-                for _ in 0..count {
-                    state.record(&session_id, "agent", &text);
-                    notify(
-                        connection,
-                        &session_id,
-                        message_chunk(&message_id(), text.clone()),
-                    )?;
                 }
             }
             Directive::Pid => say(std::process::id().to_string())?,
@@ -1236,13 +1201,6 @@ async fn run(
                 if !stdout.is_empty() {
                     say(stdout)?;
                 }
-            }
-            Directive::Next(script) => {
-                state
-                    .next
-                    .lock()
-                    .unwrap()
-                    .insert(session_id.to_string(), script);
             }
             Directive::BackgroundStart(name) => {
                 start_background(connection, &session_id, &name)?;

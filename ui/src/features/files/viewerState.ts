@@ -47,7 +47,7 @@ export function openFile(id: string, path: string | null) {
   for (const watcher of watchers) watcher();
 }
 
-/** Removes the viewer of every session or run not in `views`. */
+/** Removes the viewer of every session or draft not in `views`. */
 export function forgetDeletedViewers(views: readonly { id: string }[]) {
   const ids = new Set(views.map((view) => view.id));
   for (const id of states.keys()) if (!ids.has(id)) states.delete(id);

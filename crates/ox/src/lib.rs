@@ -10,15 +10,15 @@ use std::sync::{Arc, Mutex};
 use ox_protocol::schema::{ContentBlock, ElicitationAction, TextContent};
 use ox_protocol::{
     Branches, Checkout, Client, ConfigSetting, ConfigValue, Controls, Deleted, DirEntry, Error,
-    FileContent, Focus, Harness, ListingChange, RunInfo, SessionInfo, WorkflowInfo, WorkspaceInfo,
-    code, content, default_socket_path, describe,
+    FileContent, Harness, ListingChange, SessionInfo, WorkspaceInfo, code, content,
+    default_socket_path, describe,
 };
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
-use crate::conversation::{Conversation, ConversationUpdate, coalesce};
+use crate::conversation::{Conversation, Item, coalesce};
 
 /// A task that stops when dropped.
 struct Task(JoinHandle<()>);
@@ -38,9 +38,9 @@ struct App {
     /// The conversation views and the directory and file watches, by the ID
     /// of the channel each sends on.
     streams: Mutex<HashMap<u32, Task>>,
-    /// The session or run the window shows while it is in front, which the
-    /// watch's task sends to oxd.
-    focus: tokio::sync::watch::Sender<Option<Focus>>,
+    /// The session the window shows while it is in front, which the watch's
+    /// task sends to oxd.
+    focus: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl App {
@@ -141,7 +141,7 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
                     let target = focus.borrow_and_update().clone();
                     // A refused focus, such as on a session just deleted,
                     // leaves the connection unfocused.
-                    let _ = client.focus(target).await;
+                    let _ = client.focus(target.as_deref()).await;
                 }
                 changes = watch.next() => {
                     let Ok(changes) = changes else {
@@ -159,16 +159,16 @@ fn watch(handle: AppHandle, app: State<'_, App>, channel: Channel<WatchMessage>)
     app.streams.lock().unwrap().clear();
 }
 
-/// Sets the session or run the window shows in front of the user, or clears
-/// it with `None` while the window is in the background. The watch's task
+/// Sets the session the window shows in front of the user, or clears it
+/// with `None` while the window is in the background. The watch's task
 /// sends it to oxd.
 #[tauri::command]
 #[expect(
     clippy::needless_pass_by_value,
     reason = "Tauri passes managed state to commands as `State` by value"
 )]
-fn focus(app: State<'_, App>, focus: Option<Focus>) {
-    app.focus.send_replace(focus);
+fn focus(app: State<'_, App>, session_id: Option<String>) {
+    app.focus.send_replace(session_id);
 }
 
 /// Sends a session's conversation on `channel` from its first event, in
@@ -186,7 +186,7 @@ fn view_session(
     handle: AppHandle,
     app: State<'_, App>,
     session_id: String,
-    channel: Channel<Vec<ConversationUpdate>>,
+    channel: Channel<Vec<Item>>,
 ) {
     let id = channel.id();
     let task = tauri::async_runtime::spawn(async move {
@@ -535,7 +535,7 @@ async fn set_config_option(
         .map_err(message)
 }
 
-/// The outcome of deleting a session or a run.
+/// The outcome of deleting a session.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Deletion {
@@ -559,53 +559,6 @@ async fn delete_session(
         app.client()
             .await?
             .delete(&session_id, discard, utf8_env())
-            .await,
-    )
-}
-
-/// The definitions in oxd's workflows directory.
-#[tauri::command]
-async fn workflows(app: State<'_, App>) -> Result<Vec<WorkflowInfo>, String> {
-    app.client().await?.list_workflows().await.map_err(message)
-}
-
-/// Starts a run of `workflow` in a new worktree of the workspace, with
-/// `input` for its first step.
-#[tauri::command]
-async fn start_run(
-    app: State<'_, App>,
-    workspace_id: String,
-    workflow: String,
-    input: String,
-) -> Result<RunInfo, String> {
-    app.client()
-        .await?
-        .start_run(&workspace_id, &workflow, &input, utf8_env())
-        .await
-        .map_err(message)
-}
-
-#[tauri::command]
-async fn cancel_run(app: State<'_, App>, run_id: String) -> Result<(), String> {
-    app.client()
-        .await?
-        .cancel_run(&run_id)
-        .await
-        .map_err(message)
-}
-
-/// Deletes a run with its child sessions and worktree, giving up the
-/// worktree's unsaved work if `discard`.
-#[tauri::command]
-async fn delete_run(
-    app: State<'_, App>,
-    run_id: String,
-    discard: bool,
-) -> Result<Deletion, String> {
-    deletion(
-        app.client()
-            .await?
-            .delete_run(&run_id, discard, utf8_env())
             .await,
     )
 }
@@ -661,8 +614,8 @@ fn archival<T>(answer: Result<T, Error>) -> Result<Archival, String> {
     }
 }
 
-/// The outcome of a `session.delete` or `run.delete` answer. A session or run
-/// that is already gone counts as deleted.
+/// The outcome of a `session.delete` answer. A session that is already gone
+/// counts as deleted.
 fn deletion(answer: Result<Deleted, Error>) -> Result<Deletion, String> {
     match answer {
         Ok(Deleted { kept_branch }) => Ok(Deletion::Deleted { kept_branch }),
@@ -725,10 +678,6 @@ pub fn run() {
             delete_session,
             archive_session,
             unarchive_session,
-            workflows,
-            start_run,
-            cancel_run,
-            delete_run,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,7 +1,7 @@
 import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { renderApp, run, session, sidebarRow, view, workspace, worktree } from "../../test/core";
+import { renderApp, session, sidebarRow, view, workspace } from "../../test/core";
 
 /** The status dot of the sidebar row titled `title`: its class and label. */
 function dot(title: string) {
@@ -45,28 +45,6 @@ describe("The session list", () => {
     }
   });
 
-  it("shows a failed run and its failed step in red until the run is seen", async () => {
-    const project = workspace({ git_working_tree: true });
-    const tree = worktree();
-    const failed = run(project, tree, [{ name: "Break", state: "failed", started_at: 1 }], {
-      state: "failed",
-      unseen: "error",
-    });
-    const core = await renderApp(
-      { type: "workspace", workspace: project },
-      { type: "worktree", worktree: tree },
-      { type: "run", run: failed },
-    );
-    const row = sidebarRow("Implement");
-    await act(async () => row.querySelector<HTMLElement>(".disclosure")!.click());
-    expect(dot("Implement")).toEqual({ className: "status error", label: "Failed" });
-    expect(dot("Break")).toEqual({ className: "status error", label: "Failed" });
-
-    core.list({ type: "run", run: { ...failed, unseen: null } });
-    expect(dot("Implement")).toEqual({ className: "status", label: "Failed" });
-    expect(dot("Break")).toEqual({ className: "status", label: "Failed" });
-  });
-
   it("offers a choice of harness only while more than one is installed", async () => {
     const project = workspace();
     const core = await renderApp({ type: "workspace", workspace: project });
@@ -90,10 +68,10 @@ describe("The session list", () => {
       { type: "session", session: task },
     );
     await view("Task");
-    const inFront = { focus: { type: "session", session_id: task.id } };
+    const inFront = { sessionId: task.id };
     expect(core.invoked("focus").at(-1)).toEqual(inFront);
     await act(async () => window.dispatchEvent(new Event("blur")));
-    expect(core.invoked("focus").at(-1)).toEqual({ focus: null });
+    expect(core.invoked("focus").at(-1)).toEqual({ sessionId: null });
     await act(async () => window.dispatchEvent(new Event("focus")));
     expect(core.invoked("focus").at(-1)).toEqual(inFront);
   });

@@ -31,8 +31,6 @@ mockIPC((cmd, args) => {
       return;
     case "agents":
       return ["claude", "pi"];
-    case "workflows":
-      return scenario.workflows ?? [];
     case "workspace_branches":
       return { head: "main" } satisfies Branches;
   }

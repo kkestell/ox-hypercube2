@@ -4,7 +4,7 @@ import { FileViewer } from "./FileViewer";
 import { subscribeViewer, updateViewer, viewerState } from "./viewerState";
 
 /**
- * A session's or run's content, beside its open file. `toggles` end the
+ * A session's or draft's content, beside its open file. `toggles` end the
  * rightmost header: the file viewer's while a file is open, otherwise the
  * content's.
  */

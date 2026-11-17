@@ -6,20 +6,20 @@ replies or thousands.
 
 ## Daemon
 
-A `watch` sends every workspace, worktree, session and run once, then only
-those added, changed or removed. Each worktree, session and run counts its
-changes; the watch remembers the count it last sent for each and reads the
-info only of those whose count moved. Workspaces are listed again, with
-their `git_working_tree` worked out from the filesystem, when a workspace or
-session is added or removed or a client connects or disconnects.
+A `watch` sends every workspace, worktree and session once, then only those
+added, changed or removed. Each worktree and session counts its changes; the
+watch remembers the count it last sent for each and reads the info only of
+those whose count moved. Workspaces are listed again, with their
+`git_working_tree` worked out from the filesystem, when a workspace or session
+is added or removed or a client connects or disconnects.
 
 ## Desktop core
 
-The core sends each viewed conversation, the viewed session's or each child
-of the viewed run, to the webview in batches on a channel of its own:
-each holds the items from the events received together, with an item merged
-into the earlier one with its key. Replaying a long session is a few large
-messages, and a message's streamed text chunks arrive joined.
+The core sends the viewed session's conversation to the webview in batches
+on a channel of its own: each holds the items from the events received
+together, with an item merged into the earlier one with its key. Replaying a
+long session is a few large messages, and a message's streamed text chunks
+arrive joined.
 
 ## UI
 
@@ -33,8 +33,6 @@ messages, and a message's streamed text chunks arrive joined.
   change to another session renders nothing in the transcript.
 - A completed turn's work renders only while its Worked group is open, and a
   group renders again only when its own items change.
-- The run view keeps each child's items apart. A change to one child's
-  conversation leaves the other children's items unchanged.
 - A message's Markdown is parsed into top-level blocks, and each block renders
   on its own from that parse. Text appended to a message parses and renders
   only its last block again; the blocks before it keep their identity.

@@ -75,7 +75,8 @@ pub struct Options {
     pub fd_limit: Option<u32>,
     pub park_after_ms: Option<u64>,
     /// Runs the daemon from a directory that holds the fake agent under each
-    /// harness's bridge name, so steps launch it as they launch a bridge.
+    /// harness's bridge name, so the daemon launches it as it launches a
+    /// bridge.
     pub bridges: bool,
     /// Variables over the daemon's environment.
     pub env: BTreeMap<String, String>,
@@ -83,14 +84,13 @@ pub struct Options {
     pub log: bool,
 }
 
-/// An oxd on a socket in its own directory, with that directory as its
-/// configuration home and without the user's or the system's git
-/// configuration.
+/// An oxd on a socket in its own directory, without the user's or the
+/// system's git configuration. The directory is its configuration home, so
+/// git reads no global ignore or attributes file.
 pub struct Daemon {
     pub child: Child,
     stderr: Option<Lines<BufReader<ChildStderr>>>,
-    /// Holds the socket, the worktrees, and `ox/workflows`, the daemon's
-    /// workflows directory.
+    /// Holds the socket and the worktrees.
     pub dir: TempDir,
     pub socket: PathBuf,
     options: Options,
@@ -107,7 +107,7 @@ impl Daemon {
 
     /// Starts oxd on the socket in `dir` and waits for it to report that it
     /// is ready. A daemon started on the socket of one that exited finds its
-    /// workspaces, sessions and runs.
+    /// workspaces and sessions.
     pub async fn start_in(dir: TempDir, options: Options) -> Self {
         let socket = dir.path().join("oxd.sock");
         let oxd = if options.bridges {
@@ -171,8 +171,8 @@ impl Daemon {
             .unwrap()
     }
 
-    /// Stops the daemon with SIGTERM, which keeps its sessions and runs
-    /// saved, and waits for it to exit.
+    /// Stops the daemon with SIGTERM, which keeps its sessions saved, and
+    /// waits for it to exit.
     pub async fn stop(&mut self) {
         self.stop_signal();
         assert!(self.wait_for_exit().await.success());
@@ -414,8 +414,7 @@ pub async fn next_changes(watch: &mut Stream<Vec<ListingChange>>) -> Vec<Listing
         .expect("the watch ended")
 }
 
-/// Every workspace, worktree, session and run, as a new watch first lists
-/// them.
+/// Every workspace, worktree and session, as a new watch first lists them.
 pub async fn listing(client: &Client) -> Listing {
     let mut watch = client.watch().await.unwrap();
     let mut listing = Listing::default();
@@ -482,13 +481,6 @@ pub fn apply(listing: &mut Listing, change: ListingChange) {
         }
         ListingChange::SessionRemoved { session_id } => {
             listing.sessions.retain(|s| s.id != session_id);
-        }
-        ListingChange::Run { run } => match listing.runs.iter_mut().find(|r| r.id == run.id) {
-            Some(listed) => *listed = run,
-            None => listing.runs.push(run),
-        },
-        ListingChange::RunRemoved { run_id } => {
-            listing.runs.retain(|r| r.id != run_id);
         }
     }
 }
