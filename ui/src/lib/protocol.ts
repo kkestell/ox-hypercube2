@@ -147,6 +147,11 @@ export interface RunInfo {
   steps: StepInfo[];
   /** When the run was started, in milliseconds since the Unix epoch. */
   created_at: number;
+  /**
+   * When the run succeeded, failed or was cancelled, in milliseconds since the
+   * Unix epoch. Unset while it runs and for an interrupted run.
+   */
+  ended_at: number | null;
   /** How the run ended while it was out of focus, until it is focused. */
   unseen: Unseen | null;
 }
@@ -202,7 +207,11 @@ export type ToolContent =
   | { type: "text"; text: string }
   | { type: "image"; mime_type: string; data: string };
 
-export type Item =
+/**
+ * An item of a session's conversation, with the time its key first appeared,
+ * in milliseconds since the Unix epoch.
+ */
+export type Item = { recorded_at: number } & (
   | { type: "prompt"; key: string; text: string; attachments: string[] }
   | { type: "text"; key: string; text: string; replace: boolean }
   | { type: "thought"; key: string; text: string; replace: boolean }
@@ -232,7 +241,8 @@ export type Item =
   | { type: "turn_completed"; key: string }
   | { type: "turn_error"; key: string; message: string }
   | { type: "agent_exited"; key: string; error: string | null }
-  | { type: "session_closed"; key: string };
+  | { type: "session_closed"; key: string }
+);
 
 /** An open permission request or form. */
 export type Request = Extract<Item, { type: "permission" | "elicitation" }>;
@@ -241,7 +251,9 @@ export function isRequest(item: Item): item is Request {
   return item.type === "permission" || item.type === "elicitation";
 }
 
-export type ConversationUpdate = Item | { type: "request_resolved"; request_id: string };
+export type ConversationUpdate =
+  | Item
+  | { type: "request_resolved"; recorded_at: number; request_id: string };
 
 /**
  * A change to the listing: a workspace, worktree, session or run added or

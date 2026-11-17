@@ -1699,7 +1699,7 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
     ] {
         database
             .execute(
-                "INSERT INTO events (session_id, seq, kind) VALUES (?1, ?2, ?3)",
+                "INSERT INTO events (session_id, seq, recorded_at, kind) VALUES (?1, ?2, 0, ?3)",
                 (
                     &session.id,
                     i64::try_from(seq).unwrap(),

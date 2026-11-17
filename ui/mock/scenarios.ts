@@ -33,7 +33,8 @@ class Listing {
   readonly runs: RunInfo[] = [];
   private clock = Date.now() - 3_600_000;
 
-  private tick() {
+  /** A minute after the previous time this listing gave out. */
+  tick() {
     this.clock += 60_000;
     return this.clock;
   }
@@ -115,6 +116,7 @@ class Listing {
           sessionState === undefined ? null : this.session(name, sessionState, worktree.id).id,
       })),
       created_at,
+      ended_at: state === "running" || state === "interrupted" ? null : this.tick(),
       unseen: null,
     };
     this.runs.push(run);
@@ -180,24 +182,28 @@ function sidebar(): Scenario {
     conversations: {
       [working.id]: [
         {
+          recorded_at: listing.tick(),
           type: "prompt",
           key: "1",
           text: "Why do the sidebar's status dots look the same?",
           attachments: [],
         },
         {
+          recorded_at: listing.tick(),
           type: "thought",
           key: "thought:1",
           text: "The dots take their colours from the status classes.",
           replace: false,
         },
         {
+          recorded_at: listing.tick(),
           type: "text",
           key: "text:1",
           text: "Checking the status styles.",
           replace: false,
         },
         {
+          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:1",
           title: "Read `ui/src/features/sessions/SessionList.tsx`",
@@ -206,6 +212,7 @@ function sidebar(): Scenario {
           content: [],
         },
         {
+          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:2",
           title: "Search for `--success`",
@@ -214,19 +221,22 @@ function sidebar(): Scenario {
           content: [{ type: "text", text: "ui/src/styles/controls.css" }],
         },
         {
+          recorded_at: listing.tick(),
           type: "text",
           key: "text:2",
           text: "Running and succeeded sessions both use `--success`.",
           replace: false,
         },
-        { type: "turn_completed", key: "7" },
+        { recorded_at: listing.tick(), type: "turn_completed", key: "7" },
         {
+          recorded_at: listing.tick(),
           type: "prompt",
           key: "8",
           text: "Make running and succeeded look different.",
           attachments: [],
         },
         {
+          recorded_at: listing.tick(),
           type: "tool_call",
           key: "tool:3",
           title: "Read ui/src/styles/controls.css",
@@ -234,7 +244,13 @@ function sidebar(): Scenario {
           raw_input: null,
           content: [],
         },
-        { type: "text", key: "text:3", text: "Both states use `--success`. ", replace: false },
+        {
+          recorded_at: listing.tick(),
+          type: "text",
+          key: "text:3",
+          text: "Both states use `--success`. ",
+          replace: false,
+        },
       ],
     },
     workflows: [{ workflow: "implement", name: "Implement", error: null }],
@@ -251,21 +267,28 @@ function runStatus(): Scenario {
       "pending",
     ]),
   ]);
+  const failed = listing.run("Fix the replay cursor", "failed", [
+    ["Plan", "succeeded", "exited"],
+    ["Implement", "failed", "exited"],
+    ["Review", "pending"],
+  ]);
+  const text = (key: string, text: string): ConversationUpdate => ({
+    recorded_at: listing.tick(),
+    type: "text",
+    key,
+    text,
+    replace: false,
+  });
   return {
     changes: listing.changes(),
     conversations: {
-      [run.steps[0]!.session_id!]: [
-        { type: "text", key: "text:1", text: "Read the run view", replace: false },
-      ],
+      [run.steps[0]!.session_id!]: [text("text:1", "Read the run view")],
       [run.steps[1]!.session_id!]: [
-        {
-          type: "text",
-          key: "text:1",
-          text: "Updated the run view.\n\nEach step now lists its agent's messages.",
-          replace: false,
-        },
-        { type: "text", key: "text:2", text: "Running checks", replace: false },
+        text("text:1", "Updated the run view.\n\nEach step now lists its agent's messages."),
+        text("text:2", "Running checks"),
       ],
+      [failed.steps[0]!.session_id!]: [text("text:1", "Planned the replay cursor fix")],
+      [failed.steps[1]!.session_id!]: [text("text:1", "The replay tests still fail")],
     },
   };
 }

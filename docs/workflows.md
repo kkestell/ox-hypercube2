@@ -344,9 +344,10 @@ Selecting a run opens the run view. Its header shows how long the run has
 been running, or when it started once it has ended, the worktree's branch
 and how it compares with its base, and the workflow's name when it fits.
 Below it is every step, in order, with its start time once it has started and
-the messages its agent wrote, oldest first. A step's dot there is green once it
-succeeded and red once it failed. A failed or interrupted run's reason shows
-under the step it stopped at. The steps fill the view's height. Clicking the
+the messages its agent wrote, oldest first, each with its time. A step's dot
+there is green once it succeeded and red once it failed. A failed or
+interrupted run's reason shows under the step it stopped at, a failed run's
+with the time the run ended. The steps fill the view's height. Clicking the
 name of a step with messages collapses or expands them; a step shows its
 messages until it has succeeded and a later step shows its first message or
 the run's failure, unless you have expanded or collapsed it.

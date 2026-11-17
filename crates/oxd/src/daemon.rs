@@ -167,6 +167,7 @@ impl Daemon {
                         saved.state,
                         saved.error.as_deref(),
                         &saved.steps,
+                        saved.ended_at,
                         saved.unseen,
                     )?;
                 }
@@ -900,6 +901,7 @@ impl Daemon {
                         })
                         .collect(),
                     created_at: now(),
+                    ended_at: None,
                     unseen: None,
                 };
                 saved.number = self

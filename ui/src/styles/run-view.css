@@ -57,19 +57,23 @@
   padding: 0 0 calc(var(--spacing) * 4) var(--run-status-indent);
 }
 
-/* A started step's start time, in the gutter left of the connector, starting
-   at the content's edge. */
-.run-status-time {
+/* A started step's start time, and each message's time, in the gutter left
+   of the connector, starting at the content's edge. */
+.run-status-time,
+.run-status-entry-time {
   position: absolute;
   top: 0;
-  left: 0;
   display: flex;
   align-items: center;
   width: calc(var(--run-status-line) - var(--spacing) * 4);
-  height: calc(var(--spacing) * 5);
   color: var(--muted-foreground);
   font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
+}
+
+.run-status-time {
+  left: 0;
+  height: calc(var(--spacing) * 5);
 }
 
 .run-status-step.connector::before {
@@ -140,27 +144,28 @@
   rotate: 90deg;
 }
 
-/* An expanded step's messages scroll within its share of the view. The
-   messages' dots and ticks sit in the list's left padding. */
+/* An expanded step's messages scroll within its share of the view. The list
+   starts at the step's left edge, and the messages' times, dots and ticks sit
+   in its left padding. */
 .run-status-messages {
   --message-dot: calc(var(--spacing) * 1.5);
   /* The space between a message's dot and its text. */
   --message-gap: calc(var(--spacing) * 3.25);
+  /* The distance from the step's left edge to a message's text. */
+  --message-indent: calc(
+    var(--run-status-line) +
+    var(--border-width) /
+    2 +
+    var(--tree-branch-length) +
+    var(--message-dot) +
+    var(--message-gap)
+  );
   display: flex;
   flex-direction: column;
   gap: calc(var(--spacing) * 3);
   min-height: 0;
-  margin: calc(var(--spacing) * 3) 0 0;
-  padding: 0 0 0
-    calc(
-      var(--run-status-line) -
-      var(--run-status-indent) +
-      var(--border-width) /
-      2 +
-      var(--tree-branch-length) +
-      var(--message-dot) +
-      var(--message-gap)
-    );
+  margin: calc(var(--spacing) * 3) 0 0 calc(-1 * var(--run-status-indent));
+  padding: 0 0 0 var(--message-indent);
   overflow-y: auto;
   list-style: none;
 }
@@ -191,6 +196,12 @@
   width: var(--tree-branch-length);
   height: var(--border-width);
   background: var(--border);
+}
+
+/* A message's time, centred on its first line. */
+.run-status-entry-time {
+  left: calc(-1 * var(--message-indent));
+  height: calc(var(--spacing) * 6);
 }
 
 .run-status-messages p {

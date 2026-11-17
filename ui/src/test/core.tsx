@@ -222,6 +222,7 @@ export function run(
       ...step,
     })),
     created_at: ++ids,
+    ended_at: null,
     unseen: null,
     ...fields,
   };

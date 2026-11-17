@@ -19,12 +19,21 @@ function isAgentMessage(item: Item): item is AgentMessage {
   return item.type === "text" && item.text.trim() !== "";
 }
 
+/** A run's failure or interruption, as `runNotice` finds it. */
+export interface RunNotice {
+  text: string;
+  /** The index of the step it belongs to, or -1 when no step matches. */
+  index: number;
+  /** When the run ended, or null when it is not known. */
+  time: number | null;
+}
+
 /**
- * The run's failure or interruption, and the index of the step it belongs
- * to: the first failed step, or the first interrupted one. The index is -1
- * when no step matches.
+ * The run's failure or interruption, the index of the step it belongs to
+ * (the first failed step, or the first interrupted one), and when the run
+ * ended.
  */
-export function runNotice(run: RunInfo): { text: string; index: number } | null {
+export function runNotice(run: RunInfo): RunNotice | null {
   const text =
     run.state === "failed" && run.error !== null
       ? run.error
@@ -33,7 +42,11 @@ export function runNotice(run: RunInfo): { text: string; index: number } | null 
         : null;
   if (text === null) return null;
   const state = run.state === "failed" ? "failed" : "interrupted";
-  return { text, index: run.steps.findIndex((step) => step.state === state) };
+  return {
+    text,
+    index: run.steps.findIndex((step) => step.state === state),
+    time: run.ended_at,
+  };
 }
 
 /**
@@ -53,12 +66,21 @@ function stepOutcome(step: StepInfo, session: SessionInfo | undefined): Status {
 }
 
 /** A time as `HH:MM`. */
-function clock(time: number) {
+export function clock(time: number) {
   return new Date(time).toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     hourCycle: "h23",
   });
+}
+
+/** A message's or the notice's time, in the gutter beside it. */
+function EntryTime({ time }: { time: number }) {
+  return (
+    <time className="run-status-entry-time" dateTime={new Date(time).toISOString()}>
+      {clock(time)}
+    </time>
+  );
 }
 
 /**
@@ -79,7 +101,7 @@ export function RunStatus({
   /** The child sessions' conversations, by session ID. */
   conversations: Map<string, Item[]>;
   /** The run's `runNotice`. */
-  notice: { text: string; index: number } | null;
+  notice: RunNotice | null;
 }) {
   // Whether each step the user toggled is expanded, by index.
   const [toggled, setToggled] = useState<ReadonlyMap<number, boolean>>(new Map());
@@ -88,7 +110,7 @@ export function RunStatus({
       step.session_id === null
         ? []
         : (conversations.get(step.session_id)?.filter(isAgentMessage) ?? []);
-    const stepNotice = notice?.index === index ? notice.text : undefined;
+    const stepNotice = notice?.index === index ? notice : undefined;
     return {
       step,
       messages,
@@ -158,7 +180,7 @@ function StepStatus({
   /** The agent messages of the step's child session, oldest first. */
   messages: AgentMessage[];
   /** The run's failure or interruption, shown after the step's messages. */
-  notice: string | undefined;
+  notice: RunNotice | undefined;
   /** Whether the step shows its messages, or null when it has none to show. */
   expanded: boolean | null;
   onToggle: () => void;
@@ -203,12 +225,14 @@ function StepStatus({
         <ol className="run-status-messages" ref={follow.ref} onScroll={follow.onScroll}>
           {messages.map((message) => (
             <li key={message.key}>
+              <EntryTime time={message.recorded_at} />
               <Markdown text={message.text} />
             </li>
           ))}
           {notice !== undefined && (
             <li className="run-status-error">
-              <p>{notice}</p>
+              {notice.time !== null && <EntryTime time={notice.time} />}
+              <p>{notice.text}</p>
             </li>
           )}
         </ol>

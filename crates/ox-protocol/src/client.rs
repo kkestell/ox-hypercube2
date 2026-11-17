@@ -804,6 +804,7 @@ mod tests {
             let event = Box::new(Event {
                 session_id: "s".into(),
                 seq: 1,
+                recorded_at: 0,
                 kind: EventKind::SessionClosed,
             });
             self.send(ServerMessage::Event {

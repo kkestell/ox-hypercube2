@@ -94,6 +94,7 @@ describe("A permission request", () => {
     const core = await viewSession(task);
     core.update(task.id, {
       type: "permission",
+      recorded_at: 0,
       key: "request:7",
       request_id: "7",
       title: "Run `ls`",
@@ -106,7 +107,7 @@ describe("A permission request", () => {
     expect(core.invoked("permit")).toEqual([
       { sessionId: task.id, requestId: "7", optionId: "yes" },
     ]);
-    core.update(task.id, { type: "request_resolved", request_id: "7" });
+    core.update(task.id, { type: "request_resolved", recorded_at: 0, request_id: "7" });
     expect(screen.queryByRole("button", { name: "Allow" })).not.toBeInTheDocument();
   });
 });
@@ -147,6 +148,7 @@ describe("An agent's form", () => {
     const core = await viewSession(task);
     core.update(task.id, {
       type: "elicitation",
+      recorded_at: 0,
       key: "request:9",
       request_id: "9",
       message: "Order",

@@ -35,7 +35,7 @@ ownership and lifecycle.
 - **Child session**: The session a run starts for one of its agent steps, in the
   run's worktree.
 - **Run view**: The desktop view of a run: each step with its start time and
-  its agent's messages.
+  its agent's messages with their times.
 - **Focus**: The session or run a client shows in front of the user, which
   the client's connection tells `oxd`. The desktop sets it only while its
   window is in front of other apps. Distinct from viewing, the event

@@ -73,6 +73,9 @@ pub struct SavedRun {
     pub steps: Vec<StepInfo>,
     /// When the run was started, in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// When the run succeeded, failed or was cancelled, in milliseconds
+    /// since the Unix epoch.
+    pub ended_at: Option<u64>,
     pub unseen: Option<Unseen>,
 }
 
@@ -151,12 +154,14 @@ impl Store {
                 state        TEXT NOT NULL,
                 error        TEXT,
                 steps        TEXT NOT NULL,  -- JSON array of StepInfo
-                created_at   INTEGER NOT NULL
+                created_at   INTEGER NOT NULL,
+                ended_at     INTEGER
             );
             CREATE TABLE IF NOT EXISTS events (
-                session_id TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                seq        INTEGER NOT NULL,
-                kind       TEXT    NOT NULL,  -- JSON of EventKind
+                session_id  TEXT    NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                seq         INTEGER NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                kind        TEXT    NOT NULL,  -- JSON of EventKind
                 PRIMARY KEY (session_id, seq)
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS archived (
@@ -195,17 +200,19 @@ impl Store {
     /// A session's stored events, in order.
     pub fn events(&self, session_id: &str) -> rusqlite::Result<Vec<Event>> {
         let connection = self.lock();
-        let mut query = connection
-            .prepare("SELECT seq, kind FROM events WHERE session_id = ?1 ORDER BY seq")?;
+        let mut query = connection.prepare(
+            "SELECT seq, recorded_at, kind FROM events WHERE session_id = ?1 ORDER BY seq",
+        )?;
         query
             .query_map([session_id], |row| {
-                let kind: String = row.get(1)?;
+                let kind: String = row.get(2)?;
                 Ok(Event {
                     session_id: session_id.into(),
                     seq: u64::try_from(row.get::<_, i64>(0)?).expect("seqs are positive"),
+                    recorded_at: time_value(row, 1)?,
                     kind: serde_json::from_str::<EventKind>(&kind).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            1,
+                            2,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
@@ -360,9 +367,9 @@ impl Store {
         transaction.execute(
             "INSERT INTO runs (
                 id, workspace_id, worktree_id, workflow, name, input, state, error, steps,
-                created_at
+                created_at, ended_at
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 run.id,
                 run.workspace_id,
@@ -373,7 +380,8 @@ impl Store {
                 state_name(run.state),
                 run.error,
                 steps_json(&run.steps),
-                time(run.created_at)
+                time(run.created_at),
+                run.ended_at.map(time)
             ],
         )?;
         let number = u64::try_from(transaction.last_insert_rowid()).expect("rowids are positive");
@@ -386,7 +394,7 @@ impl Store {
         let connection = self.lock();
         let mut query = connection.prepare(
             "SELECT number, id, workspace_id, worktree_id, workflow, name, input, state, error,
-                steps, created_at,
+                steps, created_at, ended_at,
                 (SELECT unseen FROM run_unseen WHERE run_id = runs.id)
             FROM runs ORDER BY number",
         )?;
@@ -411,26 +419,36 @@ impl Store {
                         )
                     })?,
                     created_at: time_value(row, 10)?,
-                    unseen: parse_unseen(row, 11)?,
+                    ended_at: row
+                        .get::<_, Option<i64>>(11)?
+                        .map(|millis| u64::try_from(millis).expect("times are positive")),
+                    unseen: parse_unseen(row, 12)?,
                 })
             })?
             .collect()
     }
 
-    /// Saves a run's state, error, steps and unseen outcome.
+    /// Saves a run's state, error, steps, end time and unseen outcome.
     pub fn update_run(
         &self,
         id: &str,
         state: RunState,
         error: Option<&str>,
         steps: &[StepInfo],
+        ended_at: Option<u64>,
         unseen: Option<Unseen>,
     ) -> rusqlite::Result<()> {
         let mut connection = self.lock();
         let transaction = connection.transaction()?;
         transaction.execute(
-            "UPDATE runs SET state = ?2, error = ?3, steps = ?4 WHERE id = ?1",
-            params![id, state_name(state), error, steps_json(steps)],
+            "UPDATE runs SET state = ?2, error = ?3, steps = ?4, ended_at = ?5 WHERE id = ?1",
+            params![
+                id,
+                state_name(state),
+                error,
+                steps_json(steps),
+                ended_at.map(time)
+            ],
         )?;
         match unseen {
             Some(unseen) => transaction.execute(
@@ -611,7 +629,8 @@ fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
             let transaction = connection.transaction()?;
             {
                 let mut insert = transaction.prepare_cached(
-                    "INSERT INTO events SELECT ?1, ?2, ?3
+                    "INSERT INTO events (session_id, seq, recorded_at, kind)
+                    SELECT ?1, ?2, ?3, ?4
                     WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
                 )?;
                 for write in &batch {
@@ -620,7 +639,12 @@ fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
                             let seq = i64::try_from(event.seq).expect("seqs fit an i64");
                             let kind = serde_json::to_string(&event.kind)
                                 .expect("an event kind serializes");
-                            insert.execute(params![event.session_id, seq, kind])?;
+                            insert.execute(params![
+                                event.session_id,
+                                seq,
+                                time(event.recorded_at),
+                                kind
+                            ])?;
                         }
                     }
                 }
@@ -1026,6 +1050,7 @@ mod tests {
                 step("Work", StepState::Pending),
             ],
             created_at: 1_700_000_000_000,
+            ended_at: None,
             unseen: None,
         }
     }
@@ -1080,6 +1105,7 @@ mod tests {
             },
             step("Work", StepState::Failed),
         ];
+        second.ended_at = Some(1_700_000_000_900);
         second.unseen = Some(Unseen::Error);
         store
             .update_run(
@@ -1087,6 +1113,7 @@ mod tests {
                 second.state,
                 second.error.as_deref(),
                 &second.steps,
+                second.ended_at,
                 second.unseen,
             )
             .unwrap();
@@ -1098,6 +1125,7 @@ mod tests {
                 second.state,
                 second.error.as_deref(),
                 &second.steps,
+                second.ended_at,
                 None,
             )
             .unwrap();
@@ -1136,7 +1164,7 @@ mod tests {
         store.set_session_unseen("s", Some(Unseen::Error)).unwrap();
         let run = run("r");
         store
-            .update_run("r", run.state, None, &run.steps, Some(Unseen::Error))
+            .update_run("r", run.state, None, &run.steps, None, Some(Unseen::Error))
             .unwrap();
         store.remove_run("r").unwrap();
         let sessions: Vec<_> = store
@@ -1161,10 +1189,13 @@ mod tests {
         assert!(store.workspace_has_sessions("w").unwrap());
     }
 
+    /// Event `seq` of `session`, recorded `seq` milliseconds after the
+    /// epoch.
     fn event(session: &str, seq: u64, kind: EventKind) -> Event {
         Event {
             session_id: session.into(),
             seq,
+            recorded_at: seq,
             kind,
         }
     }
@@ -1199,9 +1230,9 @@ mod tests {
             .events("s")
             .unwrap()
             .into_iter()
-            .map(|event| event.seq)
+            .map(|event| (event.seq, event.recorded_at))
             .collect();
-        assert_eq!(seqs, [1, 2, 3]);
+        assert_eq!(seqs, [(1, 1), (2, 2), (3, 3)]);
         assert_eq!(store.sessions().unwrap()[0].last_seq, 3);
         assert_eq!(store.events("s").unwrap()[0], exited("s", 1));
     }

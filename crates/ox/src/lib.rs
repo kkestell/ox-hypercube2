@@ -18,7 +18,7 @@ use tauri::async_runtime::JoinHandle;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager, State};
 
-use crate::conversation::{Conversation, Item, coalesce};
+use crate::conversation::{Conversation, ConversationUpdate, coalesce};
 
 /// A task that stops when dropped.
 struct Task(JoinHandle<()>);
@@ -186,7 +186,7 @@ fn view_session(
     handle: AppHandle,
     app: State<'_, App>,
     session_id: String,
-    channel: Channel<Vec<Item>>,
+    channel: Channel<Vec<ConversationUpdate>>,
 ) {
     let id = channel.id();
     let task = tauri::async_runtime::spawn(async move {

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import type { RunInfo } from "../../lib/protocol";
 import { renderApp, run, session, view, workspace, worktree } from "../../test/core";
+import { clock } from "./RunStatus";
 
 const repo = workspace({ git_working_tree: true });
 const tree = worktree();
@@ -25,9 +26,25 @@ async function viewRun(steps: RunInfo["steps"], fields: Partial<RunInfo> = {}) {
 
 const step = (name: string) => screen.getByRole("region", { name });
 const toggle = (name: string) => within(step(name)).getByRole("button");
+const entries = (name: string) => [...step(name).querySelectorAll(".run-status-messages li")];
+/** The text of each of the step's messages and its notice, without their times. */
 const messages = (name: string) =>
-  [...step(name).querySelectorAll(".run-status-messages li")].map((item) => item.textContent);
-const say = (key: string, text: string) => ({ type: "text", key, text, replace: false }) as const;
+  entries(name).map((item) =>
+    [...item.childNodes]
+      .filter((node) => node.nodeName !== "TIME")
+      .map((node) => node.textContent)
+      .join(""),
+  );
+/** The time beside each of the step's messages and its notice, as shown and as `dateTime`. */
+const times = (name: string) =>
+  entries(name).map((item) => {
+    const time = item.querySelector("time");
+    return time === null ? null : [time.textContent, time.dateTime];
+  });
+/** `time` as an entry's time shows it. */
+const shown = (time: number) => [clock(time), new Date(time).toISOString()];
+const say = (key: string, text: string, recorded_at = 0) =>
+  ({ recorded_at, type: "text", key, text, replace: false }) as const;
 
 describe("A run's steps", () => {
   it("show their agent messages and collapse once a later step reports", async () => {
@@ -69,12 +86,30 @@ describe("A run's steps", () => {
     expect(messages("Report")).toEqual(["Reading the code", "Writing the fix"]);
   });
 
-  it("show a failure under the step that failed", async () => {
+  it("show each agent message's time, from when its first text arrived", async () => {
+    const first = new Date(2026, 10, 16, 9, 5).getTime();
+    const second = new Date(2026, 10, 16, 9, 42).getTime();
+    const { core } = await viewRun([
+      { name: "Report", state: "running", started_at: first, session_id: "child-4" },
+    ]);
+    core.update("child-4", say("a", "Reading", first));
+    core.update("child-4", say("b", "Writing the fix", second));
+    expect(times("Report")).toEqual([shown(first), shown(second)]);
+
+    core.update("child-4", say("a", " the code", second + 60_000));
+    expect(messages("Report")).toEqual(["Reading the code", "Writing the fix"]);
+    expect(times("Report")).toEqual([shown(first), shown(second)]);
+  });
+
+  it("show a failure under the step that failed, with the time the run ended", async () => {
+    const ended = new Date(2026, 10, 16, 10, 17).getTime();
     await viewRun([{ name: "Guarded", state: "failed", started_at: 1, session_id: null }], {
       state: "failed",
       error: "a precondition exited with status 3",
+      ended_at: ended,
     });
     expect(messages("Guarded")).toEqual(["a precondition exited with status 3"]);
+    expect(times("Guarded")).toEqual([shown(ended)]);
   });
 
   it("take an answer to a child's permission request", async () => {
@@ -82,6 +117,7 @@ describe("A run's steps", () => {
       { name: "Ask", state: "running", started_at: 1, session_id: "child-3" },
     ]);
     core.update("child-3", {
+      recorded_at: 0,
       type: "permission",
       key: "request:1",
       request_id: "1",

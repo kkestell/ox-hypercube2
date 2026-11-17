@@ -50,14 +50,21 @@ async function work(action: () => unknown) {
 /** A completed turn for each of `count` two-paragraph replies. */
 function replies(count: number): ConversationUpdate[] {
   return Array.from({ length: count }, (_, index): ConversationUpdate[] => [
-    { type: "prompt", key: `prompt:${index}`, text: `Prompt ${index}`, attachments: [] },
+    {
+      type: "prompt",
+      recorded_at: 0,
+      key: `prompt:${index}`,
+      text: `Prompt ${index}`,
+      attachments: [],
+    },
     {
       type: "text",
+      recorded_at: 0,
       key: `reply:${index}`,
       text: `First ${index}\n\nReply **${index}**`,
       replace: false,
     },
-    { type: "turn_completed", key: `end:${index}` },
+    { type: "turn_completed", recorded_at: 0, key: `end:${index}` },
   ]).flat();
 }
 
@@ -99,6 +106,7 @@ describe("Work", () => {
     const { core, sessions } = await bigWorkspace();
     const growing: ConversationUpdate = {
       type: "text",
+      recorded_at: 0,
       key: `reply:${REPLIES - 1}`,
       text: " and more",
       replace: false,
