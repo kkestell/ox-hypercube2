@@ -1,14 +1,13 @@
 //! The daemon's saved workspaces, worktrees and sessions, in one `SQLite`
 //! database.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 
 use ox_protocol::schema::SessionUpdate;
 use ox_protocol::{ConfigSetting, Event, EventKind, Unseen};
 use rusqlite::{Connection, Transaction, params};
-use tokio::sync::oneshot;
 
 use crate::state::{self, Queue};
 
@@ -41,6 +40,23 @@ pub struct SavedSession {
     pub queue: Queue,
     /// The session's config.
     pub config: Vec<ConfigSetting>,
+    /// Whether the session's events hold neither an `agent_started` nor a
+    /// `prompt_started`, so that loading it asks the agent to replay its
+    /// conversation.
+    pub needs_replay: bool,
+}
+
+/// What a stop left open in a session's events.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeftOpen {
+    /// Whether a turn started and did not end.
+    pub turn: bool,
+    /// The ID of each permission request or elicitation with no resolution,
+    /// in seq order, and whether it is a permission request.
+    pub requests: Vec<(String, bool)>,
+    /// The seq of each `prompt_steered` event that no
+    /// `steered_prompt_taken` or `steered_prompt_dropped` names, in order.
+    pub steered: Vec<u64>,
 }
 
 /// A worktree as the database holds it.
@@ -74,19 +90,13 @@ pub enum RowChange {
     WorktreeForgotten(String),
 }
 
-/// What the event writer thread is sent.
-enum Write {
-    Events(Vec<Event>),
-    /// Acknowledged once everything sent before it is committed.
-    Flush(oneshot::Sender<()>),
-}
+/// The events `Store::events` reads under one hold of the connection.
+const READ_BATCH: u64 = 256;
 
-/// One connection to the database. Every query is a small local read or
-/// write, so it runs inline. Events are written by a thread of their own, so
-/// recording one never waits on the database.
+/// One connection to the database. Every query but a read of a session's
+/// events is a small local read or write, so it runs inline.
 pub struct Store {
-    connection: Arc<Mutex<Connection>>,
-    writer: Sender<Write>,
+    connection: Mutex<Connection>,
 }
 
 impl Store {
@@ -106,43 +116,97 @@ impl Store {
             PRAGMA foreign_keys = ON;",
         )?;
         migrate(&mut connection)?;
-        let connection = Arc::new(Mutex::new(connection));
-        let (writer, queue) = mpsc::channel();
-        let target = connection.clone();
-        std::thread::spawn(move || write_events(&target, &queue));
-        Ok(Self { connection, writer })
+        Ok(Self {
+            connection: Mutex::new(connection),
+        })
     }
 
-    /// Queues events for writing and returns at once. Events of a session
-    /// deleted before they are written are dropped.
-    pub fn log(&self, events: Vec<Event>) {
-        let _ = self.writer.send(Write::Events(events));
-    }
-
-    /// Returns once every event logged before the call is committed.
-    pub async fn flush(&self) {
-        let (done, committed) = oneshot::channel();
-        if self.writer.send(Write::Flush(done)).is_ok() {
-            let _ = committed.await;
+    /// A session's stored events, in order. They are read `READ_BATCH` at a
+    /// time, releasing the connection between reads, so that a long history
+    /// does not hold up every session's writes.
+    pub fn events(&self, session_id: &str) -> rusqlite::Result<Vec<Event>> {
+        let mut events: Vec<Event> = Vec::new();
+        loop {
+            let after = events.last().map_or(0, |event| event.seq);
+            let batch = self.events_after(session_id, after, READ_BATCH)?;
+            let done = batch.len() < usize::try_from(READ_BATCH).expect("a batch fits a usize");
+            events.extend(batch);
+            if done {
+                return Ok(events);
+            }
         }
     }
 
-    /// A session's stored events, in order.
-    pub fn events(&self, session_id: &str) -> rusqlite::Result<Vec<Event>> {
+    /// The first `limit` of a session's stored events with `seq > after_seq`,
+    /// in order. Seqs an event write lost are skipped.
+    pub fn events_after(
+        &self,
+        session_id: &str,
+        after_seq: u64,
+        limit: u64,
+    ) -> rusqlite::Result<Vec<Event>> {
         let connection = self.lock();
-        let mut query = connection.prepare(
-            "SELECT seq, recorded_at, kind FROM events WHERE session_id = ?1 ORDER BY seq",
+        let mut query = connection.prepare_cached(
+            "SELECT seq, recorded_at, kind FROM events
+            WHERE session_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?;
         query
-            .query_map([session_id], |row| {
-                Ok(Event {
-                    session_id: session_id.into(),
-                    seq: u64::try_from(row.get::<_, i64>(0)?).expect("seqs are positive"),
-                    recorded_at: time_value(row, 1)?,
-                    kind: json_value(row, 2)?,
-                })
-            })?
+            .query_map(
+                params![session_id, seq_value(after_seq), seq_value(limit)],
+                |row| {
+                    Ok(Event {
+                        session_id: session_id.into(),
+                        seq: u64::try_from(row.get::<_, i64>(0)?).expect("seqs are positive"),
+                        recorded_at: time_value(row, 1)?,
+                        kind: json_value(row, 2)?,
+                    })
+                },
+            )?
             .collect()
+    }
+
+    /// What a stop left open in each session's events, for the sessions
+    /// with anything open. Each query reads only the `events_by_type`
+    /// entries of the event types it names, never a whole history.
+    pub fn left_open(&self) -> rusqlite::Result<HashMap<String, LeftOpen>> {
+        let connection = self.lock();
+        let mut open: HashMap<String, LeftOpen> = HashMap::new();
+        let turns = connection
+            .prepare(LEFT_OPEN_TURNS)?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for session_id in turns {
+            open.entry(session_id).or_default().turn = true;
+        }
+        let requests = connection
+            .prepare(LEFT_OPEN_REQUESTS)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)? == "permission_requested",
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (session_id, request_id, permission) in requests {
+            open.entry(session_id)
+                .or_default()
+                .requests
+                .push((request_id, permission));
+        }
+        let steered = connection
+            .prepare(LEFT_OPEN_STEERED)?
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    u64::try_from(row.get::<_, i64>(1)?).expect("seqs are positive"),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (session_id, seq) in steered {
+            open.entry(session_id).or_default().steered.push(seq);
+        }
+        Ok(open)
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
@@ -214,17 +278,7 @@ impl Store {
     /// Every session, in the order they were created.
     pub fn sessions(&self) -> rusqlite::Result<Vec<SavedSession>> {
         let connection = self.lock();
-        let mut query = connection.prepare(
-            "SELECT number, id, workspace_id, command, cwd, title, agent_session_id, worktree_id,
-                (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
-                EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
-                created_at,
-                (SELECT unseen FROM session_unseen WHERE session_id = sessions.id),
-                session_queues.paused, session_queues.prompts, config
-            FROM sessions
-            LEFT JOIN session_queues ON session_queues.session_id = sessions.id
-            ORDER BY number",
-        )?;
+        let mut query = connection.prepare(SESSIONS)?;
         query
             .query_map([], |row| {
                 Ok(SavedSession {
@@ -254,6 +308,7 @@ impl Store {
                         },
                     },
                     config: json_value(row, 14)?,
+                    needs_replay: row.get(15)?,
                 })
             })?
             .collect()
@@ -350,10 +405,16 @@ impl Store {
         )
     }
 
-    /// Writes `changes` to session `id`'s saved data in one transaction, so
-    /// that none of them is written if one fails.
-    pub fn save_session(&self, id: &str, changes: &[RowChange]) -> rusqlite::Result<()> {
-        if changes.is_empty() {
+    /// Writes `changes` to session `id`'s saved data and stores `events`, in
+    /// one transaction, so that nothing is written if one fails. Events of a
+    /// session that is no longer saved are dropped.
+    pub fn save_session(
+        &self,
+        id: &str,
+        changes: &[RowChange],
+        events: &[Event],
+    ) -> rusqlite::Result<()> {
+        if changes.is_empty() && events.is_empty() {
             return Ok(());
         }
         let mut connection = self.lock();
@@ -403,6 +464,7 @@ impl Store {
                 }
             };
         }
+        insert_events(&transaction, events)?;
         transaction.commit()
     }
 
@@ -427,6 +489,59 @@ impl Store {
     }
 }
 
+/// Every session, in the order they were created. Whether a session needs
+/// replay is found through `events_by_type`.
+const SESSIONS: &str = "SELECT number, id, workspace_id, command, cwd, title, agent_session_id,
+        worktree_id,
+        (SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = sessions.id),
+        EXISTS (SELECT 1 FROM archived WHERE session_id = sessions.id),
+        created_at,
+        (SELECT unseen FROM session_unseen WHERE session_id = sessions.id),
+        session_queues.paused, session_queues.prompts, config,
+        NOT EXISTS (SELECT 1 FROM events
+            WHERE kind ->> '$.type' = 'agent_started' AND session_id = sessions.id)
+        AND NOT EXISTS (SELECT 1 FROM events
+            WHERE kind ->> '$.type' = 'prompt_started' AND session_id = sessions.id)
+    FROM sessions
+    LEFT JOIN session_queues ON session_queues.session_id = sessions.id
+    ORDER BY number";
+
+/// The sessions whose last `prompt_started` or `turn_started` comes after
+/// their last `turn_ended`, by three index lookups each.
+const LEFT_OPEN_TURNS: &str = "SELECT id FROM sessions
+    WHERE MAX(
+        COALESCE((SELECT MAX(seq) FROM events
+            WHERE kind ->> '$.type' = 'prompt_started' AND session_id = sessions.id), 0),
+        COALESCE((SELECT MAX(seq) FROM events
+            WHERE kind ->> '$.type' = 'turn_started' AND session_id = sessions.id), 0)
+    ) > COALESCE((SELECT MAX(seq) FROM events
+        WHERE kind ->> '$.type' = 'turn_ended' AND session_id = sessions.id), 0)
+    ORDER BY number";
+
+/// Each request with no resolution: its session, its ID and the type of the
+/// event that requested it, in seq order. A request ID is unique within its
+/// session across permission requests and elicitations.
+const LEFT_OPEN_REQUESTS: &str = "SELECT session_id, kind ->> '$.data.request_id' AS request_id,
+        MIN(kind ->> '$.type')
+    FROM events
+    WHERE kind ->> '$.type' IN ('permission_requested', 'permission_resolved',
+        'elicitation_requested', 'elicitation_resolved')
+    GROUP BY session_id, request_id
+    HAVING COUNT(*) = 1
+        AND MIN(kind ->> '$.type') IN ('permission_requested', 'elicitation_requested')
+    ORDER BY session_id, MIN(seq)";
+
+/// Each steered prompt that was neither taken nor dropped: its session and
+/// the seq of its `prompt_steered` event, which the answer names.
+const LEFT_OPEN_STEERED: &str = "SELECT session_id,
+        CASE kind ->> '$.type' WHEN 'prompt_steered' THEN seq
+            ELSE kind ->> '$.data.prompt' END AS prompt
+    FROM events
+    WHERE kind ->> '$.type' IN ('prompt_steered', 'steered_prompt_taken', 'steered_prompt_dropped')
+    GROUP BY session_id, prompt
+    HAVING COUNT(*) = 1 AND MIN(kind ->> '$.type') = 'prompt_steered'
+    ORDER BY session_id, prompt";
+
 /// The steps that bring a database to the schema this build writes. Step
 /// `i` takes a database from schema version `i` to `i + 1`; the schema
 /// version, kept in `PRAGMA user_version`, is the number of steps applied.
@@ -436,7 +551,7 @@ impl Store {
 /// every older shape or comes with a step that rewrites the rows. Each schema
 /// version has a fixture in `tests/fixtures`, which every later build opens.
 const MIGRATIONS: &[fn(&Transaction<'_>) -> rusqlite::Result<()>] =
-    &[create_tables, add_session_config];
+    &[create_tables, add_session_config, add_events_by_type];
 
 /// The schema version this build writes.
 fn schema_version() -> i64 {
@@ -554,6 +669,14 @@ fn add_session_config(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Schema version 3: an index of events by type, so that startup finds what
+/// a stop left open, and whether a session needs replay, without reading
+/// message updates. A query uses it when it filters on the same expression.
+fn add_events_by_type(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
+    transaction
+        .execute_batch("CREATE INDEX events_by_type ON events (kind ->> '$.type', session_id, seq)")
+}
+
 fn insert_worktree(
     transaction: &Transaction<'_>,
     worktree: &SavedWorktree,
@@ -582,7 +705,7 @@ fn insert_events(transaction: &Transaction<'_>, events: &[Event]) -> rusqlite::R
         WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
     )?;
     for event in events {
-        let seq = i64::try_from(event.seq).expect("seqs fit an i64");
+        let seq = seq_value(event.seq);
         let kind = serde_json::to_string(&event.kind).expect("an event kind serializes");
         insert.execute(params![
             event.session_id,
@@ -592,6 +715,12 @@ fn insert_events(transaction: &Transaction<'_>, events: &[Event]) -> rusqlite::R
         ])?;
     }
     Ok(())
+}
+
+/// A seq or a count of events, as `SQLite` takes it. Counts past the largest
+/// integer `SQLite` holds are capped there.
+fn seq_value(seq: u64) -> i64 {
+    i64::try_from(seq).unwrap_or(i64::MAX)
 }
 
 /// A time in milliseconds since the Unix epoch, as its column holds it.
@@ -638,38 +767,6 @@ fn parse_unseen(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Optio
             rusqlite::types::Type::Text,
             format!("unknown unseen outcome {name:?}").into(),
         )),
-    }
-}
-
-/// Writes each batch the queue holds in one transaction, until every sender
-/// is dropped. A failed write goes to oxd's log and the thread carries on.
-fn write_events(connection: &Mutex<Connection>, queue: &Receiver<Write>) {
-    while let Ok(first) = queue.recv() {
-        let mut batch = vec![first];
-        batch.extend(queue.try_iter());
-        let mut flushes = Vec::new();
-        let mut connection = connection.lock().unwrap();
-        let result = (|| {
-            let transaction = connection.transaction()?;
-            for write in &batch {
-                if let Write::Events(events) = write {
-                    insert_events(&transaction, events)?;
-                }
-            }
-            transaction.commit()
-        })();
-        drop(connection);
-        if let Err(error) = result {
-            eprintln!("oxd: writing events: {error}");
-        }
-        for write in batch {
-            if let Write::Flush(done) = write {
-                flushes.push(done);
-            }
-        }
-        for done in flushes {
-            let _ = done.send(());
-        }
     }
 }
 
@@ -763,6 +860,7 @@ mod tests {
                     unseen: None,
                     queue: Queue::default(),
                     config: Vec::new(),
+                    needs_replay: true,
                 },
                 SavedSession {
                     number: second,
@@ -779,6 +877,7 @@ mod tests {
                     unseen: None,
                     queue: Queue::default(),
                     config: Vec::new(),
+                    needs_replay: true,
                 },
             ]
         );
@@ -845,7 +944,7 @@ mod tests {
 
     /// Writes one change to session `id`.
     fn save(store: &Store, id: &str, change: RowChange) {
-        store.save_session(id, &[change]).unwrap();
+        store.save_session(id, &[change], &[]).unwrap();
     }
 
     fn setting(config_id: &str, value: &str) -> ConfigSetting {
@@ -883,6 +982,7 @@ mod tests {
                     RowChange::AgentSessionId("agent".into()),
                     RowChange::Config(config.clone()),
                 ],
+                &[],
             )
             .unwrap();
         let saved = &store.sessions().unwrap()[0];
@@ -890,7 +990,9 @@ mod tests {
         assert_eq!(saved.agent_session_id.as_deref(), Some("agent"));
         assert_eq!(saved.config, config);
 
-        store.save_session("s", &[RowChange::Title(None)]).unwrap();
+        store
+            .save_session("s", &[RowChange::Title(None)], &[])
+            .unwrap();
         assert_eq!(store.sessions().unwrap()[0].title, None);
     }
 
@@ -919,7 +1021,7 @@ mod tests {
             .add_session("o", "v", &command(), Path::new("/other"), None, 0, &[])
             .unwrap();
         store
-            .save_session("s", &[RowChange::AgentSessionId("claude".into())])
+            .save_session("s", &[RowChange::AgentSessionId("claude".into())], &[])
             .unwrap();
         store.remove_workspace("w").unwrap();
         assert_eq!(store.workspaces().unwrap(), [workspace("v", "/other")]);
@@ -986,20 +1088,20 @@ mod tests {
         store.add_workspace(&workspace("w", "/work")).unwrap();
         add_worktree_session(&store, "s", &worktree("one"));
         store
-            .save_session("s", &[RowChange::WorktreeForgotten("one".into())])
+            .save_session("s", &[RowChange::WorktreeForgotten("one".into())], &[])
             .unwrap();
         assert!(store.worktrees().unwrap().is_empty());
         assert_eq!(store.sessions().unwrap()[0].worktree_id, None);
     }
 
-    #[tokio::test]
-    async fn a_deleted_session_takes_its_worktree_and_events() {
+    #[test]
+    fn a_deleted_session_takes_its_worktree_and_events() {
         let store = store();
         store.add_workspace(&workspace("w", "/work")).unwrap();
         add_worktree_session(&store, "s", &worktree("one"));
         add_worktree_session(&store, "t", &worktree("two"));
-        store.log(vec![exited("s", 1), exited("t", 1)]);
-        store.flush().await;
+        log(&store, "s", &[exited("s", 1)]);
+        log(&store, "t", &[exited("t", 1)]);
         store.remove_session("s").unwrap();
         assert_eq!(store.worktrees().unwrap(), [worktree("two")]);
         assert!(store.events("s").unwrap().is_empty());
@@ -1030,9 +1132,13 @@ mod tests {
     #[test]
     fn a_failed_change_leaves_the_others_unwritten() {
         let store = store_with_session();
+        // The last write of the transaction fails.
         store
             .lock()
-            .execute_batch("DROP TABLE session_queues")
+            .execute_batch(
+                "CREATE TRIGGER injected BEFORE INSERT ON events WHEN NEW.seq = 2
+                BEGIN SELECT RAISE(ABORT, 'injected'); END",
+            )
             .unwrap();
         store
             .save_session(
@@ -1041,15 +1147,11 @@ mod tests {
                     RowChange::Title(Some("Fix the build".into())),
                     RowChange::Queue(Queue::default()),
                 ],
+                &[exited("s", 1), exited("s", 2)],
             )
             .unwrap_err();
-        let title: Option<String> = store
-            .lock()
-            .query_row("SELECT title FROM sessions WHERE id = 's'", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(title, None);
+        assert_eq!(store.sessions().unwrap()[0].title, None);
+        assert_eq!(count(&store, "events"), 0);
     }
 
     /// Event `seq` of `session`, recorded `seq` milliseconds after the
@@ -1076,12 +1178,16 @@ mod tests {
         store
     }
 
-    #[tokio::test]
-    async fn events_round_trip_in_order_across_batches() {
+    /// Stores `events` of session `id`, with no row change.
+    fn log(store: &Store, id: &str, events: &[Event]) {
+        store.save_session(id, &[], events).unwrap();
+    }
+
+    #[test]
+    fn events_round_trip_in_order() {
         let store = store_with_session();
-        store.log(vec![exited("s", 1), exited("s", 2)]);
-        store.log(vec![exited("s", 3)]);
-        store.flush().await;
+        log(&store, "s", &[exited("s", 1), exited("s", 2)]);
+        log(&store, "s", &[exited("s", 3)]);
         let seqs: Vec<_> = store
             .events("s")
             .unwrap()
@@ -1093,13 +1199,225 @@ mod tests {
         assert_eq!(store.events("s").unwrap()[0], exited("s", 1));
     }
 
-    #[tokio::test]
-    async fn events_of_a_deleted_session_are_dropped() {
+    #[test]
+    fn a_history_longer_than_a_read_batch_is_read_whole() {
+        let store = store_with_session();
+        let count = READ_BATCH * 2 + 1;
+        let events: Vec<_> = (1..=count).map(|seq| exited("s", seq)).collect();
+        log(&store, "s", &events);
+        assert_eq!(store.events("s").unwrap(), events);
+    }
+
+    #[test]
+    fn events_after_skips_a_gap_and_stops_at_the_limit() {
+        let store = store_with_session();
+        log(
+            &store,
+            "s",
+            &[exited("s", 1), exited("s", 3), exited("s", 4)],
+        );
+        let seqs = |after, limit| -> Vec<u64> {
+            store
+                .events_after("s", after, limit)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.seq)
+                .collect()
+        };
+        assert_eq!(seqs(1, 10), [3, 4]);
+        assert_eq!(seqs(2, 10), [3, 4]);
+        assert_eq!(seqs(0, 2), [1, 3]);
+        assert!(seqs(4, 10).is_empty());
+    }
+
+    #[test]
+    fn events_of_a_deleted_session_are_dropped() {
         let store = store_with_session();
         store.remove_session("s").unwrap();
-        store.log(vec![exited("s", 1)]);
-        store.flush().await;
+        log(&store, "s", &[exited("s", 1)]);
         assert!(store.events("s").unwrap().is_empty());
+    }
+
+    fn prompt_started() -> EventKind {
+        EventKind::PromptStarted {
+            prompt: vec![ContentBlock::Text(TextContent::new("Fix the build"))],
+            from: None,
+        }
+    }
+
+    fn turn_ended() -> EventKind {
+        EventKind::TurnEnded {
+            stop_reason: None,
+            error: None,
+        }
+    }
+
+    fn requested(request_id: &str) -> EventKind {
+        EventKind::PermissionRequested {
+            request_id: request_id.into(),
+            title: "Tool".into(),
+            description: None,
+            subject: None,
+            options: Vec::new(),
+            session_request: None,
+        }
+    }
+
+    fn elicited(request_id: &str) -> EventKind {
+        serde_json::from_value(serde_json::json!({
+            "type": "elicitation_requested",
+            "data": {
+                "request_id": request_id,
+                "message": "Order",
+                "tool_call_id": null,
+                "requested_schema": {"type": "object", "properties": {}}
+            }
+        }))
+        .unwrap()
+    }
+
+    fn steered() -> EventKind {
+        EventKind::PromptSteered {
+            prompt: vec![ContentBlock::Text(TextContent::new("Also"))],
+            from: None,
+        }
+    }
+
+    /// Saves session `id` with `kinds` as its events, from seq 1.
+    fn session_with(store: &Store, id: &str, kinds: Vec<EventKind>) {
+        store
+            .add_session(id, "w", &command(), Path::new("/work"), None, 0, &[])
+            .unwrap();
+        let events: Vec<_> = kinds
+            .into_iter()
+            .zip(1..)
+            .map(|(kind, seq)| event(id, seq, kind))
+            .collect();
+        log(store, id, &events);
+    }
+
+    #[test]
+    fn left_open_finds_what_a_stop_left_open_and_nothing_else() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        session_with(
+            &store,
+            "open",
+            vec![
+                prompt_started(),
+                requested("1"),
+                EventKind::PermissionResolved {
+                    request_id: "1".into(),
+                    outcome: agent_client_protocol::v2::schema::CancelledPermissionOutcome::new()
+                        .into(),
+                },
+                requested("4"),
+                elicited("5"),
+                steered(),
+                steered(),
+                EventKind::SteeredPromptTaken { prompt: 6 },
+            ],
+        );
+        session_with(
+            &store,
+            "agent turn",
+            vec![prompt_started(), turn_ended(), EventKind::TurnStarted],
+        );
+        session_with(
+            &store,
+            "finished",
+            vec![
+                prompt_started(),
+                steered(),
+                EventKind::SteeredPromptDropped { prompt: 2 },
+                turn_ended(),
+                EventKind::AgentParked,
+            ],
+        );
+        session_with(&store, "empty", Vec::new());
+        let open = store.left_open().unwrap();
+        assert_eq!(
+            open,
+            HashMap::from([
+                (
+                    "open".into(),
+                    LeftOpen {
+                        turn: true,
+                        requests: vec![("4".into(), true), ("5".into(), false)],
+                        steered: vec![7],
+                    }
+                ),
+                (
+                    "agent turn".into(),
+                    LeftOpen {
+                        turn: true,
+                        ..LeftOpen::default()
+                    }
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_session_needs_replay_until_its_events_hold_a_start_or_a_prompt() {
+        let store = store();
+        store.add_workspace(&workspace("w", "/work")).unwrap();
+        session_with(&store, "none", vec![EventKind::AgentParked]);
+        session_with(&store, "prompted", vec![prompt_started()]);
+        session_with(
+            &store,
+            "started",
+            vec![EventKind::AgentStarted {
+                agent_session_id: "agent".into(),
+                prompt_capabilities: ox_protocol::schema::PromptCapabilities::default(),
+                config_options: Vec::new(),
+                available_commands: Vec::new(),
+            }],
+        );
+        let replays: Vec<_> = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .map(|session| (session.id, session.needs_replay))
+            .collect();
+        assert_eq!(
+            replays,
+            [
+                ("none".into(), true),
+                ("prompted".into(), false),
+                ("started".into(), false)
+            ]
+        );
+    }
+
+    /// Startup reads only the index entries of the event types each query
+    /// names, never every event.
+    #[test]
+    fn the_startup_queries_search_events_by_type() {
+        let store = store();
+        let connection = store.lock();
+        for query in [
+            SESSIONS,
+            LEFT_OPEN_TURNS,
+            LEFT_OPEN_REQUESTS,
+            LEFT_OPEN_STEERED,
+        ] {
+            let plan: Vec<String> = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|step| step.contains("events_by_type")),
+                "{query}: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN events")),
+                "{query}: {plan:?}"
+            );
+        }
     }
 
     #[test]
@@ -1121,6 +1439,7 @@ mod tests {
             unseen: None,
             queue: Queue::default(),
             config: vec![setting("model", "smart")],
+            needs_replay: true,
         };
         let events = [exited("s", 1), exited("s", 2)];
         let number = store.import_session(&session, &events).unwrap();
@@ -1146,7 +1465,7 @@ mod tests {
             .add_session("two", "w", &command(), Path::new("/work"), None, 0, &[])
             .unwrap();
         store
-            .save_session("one", &[RowChange::AgentSessionId("claude".into())])
+            .save_session("one", &[RowChange::AgentSessionId("claude".into())], &[])
             .unwrap();
         assert!(!store.was_deleted("claude").unwrap());
         store.remove_session("one").unwrap();
@@ -1275,7 +1594,11 @@ mod tests {
             deleted_agent_sessions: 1,
             configured: 1,
         };
-        let expected = [("schema-1.sql", contents), ("schema-2.sql", contents)];
+        let expected = [
+            ("schema-1.sql", contents),
+            ("schema-2.sql", contents),
+            ("schema-3.sql", contents),
+        ];
         let mut names: Vec<String> = std::fs::read_dir(fixtures())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())

@@ -25,11 +25,14 @@ use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::mcp::OxServer;
 use crate::state::{self, Change, Request, Resume, State, invalid_state};
-use crate::store::{SavedSession, Store};
+use crate::store::{LeftOpen, SavedSession, Store};
 use crate::transcript;
 use crate::worktree::{Git, Worktree};
 
 type ConfigReply = oneshot::Sender<Result<(), String>>;
+
+/// Events a subscriber is handed at a time.
+const BATCH: u64 = 256;
 
 /// Ox's instructions to an agent that has the `ox` tools.
 const OX_INSTRUCTIONS: &str = "You are running in Ox, a desktop app for coding agents.\n\n\
@@ -66,7 +69,7 @@ enum Command {
 
 /// One ACP agent process and its event history. The database keeps the
 /// session's workspace, command, directory, title, agent session ID, config,
-/// and the ID of its worktree.
+/// the ID of its worktree, and its events, which are read from there.
 ///
 /// Everything about the session that changes is in `state`, and every change
 /// goes through `update`. Lock order is the lifecycle guard, then the
@@ -91,9 +94,9 @@ pub struct Session {
     /// while it loads, is parked, archived, unarchived or deleted, or its
     /// workspace is removed.
     lifecycle: Arc<tokio::sync::Mutex<()>>,
-    /// Set once the stored history is in the state.
-    history: tokio::sync::OnceCell<()>,
-    /// The seq of the session's last event.
+    /// The seq of the session's last stored event, or of its
+    /// `SessionClosed` once it is closed. Every event up to it that a write
+    /// did not lose can be read from the database.
     last_seq: watch::Sender<u64>,
     /// Counts the changes to the session's `SessionInfo`.
     info_version: AtomicU64,
@@ -199,8 +202,7 @@ impl Drop for SessionFocus {
 
 impl Session {
     /// The session `saved` in `state`: a session just saved is `starting`,
-    /// and `start` launches its agent; a restored one is `exited`, and its
-    /// stored history is read by `history`.
+    /// and `start` launches its agent; a restored one is `exited`.
     pub fn new(
         store: Arc<Store>,
         changed: watch::Sender<()>,
@@ -213,7 +215,6 @@ impl Session {
             last_seq: watch::Sender::new(state.last_seq()),
             state: Mutex::new(state),
             agent: Mutex::default(),
-            history: tokio::sync::OnceCell::new(),
             id: saved.id,
             number: saved.number,
             workspace_id: saved.workspace_id,
@@ -292,9 +293,9 @@ impl Session {
     }
 
     /// Loads the session if it is `exited` once no other lifecycle operation
-    /// runs, and otherwise leaves it as it is: its history is read, and a new
-    /// agent resumes it, with replay if the history has no recorded agent
-    /// start. Records `AgentStarted` on success or `AgentExited` on failure.
+    /// runs, and otherwise leaves it as it is: a new agent resumes it, with
+    /// replay if its events hold neither an agent start nor a prompt.
+    /// Records `AgentStarted` on success or `AgentExited` on failure.
     pub async fn load_if_exited(
         self: &Arc<Self>,
         env: BTreeMap<String, String>,
@@ -303,7 +304,6 @@ impl Session {
             return Ok(());
         }
         let _lifecycle = self.lifecycle().await?;
-        self.history().await?;
         if self.state() != SessionState::Exited {
             return Ok(());
         }
@@ -537,28 +537,10 @@ impl Session {
         Viewer(self.clone())
     }
 
-    /// Reads the session's stored history into its state, once. Callers wait
-    /// for it before they subscribe to the session or load it.
-    pub async fn history(&self) -> Result<(), ErrorBody> {
-        self.history
-            .get_or_try_init(|| async {
-                if self.lock().loaded() {
-                    return Ok(());
-                }
-                let store = self.store.clone();
-                let id = self.id.clone();
-                let history = tokio::task::spawn_blocking(move || store.events(&id))
-                    .await
-                    .expect("the history read does not panic")
-                    .map_err(|error| ErrorBody {
-                        code: code::STORAGE,
-                        message: error.to_string(),
-                    })?;
-                self.update(|state| state.fill(history));
-                Ok(())
-            })
-            .await
-            .copied()
+    /// Closes what a stop left open in the session's stored events, as
+    /// startup finds it.
+    pub fn recover(&self, open: LeftOpen) {
+        self.update(|state| state.recover(open));
     }
 
     /// Checks that events follow `after_seq`, now or later.
@@ -567,14 +549,43 @@ impl Session {
     }
 
     /// Waits for events with `seq > after_seq` and returns the first of
-    /// them, in order.
+    /// them, in order, read from the database. Once every stored event has
+    /// been read, a closed session gives the events of the change that
+    /// closed it, which a deleted session no longer stores, ending with
+    /// `SessionClosed`. A failed read gives nothing and goes to oxd's log.
     pub async fn events_after(&self, after_seq: u64) -> Vec<Event> {
-        self.last_seq
-            .subscribe()
-            .wait_for(|last_seq| *last_seq > after_seq)
-            .await
-            .expect("the session holds the sender");
-        self.lock().events_after(after_seq)
+        let mut last_seq = self.last_seq.subscribe();
+        loop {
+            if *last_seq.borrow_and_update() > after_seq {
+                // Taken before the read: a session records its closing events
+                // and `SessionClosed` in one change, under the state lock, so
+                // once it is closed every event before them is stored.
+                let closing = self.lock().closing().to_vec();
+                let store = self.store.clone();
+                let id = self.id.clone();
+                let read =
+                    tokio::task::spawn_blocking(move || store.events_after(&id, after_seq, BATCH))
+                        .await
+                        .expect("the event read does not panic");
+                let mut events = read.unwrap_or_else(|error| {
+                    eprintln!("oxd: reading the events of session {}: {error}", self.id);
+                    Vec::new()
+                });
+                if events.len() < usize::try_from(BATCH).expect("a batch fits a usize") {
+                    let read = events.last().map_or(after_seq, |event| event.seq);
+                    events.extend(closing.into_iter().filter(|event| event.seq > read));
+                }
+                if !events.is_empty() {
+                    return events;
+                }
+            }
+            // Nothing to read yet, or a deleted session whose events are
+            // gone and which is not closed yet.
+            last_seq
+                .changed()
+                .await
+                .expect("the session holds the sender");
+        }
     }
 
     /// Sends a prompt now, starting a turn or steering the running one.
@@ -605,18 +616,10 @@ impl Session {
             match self.state() {
                 SessionState::Starting => {}
                 SessionState::Exited => {
-                    let state = self.lock();
-                    let error = state
-                        .events()
-                        .iter()
-                        .rev()
-                        .find_map(|event| match &event.kind {
-                            EventKind::AgentExited { error } => Some(error.clone()),
-                            _ => None,
-                        });
+                    let error = self.lock().exit_error().map(str::to_owned);
                     return Err(ErrorBody {
                         code: code::AGENT,
-                        message: match error.flatten() {
+                        message: match error {
                             Some(error) => format!("the agent did not start: {error}"),
                             None => "the agent exited while starting".into(),
                         },
@@ -654,8 +657,13 @@ impl Session {
 
     /// A page of the session's compact transcript, before seq `before`.
     pub async fn transcript(&self, before: Option<u64>) -> Result<TranscriptPage, ErrorBody> {
-        self.history().await?;
-        Ok(transcript::page(self.lock().events(), before))
+        let store = self.store.clone();
+        let id = self.id.clone();
+        let events = tokio::task::spawn_blocking(move || store.events(&id))
+            .await
+            .expect("the history read does not panic")
+            .map_err(|error| crate::daemon::storage(&error))?;
+        Ok(transcript::page(&events, before))
     }
 
     /// Appends a prompt to the queue and returns its ID.
@@ -817,12 +825,14 @@ impl Session {
 
     /// Changes the state, then, under the state lock, starts the queue's
     /// next prompt if the session can take it, records the unseen outcome
-    /// the new events give, saves the changes to the session's row, queues
-    /// the events for the database, asks the worktree for its comparison
+    /// the new events give, saves the changes to the session's row and its
+    /// new events in one transaction, asks the worktree for its comparison
     /// again when a turn ended, and publishes the seq of the last event,
     /// whether the session is parkable and, if its `SessionInfo` changed,
     /// the change. A failed save goes to oxd's log and the session carries
-    /// on.
+    /// on: its events are lost, their seqs are not reused, and the published
+    /// seq stays where it was until a later save succeeds or the session
+    /// closes.
     fn update<R>(&self, change: impl FnOnce(&mut State) -> R) -> R {
         let (result, saved) = self.apply(change);
         if let Err(error) = saved {
@@ -848,17 +858,21 @@ impl Session {
         }
         let events = state.take_unlogged();
         state.note_unseen(&events);
-        let saved = self.store.save_session(&self.id, &state.take_unsaved());
+        let saved = self
+            .store
+            .save_session(&self.id, &state.take_unsaved(), &events);
         let turn_ended = events
             .iter()
             .any(|event| matches!(event.kind, EventKind::TurnEnded { .. }));
-        if !events.is_empty() {
-            self.store.log(events);
-        }
         if turn_ended && let Some(worktree) = state.worktree() {
             worktree.recompare();
         }
-        self.last_seq.send_replace(state.last_seq());
+        if saved.is_ok() || state.closed() {
+            self.last_seq.send_replace(state.last_seq());
+        } else {
+            // `started` reads the state after each change.
+            self.last_seq.send_modify(|_| {});
+        }
         self.parkable.set(state.parkable());
         if self.info_of(&state) != before {
             self.info_version.fetch_add(1, Ordering::Release);

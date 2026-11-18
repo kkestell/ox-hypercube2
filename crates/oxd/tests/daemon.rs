@@ -2072,6 +2072,18 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
 
     let second = first.again(Options::default()).await;
     let client = second.client().await;
+    // Startup closed the turn: before anything reads the session, its error
+    // is unseen and stored.
+    assert_eq!(
+        info(&client, &session.id).await.unwrap().unseen,
+        Some(Unseen::Error)
+    );
+    assert_eq!(
+        stored_kinds(&second, &session.id)
+            .last()
+            .map(String::as_str),
+        Some("turn_ended")
+    );
     let mut events = client.subscribe(&session.id, started).await.unwrap();
     let rest = until(&mut events, turn_ended).await;
     assert_contiguous(&rest, started + 1);
@@ -2099,6 +2111,61 @@ async fn a_history_that_a_crash_left_open_ends_its_turn() {
     load(&client, &session.id).await;
     let restarted = next(&mut events).await;
     assert_eq!(restarted.seq, rest.last().unwrap().seq + 1);
+}
+
+/// The type of each event stored for session `id` in `daemon`'s database,
+/// in seq order.
+fn stored_kinds(daemon: &Daemon, id: &str) -> Vec<String> {
+    let database = rusqlite::Connection::open(daemon.dir.path().join("oxd.sock.db")).unwrap();
+    database
+        .prepare("SELECT kind ->> '$.type' FROM events WHERE session_id = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([id], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The to-do's reproduction: the database refuses one event, and every
+/// reader skips it, before and after a restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_event_a_write_lost_is_skipped_by_every_subscriber() {
+    let first = Daemon::start().await;
+    let client = first.client().await;
+    let (session, started) = first.new_session(&client).await;
+    let database = rusqlite::Connection::open(first.dir.path().join("oxd.sock.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER injected BEFORE INSERT ON events
+            WHEN json_extract(NEW.kind, '$.type') = 'prompt_started'
+            BEGIN SELECT RAISE(ABORT, 'injected event write failure'); END",
+        )
+        .unwrap();
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    client
+        .prompt(&session.id, text("text \"hi\""))
+        .await
+        .unwrap();
+    let turn = until(&mut events, turn_ended).await;
+    assert_eq!(turn[0].seq, started + 2, "{turn:?}");
+    assert!(
+        !turn
+            .iter()
+            .any(|event| matches!(event.kind, EventKind::PromptStarted { .. }))
+    );
+    let last = turn.last().unwrap().seq;
+    drop(events);
+    drop(client);
+    database.execute_batch("DROP TRIGGER injected").unwrap();
+    drop(database);
+
+    let second = first.restart().await;
+    let client = second.client().await;
+    let mut events = client.subscribe(&session.id, last - 1).await.unwrap();
+    assert_eq!(next(&mut events).await.seq, last);
+    let mut events = client.subscribe(&session.id, started).await.unwrap();
+    let replayed = until(&mut events, turn_ended).await;
+    assert_eq!(replayed, turn);
 }
 
 #[tokio::test(flavor = "multi_thread")]

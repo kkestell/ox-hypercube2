@@ -225,8 +225,6 @@ async fn run(args: Args) -> io::Result<()> {
     let _ = std::fs::remove_file(&args.socket);
     drop(listener);
     daemon.close_all();
-    // The next daemon reads the log once every queued event is committed.
-    daemon.flush().await;
     // Each client receives the end of every session it follows. One that
     // stops reading is given up on.
     let _ = stopping.send(true);

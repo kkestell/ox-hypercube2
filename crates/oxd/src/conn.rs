@@ -111,7 +111,7 @@ pub async fn serve(
             Method::SessionSubscribe {
                 session_id,
                 after_seq,
-            } => match subscribable(&daemon, &session_id, after_seq).await {
+            } => match subscribable(&daemon, &session_id, after_seq) {
                 Ok(session) => {
                     let ack = ServerMessage::Result {
                         id,
@@ -273,15 +273,13 @@ fn answer_later(
     });
 }
 
-/// The session, once its history is loaded, if it has events after
-/// `after_seq` to send.
-async fn subscribable(
+/// The session, if it has events after `after_seq` to send.
+fn subscribable(
     daemon: &Daemon,
     session_id: &str,
     after_seq: u64,
 ) -> Result<Arc<Session>, ErrorBody> {
     let session = daemon.session(session_id)?;
-    session.history().await?;
     session.subscribe(after_seq)?;
     Ok(session)
 }

@@ -18,11 +18,8 @@ use ox_protocol::{
 };
 use tokio::sync::oneshot;
 
-use crate::store::{RowChange, SavedSession};
+use crate::store::{LeftOpen, RowChange, SavedSession};
 use crate::worktree::Worktree;
-
-/// Events a subscriber is handed at a time.
-const BATCH: usize = 256;
 
 /// What an agent reports when its ACP session opens, with its available
 /// commands kept current.
@@ -590,16 +587,15 @@ pub struct Queue {
     pub paused: bool,
 }
 
-/// Everything about a session that changes: its phase, its queue, every
-/// event it has recorded, and the rest of what the database saves for it.
-/// `SessionClosed` ends a session's subscriptions and is not stored. Each
+/// Everything about a session that changes: its phase, its queue, the seq
+/// of its last event, and the rest of what the database saves for it. Its
+/// events are stored, not held: each transition records its events in
+/// `unlogged` for the database. `SessionClosed` ends a session's
+/// subscriptions and is not stored. Each
 /// `PromptStarted` and `TurnStarted` is followed by one `TurnEnded`, each
 /// `PromptSteered` by one `SteeredPromptTaken` or `SteeredPromptDropped`,
 /// each `PermissionRequested` by one `PermissionResolved`, and each
 /// `ElicitationRequested` by one `ElicitationResolved`.
-///
-/// A session restored from the database knows its last seq but holds no
-/// events until `fill` gives it the stored history, and records none before.
 ///
 /// Each transition that changes what the database saves for the session
 /// records the change in `unsaved`, as it records its events in `unlogged`.
@@ -609,13 +605,23 @@ pub struct State {
     /// The title from the last recorded `session_info_update` that set or
     /// cleared it, or from `set_title`, whichever came last.
     title: Option<String>,
-    events: Option<Vec<Event>>,
     last_seq: u64,
     /// Events recorded since `take_unlogged`, which the database has not been
     /// sent. `SessionClosed` is not stored.
     unlogged: Vec<Event>,
+    /// The events of the change that closed the session, ending with
+    /// `SessionClosed`. A deleted session's history is gone before it
+    /// closes, so these are kept for its subscribers.
+    closing: Vec<Event>,
+    /// Whether the session's events hold neither an `AgentStarted` nor a
+    /// `PromptStarted`, so that a load asks the agent to replay them.
+    needs_replay: bool,
+    /// The error of the last `AgentExited` recorded.
+    exit_error: Option<String>,
     /// The ID of the next permission request or elicitation. Request IDs
-    /// stay unique for the session's lifetime, across every agent it loads.
+    /// stay unique for the session's lifetime, across every agent it loads
+    /// and every restart: each is at most the seq of the event that records
+    /// it, so a restored session continues after its last seq.
     next_request: u64,
     queue: Queue,
     /// The worktree the session runs in. Unset when it could not be added.
@@ -675,31 +681,28 @@ impl State {
             previous: None,
             prompt: None,
         };
-        Self::of(saved, worktree, phase, Some(Vec::new()))
+        Self::of(saved, worktree, phase)
     }
 
     /// A session read from the database or imported: `exited`, with the
-    /// saved agent session if its agent ever opened one, and its history,
-    /// which ends at its last seq, not yet read.
+    /// saved agent session if its agent ever opened one, continuing after
+    /// its last stored event.
     pub fn restored(saved: &SavedSession, worktree: Option<Arc<Worktree>>) -> Self {
         let agent = saved.agent_session_id.clone().map(Agent::saved);
-        Self::of(saved, worktree, Phase::Exited(agent), None)
+        Self::of(saved, worktree, Phase::Exited(agent))
     }
 
-    fn of(
-        saved: &SavedSession,
-        worktree: Option<Arc<Worktree>>,
-        phase: Phase,
-        events: Option<Vec<Event>>,
-    ) -> Self {
+    fn of(saved: &SavedSession, worktree: Option<Arc<Worktree>>, phase: Phase) -> Self {
         Self {
             session_id: saved.id.clone(),
             phase,
             title: saved.title.clone(),
-            events,
             last_seq: saved.last_seq,
             unlogged: Vec::new(),
-            next_request: 1,
+            closing: Vec::new(),
+            needs_replay: saved.needs_replay,
+            exit_error: None,
+            next_request: saved.last_seq + 1,
             queue: saved.queue.clone(),
             worktree,
             archived: saved.archived,
@@ -712,72 +715,28 @@ impl State {
         }
     }
 
-    /// Whether the session holds its history.
-    pub fn loaded(&self) -> bool {
-        self.events.is_some()
-    }
-
-    /// Gives a restored session its stored history. What a crash left open is
-    /// closed: a pending permission request or elicitation is cancelled, a
-    /// steered prompt the agent had not taken in is dropped, and a running
-    /// turn ends with an error, which holds the queue. Request IDs continue
-    /// after the history's.
-    pub fn fill(&mut self, history: Vec<Event>) {
-        let mut turn_open = false;
-        let mut steered = Vec::new();
-        // Each open request's ID, and whether it is a permission request.
-        let mut pending: Vec<(&str, bool)> = Vec::new();
-        let mut last_request = 0;
-        for event in &history {
-            match &event.kind {
-                EventKind::PromptStarted { .. } | EventKind::TurnStarted => turn_open = true,
-                EventKind::TurnEnded { .. } => turn_open = false,
-                EventKind::PromptSteered { .. } => steered.push(event.seq),
-                EventKind::SteeredPromptTaken { prompt }
-                | EventKind::SteeredPromptDropped { prompt } => {
-                    steered.retain(|seq| seq != prompt);
+    /// Closes what a stop left open in the session's stored events: each
+    /// open request is cancelled, each steered prompt the agent had not taken
+    /// in is dropped, and an open turn ends with an error, which holds the
+    /// queue.
+    pub fn recover(&mut self, open: LeftOpen) {
+        for (request_id, permission) in open.requests {
+            self.append(if permission {
+                EventKind::PermissionResolved {
+                    request_id,
+                    outcome: CancelledPermissionOutcome::new().into(),
                 }
-                EventKind::PermissionRequested { request_id, .. }
-                | EventKind::ElicitationRequested { request_id, .. } => {
-                    let permission = matches!(event.kind, EventKind::PermissionRequested { .. });
-                    pending.push((request_id, permission));
-                    last_request = last_request.max(request_id.parse().unwrap_or(0));
+            } else {
+                EventKind::ElicitationResolved {
+                    request_id,
+                    action: ElicitationAction::Cancel,
                 }
-                EventKind::PermissionResolved { request_id, .. }
-                | EventKind::ElicitationResolved { request_id, .. } => {
-                    pending.retain(|(id, _)| id != request_id);
-                }
-                _ => {}
-            }
+            });
         }
-        let cancelled: Vec<_> = pending
-            .into_iter()
-            .map(|(request_id, permission)| {
-                let request_id = request_id.into();
-                if permission {
-                    EventKind::PermissionResolved {
-                        request_id,
-                        outcome: CancelledPermissionOutcome::new().into(),
-                    }
-                } else {
-                    EventKind::ElicitationResolved {
-                        request_id,
-                        action: ElicitationAction::Cancel,
-                    }
-                }
-            })
-            .collect();
-        self.next_request = last_request + 1;
-        self.events = Some(history);
-        for event in cancelled {
-            self.append(event);
-        }
-        for prompt in steered {
+        for prompt in open.steered {
             self.append(EventKind::SteeredPromptDropped { prompt });
         }
-        // TODO: a turn a crash cut off gets its unseen error only here, when
-        // the session's history is first read, not when oxd restarts.
-        if turn_open {
+        if open.turn {
             self.append(EventKind::TurnEnded {
                 stop_reason: None,
                 error: Some("oxd stopped during the turn".into()),
@@ -855,7 +814,7 @@ impl State {
     }
 
     /// Starts a load: the session goes from `exited` to `starting` and
-    /// returns what to request from the agent. A session whose history holds
+    /// returns what to request from the agent. A session whose events hold
     /// neither an agent start nor a prompt requests and records replay to
     /// recover its conversation.
     pub fn load(&mut self) -> Result<Resume, ErrorBody> {
@@ -870,12 +829,7 @@ impl State {
             }
             phase => return Err(invalid_state(phase.state())),
         };
-        let replay = !self.events.iter().flatten().any(|event| {
-            matches!(
-                event.kind,
-                EventKind::AgentStarted { .. } | EventKind::PromptStarted { .. }
-            )
-        });
+        let replay = self.needs_replay;
         self.phase = Phase::Starting {
             busy: false,
             background: None,
@@ -925,10 +879,28 @@ impl State {
         self.last_seq
     }
 
-    /// Every event the session holds, in order. A session that has not
-    /// loaded its history holds none.
-    pub fn events(&self) -> &[Event] {
-        self.events.as_deref().unwrap_or_default()
+    /// The error of the last `AgentExited` the session recorded.
+    pub fn exit_error(&self) -> Option<&str> {
+        self.exit_error.as_deref()
+    }
+
+    /// The events of the change that closed the session, ending with
+    /// `SessionClosed`. Empty while the session is open.
+    pub fn closing(&self) -> &[Event] {
+        &self.closing
+    }
+
+    /// The events with `seq > after_seq` that were recorded and not yet
+    /// taken, which in tests is every event recorded, with `SessionClosed`
+    /// last.
+    #[cfg(test)]
+    pub fn events_after(&self, after_seq: u64) -> Vec<Event> {
+        self.unlogged
+            .iter()
+            .chain(self.closing.last())
+            .filter(|event| event.seq > after_seq)
+            .cloned()
+            .collect()
     }
 
     /// Whether a turn is running, which a prompt sent now steers.
@@ -951,16 +923,6 @@ impl State {
             )));
         }
         Ok(())
-    }
-
-    /// The first events with `seq > after_seq`, in order. A session that has
-    /// not loaded its history has none to give.
-    pub fn events_after(&self, after_seq: u64) -> Vec<Event> {
-        let events = self.events.as_deref().unwrap_or_default();
-        let start = usize::try_from(after_seq)
-            .unwrap_or(usize::MAX)
-            .min(events.len());
-        events[start..].iter().take(BATCH).cloned().collect()
     }
 
     /// Records a new session's first prompt while its agent starts and
@@ -1336,10 +1298,13 @@ impl State {
                 self.unsaved.push(RowChange::Title(title));
             }
         }
-        // A session that has not loaded its history records nothing.
-        let Some(events) = &mut self.events else {
-            return;
-        };
+        match &kind {
+            EventKind::AgentStarted { .. } | EventKind::PromptStarted { .. } => {
+                self.needs_replay = false;
+            }
+            EventKind::AgentExited { error } => self.exit_error.clone_from(error),
+            _ => {}
+        }
         self.last_seq += 1;
         let event = Event {
             session_id: self.session_id.clone(),
@@ -1347,10 +1312,14 @@ impl State {
             recorded_at: crate::daemon::now(),
             kind,
         };
-        if !matches!(event.kind, EventKind::SessionClosed) {
-            self.unlogged.push(event.clone());
+        if matches!(event.kind, EventKind::SessionClosed) {
+            // `unlogged` holds the closing change's events, which `apply`
+            // takes after each change.
+            self.closing.clone_from(&self.unlogged);
+            self.closing.push(event);
+        } else {
+            self.unlogged.push(event);
         }
-        events.push(event);
     }
 }
 
@@ -1557,6 +1526,7 @@ mod tests {
             unseen: None,
             queue: Queue::default(),
             config: Vec::new(),
+            needs_replay: true,
         }
     }
 
@@ -2228,17 +2198,11 @@ mod tests {
 
         // Left when oxd stopped.
         let mut state = restored_at(3);
-        state.fill(stored(vec![
-            agent_started(),
-            EventKind::PromptStarted {
-                prompt: text("hello"),
-                from: None,
-            },
-            EventKind::PromptSteered {
-                prompt: text("also"),
-                from: None,
-            },
-        ]));
+        state.recover(LeftOpen {
+            turn: true,
+            requests: Vec::new(),
+            steered: vec![3],
+        });
         assert_eq!(
             state.events_after(3)[0].kind,
             EventKind::SteeredPromptDropped { prompt: 3 }
@@ -2446,19 +2410,17 @@ mod tests {
     }
 
     fn restored() -> State {
-        let mut state = State::restored(
+        State::restored(
             &SavedSession {
                 title: Some("Fix the build".into()),
                 ..saved_with_agent(0)
             },
             None,
-        );
-        state.fill(Vec::new());
-        state
+        )
     }
 
-    /// A session restored with agent session `agent` and a history that
-    /// ends at `last_seq`, not yet read.
+    /// A session restored with agent session `agent` and stored events that
+    /// end at `last_seq`.
     fn restored_at(last_seq: u64) -> State {
         State::restored(&saved_with_agent(last_seq), None)
     }
@@ -2468,40 +2430,6 @@ mod tests {
             agent_session_id: Some("agent".into()),
             last_seq,
             ..saved()
-        }
-    }
-
-    /// The history of a session whose daemon stopped after `kinds`.
-    fn stored(kinds: Vec<EventKind>) -> Vec<Event> {
-        kinds
-            .into_iter()
-            .zip(1..)
-            .map(|(kind, seq)| Event {
-                session_id: "s".into(),
-                seq,
-                recorded_at: 0,
-                kind,
-            })
-            .collect()
-    }
-
-    fn agent_started() -> EventKind {
-        EventKind::AgentStarted {
-            agent_session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }
-    }
-
-    fn requested(request_id: &str) -> EventKind {
-        EventKind::PermissionRequested {
-            request_id: request_id.into(),
-            title: "Tool".into(),
-            description: None,
-            subject: None,
-            options: Vec::new(),
-            session_request: None,
         }
     }
 
@@ -2516,81 +2444,73 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_session_holds_no_events_until_it_is_filled() {
+    fn closing_a_restored_session_records_session_closed_after_its_last_seq() {
         let mut state = restored_at(3);
-        assert!(!state.loaded());
-        assert_eq!(state.last_seq(), 3);
-        assert!(state.events_after(0).is_empty());
+        state.subscribe(3).unwrap();
         state.record(Change::Closed);
-        assert_eq!(state.last_seq(), 3);
+        assert_eq!(state.last_seq(), 4);
+        assert_eq!(state.closing().last().unwrap().seq, 4);
+        assert_eq!(kinds(&state, 3), ["session_closed"]);
         assert!(state.take_unlogged().is_empty());
+        state.subscribe(3).unwrap();
+        assert_eq!(state.subscribe(4).unwrap_err().code, code::INVALID_REQUEST);
     }
 
     #[test]
-    fn fill_closes_the_turn_and_the_permission_request_a_stop_left_open() {
+    fn recover_closes_the_turn_and_the_requests_a_stop_left_open() {
         let mut state = restored_at(6);
-        state.fill(stored(vec![
-            agent_started(),
-            EventKind::TurnStarted,
-            requested("1"),
-            EventKind::PermissionResolved {
-                request_id: "1".into(),
-                outcome: CancelledPermissionOutcome::new().into(),
-            },
-            requested("2"),
-            requested("7"),
-        ]));
-        assert!(state.loaded());
+        state.recover(LeftOpen {
+            turn: true,
+            requests: vec![("2".into(), true), ("5".into(), false)],
+            steered: Vec::new(),
+        });
         assert_eq!(
-            kinds(&state, 0),
-            [
-                "agent_started",
-                "turn_started",
-                "permission_requested",
-                "permission_resolved",
-                "permission_requested",
-                "permission_requested",
-                "permission_resolved",
-                "permission_resolved",
-                "turn_ended",
-            ]
+            kinds(&state, 6),
+            ["permission_resolved", "elicitation_resolved", "turn_ended"]
         );
         let logged = state.take_unlogged();
         assert_eq!(logged.iter().map(|e| e.seq).collect::<Vec<_>>(), [7, 8, 9]);
         assert!(matches!(
+            &logged[0].kind,
+            EventKind::PermissionResolved {
+                request_id,
+                outcome: RequestPermissionOutcome::Cancelled(_),
+            } if request_id == "2"
+        ));
+        assert_eq!(
+            logged[1].kind,
+            EventKind::ElicitationResolved {
+                request_id: "5".into(),
+                action: ElicitationAction::Cancel,
+            }
+        );
+        assert!(matches!(
             &logged[2].kind,
             EventKind::TurnEnded { error: Some(error), .. } if error == "oxd stopped during the turn"
         ));
-        assert!(state.take_unlogged().is_empty());
+        assert_eq!(
+            state.take_unsaved(),
+            [RowChange::Queue(Queue {
+                prompts: Vec::new(),
+                paused: true,
+            })]
+        );
     }
 
     #[test]
-    fn fill_leaves_a_finished_history_as_it_is() {
+    fn recover_with_nothing_open_records_nothing() {
         let mut state = restored_at(4);
-        state.fill(stored(vec![
-            agent_started(),
-            EventKind::TurnStarted,
-            EventKind::TurnEnded {
-                stop_reason: None,
-                error: None,
-            },
-            EventKind::AgentParked,
-        ]));
+        state.recover(LeftOpen::default());
         assert_eq!(state.last_seq(), 4);
         assert!(state.take_unlogged().is_empty());
+        assert!(state.take_unsaved().is_empty());
     }
 
     #[test]
-    fn permission_request_ids_continue_after_the_history() {
-        let mut state = restored_at(2);
-        state.fill(stored(vec![agent_started(), requested("5")]));
+    fn request_ids_of_a_restored_session_continue_after_its_last_seq() {
+        let mut state = restored_at(5);
         state.load().unwrap();
-        state.record(Change::Started(Agent {
-            session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }));
+        state.record(Change::Started(Agent::saved("agent".into())));
         state.record(running());
         let _outcome = request_permission(&mut state);
         let last = state.events_after(state.last_seq() - 1);
@@ -2632,21 +2552,22 @@ mod tests {
         assert_eq!(state.state(), SessionState::Idle);
         assert_eq!(kinds(&state, 0), ["update", "agent_started"]);
         assert_eq!(state.title(), Some("Fix the build"));
+
+        // Its events now hold an agent start, so the next load replays
+        // nothing.
+        state.record(Change::Exited(None));
+        assert!(!state.load().unwrap().replay);
     }
 
     #[test]
-    fn a_restored_session_whose_history_has_a_prompt_loads_without_replay() {
-        let mut state = restored_at(2);
-        state.fill(stored(vec![
-            EventKind::PromptStarted {
-                prompt: vec![ContentBlock::Text(TextContent::new("Fix the build"))],
-                from: None,
+    fn a_restored_session_whose_events_hold_a_prompt_loads_without_replay() {
+        let mut state = State::restored(
+            &SavedSession {
+                needs_replay: false,
+                ..saved_with_agent(2)
             },
-            EventKind::TurnEnded {
-                stop_reason: Some(StopReason::EndTurn),
-                error: None,
-            },
-        ]));
+            None,
+        );
         let resume = state.load().unwrap();
         assert!(!resume.replay);
         assert_eq!(resume.session_id, "agent");
@@ -3045,39 +2966,6 @@ mod tests {
     }
 
     #[test]
-    fn fill_cancels_an_open_elicitation_and_ids_continue_past_it() {
-        let mut state = restored_at(3);
-        state.fill(stored(vec![
-            agent_started(),
-            requested("1"),
-            EventKind::ElicitationRequested {
-                request_id: "4".into(),
-                message: "Order".into(),
-                tool_call_id: None,
-                requested_schema: order(),
-            },
-        ]));
-        assert_eq!(
-            kinds(&state, 3),
-            ["permission_resolved", "elicitation_resolved"]
-        );
-        assert_eq!(
-            state.events_after(4)[0].kind,
-            EventKind::ElicitationResolved {
-                request_id: "4".into(),
-                action: ElicitationAction::Cancel,
-            }
-        );
-        state.load().unwrap();
-        state.record(Change::Started(Agent::saved("agent".into())));
-        let _action = elicit(&mut state);
-        assert!(matches!(
-            &state.events_after(state.last_seq() - 1)[0].kind,
-            EventKind::ElicitationRequested { request_id, .. } if request_id == "5"
-        ));
-    }
-
-    #[test]
     fn forms_a_client_cannot_render_are_refused() {
         let form = |schema: ElicitationSchema| {
             CreateElicitationRequest::new(
@@ -3207,7 +3095,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_session_that_never_started_holds_its_first_prompt_and_cannot_load() {
+    fn a_restored_session_that_never_started_cannot_load() {
         let mut state = State::restored(
             &SavedSession {
                 last_seq: 3,
@@ -3216,24 +3104,6 @@ mod tests {
             None,
         );
         assert_eq!(state.state(), SessionState::Exited);
-        state.fill(stored(vec![
-            EventKind::PromptStarted {
-                prompt: text("hello"),
-                from: None,
-            },
-            EventKind::TurnEnded {
-                stop_reason: None,
-                error: Some("no agent".into()),
-            },
-            EventKind::AgentExited {
-                error: Some("no agent".into()),
-            },
-        ]));
-        assert_eq!(
-            kinds(&state, 0),
-            ["prompt_started", "turn_ended", "agent_exited"]
-        );
-        assert!(state.take_unlogged().is_empty());
         let refused = state.load().unwrap_err();
         assert_eq!(refused.code, code::INVALID_STATE);
         assert_eq!(

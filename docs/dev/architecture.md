@@ -180,16 +180,17 @@ the rows. Each schema version has a SQL fixture in
 code. Values the UI keeps in local storage follow the same rule: a new shape
 still reads what the previous build wrote.
 
-Session metadata is saved as sessions are created, and each change to it is
-saved in the step that makes the change, before clients are told. Conversation
-events are queued and committed in batches, ordered by session and sequence
-number. Graceful shutdown drains the queue. A forced stop can lose queued
-events; a failed batch is logged and dropped, leaving gaps in saved history.
+Session metadata is saved as sessions are created. Each change to it, and
+each conversation event, is saved in the step that makes it, in one
+transaction, before clients are told. A failed write is logged and leaves a
+gap in saved history, which readers skip.
 
 Saved history includes tool output and images and can be read without
-starting an agent. It is loaded on demand after a daemon restart, with
-interrupted turns ended as errors, unresolved requests cancelled, and steered
-prompts the agent had not taken in dropped.
+starting an agent. The daemon keeps no history in memory: subscriptions and
+transcripts read it from the database by sequence number. At startup, the
+daemon ends turns a crash interrupted as errors, cancels unresolved requests,
+and drops steered prompts the agent had not taken in. It finds them through
+an index of events by type, without reading whole histories.
 
 Ox's saved conversation and the agent's resumable conversation are separate.
 Continuing a Claude session requires its native transcript even when Ox still

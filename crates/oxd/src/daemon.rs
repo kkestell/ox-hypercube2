@@ -9,9 +9,9 @@ use ox_protocol::schema::{
     RequestPermissionOutcome, TextContent,
 };
 use ox_protocol::{
-    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, Harness, ImportedSessions,
-    ListingChange, MessageSent, Method, QueueAdded, RequestedCheckout, Sender, SessionInfo,
-    SessionRequest, SessionState, WorkspaceInfo, code,
+    Branches, Checkout, ConfigSetting, ConfigValue, Deleted, ErrorBody, EventKind, Harness,
+    ImportedSessions, ListingChange, MessageSent, Method, QueueAdded, RequestedCheckout, Sender,
+    SessionInfo, SessionRequest, SessionState, WorkspaceInfo, code,
 };
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedMutexGuard, watch};
@@ -121,8 +121,9 @@ impl Daemon {
     /// session that has been idle, with no background work, and unviewed for
     /// `park_after`, whose directory watches follow `directories`, and whose
     /// sessions' agents are given `ox_server`. Each saved session is
-    /// `exited`, with no agent, until it loads. A saved session whose agent
-    /// never started keeps its history and has nothing to load.
+    /// `exited`, with no agent, until it loads, and what a stop left open in
+    /// its events is closed. A saved session whose agent never started keeps
+    /// its history and has nothing to load.
     pub fn new(
         store: Store,
         worktrees_dir: PathBuf,
@@ -137,6 +138,7 @@ impl Daemon {
             .into_iter()
             .map(|saved| (saved.id.clone(), Worktree::new(saved, changed.clone())))
             .collect();
+        let mut left_open = store.left_open()?;
         let mut sessions = HashMap::new();
         for saved in store.sessions()? {
             let worktree = saved.worktree_id.as_ref().map(|id| {
@@ -154,6 +156,9 @@ impl Daemon {
                 saved,
                 state,
             );
+            if let Some(open) = left_open.remove(&session.id) {
+                session.recover(open);
+            }
             sessions.insert(session.id.clone(), session);
         }
         let registry = Registry {
@@ -241,11 +246,6 @@ impl Daemon {
         for worktree in worktrees {
             worktree.close();
         }
-    }
-
-    /// Returns once every recorded event is in the database.
-    pub async fn flush(&self) {
-        self.store.flush().await;
     }
 
     /// A receiver that sees a change each time the lists may have changed.
@@ -790,6 +790,7 @@ impl Daemon {
                 unseen: None,
                 queue: Queue::default(),
                 config,
+                needs_replay: true,
             };
             let state = State::created(
                 &saved,
@@ -1244,6 +1245,12 @@ impl Daemon {
                 unseen: None,
                 queue: Queue::default(),
                 config: Vec::new(),
+                needs_replay: !events.iter().any(|event| {
+                    matches!(
+                        event.kind,
+                        EventKind::AgentStarted { .. } | EventKind::PromptStarted { .. }
+                    )
+                }),
             };
             saved.number = self
                 .store

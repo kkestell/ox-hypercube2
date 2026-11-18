@@ -32,7 +32,7 @@ Each of these underlies several bugs below, which the fix closes.
   whatever path requests it. Underlies the queued prompt starting during a
   branch move and the workspace removal race. `crates/oxd/src/daemon.rs:280`,
   `crates/oxd/src/state.rs:813`, `crates/oxd/src/daemon.rs:612`.
-- [ ] **A restored session is a second mode of `State`.** Medium. Its events
+- [x] **A restored session is a second mode of `State`.** Medium. Its events
   are `None` until first read, and crash recovery runs in `fill` at that read
   rather than at startup. Events are persisted in batches after their seq is
   assigned in memory, and replay treats `after_seq` as a vector offset. A
@@ -72,12 +72,12 @@ Each of these underlies several bugs below, which the fix closes.
   Medium. Queue draining starts the next prompt inside `Session::update`
   without the daemon's move guard, though `session.prompt` refuses the same
   prompt. `crates/oxd/src/state.rs:811`, `crates/oxd/src/session.rs:816`.
-- [ ] **Deleting a session during its first history read can hang a
+- [x] **Deleting a session during its first history read can hang a
   subscriber.** Medium; dropped once during review. Closing a session whose
   history is not loaded records no `session_closed`; the load then fills the
   closed state and the subscription is accepted, so it never ends.
   `crates/oxd/src/conn.rs:276`, `crates/oxd/src/state.rs:1150`.
-- [ ] **A failed event write breaks replay after restart.** Low; deferred
+- [x] **A failed event write breaks replay after restart.** Low; deferred
   until a storage failure affects normal use or a supported caller depends on
   a nonzero replay cursor. The writer drops the failed batch, and replay uses
   `after_seq` as a vector offset, so a subscription from a nonzero cursor
@@ -129,7 +129,7 @@ Each of these underlies several bugs below, which the fix closes.
      stored sequence if it differs. The subscription waits even though event 7
      is already in the database.
 
-- [ ] **A crash-interrupted turn shows its error only once history is read.**
+- [x] **A crash-interrupted turn shows its error only once history is read.**
   Low. The error and its unseen outcome are added when the session's history
   is first loaded, not when `oxd` restarts. `crates/oxd/src/state.rs:768`.
 - [ ] **A new session whose agent exits before its first prompt resumes
