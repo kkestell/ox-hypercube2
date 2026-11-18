@@ -7,5 +7,5 @@ fn main() {
     if let Err(error) = fix_path_env::fix() {
         eprintln!("Failed to read shell PATH: {error}");
     }
-    ox_lib::run();
+    ox::run();
 }

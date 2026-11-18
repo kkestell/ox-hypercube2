@@ -3,8 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [profile.release]
-codegen-units = 1
-lto = true
+lto = "thin"
 opt-level = 3
 strip = true
 

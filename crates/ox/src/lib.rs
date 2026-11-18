@@ -648,7 +648,6 @@ fn utf8_env() -> BTreeMap<String, String> {
         .collect()
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
