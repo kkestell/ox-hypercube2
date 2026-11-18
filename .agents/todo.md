@@ -41,13 +41,13 @@ Each of these underlies several bugs below, which the fix closes.
   crash error shown only once history is read, the subscriber hung by a
   delete during the first read, and replay breaking after a failed write.
   `crates/oxd/src/state.rs:715`, `crates/oxd/src/store.rs`.
-- [ ] **The Pi bridge infers which prompt a dialog or model change belongs
+- [x] **The Pi bridge infers which prompt a dialog or model change belongs
   to.** Medium. Pi's RPC tags neither with a prompt, and Pi handles RPC lines
   concurrently, so the bridge matches them by position. A pure turn state
   machine, like `Phase::after` in `oxd`, could be tested over interleavings
   of prompts, cancellation, dialogs and model changes. Underlies cancelling
   before a Pi dialog arrives and a prompt running on the previous model.
-  `crates/pi-acp/src/pi.rs:383`, `crates/pi-acp/src/bridge.rs:273`.
+  `crates/pi-acp/src/turns.rs`.
 - [x] **Clients sequence session lifecycle themselves.** Medium. Selecting an
   exited session awaits `load_session` before switching, and `set_config`
   replaces the whole config, so the composer tracks the base each change
@@ -185,12 +185,12 @@ Each of these underlies several bugs below, which the fix closes.
 
 ### Pi bridge
 
-- [ ] **Cancelling before an extension dialog arrives leaves the prompt
+- [x] **Cancelling before an extension dialog arrives leaves the prompt
   pending.** Medium. Cancellation withdraws only dialogs already open; a later
-  dialog for the cancelled prompt opens normally. `crates/pi-acp/src/pi.rs:383`.
-- [ ] **A prompt sent during a model change can run on the previous model.**
+  dialog for the cancelled prompt opens normally. `crates/pi-acp/tests/protocol.rs`.
+- [x] **A prompt sent during a model change can run on the previous model.**
   Low. Pi handles RPC lines concurrently, so a following prompt can start
-  while `set_model` awaits authentication. `crates/pi-acp/src/bridge.rs:273`.
+  while `set_model` awaits authentication. `crates/pi-acp/tests/protocol.rs`.
 - [ ] **A session keeps a title from a first prompt Pi rejected.** Low. The
   title is published before Pi answers the prompt.
   `crates/pi-acp/src/bridge.rs:166`.

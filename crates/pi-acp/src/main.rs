@@ -6,6 +6,7 @@ mod history;
 mod options;
 mod pi;
 mod tools;
+mod turns;
 mod updates;
 
 use agent_client_protocol::{Agent, Result};

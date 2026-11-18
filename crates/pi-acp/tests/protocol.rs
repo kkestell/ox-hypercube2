@@ -24,6 +24,7 @@ if [ -n "${PI_ACP_MCP_SERVERS-}" ]; then printf '%s\n' "$PI_ACP_MCP_SERVERS" >> 
 # Reads the next command into $command. Pi ends when its stdin closes.
 next_command() {
   IFS= read -r command || { : > closed; exit 0; }
+  case "$command" in *'"type":"prompt"'*) printf '%s\n' "$command" >> prompts;; esac
 }
 # Exits unless $command is of type $1.
 expect() {
@@ -48,14 +49,21 @@ describe() {
   command=$commands_command
   answer get_commands ',"data":{"commands":[{"name":"template","description":"A template","source":"prompt"},{"name":"extension","source":"extension"},{"name":"skill:review","description":"Review","source":"skill"}]}'
   command=$state_command
+  answer_state
+}
+answer_state() {
   model=${current_model:-'{"provider":"first","id":"one","name":"One"}'}
   answer get_state ",\"data\":{\"sessionFile\":\"$PWD/history.jsonl\",\"model\":$model,\"thinkingLevel\":\"${thinking:-high}\"}"
 }
-# Reads a prompt and records it in `prompts`.
+describe_state() {
+  next_command
+  expect get_state
+  answer_state
+}
+# Reads the next command, which must be a prompt.
 next_prompt() {
   next_command
   expect prompt
-  printf '%s\n' "$command" >> prompts
 }
 # Accepts the prompt in $command with disposition $1, `started` by default.
 accept() {
@@ -468,7 +476,7 @@ printf '{"id":"%s","type":"response","command":"prompt","success":false,"error":
 next_command
 expect set_thinking_level
 answer set_thinking_level
-describe
+describe_state
 "#,
     )
     .await;
@@ -509,28 +517,29 @@ settled
 
 #[tokio::test]
 async fn cancel_aborts_the_turn() {
-    let (_temp, _project, mut child, mut reader, session) = session(
-        r#"
-next_prompt
-accept
-emit '{"type":"agent_start"}'
+    let run = r#"
 emit '{"type":"message_start","message":{"role":"assistant","content":[]}}'
 emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"working"}}'
 aborted
 emit '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"working"}],"stopReason":"aborted"}}'
 settled true
-"#,
-    )
-    .await;
-    send(&mut child, prompt_request(3, &session)).await;
-    let mut seen = Vec::new();
-    while update(seen.last().unwrap_or(&Value::Null))["content"]["text"] != "working" {
-        seen.push(receive(&mut reader).await);
+"#;
+    for start in [
+        "accept\nemit '{\"type\":\"agent_start\"}'",
+        "emit '{\"type\":\"agent_start\"}'\naccept handled",
+    ] {
+        let (_temp, _project, mut child, mut reader, session) =
+            session(&format!("next_prompt\n{start}\n{run}")).await;
+        send(&mut child, prompt_request(3, &session)).await;
+        let mut seen = Vec::new();
+        while update(seen.last().unwrap_or(&Value::Null))["content"]["text"] != "working" {
+            seen.push(receive(&mut reader).await);
+        }
+        send(&mut child, cancel_notification(&session)).await;
+        let (idle, _) = finish(&mut reader, 3, seen).await;
+        assert_eq!(idle["stopReason"], "cancelled", "{start}: {idle}");
+        child.kill().await.unwrap();
     }
-    send(&mut child, cancel_notification(&session)).await;
-    let (idle, _) = finish(&mut reader, 3, seen).await;
-    assert_eq!(idle["stopReason"], "cancelled", "{idle}");
-    child.kill().await.unwrap();
 }
 
 /// A cancel that reaches Pi before Pi answers the prompt does not stop the
@@ -659,6 +668,7 @@ command=$started
 accept
 emit '{"type":"agent_start"}'
 emit '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}'
+emit '{"type":"message_start","message":{"role":"toolResult","content":[]}}'
 assistant '[{"type":"text","text":"first"}]'
 emit '{"type":"message_start","message":{"role":"user","content":[{"type":"text","text":"steer"}]}}'
 assistant '[{"type":"text","text":"second"}]'
@@ -866,7 +876,7 @@ settled
 }
 
 #[tokio::test]
-async fn cancel_withdraws_open_dialogs() {
+async fn cancel_withdraws_open_dialogs_and_refuses_later_ones() {
     let (_temp, project, mut child, mut reader, session) = session(
         r#"
 next_prompt
@@ -876,6 +886,9 @@ emit '{"type":"extension_ui_request","id":"ask-1","method":"confirm","title":"Ru
 next_command
 printf '%s\n' "$command" > dialog
 aborted
+emit '{"type":"extension_ui_request","id":"ask-2","method":"confirm","title":"Continue?"}'
+next_command
+printf '%s\n' "$command" >> dialog
 settled true
 "#,
     )
@@ -886,12 +899,24 @@ settled true
     let (cancel, more) = until_method(&mut reader, "$/cancel_request").await;
     seen.extend(more);
     assert_eq!(cancel["params"]["requestId"], request["id"]);
+    assert!(
+        seen.iter()
+            .all(|value| value["method"] != "elicitation/create"),
+        "{seen:?}"
+    );
+    while !seen.iter().any(|value| is_state(value, "idle")) {
+        let value = receive(&mut reader).await;
+        assert_ne!(value["method"], "elicitation/create", "{value}");
+        seen.push(value);
+    }
     let (idle, _) = finish(&mut reader, 3, seen).await;
     assert_eq!(idle["stopReason"], "cancelled");
-    assert_eq!(
-        serde_json::from_str::<Value>(&lines(&project, "dialog", 1)[0]).unwrap(),
-        json!({"type":"extension_ui_response","id":"ask-1","cancelled":true})
-    );
+    for (line, id) in lines(&project, "dialog", 2).iter().zip(["ask-1", "ask-2"]) {
+        assert_eq!(
+            serde_json::from_str::<Value>(line).unwrap(),
+            json!({"type":"extension_ui_response","id":id,"cancelled":true})
+        );
+    }
     child.kill().await.unwrap();
 }
 
@@ -1059,13 +1084,13 @@ expect set_model
 printf '%s\n' "$command" >> changes
 current_model='{"provider":"second","id":"org/two","name":"Two"}'
 answer set_model
-describe
+describe_state
 next_command
 expect set_thinking_level
 printf '%s\n' "$command" >> changes
 thinking=low
 answer set_thinking_level
-describe
+describe_state
 next_prompt
 accept
 emit '{"type":"agent_start"}'
@@ -1349,6 +1374,40 @@ fn config_request(id: i64, session: &Value, config: &str, value: &str) -> Value 
 }
 
 #[tokio::test]
+async fn a_cancel_fails_a_prompt_waiting_for_a_model_change() {
+    let (_temp, project, mut child, mut reader, session) = session(
+        r#"
+next_command
+expect set_model
+change=$command
+aborted
+command=$change
+current_model='{"provider":"second","id":"org/two","name":"Two"}'
+answer set_model
+describe_state
+"#,
+    )
+    .await;
+    send(
+        &mut child,
+        config_request(3, &session, "model", "second/org/two"),
+    )
+    .await;
+    send(&mut child, prompt_request(4, &session)).await;
+    send(&mut child, cancel_notification(&session)).await;
+
+    let (prompt, _) = response(&mut reader, 4).await;
+    assert_eq!(prompt["error"]["code"], -32800, "{prompt}");
+    let (change, _) = response(&mut reader, 3).await;
+    assert_eq!(
+        change["result"]["configOptions"][0]["currentValue"], "second/org/two",
+        "{change}"
+    );
+    assert!(!project.join("prompts").exists());
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_config_change_restarts_pi_and_refreshes_its_commands() {
     let (_temp, project, mut child, mut reader, session) =
         session("next_prompt\naccept\nexit 3").await;
@@ -1397,13 +1456,13 @@ printf '%s\n' "$command" >> changes
 current_model='{"provider":"second","id":"org/two","name":"Two"}'
 thinking=low
 answer set_model
-describe
+describe_state
 next_command
 expect set_thinking_level
 printf '%s\n' "$command" >> changes
 thinking=high
 answer set_thinking_level
-describe
+describe_state
 "#,
     )
     .await;
@@ -1427,6 +1486,64 @@ describe
     assert_eq!(model["modelId"], "org/two");
     let effort: Value = serde_json::from_str(&changes[1]).unwrap();
     assert_eq!(effort["level"], "high");
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn overlapping_effort_changes_each_report_the_level_they_applied() {
+    let (_temp, _project, mut child, mut reader, session) = session(
+        r#"
+next_command
+expect set_thinking_level
+first=$command
+# Hold the first answer until both requests have reached the bridge. Cancel
+# goes straight to Pi and leaves configuration changes alone.
+next_command
+case "$command" in
+  *'"type":"set_thinking_level"'*) second=$command; next_command;;
+esac
+expect clear_queue
+answer clear_queue
+next_command
+expect abort
+answer abort
+thinking=low
+command=$first
+answer set_thinking_level
+if [ -n "${second-}" ]; then
+  thinking=high
+  command=$second
+  answer set_thinking_level
+fi
+while :; do
+  next_command
+  case "$command" in
+    *'"type":"set_thinking_level"'*) thinking=high; answer set_thinking_level;;
+    *'"type":"get_state"'*) answer_state;;
+    *'"type":"get_commands"'*) answer get_commands;;
+    *) exit 20;;
+  esac
+done
+"#,
+    )
+    .await;
+    send(&mut child, config_request(3, &session, "effort", "low")).await;
+    send(&mut child, config_request(4, &session, "effort", "high")).await;
+    send(&mut child, cancel_notification(&session)).await;
+
+    let (first, seen) = response(&mut reader, 3).await;
+    assert_eq!(
+        first["result"]["configOptions"][1]["currentValue"], "low",
+        "{first}"
+    );
+    let second = match seen.into_iter().find(|value| value["id"] == 4) {
+        Some(second) => second,
+        None => response(&mut reader, 4).await.0,
+    };
+    assert_eq!(
+        second["result"]["configOptions"][1]["currentValue"], "high",
+        "{second}"
+    );
     child.kill().await.unwrap();
 }
 

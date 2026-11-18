@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Arc, Mutex},
@@ -19,7 +19,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::{dialogs, tools, updates::Updates};
+use crate::{
+    dialogs, tools,
+    turns::{Action, Turns},
+    updates::Updates,
+};
 
 /// The Pi extension that registers the client's MCP servers.
 const MCP_EXTENSION: &str = include_str!("mcp-servers.js");
@@ -37,74 +41,55 @@ fn write_mcp_extension() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// A prompt waiting for Pi's answer to its `prompt` command, or for Pi to
-/// take it into the run it steers.
+/// The client response and message to send when Pi takes in a prompt.
 struct Prompt {
     message_id: String,
     content: Vec<ContentBlock>,
     responder: Responder<PromptResponse>,
 }
 
-/// A command waiting for Pi's response.
-enum Pending {
-    Prompt(Box<Prompt>),
-    /// `clear_queue` or `abort`, named for the log.
-    Stop(&'static str),
-    Request(oneshot::Sender<Result<Value, String>>),
-}
-
 #[derive(Default)]
 struct State {
-    counter: u64,
+    turns: Turns<Box<Prompt>>,
     /// Client forms still waiting for an answer, by Pi request ID.
     dialogs: HashMap<String, AbortHandle>,
-    /// Commands Pi has not answered, by ID.
-    pending: HashMap<String, Pending>,
-    /// Prompts Pi queued to steer its run, in the order Pi takes them in.
-    steering: VecDeque<Box<Prompt>>,
-    /// The client cancelled while prompts waited for Pi's answer. Pi's abort
-    /// does not stop a run that has not started, nor a steer it has yet to
-    /// queue, so the bridge stops again as Pi answers each of them.
-    abort_on_start: bool,
-    /// Why Pi exited, once it has.
-    exited: Option<String>,
 }
 
 impl State {
-    fn withdraw_dialogs(&mut self, input: Option<&mpsc::UnboundedSender<Value>>) {
-        for (id, task) in self.dialogs.drain() {
-            task.abort();
+    /// Applies turn actions while holding the state lock, preserving their order.
+    fn apply(
+        &mut self,
+        actions: Vec<Action<Box<Prompt>>>,
+        input: Option<&mpsc::UnboundedSender<Value>>,
+        updates: &Updates,
+    ) {
+        let send = |command| {
             if let Some(input) = input {
-                let _ =
-                    input.send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}));
+                let _ = input.send(command);
+            }
+        };
+        for action in actions {
+            match action {
+                Action::Send(command) => send(command),
+                Action::Accept(prompt) => {
+                    let _ = prompt
+                        .responder
+                        .respond(PromptResponse::new(prompt.message_id.clone()));
+                    updates.user_message(&prompt.message_id, prompt.content);
+                    updates.working();
+                }
+                Action::Fail(prompt, error) => {
+                    let _ = prompt.responder.respond_with_error(error);
+                }
+                Action::WithdrawDialogs => {
+                    for (id, task) in self.dialogs.drain() {
+                        task.abort();
+                        send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}));
+                    }
+                }
+                Action::EndTurn => updates.idle(StopReason::EndTurn),
             }
         }
-    }
-
-    /// Stops Pi's run. Pi's `abort` goes on to deliver the steering queue, so
-    /// the queue is cleared first and its prompts fail as cancelled.
-    fn stop(&mut self, input: &mpsc::UnboundedSender<Value>) {
-        self.send(
-            input,
-            json!({"type": "clear_queue"}),
-            Pending::Stop("clear_queue"),
-        );
-        self.send(input, json!({"type": "abort"}), Pending::Stop("abort"));
-        for prompt in self.steering.drain(..) {
-            let _ = prompt
-                .responder
-                .respond_with_error(agent_client_protocol::Error::request_cancelled());
-        }
-    }
-
-    /// Sends `command` to Pi under a new ID and records what waits for the
-    /// response.
-    fn send(&mut self, input: &mpsc::UnboundedSender<Value>, mut command: Value, pending: Pending) {
-        self.counter += 1;
-        let id = self.counter.to_string();
-        command["id"] = json!(id);
-        self.pending.insert(id, pending);
-        let _ = input.send(command);
     }
 }
 
@@ -170,8 +155,6 @@ impl Pi {
             state: state.clone(),
             input: input.downgrade(),
             cwd: cwd.to_owned(),
-            running: false,
-            starting: 0,
             blocks: HashMap::new(),
             tools: HashMap::new(),
             last_stop: None,
@@ -188,22 +171,27 @@ impl Pi {
         self.updates.snapshot()
     }
 
-    pub fn request(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
+    pub fn change(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
         let (send, receive) = oneshot::channel();
         let mut state = self.state.lock().unwrap();
-        if let Some(error) = &state.exited {
-            let _ = send.send(Err(error.clone()));
-        } else {
-            state.send(&self.input, command, Pending::Request(send));
-        }
+        let actions = state.turns.change(command, send);
+        state.apply(actions, Some(&self.input), &self.updates);
+        receive
+    }
+
+    pub fn query(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
+        let (send, receive) = oneshot::channel();
+        let mut state = self.state.lock().unwrap();
+        let actions = state.turns.query(command, send);
+        state.apply(actions, Some(&self.input), &self.updates);
         receive
     }
 
     pub fn has_exited(&self) -> bool {
-        self.state.lock().unwrap().exited.is_some()
+        self.state.lock().unwrap().turns.has_exited()
     }
 
-    /// Sends a prompt. Once Pi accepts it, the session gets it as the user
+    /// Submits a prompt. Once Pi accepts it, the session gets it as the user
     /// message `message_id` and `responder` answers with that ID. If Pi has
     /// exited, the responder comes back.
     pub fn prompt(
@@ -214,10 +202,6 @@ impl Pi {
         images: &[Value],
         responder: Responder<PromptResponse>,
     ) -> Result<(), Box<Responder<PromptResponse>>> {
-        let mut state = self.state.lock().unwrap();
-        if state.exited.is_some() {
-            return Err(Box::new(responder));
-        }
         let mut command = json!({
             "type": "prompt",
             "message": message,
@@ -228,34 +212,26 @@ impl Pi {
         if !images.is_empty() {
             command["images"] = json!(images);
         }
-        state.send(
-            &self.input,
-            command,
-            Pending::Prompt(Box::new(Prompt {
-                message_id: message_id.to_owned(),
-                content,
-                responder,
-            })),
-        );
+        let mut state = self.state.lock().unwrap();
+        let actions = state
+            .turns
+            .prompt(
+                command,
+                Box::new(Prompt {
+                    message_id: message_id.to_owned(),
+                    content,
+                    responder,
+                }),
+            )
+            .map_err(|prompt| Box::new(prompt.responder))?;
+        state.apply(actions, Some(&self.input), &self.updates);
         Ok(())
     }
 
-    /// Stops Pi's run, including the run of a prompt Pi has yet to answer,
-    /// and fails the prompts waiting to steer it.
-    pub fn abort(&self) {
+    pub fn cancel(&self) {
         let mut state = self.state.lock().unwrap();
-        if state.exited.is_some() {
-            return;
-        }
-        if state
-            .pending
-            .values()
-            .any(|pending| matches!(pending, Pending::Prompt(_)))
-        {
-            state.abort_on_start = true;
-        }
-        state.withdraw_dialogs(Some(&self.input));
-        state.stop(&self.input);
+        let actions = state.turns.cancel();
+        state.apply(actions, Some(&self.input), &self.updates);
     }
 }
 
@@ -282,11 +258,6 @@ struct Output {
     /// session's `Pi` alone keeps stdin open.
     input: mpsc::WeakUnboundedSender<Value>,
     cwd: PathBuf,
-    /// Pi has started a run and not settled.
-    running: bool,
-    /// Prompts Pi started whose user message has not started yet. Their
-    /// user messages precede those of the prompts steering their runs.
-    starting: usize,
     /// The blocks of the assistant message being streamed, by content index.
     blocks: HashMap<u64, Block>,
     tools: HashMap<String, Tool>,
@@ -305,33 +276,22 @@ impl Output {
                 ),
                 Err(error) => format!("pi process failed: {error}"),
             };
-        let (pending, steering) = {
+        {
             let mut state = self.state.lock().unwrap();
-            state.exited = Some(error.clone());
-            state.withdraw_dialogs(None);
-            (
-                std::mem::take(&mut state.pending),
-                std::mem::take(&mut state.steering),
-            )
-        };
-        let fail = |prompt: Box<Prompt>| {
-            let _ = prompt
-                .responder
-                .respond_with_error(agent_client_protocol::Error::new(-32603, error.clone()));
-        };
-        for (_, pending) in pending {
-            match pending {
-                Pending::Prompt(prompt) => fail(prompt),
-                Pending::Request(send) => {
-                    let _ = send.send(Err(error.clone()));
-                }
-                Pending::Stop(_) => {}
-            }
+            let actions = state.turns.exited(&error);
+            state.apply(actions, None, &self.updates);
         }
-        steering.into_iter().for_each(fail);
-
         self.updates.fail_open_tools();
         self.updates.idle(error_stop(error));
+    }
+
+    fn handle_turns(
+        &self,
+        event: impl FnOnce(&mut Turns<Box<Prompt>>) -> Vec<Action<Box<Prompt>>>,
+    ) {
+        let mut state = self.state.lock().unwrap();
+        let actions = event(&mut state.turns);
+        state.apply(actions, self.input.upgrade().as_ref(), &self.updates);
     }
 
     fn send(&self, message: Value) {
@@ -348,14 +308,16 @@ impl Output {
         let role = &record["message"]["role"];
         let assistant = role == "assistant";
         match record["type"].as_str() {
-            Some("response") => self.response(&record),
+            Some("response") => self.handle_turns(|turns| turns.response(&record)),
             Some("agent_start") => {
-                self.running = true;
+                self.state.lock().unwrap().turns.run_started();
                 self.updates.working();
             }
             Some("agent_settled") => self.settled(record["aborted"] == true),
             Some("message_start") if assistant => self.blocks.clear(),
-            Some("message_start") if role == "user" => self.user_message_started(),
+            Some("message_start") if role == "user" => {
+                self.handle_turns(Turns::user_message_started);
+            }
             Some("message_update") => self.message_update(&record["assistantMessageEvent"]),
             Some("message_end") if assistant => self.assistant_message(&record["message"]),
             Some("tool_execution_start") => {
@@ -381,6 +343,11 @@ impl Output {
         reason = "Pi's dialog timeout is the behavior"
     )]
     fn dialog(&self, request: Value) {
+        let mut locked = self.state.lock().unwrap();
+        if !locked.turns.takes_dialogs() {
+            self.send(dialogs::response(&request, None));
+            return;
+        }
         let Some((message, schema)) = dialogs::form(&request) else {
             self.send(dialogs::response(&request, None));
             return;
@@ -388,13 +355,11 @@ impl Output {
         let Some(id) = request["id"].as_str().map(str::to_owned) else {
             return;
         };
-        let updates = self.updates.clone();
+        let ask = self.updates.ask(message, schema);
         let state = self.state.clone();
         let input = self.input.clone();
-        let mut locked = self.state.lock().unwrap();
         let task_id = id.clone();
         let task = tokio::spawn(async move {
-            let ask = updates.ask(message, schema);
             // Pi silently forgets timed-out dialogs; it sends no withdrawal record.
             // An extension's private AbortSignal cannot be observed over RPC.
             let action = if let Some(timeout) = dialogs::timeout(&request) {
@@ -415,110 +380,9 @@ impl Output {
         locked.dialogs.insert(id, task.abort_handle());
     }
 
-    /// Resolves the command Pi answered.
-    fn response(&mut self, response: &Value) {
-        let id = response["id"].as_str().unwrap_or_default();
-        let pending = self.state.lock().unwrap().pending.remove(id);
-        match pending {
-            Some(Pending::Prompt(prompt)) => self.prompt_answered(prompt, response),
-            Some(Pending::Request(send)) => {
-                let result = if response["success"] == true {
-                    Ok(response["data"].clone())
-                } else {
-                    Err(response["error"]
-                        .as_str()
-                        .unwrap_or("pi refused the command")
-                        .to_owned())
-                };
-                let _ = send.send(result);
-            }
-            Some(Pending::Stop(command)) => {
-                if response["success"] != true {
-                    eprintln!("pi refused to {command}: {}", response["error"]);
-                }
-            }
-            None => eprintln!("pi answered an unknown command: {response}"),
-        }
-    }
-
-    /// Answers a prompt once Pi accepted or refused it. A prompt an
-    /// extension command handled ends its turn unless the command started a
-    /// run. A prompt Pi queued to steer its run waits for Pi to take it in.
-    fn prompt_answered(&mut self, prompt: Box<Prompt>, response: &Value) {
-        let abort = {
-            let mut state = self.state.lock().unwrap();
-            let abort = state.abort_on_start;
-            if !state
-                .pending
-                .values()
-                .any(|pending| matches!(pending, Pending::Prompt(_)))
-            {
-                state.abort_on_start = false;
-            }
-            abort
-        };
-        if response["success"] != true {
-            let error = response["error"]
-                .as_str()
-                .unwrap_or("pi refused the prompt");
-            let _ = prompt
-                .responder
-                .respond_with_error(agent_client_protocol::Error::new(-32603, error));
-            return;
-        }
-        let disposition = &response["data"]["disposition"];
-        if disposition == "queued" {
-            let mut state = self.state.lock().unwrap();
-            state.steering.push_back(prompt);
-            if abort && let Some(input) = self.input.upgrade() {
-                state.stop(&input);
-            }
-            return;
-        }
-        let _ = prompt
-            .responder
-            .respond(PromptResponse::new(prompt.message_id.clone()));
-        self.updates
-            .user_message(&prompt.message_id, prompt.content);
-        self.updates.working();
-        if disposition == "handled" {
-            if !self.running {
-                self.updates.idle(StopReason::EndTurn);
-            }
-        } else {
-            self.starting += 1;
-            if abort && let Some(input) = self.input.upgrade() {
-                self.state.lock().unwrap().stop(&input);
-            }
-        }
-    }
-
-    /// Answers the next steering prompt once Pi takes it into its run. The
-    /// user message of a prompt Pi started is already sent.
-    fn user_message_started(&mut self) {
-        if self.starting > 0 {
-            self.starting -= 1;
-            return;
-        }
-        let Some(prompt) = self.state.lock().unwrap().steering.pop_front() else {
-            return;
-        };
-        let _ = prompt
-            .responder
-            .respond(PromptResponse::new(prompt.message_id.clone()));
-        self.updates
-            .user_message(&prompt.message_id, prompt.content);
-    }
-
     /// Ends the turn once Pi has no more automatic work.
     fn settled(&mut self, aborted: bool) {
-        if aborted {
-            self.state
-                .lock()
-                .unwrap()
-                .withdraw_dialogs(self.input.upgrade().as_ref());
-        }
-        self.running = false;
+        self.handle_turns(|turns| turns.settled(aborted));
         self.updates.fail_open_tools();
         self.tools.clear();
         let last_stop = self.last_stop.take();

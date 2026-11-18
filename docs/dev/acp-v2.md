@@ -31,7 +31,7 @@ relays the update or acts on it as the protocol requires.
 | `session/list` | ❌ | ❌ | ❌ | |
 | `session/resume` | ✅ | ✅ | ✅ | Both bridges support only `replayFrom: start`. See [Resume and replay](#resume-and-replay). |
 | `session/close` | ❌ | ❌ | ❌ | Ox ends a session by stopping its agent process. |
-| `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude takes the prompt in at its next opportunity (`priority: "next"`), and Pi steers the turn with it; each bridge answers the prompt when its harness takes it in. A prompt Claude has not taken in when the turn ends starts a turn of its own. |
+| `session/prompt` | ✅ | ✅ | ✅ | During a turn, Claude takes the prompt in at its next opportunity (`priority: "next"`), and Pi steers the turn with it. Each bridge answers the prompt when its harness takes it in. A prompt Claude has not taken in when the turn ends starts a turn of its own. Pi's bridge holds prompts until preceding config changes are answered and any active cancellation finishes. A prompt held during cancellation starts a turn of its own. |
 | `session/set_config_option` | ✅ | ✅ | ✅ | Claude: `model`, `effort`, `mode`. Pi: `model` (`provider/id`) and `effort`, its thinking level, when Pi reports one. Each option offers only its current value, and the bridge passes any value to its harness. Pi sets an effort its model lacks to one the model has, and Pi's bridge refuses that change, naming the level Pi runs at. Ox supports select and boolean options. |
 | `session/delete` | ❌ | ❌ | ❌ | |
 | `session/fork` (unstable) | ❌ | ❌ | ❌ | |
@@ -59,7 +59,7 @@ relays the update or acts on it as the protocol requires.
 | Feature | oxd | claude-code-acp | pi-acp | Caveats |
 | --- | --- | --- | --- | --- |
 | `session/request_permission` | ✅ | ✅ | ❌ | Pi runs tools without asking. Claude's AskUserQuestion uses `elicitation/create` instead. |
-| `elicitation/create` | ✅ | ✅ | ✅ | Claude: AskUserQuestion forms. Pi: extension dialogs. Ox supports session-scoped forms only; URL mode and request scope are unsupported. Forms show string choices (`oneOf`), text fields and multiple choices (`anyOf`); oxd rejects forms with other field kinds, except optional fields of unknown type, which are left out. The client constrains answers to the form. |
+| `elicitation/create` | ✅ | ✅ | ✅ | Claude uses AskUserQuestion forms. Pi uses extension dialogs. While cancellation is stopping Pi, the bridge answers incoming dialogs as cancelled without showing a form. Ox supports session-scoped forms only. URL mode and request scope are unsupported. Forms show string choices (`oneOf`), text fields and multiple choices (`anyOf`). oxd rejects forms with other field kinds, except optional fields of unknown type, which are left out. The client constrains answers to the form. |
 | `mcp/message` (unstable) | ❌ | ❌ | ❌ | |
 | Extension requests (`_`-prefixed) | ❌ | ❌ | ❌ | |
 

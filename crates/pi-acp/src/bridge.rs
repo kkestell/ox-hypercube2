@@ -123,13 +123,13 @@ impl acp_bridge::Bridge for Bridge {
         if let Ok(mut open) = self.require(id)
             && let Some(pi) = &open_session(&mut open).pi
         {
-            pi.abort();
+            pi.cancel();
         }
     }
 
-    /// Sends a prompt to its session's Pi, which answers `responder` once it
-    /// accepts the prompt. The prompt is sent before this returns, so a
-    /// cancel that arrives right after the prompt follows it.
+    /// Submits a prompt to its session's Pi and answers once Pi takes it in.
+    /// The bridge records the prompt before returning so a following cancel
+    /// can stop it.
     fn prompt(
         self: &Arc<Self>,
         request: &acp::PromptRequest,
@@ -270,27 +270,22 @@ impl acp_bridge::Bridge for Bridge {
             }
             let mut open = self.require(&id)?;
             let pi = open_session(&mut open).pi.as_ref().expect("started pi");
-            // TODO: Pi handles RPC lines concurrently; a following prompt can
-            // start on the previous model while set_model awaits authentication.
-            Ok(pi.request(command))
+            Ok(pi.change(command))
         })();
-        let bridge = self.clone();
         async move {
-            answer(change?).await?;
-            let description = bridge.describe(&id).await?;
+            let state = answer(change?).await?;
+            let config_options = options::build(&state);
             notify(
                 &connection,
                 &id,
                 SessionUpdate::ConfigOptionUpdate(acp::ConfigOptionUpdate::new(
-                    description.config_options.clone(),
+                    config_options.clone(),
                 )),
             );
             if let Some(effort) = effort {
-                options::check_effort(&description.state, &effort).map_err(invalid)?;
+                options::check_effort(&state, &effort).map_err(invalid)?;
             }
-            Ok(acp::SetSessionConfigOptionResponse::new(
-                description.config_options,
-            ))
+            Ok(acp::SetSessionConfigOptionResponse::new(config_options))
         }
     }
 }
@@ -395,8 +390,8 @@ fn description(
     pi: &Pi,
 ) -> impl Future<Output = Result<Description, Error>> + Send + 'static + use<> {
     let queries = [
-        pi.request(json!({"type":"get_state"})),
-        pi.request(json!({"type":"get_commands"})),
+        pi.query(json!({"type":"get_state"})),
+        pi.query(json!({"type":"get_commands"})),
     ];
     async move {
         let [state, catalog] = queries;
