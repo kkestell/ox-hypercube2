@@ -59,3 +59,29 @@ The Structure item and both related bugs are checked off.
 
    The run ended with `{"check": "passed"}`. The protocol regressions above
    exercise the model and dialog interleavings directly.
+
+## Structural simplification after review
+
+Replaced the generic `Turns<P>` and its action interpreter with one concrete
+`Turns` owner for dispatch, prompt replies, and dialogs. State transitions and
+their effects run under the same lock. Config blocking derives from pending
+changes, removing the separately maintained `changing` flag. Shared prompt
+completion and request failure handling replace repeated response plumbing.
+
+The three coordinator unit tests were replaced by assertions and controlled
+interleavings in existing protocol tests. FIFO gates hold Pi's answers until a
+later ACP response proves the bridge has registered the queued work; child
+processes open those gates under a timeout, so no runtime thread blocks opening
+a FIFO. Coverage includes model/effort/prompt ordering, idle cancellation,
+cancellation before a handled or started prompt's reply, and a subsequent prompt
+surviving the earlier cancellation.
+
+- `make check-rust` passed, including 10 Pi unit tests and 32 protocol tests.
+- `make smoke-pi` still failed at the existing obsolete handshake.
+- With the current handshake substituted in memory as above, the live run
+  passed model verification, effort changes, forms, steering, queueing, and
+  cancellation. It then failed the title-tool check: the model asked which
+  instruction to follow rather than invoking `set_title`. The event log shows
+  its text response and no title-tool call. The full live suite therefore did
+  not pass on this revision; results are in
+  `/private/tmp/ox-acp-s9bgmj7_/results.json`.

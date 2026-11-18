@@ -236,6 +236,24 @@ fn lines(project: &Path, name: &str, count: usize) -> Vec<String> {
     lines
 }
 
+/// Releases a fake held at its FIFO after the test observes its ready message.
+/// A child process opens the FIFO so a missing reader cannot block a runtime thread.
+async fn release_pi(project: &Path) {
+    let mut writer = Command::new("sh")
+        .args(["-c", "printf 'release\\n' > release"])
+        .current_dir(project)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(acp_bridge::testing::TIMEOUT, writer.wait())
+            .await
+            .expect("fake Pi did not reach its release FIFO")
+            .unwrap()
+            .success()
+    );
+}
+
 /// The message of the error an idle update ends its turn with.
 fn error_message(idle: &Value) -> Option<&str> {
     (idle["stopReason"] == "error").then(|| idle["error"]["message"].as_str().unwrap())
@@ -529,7 +547,9 @@ settled true
         "emit '{\"type\":\"agent_start\"}'\naccept handled",
     ] {
         let (_temp, _project, mut child, mut reader, session) =
-            session(&format!("next_prompt\n{start}\n{run}")).await;
+            session(&format!("aborted\nnext_prompt\n{start}\n{run}")).await;
+        // Cancelling while idle must leave the next prompt free to start.
+        send(&mut child, cancel_notification(&session)).await;
         send(&mut child, prompt_request(3, &session)).await;
         let mut seen = Vec::new();
         while update(seen.last().unwrap_or(&Value::Null))["content"]["text"] != "working" {
@@ -545,17 +565,25 @@ settled true
 /// A cancel that reaches Pi before Pi answers the prompt does not stop the
 /// run that prompt starts, so the bridge aborts again once Pi starts it.
 #[tokio::test]
-async fn cancel_sent_right_after_prompt_cancels_it() {
-    let (_temp, _project, mut child, mut reader, session) = session(
+async fn cancel_sent_right_after_prompt_cancels_it_without_stopping_a_later_prompt() {
+    let (_temp, project, mut child, mut reader, session) = session(
         r#"
+mkfifo release
 next_prompt
 prompt=$command
 aborted
+emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"stopping"}}'
+IFS= read -r released < release
 command=$prompt
 accept
 aborted
 emit '{"type":"agent_start"}'
 settled true
+next_prompt
+accept
+emit '{"type":"agent_start"}'
+assistant '[{"type":"text","text":"next"}]'
+settled
 "#,
     )
     .await;
@@ -563,16 +591,33 @@ settled true
     stdin
         .write_all(
             format!(
-                "{}\n{}\n",
+                "{}\n{}\n{}\n",
                 prompt_request(3, &session),
-                cancel_notification(&session)
+                cancel_notification(&session),
+                steer_request(4, &session)
             )
             .as_bytes(),
         )
         .await
         .unwrap();
-    let (idle, _) = finish(&mut reader, 3, Vec::new()).await;
+    // An invalid setting is answered without contacting Pi. Its response
+    // proves the bridge has registered the later prompt before Pi starts the
+    // cancelled one, regardless of how fast either process runs.
+    send(&mut child, config_request(5, &session, "effort", "")).await;
+    let (barrier, mut seen) = response(&mut reader, 5).await;
+    assert!(barrier["error"].is_object(), "{barrier}");
+    while !seen
+        .iter()
+        .any(|value| update(value)["content"]["text"] == "stopping")
+    {
+        seen.push(receive(&mut reader).await);
+    }
+    assert!(!seen.iter().any(|value| value["id"] == 4), "{seen:?}");
+    release_pi(&project).await;
+    let (idle, _) = finish(&mut reader, 3, seen).await;
     assert_eq!(idle["stopReason"], "cancelled", "{idle}");
+    let (idle, _) = finish(&mut reader, 4, Vec::new()).await;
+    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
     child.kill().await.unwrap();
 }
 
@@ -1015,16 +1060,23 @@ expect set_thinking_level
 
 #[tokio::test]
 async fn a_handled_prompt_ends_its_turn() {
-    let (_temp, _project, mut child, mut reader, session) = session(
-        r"
-next_prompt
-accept handled
-",
-    )
-    .await;
-    let (idle, _) = prompt(&mut child, &mut reader, 3, &session).await;
-    assert_eq!(idle["stopReason"], "end_turn", "{idle}");
-    child.kill().await.unwrap();
+    for cancelled in [false, true] {
+        let before_answer = if cancelled { "aborted" } else { "" };
+        let (_temp, _project, mut child, mut reader, session) = session(&format!(
+            "next_prompt\nprompt=$command\n{before_answer}\ncommand=$prompt\naccept handled"
+        ))
+        .await;
+        send(&mut child, prompt_request(3, &session)).await;
+        if cancelled {
+            send(&mut child, cancel_notification(&session)).await;
+        }
+        let (idle, _) = finish(&mut reader, 3, Vec::new()).await;
+        assert_eq!(
+            idle["stopReason"], "end_turn",
+            "cancelled={cancelled}: {idle}"
+        );
+        child.kill().await.unwrap();
+    }
 }
 
 fn resume_request(id: i64, session: &Value, project: &Path, replay: Option<Value>) -> Value {
@@ -1079,9 +1131,12 @@ settled
     fake_pi(
         &project.parent().unwrap().join("bin"),
         r#"
+mkfifo release
 next_command
 expect set_model
 printf '%s\n' "$command" >> changes
+emit '{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"changing"}}'
+IFS= read -r released < release
 current_model='{"provider":"second","id":"org/two","name":"Two"}'
 answer set_model
 describe_state
@@ -1107,15 +1162,33 @@ settled
         config_request(4, &session, "model", "second/org/two"),
     )
     .await;
-    let (set, _) = response(&mut reader, 4).await;
+    send(&mut child, config_request(5, &session, "effort", "low")).await;
+    send(&mut child, prompt_request(6, &session)).await;
+    send(&mut child, config_request(7, &session, "effort", "")).await;
+    let (barrier, mut updates) = response(&mut reader, 7).await;
+    assert!(barrier["error"].is_object(), "{barrier}");
+    while !updates
+        .iter()
+        .any(|value| update(value)["content"]["text"] == "changing")
+    {
+        updates.push(receive(&mut reader).await);
+    }
+    release_pi(&project).await;
+    // Responses to separate ACP requests can arrive in either order.
+    while ![4, 5]
+        .iter()
+        .all(|id| updates.iter().any(|value| value["id"] == *id))
+    {
+        updates.push(receive(&mut reader).await);
+    }
+    let set = updates.iter().find(|value| value["id"] == 4).unwrap();
     assert_eq!(
         set["result"]["configOptions"][0]["currentValue"],
         "second/org/two"
     );
-    send(&mut child, config_request(5, &session, "effort", "low")).await;
-    let (set, _) = response(&mut reader, 5).await;
+    let set = updates.iter().find(|value| value["id"] == 5).unwrap();
     assert_eq!(set["result"]["configOptions"][1]["currentValue"], "low");
-    let (_, updates) = prompt(&mut child, &mut reader, 6, &session).await;
+    let (_, updates) = finish(&mut reader, 6, updates).await;
     assert!(
         !updates.iter().any(|v| kind(v) == "session_info_update"),
         "a resumed session keeps its title: {updates:?}"

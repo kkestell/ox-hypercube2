@@ -8,20 +8,18 @@ use std::{
 use acp_bridge::McpServer;
 use agent_client_protocol::v2::Responder;
 use agent_client_protocol::v2::schema::{
-    self as acp, ContentBlock, ErrorStopReason, PromptResponse, StopReason, ToolCallContent,
+    self as acp, ContentBlock, PromptResponse, StopReason, ToolCallContent,
 };
 use serde_json::{Value, json};
 use tokio::{
     process::{Child, Command},
     sync::{mpsc, oneshot},
-    task::AbortHandle,
-    time::sleep,
 };
 use uuid::Uuid;
 
 use crate::{
-    dialogs, tools,
-    turns::{Action, Turns},
+    tools,
+    turns::{Prompt, Turns, error_stop},
     updates::Updates,
 };
 
@@ -41,65 +39,14 @@ fn write_mcp_extension() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The client response and message to send when Pi takes in a prompt.
-struct Prompt {
-    message_id: String,
-    content: Vec<ContentBlock>,
-    responder: Responder<PromptResponse>,
-}
-
-#[derive(Default)]
-struct State {
-    turns: Turns<Box<Prompt>>,
-    /// Client forms still waiting for an answer, by Pi request ID.
-    dialogs: HashMap<String, AbortHandle>,
-}
-
-impl State {
-    /// Applies turn actions while holding the state lock, preserving their order.
-    fn apply(
-        &mut self,
-        actions: Vec<Action<Box<Prompt>>>,
-        input: Option<&mpsc::UnboundedSender<Value>>,
-        updates: &Updates,
-    ) {
-        let send = |command| {
-            if let Some(input) = input {
-                let _ = input.send(command);
-            }
-        };
-        for action in actions {
-            match action {
-                Action::Send(command) => send(command),
-                Action::Accept(prompt) => {
-                    let _ = prompt
-                        .responder
-                        .respond(PromptResponse::new(prompt.message_id.clone()));
-                    updates.user_message(&prompt.message_id, prompt.content);
-                    updates.working();
-                }
-                Action::Fail(prompt, error) => {
-                    let _ = prompt.responder.respond_with_error(error);
-                }
-                Action::WithdrawDialogs => {
-                    for (id, task) in self.dialogs.drain() {
-                        task.abort();
-                        send(json!({"type":"extension_ui_response", "id":id, "cancelled":true}));
-                    }
-                }
-                Action::EndTurn => updates.idle(StopReason::EndTurn),
-            }
-        }
-    }
-}
-
 /// A `pi --mode rpc` process that serves one session for as long as it
 /// runs. Everything it writes becomes session updates, whether or not a
 /// prompt is waiting. Dropping it closes Pi's stdin, which ends Pi.
 pub struct Pi {
-    input: mpsc::UnboundedSender<Value>,
+    /// Keeps stdin open until the session drops this handle.
+    _input: mpsc::UnboundedSender<Value>,
     updates: Updates,
-    state: Arc<Mutex<State>>,
+    turns: Arc<Mutex<Turns>>,
 }
 
 impl Pi {
@@ -149,11 +96,10 @@ impl Pi {
             child.stdin.take().expect("piped stdin"),
             commands,
         ));
-        let state = Arc::new(Mutex::new(State::default()));
+        let turns = Arc::new(Mutex::new(Turns::new(&input, updates.clone())));
         let output = Output {
             updates: updates.clone(),
-            state: state.clone(),
-            input: input.downgrade(),
+            turns: turns.clone(),
             cwd: cwd.to_owned(),
             blocks: HashMap::new(),
             tools: HashMap::new(),
@@ -161,9 +107,9 @@ impl Pi {
         };
         tokio::spawn(output.read(child));
         Ok(Self {
-            input,
+            _input: input,
             updates,
-            state,
+            turns,
         })
     }
 
@@ -172,23 +118,15 @@ impl Pi {
     }
 
     pub fn change(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
-        let (send, receive) = oneshot::channel();
-        let mut state = self.state.lock().unwrap();
-        let actions = state.turns.change(command, send);
-        state.apply(actions, Some(&self.input), &self.updates);
-        receive
+        self.turns.lock().unwrap().change(command)
     }
 
     pub fn query(&self, command: Value) -> oneshot::Receiver<Result<Value, String>> {
-        let (send, receive) = oneshot::channel();
-        let mut state = self.state.lock().unwrap();
-        let actions = state.turns.query(command, send);
-        state.apply(actions, Some(&self.input), &self.updates);
-        receive
+        self.turns.lock().unwrap().query(command)
     }
 
     pub fn has_exited(&self) -> bool {
-        self.state.lock().unwrap().turns.has_exited()
+        self.turns.lock().unwrap().has_exited()
     }
 
     /// Submits a prompt. Once Pi accepts it, the session gets it as the user
@@ -212,26 +150,18 @@ impl Pi {
         if !images.is_empty() {
             command["images"] = json!(images);
         }
-        let mut state = self.state.lock().unwrap();
-        let actions = state
-            .turns
-            .prompt(
-                command,
-                Box::new(Prompt {
-                    message_id: message_id.to_owned(),
-                    content,
-                    responder,
-                }),
-            )
-            .map_err(|prompt| Box::new(prompt.responder))?;
-        state.apply(actions, Some(&self.input), &self.updates);
-        Ok(())
+        self.turns.lock().unwrap().prompt(
+            command,
+            Box::new(Prompt {
+                message_id: message_id.to_owned(),
+                content,
+                responder,
+            }),
+        )
     }
 
     pub fn cancel(&self) {
-        let mut state = self.state.lock().unwrap();
-        let actions = state.turns.cancel();
-        state.apply(actions, Some(&self.input), &self.updates);
+        self.turns.lock().unwrap().cancel();
     }
 }
 
@@ -253,10 +183,7 @@ struct Tool {
 /// Pi's output, translated as it arrives.
 struct Output {
     updates: Updates,
-    state: Arc<Mutex<State>>,
-    /// Pi's stdin, for answers to its requests. It is weak so that the
-    /// session's `Pi` alone keeps stdin open.
-    input: mpsc::WeakUnboundedSender<Value>,
+    turns: Arc<Mutex<Turns>>,
     cwd: PathBuf,
     /// The blocks of the assistant message being streamed, by content index.
     blocks: HashMap<u64, Block>,
@@ -276,28 +203,8 @@ impl Output {
                 ),
                 Err(error) => format!("pi process failed: {error}"),
             };
-        {
-            let mut state = self.state.lock().unwrap();
-            let actions = state.turns.exited(&error);
-            state.apply(actions, None, &self.updates);
-        }
         self.updates.fail_open_tools();
-        self.updates.idle(error_stop(error));
-    }
-
-    fn handle_turns(
-        &self,
-        event: impl FnOnce(&mut Turns<Box<Prompt>>) -> Vec<Action<Box<Prompt>>>,
-    ) {
-        let mut state = self.state.lock().unwrap();
-        let actions = event(&mut state.turns);
-        state.apply(actions, self.input.upgrade().as_ref(), &self.updates);
-    }
-
-    fn send(&self, message: Value) {
-        if let Some(input) = self.input.upgrade() {
-            let _ = input.send(message);
-        }
+        self.turns.lock().unwrap().exited(error);
     }
 
     /// Translates a record of Pi's output.
@@ -308,15 +215,12 @@ impl Output {
         let role = &record["message"]["role"];
         let assistant = role == "assistant";
         match record["type"].as_str() {
-            Some("response") => self.handle_turns(|turns| turns.response(&record)),
-            Some("agent_start") => {
-                self.state.lock().unwrap().turns.run_started();
-                self.updates.working();
-            }
+            Some("response") => self.turns.lock().unwrap().response(&record),
+            Some("agent_start") => self.turns.lock().unwrap().started(),
             Some("agent_settled") => self.settled(record["aborted"] == true),
             Some("message_start") if assistant => self.blocks.clear(),
             Some("message_start") if role == "user" => {
-                self.handle_turns(Turns::user_message_started);
+                self.turns.lock().unwrap().user_message_started();
             }
             Some("message_update") => self.message_update(&record["assistantMessageEvent"]),
             Some("message_end") if assistant => self.assistant_message(&record["message"]),
@@ -332,57 +236,14 @@ impl Output {
                     Some("select" | "confirm" | "input" | "editor")
                 ) =>
             {
-                self.dialog(record);
+                Turns::dialog(&self.turns, record);
             }
             _ => {}
         }
     }
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "Pi's dialog timeout is the behavior"
-    )]
-    fn dialog(&self, request: Value) {
-        let mut locked = self.state.lock().unwrap();
-        if !locked.turns.takes_dialogs() {
-            self.send(dialogs::response(&request, None));
-            return;
-        }
-        let Some((message, schema)) = dialogs::form(&request) else {
-            self.send(dialogs::response(&request, None));
-            return;
-        };
-        let Some(id) = request["id"].as_str().map(str::to_owned) else {
-            return;
-        };
-        let ask = self.updates.ask(message, schema);
-        let state = self.state.clone();
-        let input = self.input.clone();
-        let task_id = id.clone();
-        let task = tokio::spawn(async move {
-            // Pi silently forgets timed-out dialogs; it sends no withdrawal record.
-            // An extension's private AbortSignal cannot be observed over RPC.
-            let action = if let Some(timeout) = dialogs::timeout(&request) {
-                tokio::select! {
-                    action = ask => action,
-                    () = sleep(timeout) => None,
-                }
-            } else {
-                ask.await
-            };
-            let mut state = state.lock().unwrap();
-            if state.dialogs.remove(&task_id).is_some()
-                && let Some(input) = input.upgrade()
-            {
-                let _ = input.send(dialogs::response(&request, action));
-            }
-        });
-        locked.dialogs.insert(id, task.abort_handle());
-    }
-
     /// Ends the turn once Pi has no more automatic work.
     fn settled(&mut self, aborted: bool) {
-        self.handle_turns(|turns| turns.settled(aborted));
         self.updates.fail_open_tools();
         self.tools.clear();
         let last_stop = self.last_stop.take();
@@ -394,7 +255,7 @@ impl Output {
             Some((reason, _)) if reason == "length" => StopReason::MaxTokens,
             _ => StopReason::EndTurn,
         };
-        self.updates.idle(stop_reason);
+        self.turns.lock().unwrap().settled(aborted, stop_reason);
     }
 
     /// Streams a delta of the assistant message.
@@ -516,10 +377,6 @@ impl Output {
         );
         self.updates.tool_ended(id, failed, content);
     }
-}
-
-fn error_stop(message: String) -> StopReason {
-    StopReason::Error(ErrorStopReason::new().error(acp::Error::new(-32603, message)))
 }
 
 fn new_id() -> String {
