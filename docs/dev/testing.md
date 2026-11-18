@@ -113,10 +113,14 @@ behavior, such as the park delay, sits in a small function marked with an
 
 ## Maintaining the suite
 
-- Treat tests as maintained code. Rewrite or remove tests when their behavior
-  changes or disappears.
-- Add meaningful regression coverage for reproduced bugs when practical. A
-  regression test should fail for the original behavior and pass with the fix.
+- Treat tests as maintained code. A change that replaces behavior replaces the
+  tests of the old behavior with tests of the new. Remove tests whose behavior
+  disappears.
+- Add meaningful regression coverage for reproduced bugs when practical.
+- A new test fails on the code before the change and passes with it. To check,
+  run it against a detached worktree of `HEAD`.
+- A case that an existing test's setup already reaches is an assertion in that
+  test.
 - Inspect the complete test diff. Check that removed or rewritten tests have
   kept required coverage, and explain material coverage gaps.
 - A failing test is evidence to investigate. Determine whether the code, the
