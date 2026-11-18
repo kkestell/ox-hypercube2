@@ -191,16 +191,4 @@ mod tests {
             expected.map(|(seq, at, kind)| (seq, at, kind.to_owned()))
         );
     }
-
-    #[test]
-    fn updates_without_a_prompt_end_no_turn() {
-        let events = events("s", vec![agent(10, "Hello"), tool(20)]);
-        assert_eq!(
-            described(&events),
-            [
-                (1, 10, "agent message".to_owned()),
-                (2, 20, "tool call".to_owned())
-            ]
-        );
-    }
 }

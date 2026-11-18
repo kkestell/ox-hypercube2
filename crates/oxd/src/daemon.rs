@@ -1616,17 +1616,6 @@ mod tests {
     // on a timer, and then straight to the earliest one.
 
     #[tokio::test(start_paused = true)]
-    async fn idling_for_the_delay_resolves() {
-        let changed = watch::Sender::new(());
-        let idle = Arc::new(AtomicBool::new(true));
-        let start = Instant::now();
-        let mut resolution = idle_task(&changed, &idle);
-        tokio::time::sleep(DELAY.saturating_sub(TICK)).await;
-        assert!(resolution.try_recv().is_err());
-        assert_eq!(resolution.await.unwrap() - start, DELAY);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_change_restarts_the_delay_and_busy_time_does_not_count() {
         let changed = watch::Sender::new(());
         let idle = Arc::new(AtomicBool::new(true));

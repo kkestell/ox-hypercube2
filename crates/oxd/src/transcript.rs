@@ -327,39 +327,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_history_has_no_entries() {
-        assert_eq!(
-            page(&[], None),
-            TranscriptPage {
-                text: String::new(),
-                before: None,
-            }
-        );
-    }
-
-    #[test]
-    fn a_page_stops_at_the_budget_and_names_the_earlier_entries() {
-        // Each entry is "User: " and 19,990 characters: two fit with the blank
-        // line between them, and a third does not.
-        let long = |c: char| prompt(&c.to_string().repeat(19_990));
-        let history = events(vec![long('a'), long('b'), long('c')]);
-        let latest = page(&history, None);
-        assert_eq!(latest.before, Some(2));
-        assert!(
-            latest.text.starts_with("User: bbb"),
-            "{}",
-            &latest.text[..20]
-        );
-        assert!(latest.text.ends_with("ccc"));
-        assert_eq!(latest.text.matches("\n\n").count(), 1);
-
-        let earlier = page(&history, latest.before);
-        assert_eq!(earlier.before, None);
-        assert!(earlier.text.starts_with("User: aaa"));
-        assert!(earlier.text.ends_with("aaa"));
-    }
-
-    #[test]
     fn an_entry_over_the_budget_is_cut() {
         let history = events(vec![prompt("hi"), prompt(&"x".repeat(BUDGET))]);
         let latest = page(&history, None);

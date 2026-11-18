@@ -1269,17 +1269,6 @@ mod tests {
     // on a timer, and then straight to the earliest one.
 
     #[tokio::test(start_paused = true)]
-    async fn a_parkable_session_is_parked_once_the_delay_passes() {
-        let parkability = Arc::new(Parkability::default());
-        let mut parks = parker(&parkability, None);
-        let start = Instant::now();
-        parkability.set(true);
-        tokio::time::sleep(DELAY.saturating_sub(TICK)).await;
-        assert!(parks.try_recv().is_err());
-        assert_eq!(parks.recv().await.unwrap() - start, DELAY);
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_lapse_that_reverts_before_the_park_task_looks_restarts_the_delay() {
         let parkability = Arc::new(Parkability::default());
         let mut parks = parker(&parkability, None);

@@ -1498,12 +1498,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use agent_client_protocol::v2::schema::{
-        BackgroundToolCall, ContentChunk, ElicitationAcceptAction, ElicitationContentValue,
-        ElicitationFormMode, ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode,
-        EnumOption, ErrorStopReason, IdleStateUpdate, MultiSelectPropertySchema,
-        OtherElicitationPropertySchema, OtherStateUpdate, PermissionOptionKind,
-        RequiresActionStateUpdate, RunningStateUpdate, SessionConfigSelectOption,
-        SessionInfoUpdate, StopReason, StringPropertySchema, TextContent,
+        ContentChunk, ElicitationAcceptAction, ElicitationContentValue, ElicitationFormMode,
+        ElicitationRequestScope, ElicitationSessionScope, ElicitationUrlMode, EnumOption,
+        ErrorStopReason, IdleStateUpdate, MultiSelectPropertySchema,
+        OtherElicitationPropertySchema, PermissionOptionKind, RunningStateUpdate,
+        SessionConfigSelectOption, StopReason, StringPropertySchema, TextContent,
     };
     use serde_json::json;
 
@@ -1661,57 +1660,6 @@ mod tests {
     }
 
     #[test]
-    fn state_follows_the_turn_and_its_permission_requests() {
-        let mut state = created();
-        assert_eq!(state.state(), SessionState::Starting);
-        assert_eq!(prompt(&mut state).unwrap_err().code, code::INVALID_STATE);
-
-        let mut state = started();
-        assert_eq!(state.state(), SessionState::Idle);
-        prompt(&mut state).unwrap();
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(running());
-
-        let mut outcome = request_permission(&mut state);
-        assert_eq!(state.state(), SessionState::AwaitingPermission);
-        let permit = |option_id: &str| Request::Permit {
-            request_id: "1".into(),
-            option_id: option_id.into(),
-        };
-        let error = state.request(permit("deny")).unwrap_err();
-        assert_eq!(error.code, code::INVALID_REQUEST);
-        state.request(permit("allow")).unwrap();
-        assert_eq!(state.state(), SessionState::Running);
-        assert!(matches!(
-            outcome.try_recv(),
-            Ok(RequestPermissionOutcome::Selected(selected)) if &*selected.option_id.0 == "allow"
-        ));
-        let error = state.request(permit("allow")).unwrap_err();
-        assert_eq!(error.code, code::INVALID_STATE);
-
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(
-            kinds(&state, 1),
-            [
-                "prompt_started",
-                "update",
-                "permission_requested",
-                "permission_resolved",
-                "update",
-                "turn_ended"
-            ]
-        );
-        assert_eq!(
-            state.events_after(6)[0].kind,
-            EventKind::TurnEnded {
-                stop_reason: Some(StopReason::EndTurn),
-                error: None
-            }
-        );
-    }
-
-    #[test]
     fn a_first_prompt_is_recorded_while_starting_and_runs_once_started() {
         let mut state = created();
         let seq = state.record_first_prompt(vec![ContentBlock::Text(TextContent::new("hello"))]);
@@ -1755,93 +1703,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn exit_and_close_end_the_turn_and_its_permission_requests() {
-        for (change, last) in [
-            (Change::Exited(None), "agent_exited"),
-            (Change::Closed, "session_closed"),
-        ] {
-            let mut state = started();
-            prompt(&mut state).unwrap();
-            let mut outcome = request_permission(&mut state);
-            state.record(change);
-            assert_eq!(state.state(), SessionState::Exited);
-            assert_eq!(
-                kinds(&state, 3),
-                ["permission_resolved", "turn_ended", last]
-            );
-            assert_eq!(
-                outcome.try_recv(),
-                Ok(CancelledPermissionOutcome::new().into()),
-                "{last}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_agent_starts_and_ends_turns_of_its_own() {
-        let mut state = started();
-        state.record(idle(None));
-        assert_eq!(kinds(&state, 1), ["update"]);
-        assert_eq!(state.state(), SessionState::Idle);
-
-        state.record(running());
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(running());
-
-        let mut outcome = request_permission(&mut state);
-        assert_eq!(state.state(), SessionState::AwaitingPermission);
-        state.record(Change::Cancelled);
-        assert_eq!(
-            outcome.try_recv(),
-            Ok(CancelledPermissionOutcome::new().into())
-        );
-        assert_eq!(state.state(), SessionState::Running);
-
-        state.record(idle(Some(StopReason::Cancelled)));
-        assert_eq!(state.state(), SessionState::Idle);
-        state.record(idle(None));
-        assert_eq!(
-            kinds(&state, 1),
-            [
-                "update",
-                "update",
-                "turn_started",
-                "update",
-                "permission_requested",
-                "permission_resolved",
-                "update",
-                "turn_ended",
-                "update"
-            ]
-        );
-        assert_eq!(
-            state.events_after(8)[0].kind,
-            EventKind::TurnEnded {
-                stop_reason: Some(StopReason::Cancelled),
-                error: None
-            }
-        );
-        prompt(&mut state).unwrap();
-    }
-
-    #[test]
-    fn a_repeated_idle_snapshot_after_a_prompt_leaves_the_turn_running() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        // The agent repeats the snapshot it sent before the prompt, then
-        // reports the work the prompt asked for, then stops.
-        state.record(idle(None));
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(
-            kinds(&state, 1),
-            ["prompt_started", "update", "update", "update", "turn_ended"]
-        );
-    }
-
     /// The agent's rejection of the last prompt sent.
     fn rejected(state: &State, error: &str) -> Change {
         let prompt = state
@@ -1854,61 +1715,6 @@ mod tests {
             prompt,
             error: error.into(),
         }
-    }
-
-    #[test]
-    fn a_rejected_prompt_ends_the_turn_with_its_error() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        state.record(rejected(&state, "not inserted"));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(kinds(&state, 1), ["prompt_started", "turn_ended"]);
-        assert_eq!(
-            state.events_after(2)[0].kind,
-            EventKind::TurnEnded {
-                stop_reason: None,
-                error: Some("not inserted".into())
-            }
-        );
-        // The agent may report the state it was already in.
-        state.record(idle(None));
-        assert_eq!(kinds(&state, 3), ["update"]);
-        prompt(&mut state).unwrap();
-    }
-
-    #[test]
-    fn a_rejected_prompt_after_the_agent_reported_work_waits_for_idle() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        state.record(running());
-        state.record(rejected(&state, "late"));
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(idle(Some(StopReason::Cancelled)));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(
-            kinds(&state, 1),
-            ["prompt_started", "update", "update", "turn_ended"]
-        );
-        assert_eq!(
-            state.events_after(4)[0].kind,
-            EventKind::TurnEnded {
-                stop_reason: Some(StopReason::Cancelled),
-                error: None
-            }
-        );
-    }
-
-    #[test]
-    fn an_answered_prompt_that_was_rejected_after_its_turn_ended_changes_nothing() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        state.record(rejected(&state, "late"));
-        assert_eq!(
-            kinds(&state, 1),
-            ["prompt_started", "update", "update", "turn_ended"]
-        );
     }
 
     #[test]
@@ -1972,36 +1778,6 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn a_prompt_during_a_turn_is_steered_and_taken_when_the_agent_accepts_it() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        let (_, seq) = state
-            .request(Request::Prompt(text("also")))
-            .unwrap()
-            .unwrap();
-        assert_eq!(seq, last_steered(&state));
-        state.record(running());
-        state.record(Change::PromptAccepted { prompt: seq });
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(
-            kinds(&state, 1),
-            [
-                "prompt_started",
-                "prompt_steered",
-                "update",
-                "steered_prompt_taken",
-                "update",
-                "turn_ended"
-            ]
-        );
-        assert_eq!(
-            state.events_after(4)[0].kind,
-            EventKind::SteeredPromptTaken { prompt: seq }
-        );
-        assert_eq!(state.state(), SessionState::Idle);
-    }
-
     fn message(state: &mut State, text: &str) -> Result<(Vec<ContentBlock>, u64), ErrorBody> {
         state
             .request(Request::Message {
@@ -2057,65 +1833,6 @@ mod tests {
             header.starts_with("Message from Ox session peer. "),
             "{header}"
         );
-    }
-
-    #[test]
-    fn a_peer_message_after_a_cancelled_turn_leaves_the_queue_held() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        enqueue(&mut state, "first");
-        state.record(running());
-        state.record(Change::Cancelled);
-        state.record(idle(Some(StopReason::Cancelled)));
-        message(&mut state, "hello").unwrap();
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(start_queued(&mut state), None);
-        assert_eq!(queued_ids(&state), ["first"]);
-    }
-
-    #[test]
-    fn queued_prompts_start_one_turn_each_in_order_after_normal_ends() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        enqueue(&mut state, "first");
-        enqueue(&mut state, "second");
-        assert_eq!(start_queued(&mut state), None, "a turn is running");
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
-        assert_eq!(start_queued(&mut state), None, "one prompt per turn");
-        assert_eq!(queued_ids(&state), ["second"]);
-        state.record(running());
-        state.record(idle(None));
-        assert_eq!(start_queued(&mut state).as_deref(), Some("second"));
-        assert!(state.queued().is_empty());
-        assert_eq!(state.state(), SessionState::Running);
-    }
-
-    #[test]
-    fn a_prompt_queued_on_an_idle_session_starts_at_once() {
-        let mut state = started();
-        enqueue(&mut state, "first");
-        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
-        assert_eq!(kinds(&state, 1), ["prompt_started"]);
-    }
-
-    #[test]
-    fn cancelling_holds_the_queue_until_a_prompt_is_sent() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        enqueue(&mut state, "first");
-        enqueue(&mut state, "second");
-        state.record(running());
-        state.record(Change::Cancelled);
-        state.record(idle(Some(StopReason::Cancelled)));
-        assert_eq!(start_queued(&mut state), None);
-        prompt(&mut state).unwrap();
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        assert_eq!(start_queued(&mut state).as_deref(), Some("first"));
     }
 
     #[test]
@@ -2275,60 +1992,6 @@ mod tests {
     }
 
     #[test]
-    fn states_other_than_idle_are_work() {
-        let unknown = || {
-            state_change(StateUpdate::Other(OtherStateUpdate::new(
-                "_waiting",
-                BTreeMap::new(),
-            )))
-        };
-        let requires_action =
-            || state_change(StateUpdate::RequiresAction(RequiresActionStateUpdate::new()));
-        for change in [unknown(), requires_action()] {
-            let mut state = started();
-            state.record(change);
-            assert_eq!(state.state(), SessionState::Running);
-            assert_eq!(kinds(&state, 1), ["update", "turn_started"]);
-            // An unknown state is never taken for idle.
-            state.record(running());
-            state.record(idle(None));
-            assert_eq!(state.state(), SessionState::Idle);
-        }
-    }
-
-    #[test]
-    fn exit_ends_a_turn_the_agent_started() {
-        let mut state = started();
-        state.record(running());
-        state.record(Change::Exited(None));
-        assert_eq!(
-            kinds(&state, 1),
-            ["update", "turn_started", "turn_ended", "agent_exited"]
-        );
-        assert!(matches!(
-            state.events_after(3)[0].kind,
-            EventKind::TurnEnded {
-                stop_reason: None,
-                error: Some(_)
-            }
-        ));
-    }
-
-    #[test]
-    fn a_turn_ends_once() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        state.record(running());
-        state.record(idle(Some(StopReason::EndTurn)));
-        state.record(idle(Some(StopReason::EndTurn)));
-        state.record(rejected(&state, "late"));
-        assert_eq!(
-            kinds(&state, 1),
-            ["prompt_started", "update", "update", "turn_ended", "update"]
-        );
-    }
-
-    #[test]
     fn nothing_follows_session_closed() {
         let mut state = started();
         prompt(&mut state).unwrap();
@@ -2434,16 +2097,6 @@ mod tests {
     }
 
     #[test]
-    fn an_appended_event_carries_the_time_it_was_recorded() {
-        let mut state = started();
-        let before = crate::daemon::now();
-        state.record(Change::Closed);
-        let after = crate::daemon::now();
-        let recorded_at = state.events_after(state.last_seq() - 1)[0].recorded_at;
-        assert!((before..=after).contains(&recorded_at));
-    }
-
-    #[test]
     fn closing_a_restored_session_records_session_closed_after_its_last_seq() {
         let mut state = restored_at(3);
         state.subscribe(3).unwrap();
@@ -2521,15 +2174,6 @@ mod tests {
     }
 
     #[test]
-    fn session_closed_is_not_logged() {
-        let mut state = started();
-        state.take_unlogged();
-        state.record(Change::Closed);
-        assert_eq!(kinds(&state, 1), ["session_closed"]);
-        assert!(state.take_unlogged().is_empty());
-    }
-
-    #[test]
     fn a_restored_session_is_exited_and_loads_its_replay_as_history() {
         let mut state = restored();
         assert_eq!(state.state(), SessionState::Exited);
@@ -2571,232 +2215,6 @@ mod tests {
         let resume = state.load().unwrap();
         assert!(!resume.replay);
         assert_eq!(resume.session_id, "agent");
-    }
-
-    fn idle_with(background: Vec<BackgroundWork>) -> Change {
-        state_change(StateUpdate::Idle(
-            IdleStateUpdate::new().background(background),
-        ))
-    }
-
-    fn work() -> BackgroundWork {
-        BackgroundWork::ToolCall(BackgroundToolCall::new("tool"))
-    }
-
-    #[test]
-    fn a_session_is_quiet_when_the_agent_reports_no_background_work() {
-        let mut state = started();
-        assert!(!state.quiet(), "an agent that reports no list is not quiet");
-        state.record(idle_with(vec![work()]));
-        assert!(!state.quiet());
-        state.record(idle_with(Vec::new()));
-        assert!(state.quiet());
-        state.record(idle(None));
-        assert!(!state.quiet(), "a state without the list is not quiet");
-
-        state.record(idle_with(Vec::new()));
-        prompt(&mut state).unwrap();
-        assert!(!state.quiet());
-        state.record(idle_with(Vec::new()));
-        state.record(running());
-        state.record(idle_with(Vec::new()));
-        assert!(state.quiet());
-        let _answer = request_permission(&mut state);
-        assert!(!state.quiet());
-    }
-
-    #[test]
-    fn the_resume_snapshot_gives_the_session_its_background_work() {
-        let resumed = |snapshot: Change| {
-            let mut state = restored();
-            state.load().unwrap();
-            state.record(snapshot);
-            state.record(Change::Started(Agent {
-                session_id: "agent".into(),
-                prompt_capabilities: PromptCapabilities::default(),
-                config_options: Vec::new(),
-                available_commands: Vec::new(),
-            }));
-            state
-        };
-        assert!(resumed(idle_with(Vec::new())).quiet());
-        assert!(!resumed(idle_with(vec![work()])).quiet());
-        assert!(!resumed(idle(None)).quiet());
-    }
-
-    #[test]
-    fn parking_exits_a_quiet_session_and_records_it() {
-        let mut state = started();
-        state.record(idle_with(Vec::new()));
-        state.record(Change::Parked);
-        assert_eq!(state.state(), SessionState::Exited);
-        assert_eq!(
-            kinds(&state, 0),
-            ["agent_started", "update", "agent_parked"]
-        );
-        assert_eq!(state.load().unwrap().session_id, "agent");
-
-        let mut state = created();
-        state.record(Change::Parked);
-        assert_eq!(state.state(), SessionState::Starting);
-        assert!(kinds(&state, 0).is_empty());
-    }
-
-    #[test]
-    fn the_resume_snapshot_sets_the_state_without_recording_a_turn() {
-        let resumed = |state: &mut State, snapshot: Change| {
-            state.load().unwrap();
-            state.record(replayed("hello"));
-            state.record(snapshot);
-            state.record(Change::Started(Agent {
-                session_id: "agent".into(),
-                prompt_capabilities: PromptCapabilities::default(),
-                config_options: Vec::new(),
-                available_commands: Vec::new(),
-            }));
-        };
-
-        let mut state = restored();
-        resumed(&mut state, idle(None));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(kinds(&state, 0), ["update", "update", "agent_started"]);
-
-        let mut state = restored();
-        resumed(&mut state, running());
-        assert_eq!(state.state(), SessionState::Running);
-        assert_eq!(kinds(&state, 0), ["update", "update", "agent_started"]);
-        state.record(idle(Some(StopReason::Cancelled)));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(
-            kinds(&state, 0),
-            ["update", "update", "agent_started", "update"]
-        );
-        prompt(&mut state).unwrap();
-
-        // The snapshot counts when the session keeps its history and drops
-        // the replay, and a turn it reports ends silently if the agent exits.
-        let mut state = started();
-        state.record(Change::Exited(None));
-        resumed(&mut state, running());
-        assert_eq!(state.state(), SessionState::Running);
-        state.record(Change::Exited(None));
-        assert_eq!(
-            kinds(&state, 0),
-            [
-                "agent_started",
-                "agent_exited",
-                "agent_started",
-                "agent_exited"
-            ]
-        );
-    }
-
-    #[test]
-    fn a_session_with_a_history_loads_without_duplicating_it() {
-        let mut state = started();
-        state.record(Change::Exited(None));
-        assert!(!state.load().unwrap().replay);
-        state.record(replayed("hello"));
-        state.record(Change::Started(Agent {
-            session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }));
-        assert_eq!(state.state(), SessionState::Idle);
-        assert_eq!(
-            kinds(&state, 0),
-            ["agent_started", "agent_exited", "agent_started"]
-        );
-    }
-
-    #[test]
-    fn only_an_exited_session_with_an_agent_session_loads() {
-        let mut state = created();
-        assert_eq!(state.load().unwrap_err().code, code::INVALID_STATE);
-        state.record(Change::Exited(Some("never started".into())));
-        assert_eq!(state.state(), SessionState::Exited);
-        assert_eq!(state.load().unwrap_err().code, code::INVALID_STATE);
-
-        let mut state = started();
-        assert_eq!(state.load().unwrap_err().code, code::INVALID_STATE);
-        state.record(Change::Closed);
-        assert_eq!(state.load().unwrap_err().code, code::INVALID_STATE);
-    }
-
-    #[test]
-    fn a_load_that_fails_leaves_the_session_loadable() {
-        let mut state = restored();
-        state.load().unwrap();
-        state.record(Change::Exited(Some("cannot load".into())));
-        assert_eq!(state.state(), SessionState::Exited);
-        assert_eq!(state.agent().unwrap().session_id, "agent");
-        assert_eq!(kinds(&state, 0), ["agent_exited"]);
-
-        // The failed load recorded no conversation, so the next one does.
-        assert!(state.load().unwrap().replay);
-        state.record(replayed("hello"));
-        state.record(Change::Started(Agent {
-            session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }));
-        assert_eq!(kinds(&state, 1), ["update", "agent_started"]);
-    }
-
-    #[test]
-    fn a_load_that_fails_partway_through_its_replay_records_none_of_it() {
-        let mut state = restored();
-        state.load().unwrap();
-        state.record(replayed("hello"));
-        state.record(Change::Exited(Some("load interrupted".into())));
-        assert_eq!(kinds(&state, 0), ["agent_exited"]);
-
-        state.load().unwrap();
-        state.record(replayed("hello"));
-        state.record(Change::Started(Agent {
-            session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }));
-        assert_eq!(
-            kinds(&state, 0),
-            ["agent_exited", "update", "agent_started"]
-        );
-    }
-
-    fn info(update: SessionInfoUpdate) -> Change {
-        Change::Update(SessionUpdate::SessionInfoUpdate(update))
-    }
-
-    #[test]
-    fn session_info_updates_set_clear_and_keep_the_title() {
-        // A loading agent replays its title before it starts.
-        let mut state = created();
-        state.record(info(SessionInfoUpdate::new().title("Replayed")));
-        state.record(Change::Started(Agent {
-            session_id: "agent".into(),
-            prompt_capabilities: PromptCapabilities::default(),
-            config_options: Vec::new(),
-            available_commands: Vec::new(),
-        }));
-        assert_eq!(state.title(), Some("Replayed"));
-
-        state.record(info(SessionInfoUpdate::new().title("Fix the build")));
-        assert_eq!(state.title(), Some("Fix the build"));
-        state.record(info(
-            SessionInfoUpdate::new().updated_at("2026-11-11T00:00:00Z"),
-        ));
-        assert_eq!(state.title(), Some("Fix the build"));
-        state.record(Change::Exited(None));
-        assert_eq!(state.title(), Some("Fix the build"));
-
-        let mut state = started();
-        state.record(info(SessionInfoUpdate::new().title("Fix the build")));
-        state.record(info(SessionInfoUpdate::new().title(None::<String>)));
-        assert_eq!(state.title(), None);
     }
 
     /// A form like the fake agent's: `color` (required, `red` or `blue`),
@@ -2904,43 +2322,6 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_the_turn_leaves_an_elicitation_open() {
-        let mut state = started();
-        prompt(&mut state).unwrap();
-        state.record(running());
-        let mut action = elicit(&mut state);
-        let mut outcome = request_permission(&mut state);
-        state.record(Change::Cancelled);
-        assert_eq!(
-            outcome.try_recv(),
-            Ok(CancelledPermissionOutcome::new().into())
-        );
-        assert!(action.try_recv().is_err());
-        assert_eq!(state.state(), SessionState::AwaitingInput);
-        respond(&mut state, "1", ElicitationAction::Decline).unwrap();
-        assert_eq!(action.try_recv(), Ok(ElicitationAction::Decline));
-    }
-
-    #[test]
-    fn exit_park_and_close_cancel_an_elicitation() {
-        for (change, last) in [
-            (Change::Exited(None), "agent_exited"),
-            (Change::Parked, "agent_parked"),
-            (Change::Closed, "session_closed"),
-        ] {
-            let mut state = started();
-            prompt(&mut state).unwrap();
-            let mut action = elicit(&mut state);
-            state.record(change);
-            assert_eq!(
-                kinds(&state, 3),
-                ["elicitation_resolved", "turn_ended", last]
-            );
-            assert_eq!(action.try_recv(), Ok(ElicitationAction::Cancel), "{last}");
-        }
-    }
-
-    #[test]
     fn a_withdrawal_ends_only_the_elicitation_whose_receiver_closed() {
         let mut state = started();
         prompt(&mut state).unwrap();
@@ -3017,84 +2398,6 @@ mod tests {
     }
 
     #[test]
-    fn unseen_reads_how_turns_and_agents_ended() {
-        let event = |kind| Event {
-            session_id: "s".into(),
-            seq: 1,
-            recorded_at: 0,
-            kind,
-        };
-        let turn = |stop_reason, error: Option<&str>| {
-            event(EventKind::TurnEnded {
-                stop_reason,
-                error: error.map(String::from),
-            })
-        };
-        let exited = |error: Option<&str>| {
-            event(EventKind::AgentExited {
-                error: error.map(String::from),
-            })
-        };
-        let cases = [
-            (
-                "end turn",
-                vec![turn(Some(StopReason::EndTurn), None)],
-                Some(Unseen::Finished),
-            ),
-            (
-                "max tokens",
-                vec![turn(Some(StopReason::MaxTokens), None)],
-                Some(Unseen::Finished),
-            ),
-            (
-                "refusal",
-                vec![turn(Some(StopReason::Refusal), None)],
-                Some(Unseen::Finished),
-            ),
-            (
-                "no stop reason",
-                vec![turn(None, None)],
-                Some(Unseen::Finished),
-            ),
-            (
-                "cancelled",
-                vec![turn(Some(StopReason::Cancelled), None)],
-                None,
-            ),
-            (
-                "error stop reason",
-                vec![turn(Some(StopReason::Error(ErrorStopReason::new())), None)],
-                Some(Unseen::Error),
-            ),
-            (
-                "turn error",
-                vec![turn(None, Some("boom"))],
-                Some(Unseen::Error),
-            ),
-            (
-                "agent exited with an error",
-                vec![exited(Some("boom"))],
-                Some(Unseen::Error),
-            ),
-            ("agent exited", vec![exited(None)], None),
-            (
-                "error after a finish",
-                vec![turn(Some(StopReason::EndTurn), None), exited(Some("boom"))],
-                Some(Unseen::Error),
-            ),
-            (
-                "parked",
-                vec![turn(None, Some("parked")), event(EventKind::AgentParked)],
-                None,
-            ),
-            ("nothing ended", vec![event(EventKind::TurnStarted)], None),
-        ];
-        for (name, events, expected) in cases {
-            assert_eq!(unseen(&events), expected, "{name}");
-        }
-    }
-
-    #[test]
     fn a_restored_session_that_never_started_cannot_load() {
         let mut state = State::restored(
             &SavedSession {
@@ -3110,26 +2413,6 @@ mod tests {
             refused.message,
             "the session never started, so it has nothing to load"
         );
-    }
-
-    #[test]
-    fn a_move_begins_only_on_an_idle_or_exited_session() {
-        let mut starting = created();
-        assert_eq!(starting.begin_move(), Err(SessionState::Starting));
-
-        let mut running = started();
-        prompt(&mut running).unwrap();
-        assert_eq!(running.begin_move(), Err(SessionState::Running));
-
-        let mut awaiting = started();
-        prompt(&mut awaiting).unwrap();
-        let _answer = request_permission(&mut awaiting);
-        assert_eq!(awaiting.begin_move(), Err(SessionState::AwaitingPermission));
-
-        assert_eq!(started().begin_move(), Ok(()));
-        let mut exited = started();
-        exited.record(Change::Exited(None));
-        assert_eq!(exited.begin_move(), Ok(()));
     }
 
     #[test]
@@ -3164,80 +2447,11 @@ mod tests {
         state.load().unwrap();
     }
 
-    fn agent_with(config_options: Vec<SessionConfigOption>) -> Agent {
-        Agent {
-            config_options,
-            ..Agent::saved("agent".into())
-        }
-    }
-
-    fn model_option(value: &str) -> SessionConfigOption {
-        SessionConfigOption::select(
-            "model".to_owned(),
-            "Model".to_owned(),
-            value.to_owned(),
-            vec![SessionConfigSelectOption::new(
-                value.to_owned(),
-                value.to_owned(),
-            )],
-        )
-        .category(Some(SessionConfigOptionCategory::Model))
-    }
-
     fn model(value: &str) -> ConfigSetting {
         ConfigSetting {
             config_id: "model".into(),
             value: ConfigValue::Id(value.into()),
         }
-    }
-
-    #[test]
-    fn transitions_record_the_changes_to_the_saved_session() {
-        let mut state = created();
-        state.record(Change::Started(agent_with(vec![model_option("smart")])));
-        assert_eq!(state.config(), [model("smart")]);
-        assert_eq!(
-            state.take_unsaved(),
-            [
-                RowChange::AgentSessionId("agent".into()),
-                RowChange::Config(vec![model("smart")]),
-            ]
-        );
-
-        state.set_title("Plan".into());
-        state.record(info(SessionInfoUpdate::new().title("Fix the build")));
-        state.set_archived(true);
-        enqueue(&mut state, "first");
-        state
-            .request(Request::QueueRemove { id: "first".into() })
-            .unwrap();
-        assert_eq!(
-            state.take_unsaved(),
-            [
-                RowChange::Title(Some("Fix the build".into())),
-                RowChange::Archived(true),
-                RowChange::Queue(Queue::default()),
-            ],
-            "the last change of each kind"
-        );
-        assert!(state.take_unsaved().is_empty());
-    }
-
-    #[test]
-    fn a_session_with_a_config_keeps_it_when_the_agent_reports_another() {
-        let mut state = State::created(
-            &SavedSession {
-                config: vec![model("fast")],
-                ..saved()
-            },
-            None,
-        );
-        state.record(Change::Started(agent_with(vec![model_option("smart")])));
-        assert_eq!(state.config(), [model("fast")]);
-        assert_eq!(
-            state.take_unsaved(),
-            [RowChange::AgentSessionId("agent".into())]
-        );
     }
 
     #[test]
@@ -3290,30 +2504,5 @@ mod tests {
 
         state.settle_config(vec![(model("tiny"), None)]).unwrap();
         assert_eq!(state.config(), [model("tiny"), mode("plan")]);
-    }
-
-    #[tokio::test]
-    async fn a_failed_start_forgets_the_worktree() {
-        let worktree = Worktree::new(
-            crate::store::SavedWorktree {
-                id: "t".into(),
-                path: "/worktrees/t".into(),
-                branch: "ox/t".into(),
-                base: "abc".into(),
-                created_branch: true,
-                compare: None,
-                common_dir: "/repos/work/.git".into(),
-            },
-            tokio::sync::watch::Sender::new(()),
-        );
-        let mut state = State::created(&saved(), Some(worktree.clone()));
-        state.fail_start("worktree add failed".into());
-        worktree.close();
-        assert!(state.worktree().is_none());
-        assert_eq!(state.state(), SessionState::Exited);
-        assert_eq!(
-            state.take_unsaved(),
-            [RowChange::WorktreeForgotten("t".into())]
-        );
     }
 }

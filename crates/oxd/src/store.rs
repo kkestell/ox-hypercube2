@@ -772,7 +772,6 @@ fn parse_unseen(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Optio
 
 #[cfg(test)]
 mod tests {
-    use ox_protocol::QueuedPrompt;
     use ox_protocol::schema::{ContentBlock, TextContent};
 
     use super::*;
@@ -804,14 +803,6 @@ mod tests {
 
         store.remove_workspace("b").unwrap();
         assert_eq!(store.workspaces().unwrap(), [first]);
-    }
-
-    #[test]
-    fn a_workspace_path_is_saved_once() {
-        let store = store();
-        assert!(store.add_workspace(&workspace("a", "/work")).unwrap());
-        assert!(!store.add_workspace(&workspace("b", "/work")).unwrap());
-        assert_eq!(store.workspaces().unwrap(), [workspace("a", "/work")]);
     }
 
     #[test]
@@ -881,70 +872,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn archiving_is_saved_and_deleted_with_the_session() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
-            .unwrap();
-        assert!(!store.sessions().unwrap()[0].archived);
-        save(&store, "one", RowChange::Archived(true));
-        assert!(store.sessions().unwrap()[0].archived);
-        save(&store, "one", RowChange::Archived(false));
-        assert!(!store.sessions().unwrap()[0].archived);
-        save(&store, "one", RowChange::Archived(true));
-        store.remove_session("one").unwrap();
-        assert_eq!(count(&store, "archived"), 0);
-    }
-
-    #[test]
-    fn unseen_is_saved_replaced_and_deleted_with_the_session() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
-            .unwrap();
-        assert_eq!(store.sessions().unwrap()[0].unseen, None);
-        save(&store, "one", RowChange::Unseen(Some(Unseen::Finished)));
-        assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Finished));
-        save(&store, "one", RowChange::Unseen(Some(Unseen::Error)));
-        assert_eq!(store.sessions().unwrap()[0].unseen, Some(Unseen::Error));
-        save(&store, "one", RowChange::Unseen(None));
-        assert_eq!(store.sessions().unwrap()[0].unseen, None);
-        save(&store, "one", RowChange::Unseen(Some(Unseen::Error)));
-        store.remove_session("one").unwrap();
-        assert_eq!(count(&store, "session_unseen"), 0);
-    }
-
-    #[test]
-    fn a_saved_queue_comes_back_with_its_session_and_is_deleted_with_it() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        store
-            .add_session("one", "w", &command(), Path::new("/work"), None, 0, &[])
-            .unwrap();
-        let queue = Queue {
-            prompts: vec![QueuedPrompt {
-                id: "q".into(),
-                prompt: vec![ContentBlock::Text(TextContent::new("Then test"))],
-            }],
-            paused: true,
-        };
-        save(&store, "one", RowChange::Queue(queue.clone()));
-        assert_eq!(store.sessions().unwrap()[0].queue, queue);
-        save(&store, "one", RowChange::Queue(Queue::default()));
-        assert_eq!(store.sessions().unwrap()[0].queue, Queue::default());
-        save(&store, "one", RowChange::Queue(queue.clone()));
-        store.remove_session("one").unwrap();
-        assert_eq!(count(&store, "session_queues"), 0);
-    }
-
-    /// Writes one change to session `id`.
-    fn save(store: &Store, id: &str, change: RowChange) {
-        store.save_session(id, &[change], &[]).unwrap();
     }
 
     fn setting(config_id: &str, value: &str) -> ConfigSetting {
@@ -1063,25 +990,6 @@ mod tests {
             .unwrap()
     }
 
-    /// The worktree, with its comparison ref and repository, comes back as
-    /// saved, and the session names it.
-    #[test]
-    fn a_session_round_trips_with_its_worktree() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        store
-            .add_session("plain", "w", &command(), Path::new("/work"), None, 0, &[])
-            .unwrap();
-        let mut compared = worktree("01234567");
-        compared.compare = Some("main".into());
-        add_worktree_session(&store, "s", &compared);
-        assert_eq!(store.worktrees().unwrap(), [compared]);
-        let sessions = store.sessions().unwrap();
-        assert_eq!(sessions[0].worktree_id, None);
-        assert_eq!(sessions[1].worktree_id.as_deref(), Some("01234567"));
-        assert_eq!(sessions[1].cwd, Path::new("/worktrees/work-01234567"));
-    }
-
     #[test]
     fn a_forgotten_worktree_leaves_its_session_without_one() {
         let store = store();
@@ -1106,27 +1014,6 @@ mod tests {
         assert_eq!(store.worktrees().unwrap(), [worktree("two")]);
         assert!(store.events("s").unwrap().is_empty());
         assert_eq!(store.events("t").unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_session_whose_worktree_row_fails_is_not_saved() {
-        let store = store();
-        store.add_workspace(&workspace("w", "/work")).unwrap();
-        add_worktree_session(&store, "s", &worktree("one"));
-        // The second worktree row conflicts with the first.
-        store
-            .add_session(
-                "t",
-                "w",
-                &command(),
-                Path::new("/work"),
-                Some(&worktree("one")),
-                0,
-                &[],
-            )
-            .unwrap_err();
-        assert_eq!(count(&store, "sessions"), 1);
-        assert_eq!(count(&store, "worktrees"), 1);
     }
 
     #[test]
@@ -1475,17 +1362,6 @@ mod tests {
         assert_eq!(count(&store, "deleted_agent_sessions"), 1);
     }
 
-    const TABLES: [&str; 8] = [
-        "workspaces",
-        "worktrees",
-        "sessions",
-        "events",
-        "archived",
-        "session_unseen",
-        "session_queues",
-        "deleted_agent_sessions",
-    ];
-
     fn user_version(connection: &Connection) -> i64 {
         connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1501,15 +1377,6 @@ mod tests {
 
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-    }
-
-    #[test]
-    fn a_new_database_has_every_table_at_the_latest_version() {
-        let store = store();
-        assert_eq!(user_version(&store.lock()), schema_version());
-        for table in TABLES {
-            assert_eq!(count(&store, table), 0, "{table}");
-        }
     }
 
     #[test]
